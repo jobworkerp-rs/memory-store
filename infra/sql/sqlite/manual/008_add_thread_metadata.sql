@@ -1,0 +1,13 @@
+-- Manual migration: adds metadata JSON column to the thread table.
+-- Run this on existing databases created before the column was introduced.
+--
+-- New databases (created with the current 001_schema.sql) already have this
+-- column and do NOT need this script.
+--
+-- Storage semantics: JSON-encoded string, server stores as-is on SQLite
+-- (the JSON type is just a hint here, the column is TEXT under the hood).
+-- The application layer never inspects the value;
+-- ThreadService.AddMemoriesBatch never overwrites an existing row's metadata.
+-- Use ThreadService.Update to mutate it. Round-trip is byte-identical here
+-- but only JSON-equivalent on PostgreSQL — see proto docs on `Thread.metadata`.
+ALTER TABLE `thread` ADD COLUMN `metadata` JSON;

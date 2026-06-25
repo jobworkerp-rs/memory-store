@@ -1,0 +1,2 @@
+未来の視点で自省(reflection)を行うこと。forward-looking な lessons を抽出し、各 lesson・decision・score を上記のターン番号に facts で結びつけること。
+以下に reflection の JSON を出力せよ。自由記述フィールドはすべて日本語で書き、コード・コマンド・パス・ツール名・enum 値は英語のままにすること:

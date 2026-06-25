@@ -1,0 +1,134 @@
+# Depends on `memories-mm-embedding` (auto-embedding-workers.yaml,
+# MEMORY_AUTO_EMBEDDING_ENABLED=true) for the embed step. user_id is
+# injected into options.filter server-side so a malicious or forgetful
+# LLM cannot bypass tenant isolation by omitting it inside `filter`.
+
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: rag-recall-memories
+  version: "1.0.0"
+
+input:
+  schema:
+    document:
+      type: object
+      properties:
+        query:
+          type: string
+          description: "Natural-language search query. Embedded server-side; do NOT pass embedding vectors."
+        user_id:
+          # int64 as decimal string — same precision rationale as the
+          # memory_id / thread_id fields in get-surrounding-memories.yaml.
+          # Tenant ids are typically snowflakes that exceed JSON's safe
+          # integer range; string-on-the-wire prevents silent rounding by
+          # JS / function-calling clients.
+          type: string
+          pattern: "^-?[0-9]+$"
+          description: "Tenant user id (int64 as decimal string). Enforced as MemorySearchFilter.user_id; cross-tenant results are never returned."
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 10
+          description: "Maximum number of results to return (default 10)."
+        filter:
+          type: object
+          description: |
+            Optional MemorySearchFilter subset. `user_id` is injected
+            automatically from the top-level `user_id` and must NOT be set
+            here. All keys are optional; combine them with AND semantics.
+          properties:
+            roles:
+              type: array
+              description: "Restrict by message roles (e.g. ROLE_USER, ROLE_ASSISTANT, ROLE_SYSTEM). Empty / omitted = any role."
+              items: { type: string }
+            content_types:
+              type: array
+              description: "Restrict by content types (e.g. TEXT, IMAGE). Empty / omitted = any type."
+              items: { type: string }
+            created_after:
+              type: integer
+              description: "Inclusive lower bound on creation time, milliseconds since epoch."
+            created_before:
+              type: integer
+              description: "Exclusive upper bound on creation time, milliseconds since epoch."
+            updated_after:
+              type: integer
+              description: "Exclusive lower bound on update time, milliseconds since epoch."
+            updated_before:
+              type: integer
+              description: "Exclusive upper bound on update time, milliseconds since epoch."
+            thread_filter:
+              type: object
+              description: "Restrict to memories attached to threads matching these criteria."
+              properties:
+                labels:
+                  type: array
+                  description: "Thread labels."
+                  items: { type: string }
+                label_match_mode:
+                  type: string
+                  description: "LABEL_ANY (default) = match threads with at least one of the labels. LABEL_ALL = require every label."
+                channel:
+                  type: string
+                  description: "Thread channel name."
+                created_after:    { type: integer }
+                created_before:   { type: integer }
+                updated_after:    { type: integer }
+                updated_before:   { type: integer }
+        hybrid_strategy:
+          type: string
+          enum: [RRF, WEIGHTED, VECTOR_THEN_FTS, FTS_THEN_VECTOR]
+          default: RRF
+          description: "Fusion strategy. RRF (default) blends rankings; WEIGHTED blends scores."
+      required: [query, user_id]
+
+do:
+  # Reference memories-mm-embedding by name (defined in
+  # auto-embedding-workers.yaml) rather than redefining it — avoids
+  # last-write-wins drift between the two YAMLs. The query is short, so
+  # embed_text returns a single chunk; take embeddings[0].
+  - generateEmbedding:
+      run:
+        worker:
+          name: "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}"
+          using: embed_text
+          arguments:
+            text: "${ .query }"
+      output:
+        as:
+          values: "${ .embeddings[0].values }"
+
+  # json_body is assembled in a single jq expression terminated by
+  # `tojson`. Splitting it across literal text + ${...} placeholders
+  # silently skips expansion (DSL §Runtime Expressions corner case
+  # documented in workflows/auto-embedding.yaml).
+  - hybridSearch:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "%{MEMORY_GRPC_HOST}"
+            port: %{MEMORY_GRPC_PORT}
+            tls: false
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryVectorService/HybridSearch"
+            as_json: true
+            json_body: >-
+              ${ {
+                query_vectors: [ { values: .values } ],
+                query_text: $workflow.input.query,
+                options: {
+                  limit: ($workflow.input.limit // 10),
+                  filter: ( ($workflow.input.filter // {})
+                            + { user_id: $workflow.input.user_id } )
+                },
+                hybrid_options: {
+                  strategy: ($workflow.input.hybrid_strategy // "RRF")
+                }
+              } | tojson }
+      output:
+        as: "${ .jsonBody | fromjson }"

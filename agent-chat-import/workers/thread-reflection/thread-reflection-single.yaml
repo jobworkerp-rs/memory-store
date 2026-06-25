@@ -1,0 +1,865 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: thread-reflection-single
+  version: "1.0.0"
+
+# F-G1 single-thread reflection workflow.
+#
+# Generates a reflection for one origin thread by running the
+# reflector LLM over the chat history, validating the structured
+# output against Appendix A's JSON Schema, and persisting via the
+# internal `FinalizeReflection` RPC. Failure paths converge on the
+# same RPC with `outcome=UNKNOWN` + `reflector_error_kind` set, so
+# the F-G9 "record failures" contract is uniform across success and
+# failure branches.
+#
+# Phase F MVP scope: single-pass reflection only. The sliding-window
+# branch (F-G8 b) for threads above `single_pass_threshold_tokens` is
+# deferred to a follow-up issue (see `reflection-open-issues.md`).
+# Threads above the threshold are still processed: a head/tail
+# truncation keeps them under `context_limit_tokens`, and a
+# `target.truncated` flag is recorded in the request so operators can
+# spot threads that need the full sliding-window pipeline later.
+
+input:
+  schema:
+    document:
+      type: object
+      required:
+        - user_id
+        - thread_id
+        - memories_grpc_host
+        - memories_grpc_port
+        - reflector_model
+        - reflector_base_url
+        - prompt_version
+      properties:
+        user_id: { type: integer }
+        thread_id: { type: integer }
+        memories_grpc_host: { type: string, default: "localhost" }
+        memories_grpc_port: { type: integer, default: 9010 }
+        memories_grpc_tls: { type: boolean, default: false }
+        llm_worker_name: { type: string, default: "memories-llm" }
+        reflector_model: { type: string }
+        reflector_base_url: { type: string }
+        prompt_version: { type: string }
+        reflector_id: { type: string, default: "self" }
+        # Output language code (ja|en) for logging/branching only. The
+        # actual prompt body is supplied via workflow_context
+        # ($reflection_system_prompt / $reflection_user_tail), so
+        # this field does not carry prompt text.
+        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
+        force: { type: boolean, default: false }
+        # Sliding-window knobs (Appendix C). Single-pass path uses
+        # `context_limit_tokens` / `single_pass_threshold_tokens`. The
+        # remaining knobs are accepted for API stability with the
+        # sliding-window path that lands in a follow-up issue.
+        context_limit_tokens: { type: integer, default: 222000 }
+        single_pass_threshold_tokens: { type: integer, default: 170000 }
+        window_size_turns: { type: integer, default: 80 }
+        window_overlap_turns: { type: integer, default: 10 }
+        merge_max_input_tokens: { type: integer, default: 100000 }
+        estimated_tokens_per_turn: { type: integer, default: 1500 }
+        experiment_id: { type: string }
+        experiment_variant: { type: string }
+
+do:
+  # Step 0: initialize output-shaped variables so the `output.as`
+  # transform never references undefined names on early exits. Same
+  # pattern as `thread-summary-single.yaml::initOutputVars` (see the
+  # comment there for the validator constraint).
+  - initOutputVars:
+      set:
+        skipped: "${ false }"
+        skip_reason: "${ null }"
+        reflection_id: "${ null }"
+        outcome: "${ null }"
+        failure_kind: "${ null }"
+        finalize_error: "${ null }"
+
+  # ============================================================
+  # Step 1: fetch the origin thread.
+  # ============================================================
+  - fetchThread:
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/Find"
+            json_body: >-
+              ${ { value: $workflow.input.thread_id } | tojson }
+            as_json: true
+      export:
+        as:
+          thread: ${ .jsonBody | fromjson | .data }
+
+  - checkThreadExists:
+      if: "${ $thread == null }"
+      set:
+        skipped: true
+        skip_reason: "thread not found"
+      then: exit
+
+  # ============================================================
+  # Step 2: idempotent duplicate detection. The (thread_id,
+  # prompt_version, reflector_id) tuple maps to a single
+  # `memory.external_id` enforced UNIQUE by FinalizeReflection
+  # (see app/src/app/reflection/finalize.rs Phase 3). Once a
+  # reflection exists for a tuple, no LLM run can produce a new one
+  # without bumping `prompt_version` — Phase 3 would observe the
+  # UNIQUE conflict and return the existing id. Short-circuit here
+  # to save the LLM round-trip. The follow-up plan to make history
+  # regeneration first-class (e.g. by including a sequence in
+  # external_id) lives in `reflection-open-issues.md`.
+  #
+  # `prompt_version` and `reflector_id` are direct fields on
+  # `ReflectionData` (proto3 → camelCase in JSON: promptVersion /
+  # reflectorId); they are NOT nested under any `metadata` envelope.
+  # ============================================================
+  - checkExistsActiveReflection:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ReflectionService/FindByThread"
+            # Pull the full history so an older row with the same tuple
+            # (e.g. produced by a different reflector first) is visible
+            # to the jq filter below. `include_history=false` would only
+            # return the newest row regardless of tuple.
+            json_body: >-
+              ${ {
+                thread_id: { value: $workflow.input.thread_id },
+                include_history: true
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          existing_reflection: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | map(select(
+                   (.data.promptVersion // "")
+                   == $workflow.input.prompt_version
+                 and (.data.reflectorId // "self")
+                   == $workflow.input.reflector_id))
+               | (if length > 0 then .[0] else null end) }
+
+  - skipIfExisting:
+      # `force=true` is accepted but cannot actually regenerate — the
+      # UNIQUE on external_id sees the existing row in Phase 3 and
+      # returns it anyway. Skipping here keeps the observable contract
+      # while saving the LLM call.
+      if: "${ $existing_reflection != null }"
+      set:
+        skipped: true
+        skip_reason: "existing reflection found for (prompt_version, reflector_id); bump prompt_version to regenerate"
+        reflection_id: "${ $existing_reflection.id.value }"
+      then: exit
+
+  # ============================================================
+  # Step 3: fetch the full chat history. Use all message roles so
+  # the reflector can see tool calls and system context — the
+  # generic-search exclusion of ROLE_REFLECTION still applies
+  # (reflections live under a different user and never attach to the
+  # origin thread).
+  # ============================================================
+  - fetchMemoriesAll:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindMemoriesByThreadId"
+            json_body: >-
+              ${ {
+                thread_id: { value: $workflow.input.thread_id },
+                roles: ["ROLE_USER", "ROLE_ASSISTANT", "ROLE_TOOL",
+                        "ROLE_META", "ROLE_SYSTEM"],
+                content_types: ["TEXT"]
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          messages: ${ (.jsonBody // "[]") | fromjson }
+
+  - checkMinTurns:
+      if: "${ ($messages | length) < 2 }"
+      set:
+        skipped: true
+        skip_reason: "not enough turns for reflection"
+      then: exit
+
+  # ============================================================
+  # Step 4: assign chronological global_turn_index. This is the
+  # contract between the workflow and the LLM: the LLM emits
+  # `facts[].turn_index` using this numbering, and the workflow
+  # resolves the index back to `memory_id` before calling
+  # FinalizeReflection (§4.2.7).
+  # ============================================================
+  - assignGlobalTurnIndex:
+      set:
+        # `messages` is already ordered by created_at asc (the RPC
+        # documents this); `to_entries`-style enumeration produces a
+        # parallel array of `{turn_index, memory_id, role, content,
+        # external_id}` records that the LLM template iterates over.
+        indexed_turns: >-
+          ${ ($messages | to_entries
+              | map({
+                  turn_index: .key,
+                  memory_id: .value.id.value,
+                  external_id: (.value.data.externalId // ""),
+                  role: .value.data.role,
+                  content: (.value.data.content // "")
+                })) }
+        # Look-up table used by `resolveFactAnchors` (Step 9). Keyed by
+        # turn_index for O(1) lookup from each fact's reported index.
+        turn_index_lookup: >-
+          ${ ($messages | to_entries
+              | map({
+                  key: (.key | tostring),
+                  value: {
+                    memory_id: .value.id.value,
+                    external_id: (.value.data.externalId // "")
+                  }
+                }) | from_entries) }
+
+  # ============================================================
+  # Step 5: estimate input size from character count. Conservatively
+  # 4 chars/token (English) to fit through narrow safety budgets;
+  # F-G8 b sliding window kicks in above
+  # `single_pass_threshold_tokens` but is deferred to a follow-up.
+  # ============================================================
+  - estimateTokens:
+      set:
+        estimated_tokens: >-
+          ${ (($messages | map(.data.content | length) | add) // 0) / 4
+             | floor }
+
+  # ============================================================
+  # Step 6: prepare LLM input. Single-pass MVP: when
+  # `estimated_tokens > context_limit_tokens`, head/tail-truncate the
+  # turn list to fit, flagging `truncated=true` so the heuristic
+  # score knows to penalise. Sliding-window pipeline is deferred.
+  # ============================================================
+  - prepareLlmInput:
+      set:
+        truncated: >-
+          ${ $estimated_tokens > $workflow.input.context_limit_tokens }
+        # When truncating, derive a turn budget from
+        # `context_limit_tokens / estimated_tokens_per_turn` so the
+        # kept slice actually fits the budget. Split the budget 1/3
+        # head + 2/3 tail because endings are more diagnostic than
+        # openings for outcome reflection. The previous formulation
+        # used the *raw* turn count for `keep_head` (= len/3) and
+        # `tail_start = len - 2*len/3` (= len/3), which left
+        # essentially the entire transcript in place — the old
+        # comment matched the intent but the arithmetic kept ~all
+        # turns (e.g. len=30 → keep_head=10, tail_start=10 → 30/30
+        # turns + marker).
+        llm_turns: >-
+          ${ if $estimated_tokens > $workflow.input.context_limit_tokens
+             then
+               ( ($indexed_turns | length) as $len
+                 | (($workflow.input.context_limit_tokens
+                       / $workflow.input.estimated_tokens_per_turn)
+                    | floor) as $budget_turns_raw
+                 | (if $budget_turns_raw < 2 then 2 else $budget_turns_raw end) as $budget_turns
+                 | (if $budget_turns >= $len
+                    then $indexed_turns
+                    else
+                      ( (($budget_turns / 3) | floor) as $keep_head_raw
+                        | (if $keep_head_raw < 1 then 1 else $keep_head_raw end) as $keep_head
+                        | ($budget_turns - $keep_head) as $keep_tail_raw
+                        | (if $keep_tail_raw < 1 then 1 else $keep_tail_raw end) as $keep_tail
+                        | ($len - $keep_tail) as $tail_start
+                        | ($indexed_turns[:$keep_head]
+                           + [{ turn_index: -1,
+                                memory_id: 0,
+                                external_id: "",
+                                role: "ROLE_META",
+                                content: ("... (" + (($tail_start - $keep_head) | tostring)
+                                          + " turns truncated) ...") }]
+                           + $indexed_turns[$tail_start:]) )
+                    end) )
+             else $indexed_turns
+             end }
+
+  # ============================================================
+  # Step 7-8: call the reflector LLM, wrapped in try/catch so that
+  # any failure flows into the F-G9 fallback path (§5.2.1).
+  # ============================================================
+  - callReflectorLlmWithFallback:
+      try:
+        - initPromptFetchVars:
+            set:
+              fetched_system_prompt: ""
+              fetched_user_tail: ""
+              prompt_fetch_stage: ""
+              resolved_prompt_source: "${ $prompt_source // \"embedded_context\" }"
+              prompt_context_missing_detail: ""
+
+        - markFetchPromptSystem:
+            if: "${ $resolved_prompt_source == \"http_raw\" }"
+            set:
+              prompt_fetch_stage: "system_prompt"
+
+        - fetchPromptSystem:
+            if: "${ $resolved_prompt_source == \"http_raw\" }"
+            run:
+              runner:
+                name: HTTP_REQUEST
+                settings:
+                  baseUrl: "${ $prompt_base_url }"
+                arguments:
+                  method: GET
+                  path: >-
+                    ${ "/system_prompt." + $workflow.input.output_language + ".txt" }
+                  headers: []
+            export:
+              as:
+                fetched_system_prompt: >-
+                  ${ if .statusCode == 200 then (.content // "") else "" end }
+
+        - validateFetchedSystemPrompt:
+            if: >-
+              ${ $resolved_prompt_source == "http_raw"
+                 and (($fetched_system_prompt // "") | length) == 0 }
+            raise:
+              error:
+                type: "https://memories.local/errors/reflection/prompt_fetch_failed"
+                status: 502
+                title: "Reflection prompt fetch failed"
+                detail: "system_prompt could not be fetched or was empty"
+
+        - markFetchPromptUserTail:
+            if: "${ $resolved_prompt_source == \"http_raw\" }"
+            set:
+              prompt_fetch_stage: "user_tail"
+
+        - fetchPromptUserTail:
+            if: "${ $resolved_prompt_source == \"http_raw\" }"
+            run:
+              runner:
+                name: HTTP_REQUEST
+                settings:
+                  baseUrl: "${ $prompt_base_url }"
+                arguments:
+                  method: GET
+                  path: >-
+                    ${ "/user_tail." + $workflow.input.output_language + ".txt" }
+                  headers: []
+            export:
+              as:
+                fetched_user_tail: >-
+                  ${ if .statusCode == 200 then (.content // "") else "" end }
+
+        - validateFetchedUserTail:
+            if: >-
+              ${ $resolved_prompt_source == "http_raw"
+                 and (($fetched_user_tail // "") | length) == 0 }
+            raise:
+              error:
+                type: "https://memories.local/errors/reflection/prompt_fetch_failed"
+                status: 502
+                title: "Reflection prompt fetch failed"
+                detail: "user_tail could not be fetched or was empty"
+
+        - selectPromptSource:
+            set:
+              active_reflection_system_prompt: >-
+                ${ if $resolved_prompt_source == "http_raw"
+                   then ($fetched_system_prompt // "")
+                   elif $resolved_prompt_source == "embedded_context"
+                   then ($reflection_system_prompt // "")
+                   else ""
+                   end }
+              active_reflection_user_tail: >-
+                ${ if $resolved_prompt_source == "http_raw"
+                   then ($fetched_user_tail // "")
+                   elif $resolved_prompt_source == "embedded_context"
+                   then ($reflection_user_tail // "")
+                   else ""
+                   end }
+
+        - classifyPromptContextMissing:
+            set:
+              prompt_context_missing_detail: >-
+                ${ if $resolved_prompt_source == "embedded_context"
+                   and (($reflection_system_prompt // "") | length) == 0
+                   then "embedded_context reflection_system_prompt is missing"
+                   elif $resolved_prompt_source == "embedded_context"
+                   and (($reflection_user_tail // "") | length) == 0
+                   then "embedded_context reflection_user_tail is missing"
+                   elif $resolved_prompt_source != "embedded_context"
+                   and $resolved_prompt_source != "http_raw"
+                   then "unsupported prompt_source: " + $resolved_prompt_source
+                   else "reflection prompt context is missing"
+                   end }
+
+        - validatePromptContext:
+            if: >-
+              ${ (($active_reflection_system_prompt // "") | length) == 0
+                 or (($active_reflection_user_tail // "") | length) == 0 }
+            raise:
+              error:
+                type: "https://memories.local/errors/reflection/prompt_context_missing"
+                status: 422
+                title: "Reflection prompt context is missing"
+                detail: "${ $prompt_context_missing_detail }"
+
+        - callReflectorLlm:
+            run:
+              function:
+                runnerName: LLM
+                using: completion
+                settings:
+                  ollama:
+                    base_url: "${$workflow.input.reflector_base_url}"
+                    model: "${$workflow.input.reflector_model}"
+                options:
+                  channel: llm
+                  storeSuccess: false
+                  storeFailure: true
+                arguments:
+                  # The system prompt body is injected via workflow_context
+                  # (`$reflection_system_prompt`), not hard-coded
+                  # here, so the output language (ja/en) is selected by the
+                  # caller and the prompt text lives in editable .txt files
+                  # under agent-chat-import/workers/thread-reflection/prompts/.
+                  system_prompt: "${ $active_reflection_system_prompt }"
+                  prompt: >-
+                    $${## Thread context
+                    - Labels: {{ thread.data.labels | join: ", " }}
+                    - Created: {{ thread.data.createdAt }}
+                    - Truncated: {{ truncated }}
+
+                    ## Turns
+                    {% for turn in llm_turns %}
+                    [#{{ turn.turn_index }} {{ turn.role }}] {{ turn.content }}
+                    {% endfor %}
+
+                    {{ active_reflection_user_tail }}}
+                  options:
+                    max_tokens: 20000
+                    temperature: 0.2
+                  json_schema: |
+                    {
+                      "type": "object",
+                      "required": ["outcome","score_self","summary","task_intent",
+                                   "task_category","reflection_aspect",
+                                   "failure_modes","tools_used",
+                                   "lessons","success_factors","key_decisions",
+                                   "facts"],
+                      "properties": {
+                        "outcome": {"enum":["SUCCESS","PARTIAL","FAILURE","ABORTED","UNKNOWN"]},
+                        "score_self": {"type":"number","minimum":0.0,"maximum":1.0},
+                        "summary": {"type":"string"},
+                        "task_intent": {"type":"string","maxLength":1000},
+                        "task_category": {"enum":["coding","consultation","research","creative","general"]},
+                        "reflection_aspect": {"enum":["TASK_OUTCOME","INTERACTION_STYLE","BOTH"]},
+                        "failure_modes": {"type":"array","items":{"enum":["tool_misuse","loop","scope_drift","hallucination","context_overflow","data_loss","permission_issue","ambiguous_instruction","conflicting_requirements","missing_context","misleading_premise","goal_drift_by_user","tool_unavailable","external_service_failure","rate_limit","OTHER"]},"maxItems":8},
+                        "failure_modes_other": {"type":"array","items":{"type":"string","maxLength":100},"maxItems":5},
+                        "tools_used": {"type":"array","items":{"type":"string","maxLength":100},"maxItems":50},
+                        "success_factors": {"type":"array","items":{"type":"string","maxLength":200},"maxItems":8},
+                        "lessons": {"type":"array","items":{"type":"string","maxLength":300},"maxItems":10},
+                        "key_decisions": {"type":"array","items":{"type":"string","maxLength":300},"maxItems":10},
+                        "mitigation_hint": {"type":"string","maxLength":500},
+                        "tool_outcomes": {
+                          "type":"array",
+                          "items":{
+                            "type":"object",
+                            "required":["tool","contribution"],
+                            "properties":{
+                              "tool":{"type":"string","maxLength":100},
+                              "contribution":{"enum":["POSITIVE","NEGATIVE","NEUTRAL"]},
+                              "error_kind":{"type":"string","maxLength":100}
+                            }
+                          },
+                          "maxItems":50
+                        },
+                        "facts": {
+                          "type":"array",
+                          "items":{
+                            "type":"object",
+                            "required":["turn_index","kind"],
+                            "properties":{
+                              "turn_index":{"type":"integer","minimum":0},
+                              "kind":{"enum":["OUTCOME_EVIDENCE","SCORE_DRIVER","LESSON_SOURCE",
+                                              "KEY_DECISION_POINT","EXEMPLAR","COUNTER_EXAMPLE",
+                                              "CONTEXT_PIVOT"]},
+                              "weight":{"type":"number","minimum":0.0,"maximum":1.0},
+                              "note":{"type":"string","maxLength":200},
+                              "links":{
+                                "type":"array",
+                                "items":{
+                                  "type":"object",
+                                  "properties":{
+                                    "field":{"enum":["lesson","failure_mode","key_decision","success_factor"]},
+                                    "index":{"type":"integer","minimum":0}
+                                  }
+                                }
+                              }
+                            }
+                          },
+                          "maxItems":30
+                        }
+                      }
+                    }
+            export:
+              as:
+                llm_output: ${ .content.text | fromjson }
+
+        # Second-layer validation: the json_schema constraint at
+        # the LLM level guarantees structural well-formedness, but
+        # a model may still emit a `summary` of "" which slips
+        # through the schema. Reject explicitly so the catch path
+        # records `empty_response`.
+        - validateLlmOutput:
+            if: "${ (($llm_output.summary // \"\") | length) == 0 }"
+            raise:
+              error:
+                type: "https://memories.local/errors/reflection/empty_response"
+                status: 422
+                title: "LLM returned empty summary"
+                detail: "LLM produced a JSON-Schema-conforming object with summary == ''"
+
+        # ============================================================
+        # Step 9: resolve facts[].turn_index → memory_id and normalise
+        # every embedded enum to its proto wire form. The reflector
+        # LLM emits the short names from the JSON schema above
+        # (OUTCOME_EVIDENCE / lesson / POSITIVE …) but
+        # FinalizeReflection accepts the proto-encoded fully-qualified
+        # values (FACT_KIND_OUTCOME_EVIDENCE / FACT_LINK_FIELD_LESSON /
+        # TOOL_CONTRIBUTION_POSITIVE …); without this normalisation
+        # every successful workflow output is rejected at the gRPC
+        # boundary.
+        #
+        # `anchor_external_id` is intentionally omitted — ReflectionFact
+        # has no such field. Including it makes the prost JSON decoder
+        # reject the whole message.
+        #
+        # Facts whose turn_index doesn't appear in the lookup table
+        # (model hallucinated an index, or pointed at the truncation
+        # placeholder) are dropped with a target.fact_unresolved_count
+        # counter that surfaces in the heuristic_score input.
+        # ============================================================
+        - resolveFactAnchors:
+            set:
+              resolved_facts: >-
+                ${ (($llm_output.facts // [])
+                     | map(. as $f
+                           | ($turn_index_lookup[($f.turn_index | tostring)] // null) as $lk
+                           | select($lk != null)
+                           | { kind: ("FACT_KIND_" + (.kind // "UNSPECIFIED")),
+                               anchor_memory_id: { value: $lk.memory_id },
+                               weight: (.weight // null),
+                               note: (.note // null),
+                               links: ((.links // [])
+                                        | map({
+                                            field: ("FACT_LINK_FIELD_"
+                                                    + ((.field // "unspecified")
+                                                       | ascii_upcase)),
+                                            index: (.index // 0)
+                                          })),
+                               turn_index: .turn_index })) }
+              fact_unresolved_count: >-
+                ${ (($llm_output.facts // []) | length)
+                   - (($llm_output.facts // [])
+                      | map(. as $f
+                            | $turn_index_lookup[($f.turn_index | tostring)] // null
+                            | select(. != null))
+                      | length) }
+
+        # ============================================================
+        # Step 10: heuristic score (F-G10). The full design pulls
+        # retry / error / tool counts from thread metadata; in the
+        # absence of those signals on the origin thread we fall
+        # back to a coarse outcome-driven baseline so the column is
+        # never left at 0.0 for successful reflections. Operators
+        # who want the full formula override
+        # MEMORY_REFLECTION_SCORE_SOURCE=score_heuristic and feed
+        # custom counters via thread metadata in a future revision.
+        # ============================================================
+        - computeHeuristicScore:
+            set:
+              heuristic_score: >-
+                ${ if $llm_output.outcome == "SUCCESS" then 0.85
+                   elif $llm_output.outcome == "PARTIAL" then 0.55
+                   elif $llm_output.outcome == "ABORTED" then 0.25
+                   elif $llm_output.outcome == "FAILURE" then 0.15
+                   else 0.0
+                   end
+                   - (if $truncated then 0.1 else 0.0 end)
+                   - (if $fact_unresolved_count > 0 then 0.05 else 0.0 end) }
+
+        # ============================================================
+        # Step 10b: normalize failure_modes to the controlled
+        # vocabulary BEFORE FinalizeReflection. The proto field is the
+        # `FailureMode` enum; the prost JSON decoder runs inside the
+        # GRPC runner (before the app layer) and rejects unknown enum
+        # names outright, so language-external / mis-cased / bare
+        # lowercase values MUST be folded to FAILURE_MODE_OTHER here —
+        # the server can no longer salvage them. Any value not in the
+        # 16-name set is dropped from `failure_modes` (OTHER added once)
+        # and its raw text is preserved in `failure_modes_other`
+        # (<=100 chars, deduped, max 5) so no signal is lost.
+        #
+        # The vocabulary is hardcoded because jq cannot query the
+        # `failure_mode_dictionary` table; it is migration-only and
+        # stable. Keep in sync with the FailureMode enum
+        # (protobuf/.../reflection.proto) and the JSON Schema /
+        # system_prompt list above, and with spec Appendix A
+        # (ai-docs/reflection/thread-reflection-spec.md §F-G7 / §N-10).
+        # ============================================================
+        # NOTE: jobworkerp's `set` task evaluates every key in the same
+        # block against the SAME context snapshot — values defined
+        # earlier in the block are NOT visible to later keys (see
+        # `infra/src/workflow/definition/transform.rs::transform_ref_map`).
+        # The vocab / canonicalization / partition stages therefore
+        # need separate set steps so each one can reference variables
+        # defined by the previous step via the workflow context.
+        - defineFailureModeVocabulary:
+            set:
+              fm_vocab: >-
+                ${ ["FAILURE_MODE_TOOL_MISUSE","FAILURE_MODE_LOOP",
+                    "FAILURE_MODE_SCOPE_DRIFT","FAILURE_MODE_HALLUCINATION",
+                    "FAILURE_MODE_CONTEXT_OVERFLOW","FAILURE_MODE_DATA_LOSS",
+                    "FAILURE_MODE_PERMISSION_ISSUE",
+                    "FAILURE_MODE_AMBIGUOUS_INSTRUCTION",
+                    "FAILURE_MODE_CONFLICTING_REQUIREMENTS",
+                    "FAILURE_MODE_MISSING_CONTEXT",
+                    "FAILURE_MODE_MISLEADING_PREMISE",
+                    "FAILURE_MODE_GOAL_DRIFT_BY_USER",
+                    "FAILURE_MODE_TOOL_UNAVAILABLE",
+                    "FAILURE_MODE_EXTERNAL_SERVICE_FAILURE",
+                    "FAILURE_MODE_RATE_LIMIT","FAILURE_MODE_OTHER"] }
+
+        # Canonicalize each raw element: upper-case and prepend the
+        # FAILURE_MODE_ prefix when the model emitted a bare short
+        # name (e.g. "tool_misuse" -> "FAILURE_MODE_TOOL_MISUSE").
+        - canonicalizeFailureModes:
+            set:
+              fm_canon: >-
+                ${ ($llm_output.failure_modes // [])
+                   | map(. as $raw
+                         | ($raw | ascii_upcase) as $up
+                         | (if ($up | startswith("FAILURE_MODE_"))
+                            then $up else "FAILURE_MODE_" + $up end)
+                         | { raw: $raw, canon: . }) }
+
+        # Partition the canonicalized list against $fm_vocab. fm_norm
+        # and fm_other can share the same set step because neither
+        # references the other — both pull only from $fm_canon /
+        # $fm_vocab / $llm_output, which live in the context.
+        - partitionFailureModes:
+            set:
+              # In-vocabulary canon names, deduped, OTHER appended once
+              # if anything was salvaged. maxItems 8 (schema parity).
+              fm_norm: >-
+                ${ ($fm_canon | map(select(.canon as $c
+                                           | $fm_vocab | index($c)))
+                              | map(.canon) | unique) as $kept
+                   | ($fm_canon | any(.canon as $c
+                                      | ($fm_vocab | index($c)) | not))
+                       as $had_other
+                   | (if $had_other
+                      then ($kept + ["FAILURE_MODE_OTHER"]) | unique
+                      else $kept end)
+                   | .[0:8] }
+              # Raw text of every out-of-vocab element, 100-char capped,
+              # merged with any model-provided failure_modes_other,
+              # deduped, max 5 (schema parity).
+              fm_other: >-
+                ${ (($fm_canon | map(select(.canon as $c
+                                            | ($fm_vocab | index($c)) | not))
+                               | map(.raw[0:100]))
+                    + ($llm_output.failure_modes_other // []
+                       | map(.[0:100])))
+                   | unique | .[0:5] }
+
+        # ============================================================
+        # Step 11: build the parsed_output payload. failure_modes is
+        # already normalized to the controlled vocabulary above; the
+        # server-side `finalize` is the authoritative enforcement point
+        # but the prost enum decoder requires valid names, so the
+        # workflow MUST present FAILURE_MODE_* values here.
+        # ============================================================
+        - buildParsedOutput:
+            set:
+              # `tool_outcomes[].contribution` arrives as the short
+              # POSITIVE/NEGATIVE/NEUTRAL names from the JSON schema;
+              # rewrite to the TOOL_CONTRIBUTION_* prefix expected on
+              # the proto enum. Same rationale as resolveFactAnchors —
+              # without this every reflection FinalizeReflection input
+              # bounces with InvalidArgument.
+              parsed_output: >-
+                ${ {
+                  outcome: ("REFLECTION_OUTCOME_" + $llm_output.outcome),
+                  score_self: $llm_output.score_self,
+                  summary: $llm_output.summary,
+                  task_intent: $llm_output.task_intent,
+                  task_category: ("TASK_CATEGORY_" + ($llm_output.task_category | ascii_upcase)),
+                  reflection_aspect: ("REFLECTION_ASPECT_" + $llm_output.reflection_aspect),
+                  failure_modes: $fm_norm,
+                  failure_modes_other: $fm_other,
+                  # `unique` here replaces the schema's `uniqueItems`, which
+                  # llguidance 1.7.5 cannot compile (it aborts the whole
+                  # grammar with "Unimplemented keys"). Dedup in jq keeps the
+                  # de-duplication guarantee without the unsupported keyword.
+                  tools_used: (($llm_output.tools_used // []) | unique),
+                  success_factors: ($llm_output.success_factors // []),
+                  lessons: ($llm_output.lessons // []),
+                  key_decisions: ($llm_output.key_decisions // []),
+                  mitigation_hint: ($llm_output.mitigation_hint // null),
+                  tool_outcomes: (($llm_output.tool_outcomes // [])
+                                   | map({
+                                       tool: (.tool // ""),
+                                       contribution: ("TOOL_CONTRIBUTION_"
+                                                      + (.contribution // "UNSPECIFIED")),
+                                       error_kind: (.error_kind // null)
+                                     })),
+                  facts: $resolved_facts
+                } }
+
+      catch:
+        as: err
+        do:
+          # A reflection that fails to generate must NOT be written to
+          # the memory store: the failure has no bearing on the user's
+          # actual memories, and persisting a stub would pollute search /
+          # embeddings with an error string masquerading as a reflection
+          # summary. Instead we record the failure on the workflow output
+          # (surfaced to the caller and the sidecar log for F-A2 reject
+          # observability) and end the workflow WITHOUT calling
+          # FinalizeReflection. `reflection_id` stays null from
+          # initOutputVars, so the output transform reports
+          # completed=false.
+          #
+          # `then: end` (NOT `exit`) is required here: in this engine
+          # `exit` only leaves the current `catch.do` block and would
+          # then fall through to callFinalizeReflectionWithGuard, which
+          # is exactly the persistence we want to skip. `end` terminates
+          # the whole workflow and jumps straight to the output
+          # transform.
+          - recordReflectionFailure:
+              set:
+                outcome: "${ null }"
+                finalize_error: >-
+                  ${ {
+                    code: ($err.status // null),
+                    title: ($err.title // null),
+                    detail: ($err.detail // $err.message // null),
+                    instance: ($err.instance // null)
+                  } }
+                failure_kind: >-
+                  ${ if (($err.type // "") | contains("empty_response")) then "empty_response"
+                     elif (($err.type // "") | contains("schema")) then "schema_reject"
+                     elif (($err.type // "") | contains("merge")) then "merge_error"
+                     elif (($err.type // "") | contains("truncation")) then "truncation_failure"
+                     elif (($err.type // "") | contains("prompt_fetch_failed")) then "prompt_fetch_failed"
+                     elif (($err.type // "") | contains("prompt_context_missing")) then "prompt_context_missing"
+                     elif (($prompt_fetch_stage // "") | length) > 0 then "prompt_fetch_failed"
+                     else "llm_error"
+                     end }
+              then: end
+
+  # ============================================================
+  # Step 12: persist via FinalizeReflection. Both success and
+  # failure paths converge here so the persistence pipeline is
+  # uniform (idempotency on external_id, sidecar bookkeeping,
+  # embedding dispatch).
+  # ============================================================
+  # Wrapped in try/catch (same shape as callReflectorLlmWithFallback).
+  # On a gRPC error the GRPC runner yields `body`/`message` instead of
+  # `json_body`, so the export's `.jsonBody` is null and a naive
+  # `.jsonBody | fromjson` fails with "cannot use null as string",
+  # masking the real cause (e.g. a DB constraint violation). The
+  # defensive export plus the catch surface the actual gRPC code /
+  # detail in `finalize_error` and exit cleanly with completed=false.
+  - callFinalizeReflectionWithGuard:
+      try:
+        - callFinalizeReflection:
+            run:
+              function:
+                runnerName: GRPC
+                using: unary
+                settings:
+                  host: "${$workflow.input.memories_grpc_host}"
+                  port: ${$workflow.input.memories_grpc_port}
+                  tls: ${$workflow.input.memories_grpc_tls}
+                  useReflection: true
+                arguments:
+                  method: "/llm_memory.service.ReflectionService/FinalizeReflection"
+                  json_body: >-
+                    ${ {
+                      origin_thread_id: { value: $workflow.input.thread_id },
+                      parsed_output: $parsed_output,
+                      heuristic_score: $heuristic_score,
+                      reflector_id: $workflow.input.reflector_id,
+                      prompt_version: $workflow.input.prompt_version,
+                      target_model_version: $workflow.input.reflector_model,
+                      target_fact_unresolved_count: $fact_unresolved_count,
+                      experiment_id: $workflow.input.experiment_id,
+                      experiment_variant: $workflow.input.experiment_variant,
+                      reflector_error_kind: $failure_kind
+                    } | tojson }
+                  as_json: true
+            export:
+              as:
+                # Defensive: when the RPC errored there is no jsonBody,
+                # so guard the parse instead of letting fromjson blow up
+                # on null. A null reflection_id then drives
+                # completed=false in the output transform.
+                reflection_id: >-
+                  ${ (.jsonBody // null)
+                     | if . == null then null
+                       else (fromjson | .value) end }
+                outcome: ${ $parsed_output.outcome }
+                finalize_error: ${ null }
+      catch:
+        as: err
+        do:
+          - recordFinalizeError:
+              set:
+                reflection_id: ${ null }
+                outcome: ${ $parsed_output.outcome }
+                failure_kind: "finalize_rpc_error"
+                # Surface the real gRPC failure (e.g. the DB constraint
+                # message) so operators see the cause directly instead
+                # of a downstream jq type error.
+                finalize_error: >-
+                  ${ {
+                    code: ($err.status // null),
+                    title: ($err.title // null),
+                    detail: ($err.detail // $err.message // null),
+                    instance: ($err.instance // null)
+                  } }
+              then: exit
+
+output:
+  as:
+    completed: ${ $reflection_id != null }
+    thread_id: ${ $workflow.input.thread_id }
+    reflection_id: ${ $reflection_id }
+    outcome: ${ $outcome }
+    failure_kind: ${ $failure_kind }
+    finalize_error: ${ $finalize_error // null }
+    skipped: ${ $skipped // false }
+    skip_reason: ${ if ($skipped // false) then $skip_reason else null end }

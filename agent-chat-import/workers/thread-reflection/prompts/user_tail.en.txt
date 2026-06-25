@@ -1,0 +1,5 @@
+Reflect as a future-facing agent: extract forward-looking lessons and
+ground each lesson, decision, and score in the turn numbers above via
+facts. Emit the reflection JSON now. Write every free-text field in
+English, keeping code, commands, paths, tool names, and enum values
+verbatim in English:

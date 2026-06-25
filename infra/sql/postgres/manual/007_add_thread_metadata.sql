@@ -1,0 +1,13 @@
+-- Manual migration: adds metadata JSONB column to the thread table.
+-- Run this on existing databases created before the column was introduced.
+--
+-- New databases (created with the current 001_init_postgres.sql) already have
+-- this column and do NOT need this script.
+--
+-- Storage semantics: JSON-encoded string. JSONB canonicalises whitespace,
+-- drops duplicate keys, and may reorder keys, so callers MUST treat the
+-- returned string as JSON-equivalent rather than byte-identical to the
+-- input. The application layer never inspects the value;
+-- ThreadService.AddMemoriesBatch never overwrites an existing row's
+-- metadata. Use ThreadService.Update to mutate it.
+ALTER TABLE thread ADD COLUMN metadata JSONB;

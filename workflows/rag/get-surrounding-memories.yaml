@@ -1,0 +1,73 @@
+# RAG context-expansion workflow.
+#
+# A direct GRPC worker would expose the LLM to GrpcArgs (method /
+# json_body / metadata / ...), so structured fields like memory_id and
+# thread_id would silently end up as unknown fields and the runner
+# would issue a GetSurroundingMemories call with all-zero values. This
+# wrapper workflow gives the LLM a clean input schema and assembles the
+# json_body server-side.
+
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: rag-expand-memory-context
+  version: "1.0.0"
+
+input:
+  schema:
+    document:
+      type: object
+      properties:
+        # int64 IDs are exposed as JSON strings: snowflakes routinely exceed
+        # 2^53-1 (the JS / JSON-Schema-driven function-calling safe integer
+        # limit) and would round-trip through IEEE754 double in any client
+        # that treats `type: integer` as a JS number, silently calling
+        # GetSurroundingMemories with the wrong id. proto3 JSON mapping
+        # already encodes int64 as string on the wire, and prost-reflect's
+        # DynamicMessage::deserialize accepts string for int64 fields, so
+        # the json_body assembly below can pass the value through verbatim.
+        memory_id:
+          type: string
+          pattern: "^-?[0-9]+$"
+          description: "Anchor memory id (int64 as decimal string). Copy `memory.id.value` from a `recall_memories` hit verbatim — never coerce to a JS number."
+        thread_id:
+          type: string
+          pattern: "^-?[0-9]+$"
+          description: "Thread that defines the chronological axis (int64 as decimal string). Copy `thread_id.value` from the same `recall_memories` hit. Required because a memory may belong to multiple threads."
+        before_count:
+          type: integer
+          minimum: 0
+          maximum: 50
+          default: 5
+          description: "Number of preceding memories to include (default 5)."
+        after_count:
+          type: integer
+          minimum: 0
+          maximum: 50
+          default: 5
+          description: "Number of following memories to include (default 5)."
+      required: [memory_id, thread_id]
+
+do:
+  - getSurrounding:
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "%{MEMORY_GRPC_HOST}"
+            port: %{MEMORY_GRPC_PORT}
+            tls: false
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryVectorService/GetSurroundingMemories"
+            as_json: true
+            json_body: >-
+              ${ {
+                memory_id: $workflow.input.memory_id,
+                thread_id: $workflow.input.thread_id,
+                before_count: ($workflow.input.before_count // 5),
+                after_count: ($workflow.input.after_count // 5)
+              } | tojson }
+      output:
+        as: "${ .jsonBody | fromjson }"

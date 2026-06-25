@@ -1,0 +1,52 @@
+[package]
+name = "agent-chat-import"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "memories-import"
+path = "src/main.rs"
+
+[dependencies]
+protobuf = { path = "../protobuf" }
+command-utils = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+chrono = "0.4"
+tokio = { workspace = true, features = ["full"] }
+futures = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+dotenvy = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+jobworkerp-client = { path = "../modules/jobworkerp-client" }
+# Hash helpers used for identifier hashing (truncate_id_for_external) and
+# plain entry_uid in §5.3.3.
+sha2 = "0.10"
+# Used for Codex entry_uid composition (sha1[:16] of call_id /
+# payload.type / message text). Spec §5.2.1.
+sha1 = "0.10"
+# Plain source dependencies (spec §5.3).
+ignore = "0.4"
+globset = "0.4"
+serde_yaml = "0.9"
+# data: URL の base64 payload デコード (canonical attachment helper, §4.2.2.6.1).
+# transitive dep として既に Cargo.lock に 0.22.x が存在する。
+base64 = "0.22"
+
+[features]
+default = ["summarize-after", "personality-after"]
+# Enable post-import dispatch of the thread-summary-batch workflow via
+# jobworkerp gRPC. Independent from server-side embedding (which is
+# always on now that direct DB writes are gone).
+summarize-after = []
+# Enable post-import dispatch of the thread-personality-batch workflow.
+# Independent of `summarize-after` so operators can run only one of
+# the two pipelines.
+personality-after = []
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,12 @@
+[submodule "modules/infra-utils"]
+	path = modules/infra-utils
+	url = https://github.com/sutr-app/infra-utils.git
+[submodule "modules/command-utils"]
+	path = modules/command-utils
+	url = https://github.com/sutr-app/command-utils.git
+[submodule "modules/jobworkerp-client"]
+	path = modules/jobworkerp-client
+	url = https://github.com/jobworkerp-rs/jobworkerp-client-rs.git
+[submodule "modules/memory-utils"]
+	path = modules/memory-utils
+	url = https://github.com/sutr-app/memory-utils.git

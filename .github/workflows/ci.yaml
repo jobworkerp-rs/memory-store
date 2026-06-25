@@ -1,0 +1,179 @@
+name: CI
+on:
+  pull_request:
+    branches:
+      - main
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove large packages
+        run: |
+          sudo rm -rf /opt/hostedtoolcache || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/.ghcup || true
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev protobuf-compiler
+      - name: Clean up apt cache
+        run: |
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+      - name: Set Toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Run check
+        run: cargo check
+      - name: Run rustfmt
+        run: cargo fmt --all -- --check
+      - name: Run clippy (default/sqlite)
+        run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::all
+      - name: Run clippy (postgres)
+        # The LanceDB-backed vector / FTS stack is a required dependency
+        # (no opt-out exists); this job verifies the postgres backend
+        # builds cleanly when sqlite is swapped out.
+        run: cargo clippy --workspace --all-targets --features postgres --no-default-features -- -D warnings -W clippy::all
+      # Lindera feature compile check: runtime tests need a morphological
+      # dictionary and are gated behind `--ignored`, but the feature flag
+      # itself must stay wired up through `grpc-admin → app → infra →
+      # lance-index/tokenizer-lindera`. A lightweight `cargo check` catches
+      # breakage in that chain without paying the dictionary download cost.
+      - name: Run check (lindera feature)
+        run: cargo check --workspace --features lindera
+
+  test-sqlite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      redis:
+        image: redis:7
+        # Jobs run directly on the runner host (no `container:`), so service
+        # containers are reachable only via 127.0.0.1 + a mapped port, not by
+        # the service name. Map the port and point TEST_REDIS_URL at 127.0.0.1.
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Remove large packages
+        run: |
+          sudo rm -rf /opt/hostedtoolcache || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/.ghcup || true
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev protobuf-compiler
+      - name: Clean up apt cache
+        run: |
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-test-sqlite-${{ hashFiles('**/Cargo.lock') }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run test (SQLite)
+        run: cargo test -- --test-threads=1
+        env:
+          TEST_REDIS_URL: "redis://127.0.0.1:6379"
+          RUST_BACKTRACE: 1
+
+  test-postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        # Reachable only via 127.0.0.1 + mapped port on a host-run job.
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Remove large packages
+        run: |
+          sudo rm -rf /opt/hostedtoolcache || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/.ghcup || true
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev protobuf-compiler
+      - name: Clean up apt cache
+        run: |
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-test-postgres-${{ hashFiles('**/Cargo.lock') }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run test (PostgreSQL)
+        run: cargo test --features postgres -- --test-threads=1
+        env:
+          TEST_POSTGRES_URL: "postgres://postgres:postgres@127.0.0.1:5432/test"
+          TEST_REDIS_URL: "redis://127.0.0.1:6379"
+          RUST_BACKTRACE: 1

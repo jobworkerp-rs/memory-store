@@ -1,0 +1,29 @@
+.claude/
+.codex/
+.env
+# Image-memory e2e integration env (minio keys / jobworkerp addr / DB).
+# Carries credentials, so it is ignored like .env; the runbook
+# (docs/) documents a sample. The #[ignore] e2e test self-skips when
+# this file / its vars are absent.
+.env.image-test
+/log/
+*.log
+target/
+*.sqlite3
+*.sqlite3-*
+*.sqlite3.*
+# Local LanceDB data directory — see dot.env (MEMORY_LANCEDB_URI etc.).
+# Re-added after the PR1 commit accidentally removed it; LanceDB stores
+# memory bodies and embeddings here, so keeping it ignored prevents both
+# repo bloat and accidental disclosure.
+/data/
+# Same, but for the image-memory e2e test which runs from grpc-admin and
+# writes its throwaway LanceDB under grpc-admin/data/ (relative
+# MEMORY_LANCEDB_URI in .env.image-test). Anchored to grpc-admin/ so it does
+# NOT swallow tracked source trees like protobuf/protobuf/llm_memory/data/.
+/grpc-admin/data/
+
+*.bak
+.vscode
+refine/
+

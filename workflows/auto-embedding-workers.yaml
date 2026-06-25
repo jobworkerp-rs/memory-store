@@ -1,0 +1,99 @@
+# Worker definitions for the memory auto-embedding pipeline.
+#
+# Loaded at startup by EmbeddingJobDispatcher::get_or_init via
+# `jobworkerp_client::client::worker_yaml::register_workers_from_yaml`.
+# Values bound here are upserted to jobworkerp; subsequent edits require
+# restarting the memories process. See yaml-workers.md (memories-specific)
+# and modules/jobworkerp-client/docs/worker-yaml.md (general schema).
+
+defaults:
+  response_type: DIRECT
+  store_failure: true
+  # These workers run inside the WORKFLOW pipeline and have no external
+  # JobResultService/Listen* consumers, so broadcasting results would be
+  # wasted work. Pinned explicitly to insulate against future default
+  # changes on the YAML side.
+  broadcast_results: false
+  retry_policy:
+    type: EXPONENTIAL
+    interval: 800
+    max_interval: 60000
+    max_retry: 0 # no retry
+    basis: 2.0
+
+workers:
+  # 1. MultimodalEmbeddingRunner — text + image embeddings in one shared
+  #    vector space. Replaces the old llama-cpp EmbeddingLlmRunner so the
+  #    text and image pipelines are cross-modal comparable (image memory
+  #    Phase 5). The runner reports its own identity in
+  #    `model_info.model_name`, which the workflow propagates into the
+  #    persisted `embedding_model` metadata. `embed_text` chunks long
+  #    text and returns one embedding per chunk with character offsets;
+  #    the workflow stores every chunk as its own N-row record (no
+  #    first-chunk-only / mean collapse). To switch models edit `model_id`
+  #    (and optional `tokenizer_model_id`) consistently. This worker is
+  #    registered in ALL modes — the text path needs it even when
+  #    MEMORY_IMAGE_SEARCH_MODE=none (GPU required is a confirmed
+  #    decision).
+  #
+  #    The worker NAME is the `MEMORY_MM_EMBEDDING_WORKER` env placeholder
+  #    (default `memories-mm-embedding`): this registration is the single
+  #    definition, and every consumer — the workflow YAMLs that reference
+  #    it by name and the Rust query paths (memory_vector SearchSemantic /
+  #    SearchByMedia and reflection F-S8 via
+  #    `mm_embedding_worker_name()`) — resolves the same env var, so a name
+  #    override can never split query vectors from stored vectors.
+  - name: "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}"
+    runner: MultimodalEmbeddingRunner
+    use_static: true
+    channel: embedding
+    settings:
+      model_id: Qwen/Qwen3-VL-Embedding-2B
+      device: CUDA
+      dtype: F16
+      max_sequence_length: 8192
+      image_size_limit_bytes: 10485760
+      chunking_config:
+        max_chunk_tokens: 8192
+        min_chunk_tokens: 0
+
+  # 2. GRPC worker that calls MemoryVectorService/BatchUpsertEmbeddings
+  #    back on this server (N-row `rows` path). Both env vars are
+  #    REQUIRED — there is intentionally no `:-default` fallback because
+  #    silently routing embedding callbacks to 127.0.0.1:9010 would cause
+  #    cross-host deployments (where the memories server is not on the
+  #    same host as jobworkerp) to lose every embedding write. If the env
+  #    is unset, YAML expansion fails fast and the dispatcher refuses to
+  #    register workers.
+  - name: memories-upsert-embedding
+    runner: GRPC
+    settings:
+      host: %{MEMORY_GRPC_HOST}
+      port: %{MEMORY_GRPC_PORT}
+      use_reflection: true
+      method: llm_memory.service.MemoryVectorService/BatchUpsertEmbeddings
+      as_json: true
+
+  # 3. WORKFLOW worker that orchestrates the embed → upsert pipeline.
+  #    The $file directive inlines auto-embedding.yaml at registration time.
+  #
+  #    Pinned to the dedicated `embedding_workflow` channel (concurrency=1
+  #    on the jobworkerp side) instead of the default channel. Reasons:
+  #    - The default channel runs at concurrency=4. Letting four of these
+  #      workflows enter Step 1 simultaneously piles up against the
+  #      `embedding` channel (concurrency=1, GPU-bound) and inflates each
+  #      workflow's wall-clock by the queue depth, hitting the 600s job
+  #      timeout under bursty loads (e.g. thread-summary backfills).
+  #    - Sharing the `embedding` channel with the GPU worker would
+  #      deadlock: the workflow would hold the only embedding slot while
+  #      waiting for its child embedding job, which can never start.
+  #    - A separate single-slot channel serializes the workflow itself,
+  #      keeps each run within ~ embedding-time + ~50ms upsert, and lets
+  #      backlog pile up in the channel queue without timing out.
+  - name: memories-auto-embedding
+    runner: WORKFLOW
+    response_type: NO_RESULT
+    channel: embedding_workflow
+    settings:
+      workflow_data:
+        $file: auto-embedding.yaml

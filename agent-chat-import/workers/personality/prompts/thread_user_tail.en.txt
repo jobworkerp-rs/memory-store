@@ -1,0 +1,4 @@
+Analyze the conversation above and extract the user's preferences, interests, and thinking tendencies.
+Write every free-text field in English.
+Put the input message id values into memory_ids exactly as strings.
+Keep code, commands, file paths, API names, tool names, enum values, and log fragments verbatim in English.

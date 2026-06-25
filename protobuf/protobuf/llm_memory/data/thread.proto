@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package llm_memory.data;
+
+import "llm_memory/data/common.proto";
+
+// Content of a conversation thread — the grouping unit that ties
+// multiple Memory entries together. Used as input to the Create RPC.
+message ThreadData {
+    // Default system prompt auto-injected at the head of `parent_ids`
+    // when ThreadService.AddMemory is called with `parent_ids` empty.
+    // Must point at a ROLE_SYSTEM Memory. Unset / 0 means "no default":
+    // AddMemory then attaches the memory without a system prompt.
+    // If the caller already supplies a ROLE_SYSTEM memory in `parent_ids`,
+    // this default is ignored.
+    optional int64 default_system_memory_id = 1;
+    // Owning user of the thread.
+    llm_memory.data.UserId user_id = 2;
+    // Free-form description of the thread (conversation topic or
+    // purpose). May be auto-generated or updated by the LLM later.
+    optional string description = 3;
+    // Conversation channel identifier (e.g. Discord, Slack origin).
+    optional string channel = 4;
+    // Representative thread-level concept vector (little-endian f32 array bytes).
+    // Populated via ThreadVectorService.UpsertEmbedding.
+    optional bytes embedding = 5;
+    // Dimensionality of `embedding`, used for restoration on decode.
+    optional int32 embedding_dim = 6;
+    // Creation time (milliseconds since epoch). Server fills the current time when 0 is sent.
+    int64 created_at = 7;
+    // Last-update time (milliseconds since epoch). Server fills the current time when 0 is sent.
+    // Bumped automatically when a Memory is attached via AddMemory.
+    int64 updated_at = 8;
+    // Label list. Populated by server on Find/FindList.
+    // On Create: if non-empty, labels are persisted atomically with the thread.
+    // On Update: replaces all existing labels (PUT semantics).
+    //            Empty clears all labels.
+    // Labels can also be managed via AddLabels/RemoveLabels RPCs.
+    repeated string labels = 10;
+    // JSON-encoded source-specific metadata. The server validates that
+    // the value parses as JSON (rejects with InvalidArgument otherwise)
+    // but performs no schema validation and no merge. Validation is
+    // applied at the app layer so SQLite and PostgreSQL deployments
+    // accept the same inputs — without it SQLite would silently store
+    // garbage strings while PostgreSQL JSONB rejects them with a
+    // backend-specific error.
+    //
+    // Round-trip is JSON-equivalent, NOT byte-identical. PostgreSQL stores
+    // this as JSONB, which canonicalises whitespace, drops duplicate keys,
+    // and may reorder keys; SQLite stores it as TEXT and returns the input
+    // verbatim. Callers MUST re-parse the returned string to read fields
+    // and MUST NOT rely on the original byte layout for hashing/signing.
+    //
+    // Reserved use cases include:
+    //   - plain-git: git.last_commit / git.last_branch / source.<name>.last_imported_at
+    //   - other features as defined in their own specs
+    // ThreadService.AddMemoriesBatch must NOT overwrite an existing thread's
+    // metadata: when an upsert hits an already-present thread, this field on the
+    // incoming ThreadData is ignored. Use ThreadService.Update to mutate it.
+    optional string metadata = 11;
+}
+
+// Unique identifier for a thread.
+message ThreadId {
+    int64 value = 1;
+}
+
+// Thread entity carrying both the id and its data.
+// Returned by Find / FindList RPCs and accepted as input by the
+// Update RPC.
+message Thread {
+    ThreadId id = 1;
+    ThreadData data = 2;
+}

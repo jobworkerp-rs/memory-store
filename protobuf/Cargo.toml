@@ -1,0 +1,18 @@
+[package]
+name = "protobuf"
+version = "0.0.1"
+authors = ["sutr"]
+edition = "2024"
+
+[dependencies]
+infra-utils = { path = "../modules/infra-utils" }
+jobworkerp-client = { path = "../modules/jobworkerp-client" }
+
+anyhow = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }

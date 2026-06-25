@@ -1,0 +1,108 @@
+[package]
+name = "infra"
+version = "0.0.1"
+authors = ["sutr"]
+edition = "2024"
+
+[dependencies]
+
+protobuf = { path = "../protobuf" }
+command-utils = { path = "../modules/command-utils" }
+infra-utils = { path = "../modules/infra-utils" }
+
+anyhow = { workspace = true }
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+envy = { workspace = true }
+itertools = { workspace = true }
+prost = { workspace = true }
+#prost-types = { workspace = true }
+redis = { workspace = true, features = ["tokio-comp"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+smallvec = { workspace = true }
+sqlx = { workspace = true, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "any",
+    "macros",
+    "chrono",
+] }
+thiserror = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "parking_lot",
+] }
+
+# Vector / FTS dependencies (LanceDB stack — required)
+jobworkerp-client = { path = "../modules/jobworkerp-client" }
+prost-reflect = { version = "0.16" }
+lancedb = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+lance-index = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+# Direct dependency for the P3 highlight path so we can re-tokenize a
+# search hit's content using the same morphology as the BM25 index. The
+# crate is already pulled in transitively via `lance-index/tokenizer-lindera`,
+# so adding it here only widens the scope to this crate without changing
+# the resolved version (kept in sync with `Cargo.lock`). Kept optional so
+# the (non-lindera) builds skip the dictionary-link overhead.
+lindera = { version = "0.44", optional = true }
+# Snowball/Porter stemmer used by the highlight path to mirror
+# lance-index/tantivy's English stemming when MEMORY_FTS_TOKENIZER is
+# `simple`/`whitespace` (preset enables `stem = true`). Pinned to the
+# version tantivy 0.24 itself depends on so highlight tokens stem the
+# same way the BM25 index already does — keeping FTS hits and
+# server-side highlight ranges in sync.
+rust-stemmers = { version = "1.2" }
+
+# Media storage (image memory feature). aws-sdk-s3 powers the s3/minio
+# backend; base64 is for the test-only inline backend; bytes/tokio-util
+# back the object-safe chunk stream type. All already resolved in
+# Cargo.lock transitively, so this only widens scope to this crate.
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+aws-credential-types = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+tokio-util = { version = "0.7", features = ["io"] }
+
+[features]
+default = ["sqlite"]
+sqlite = ["sqlx/sqlite"]
+postgres = ["sqlx/postgres", "infra-utils/postgres"]
+# Enable Lindera (Japanese/Korean morphological) tokenizers for the
+# LanceDB FTS inverted index. Requires dictionary files at runtime.
+lindera = ["lance-index/tokenizer-lindera", "dep:lindera"]
+# Exposes `infra::test_helper` to downstream test crates (e.g. `app`).
+# Production binaries never enable this feature, so the helper is
+# absent from release builds.
+test-helper = []
+
+[dev-dependencies]
+serial_test = "3"
+# Test-only: the s3/minio roundtrip tests (s3.rs, #[ignore]) HTTP-GET the
+# presigned URL to assert the body matches (spec §6.1). minio is plain
+# HTTP so no TLS feature is needed; kept out of default features so the
+# aws-sdk-s3 hyper stack stays the only HTTP client in release builds.
+reqwest = { version = "0.12", default-features = false }
+# `no-env-filter` lets `#[traced_test]` capture events regardless of
+# RUST_LOG — required for startup_error tests that assert on level=ERROR
+# events without forcing the test runner to set RUST_LOG.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
+# Used by the no-duplicate-message-key test in startup_error.rs to
+# exercise the real `fmt::layer().json()` pipeline; not needed by
+# library code, which only depends on the `tracing` macros.
+tracing-subscriber = { workspace = true, features = ["json", "fmt"] }
+tempfile = "3"

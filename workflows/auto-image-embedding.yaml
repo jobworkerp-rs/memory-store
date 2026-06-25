@@ -1,0 +1,158 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: auto-image-embedding
+  version: "1.0.0"
+input:
+  schema:
+    document:
+      type: object
+      properties:
+        memory_id:
+          type: integer
+        media_object_id:
+          type: integer
+        image_search_mode:
+          type: string
+      required: [memory_id, media_object_id, image_search_mode]
+do:
+  # Step 1: Resolve a short-lived GET URL for the media. The runner
+  # fetches the URL itself (no bytes are carried over gRPC); the size
+  # cap is enforced by the embedding runner's image_size_limit_bytes.
+  - resolveUrl:
+      run:
+        worker:
+          name: memories-media-resolve
+          using: unary
+          arguments:
+            json_body: >-
+              ${ {
+                media_object_id: { value: $workflow.input.media_object_id }
+              } | tojson }
+      # A GRPC (as_json) worker returns its response as a JSON STRING in
+      # `.jsonBody`; it must be `fromjson`-parsed before fields are read
+      # (same pattern as thread-summary-single.yaml). Reading `.url`
+      # directly yields Null, which then makes embed_image fail with
+      # "source is not set".
+      output:
+        as:
+          image_url: "${ .jsonBody | fromjson | .url }"
+
+  # Step 2 (mode != vlm_caption): image embedding. 1 image = 1 vector,
+  # so chunk_index is fixed to 0 (begin_position is the image index,
+  # not reused as a chunk offset).
+  - generateImageEmbedding:
+      if: '${ $workflow.input.image_search_mode != "vlm_caption" }'
+      run:
+        worker:
+          name: "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}"
+          using: embed_image
+          arguments:
+            # Each value must be a SINGLE ${...} expression — DSL
+            # §Runtime Expressions forbids mixing literal text with
+            # ${...} (the placeholder is then left unexpanded). So the
+            # "memory:<id>" label is assembled inside jq, not as
+            # "memory:${ ... }".
+            items:
+              - url: "${ .image_url }"
+                label: "${ \"memory:\" + ($workflow.input.memory_id | tostring) }"
+      output:
+        as:
+          model_name: "${ .model_info.model_name? // \"unknown\" }"
+          image_rows: >-
+            ${ [ .embeddings[] | {
+                  vector_kind: "image",
+                  chunk_index: 0,
+                  begin_position: .begin_position,
+                  end_position: .end_position,
+                  content: .content,
+                  embedding: { values: .values }
+                } ] }
+
+  # Step 3 (mode != multimodal): VLM caption. The VLM describes the
+  # image in Japanese for retrieval.
+  # LLM chat args: MessageContent.content is a oneof (text XOR image),
+  # so the image and the instruction go in two separate USER messages
+  # (ChatRole USER = 2). The caption text comes back in
+  # LLMChatResult.content.text. Built in one jq expr + tojson (project
+  # rule; DSL forbids mixing literal text with ${...}).
+  - generateCaption:
+      if: '${ $workflow.input.image_search_mode != "multimodal" }'
+      run:
+        worker:
+          name: memories-vlm-caption
+          using: chat
+          arguments:
+            json_body: >-
+              ${ {
+                messages: [
+                  { role: 2,
+                    content: { image: { content_type: "image/png",
+                                        source: { url: .image_url } } } },
+                  { role: 2,
+                    content: { text: "Describe this image in detail in Japanese for retrieval." } }
+                ]
+              } | tojson }
+      output:
+        as:
+          caption: "${ .content.text }"
+
+  # Step 4 (mode != multimodal): write the caption back into
+  # memory.content via UpdateContentNoDispatch. This RPC does NOT spawn
+  # the embedding dispatcher, so caption→Update does not re-trigger this
+  # workflow (the loop-break — image memory §4.3.1 / design 3/3 §11.3).
+  - updateMemoryContent:
+      if: '${ $workflow.input.image_search_mode != "multimodal" }'
+      run:
+        worker:
+          name: memories-update-content-no-dispatch
+          using: unary
+          arguments:
+            json_body: >-
+              ${ {
+                id: { value: $workflow.input.memory_id },
+                content: $caption
+              } | tojson }
+
+  # Step 5 (mode != multimodal): embed the caption text so it is
+  # searchable as vector_kind=caption.
+  - generateCaptionEmbedding:
+      if: '${ $workflow.input.image_search_mode != "multimodal" }'
+      run:
+        worker:
+          name: "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}"
+          using: embed_text
+          arguments:
+            text: "${ $caption }"
+      output:
+        as:
+          model_name: "${ .model_info.model_name? // \"unknown\" }"
+          caption_rows: >-
+            ${ [ .embeddings | to_entries[] | {
+                  vector_kind: "caption",
+                  chunk_index: .key,
+                  begin_position: .value.begin_position,
+                  end_position: .value.end_position,
+                  content: .value.content,
+                  embedding: { values: .value.values }
+                } ] }
+
+  # Step 6: Upsert image and/or caption rows. `replace_kinds:
+  # ["image","caption"]` deletes only this memory's image/caption rows
+  # — the text rows are owned by a different dispatch (auto-embedding)
+  # and must not be clobbered (design 1/3 §3.3.1 kind isolation).
+  # `// []` makes a missing image_rows / caption_rows (mode gated the
+  # step off) an empty list rather than a jq error.
+  - upsertVectors:
+      run:
+        worker:
+          name: memories-upsert-embedding
+          using: unary
+          arguments:
+            json_body: >-
+              ${ {
+                memory_id: $workflow.input.memory_id,
+                embedding_model: (.model_name // "unknown"),
+                replace_kinds: ["image", "caption"],
+                rows: ((.image_rows // []) + (.caption_rows // []))
+              } | tojson }

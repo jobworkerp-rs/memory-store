@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package llm_memory.data;
+
+import "llm_memory/data/common.proto";
+
+// Search filter used by both ThreadVectorService and MemoryVectorService
+// (the latter via MemorySearchFilter.thread_filter).
+message ThreadSearchFilter {
+  // User ID filter
+  optional int64 user_id = 1;
+  // Label filter
+  repeated string labels = 2;
+  // Label match mode (default: ANY)
+  optional LabelMatchMode label_match_mode = 3;
+  // Channel filter
+  optional string channel = 4;
+  // Creation time range (milliseconds since epoch)
+  optional int64 created_after = 5;
+  optional int64 created_before = 6;
+  // Update time range (milliseconds since epoch)
+  optional int64 updated_after = 7;
+  optional int64 updated_before = 8;
+}

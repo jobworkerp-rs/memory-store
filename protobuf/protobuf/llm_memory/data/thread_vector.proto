@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package llm_memory.data;
+
+import "llm_memory/data/common.proto";
+import "llm_memory/data/memory_vector.proto";
+import "llm_memory/data/search_filter.proto";
+
+// Search options for thread vector/FTS/hybrid queries
+message ThreadSearchOptions {
+  // Max results (default: 10)
+  uint32 limit = 1;
+  // DEPRECATED: Distance type is configured per-table at creation time, not per-query.
+  // Setting this field has no effect. It will be removed in a future version.
+  optional DistanceType distance_type = 2;
+  // Filter conditions
+  optional ThreadSearchFilter filter = 3;
+  // Include description in results (server defaults to true when unset)
+  optional bool include_description = 4;
+  // Multi-vector aggregation strategy (vector-only search).
+  // Default: AVERAGE. Ignored when query_vectors has only one element.
+  optional AggregationStrategy aggregation_strategy = 5;
+}
+

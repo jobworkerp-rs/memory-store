@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package llm_memory.data;
+
+import "llm_memory/data/common.proto"; // ContentType
+
+// Identifier for a media_object row. Same `{ int64 value = 1; }`
+// convention as UserId / MemoryId.
+message MediaObjectId { int64 value = 1; }
+
+// Output-only immutable metadata returned on Find / search. NOT client
+// input (the only client input is MemoryData.media_object_id). The
+// internal storage_uri is never surfaced — clients go through a
+// presigned URL (MediaPayload).
+message MediaMetadata {
+  MediaObjectId id          = 1;
+  ContentType   kind        = 2;
+  string        media_type  = 3;
+  // Absent for url backend / unresolvable (size unknown).
+  optional int64  byte_size = 4;
+  optional uint32 width     = 5;
+  optional uint32 height    = 6;
+  optional int64  duration_ms = 7;
+  optional string alt       = 8;
+  // Integrity / manual recovery / re-upload hint. Absent for url
+  // backend (no sha256). Valid even when unresolved=true.
+  optional string sha256    = 9;
+}
+
+// Output-only enrichment attached to Memory when data.media_object_id is
+// set. Split from MemoryData so the cacheable part (metadata) and the
+// short-lived part (presigned_url, re-issued every response) have a
+// clear boundary.
+message MediaPayload {
+  MediaMetadata metadata        = 1;
+  // Short-lived. Issued just before the response. Absent for
+  // unresolvable / promoting media (no body to sign).
+  optional string presigned_url = 2;
+  optional int64  expires_at    = 3;
+  // true = the body is absent and a URL cannot be issued
+  // (storage_backend=unresolvable / gc_state in {3,4}). The client
+  // shows a "missing / recovering" placeholder. metadata and
+  // data.media_object_id remain valid.
+  bool unresolved               = 4;
+}

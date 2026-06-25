@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: test
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d test"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # minio: S3-compatible backend for the image memory feature's
+  # `MEDIA_STORAGE_BACKEND=s3` roundtrip tests (#[ignore], local only).
+  #
+  # Host ports are 9200/9201 (NOT minio's usual 9000/9001): on dev hosts
+  # :9000 is commonly taken by jobworkerp (all-in-one) and :9100 by
+  # conductor, so those would clash. The container still serves S3 on its
+  # internal :9000; only the published host port differs. Set
+  # MEDIA_STORAGE_S3_ENDPOINT=http://127.0.0.1:9200 accordingly (dot.env).
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "0.0.0.0:9200:9000"
+      - "0.0.0.0:9201:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 3s
+      retries: 20

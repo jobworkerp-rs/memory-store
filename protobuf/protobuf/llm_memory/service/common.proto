@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package llm_memory.service;
+
+// Generic response for update / delete style operations.
+message SuccessResponse {
+    // Whether the operation succeeded.
+    bool is_success = 1;
+}
+
+// Paginated list request used as input to FindList RPCs.
+message FindListRequest {
+    // Upper bound on the number of returned rows (all rows when
+    // unset).
+    optional int32 limit  = 1;
+    // Number of records to skip from the start (0 when unset).
+    optional int64 offset = 2;
+}
+
+// Filter for search criteria, used as input to Count RPCs.
+message FindCondition {
+
+}
+
+// Response returning the total row count, used by Count RPCs.
+message CountResponse {
+    // Total number of records matching the condition.
+    int64 total = 1;
+}

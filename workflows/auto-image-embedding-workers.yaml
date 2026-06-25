@@ -1,0 +1,99 @@
+# Worker definitions for the image / caption embedding pipeline
+# (image memory Phase 5).
+#
+# Registered by EmbeddingJobDispatcher::get_or_init only when
+# MEMORY_IMAGE_SEARCH_MODE != none (the dispatcher adds this file to
+# `prerequisite_yaml_paths` in image modes). The shared
+# `memories-mm-embedding` and `memories-upsert-embedding` workers live in
+# auto-embedding-workers.yaml (always registered, the text path needs
+# them too) — this file only adds the image-pipeline-specific workers.
+#
+# The VLM caption / update-content workers are defined unconditionally
+# here; in `multimodal` mode the workflow's per-step `if` simply skips
+# them, so registering an unused worker is harmless (it never runs).
+
+defaults:
+  response_type: DIRECT
+  store_failure: true
+  broadcast_results: false
+  retry_policy:
+    type: EXPONENTIAL
+    interval: 800
+    max_interval: 60000
+    max_retry: 0 # no retry
+    basis: 2.0
+
+workers:
+  # 1. GRPC worker that calls MediaService/Resolve back on this server to
+  #    get a short-lived GET URL for the media. Both env vars are
+  #    REQUIRED (no `:-default`) for the same cross-host safety reason as
+  #    memories-upsert-embedding.
+  - name: memories-media-resolve
+    runner: GRPC
+    settings:
+      host: %{MEMORY_GRPC_HOST}
+      port: %{MEMORY_GRPC_PORT}
+      use_reflection: true
+      method: llm_memory.service.MediaService/Resolve
+      as_json: true
+
+  # 2. GRPC worker that calls MemoryService/UpdateContentNoDispatch back
+  #    on this server to write the VLM caption into memory.content. This
+  #    RPC deliberately does NOT spawn the embedding dispatcher, which is
+  #    what breaks the caption→Update→re-dispatch loop (design 3/3
+  #    §11.3). Only used in vlm_caption / both modes.
+  - name: memories-update-content-no-dispatch
+    runner: GRPC
+    settings:
+      host: %{MEMORY_GRPC_HOST}
+      port: %{MEMORY_GRPC_PORT}
+      use_reflection: true
+      method: llm_memory.service.MemoryService/UpdateContentNoDispatch
+      as_json: true
+
+  # 3. VLM caption worker (LLM runner, ollama backend). Describes the
+  #    image in Japanese for retrieval. The model is swappable; a
+  #    vision-capable ollama model is required. Only used in
+  #    vlm_caption / both modes — in `multimodal` the workflow's per-step
+  #    `if` skips it, so registering it is harmless.
+  #
+  #    channel `llm`: every ollama-backed LLM step in this project
+  #    (reflection / personality / summary workers) runs on the `llm`
+  #    channel, which jobworkerp configures with a concurrency cap tuned
+  #    to the shared ollama model throughput. This worker must join the
+  #    same channel so a VLM caption job is serialized against those
+  #    other LLM jobs against the same ollama backend — otherwise they
+  #    run unbounded in parallel and contend for GPU / model memory.
+  #
+  #    base_url is intentionally omitted: it is optional on the ollama
+  #    runner and defaults to http://localhost:11434. NOTE: env
+  #    interpolation runs over the WHOLE YAML text (comments included)
+  #    BEFORE parsing, so even a no-fallback env placeholder written in
+  #    this comment would fail registration in `multimodal` (VLM never
+  #    invoked) and take the whole embedding dispatcher down — hence no
+  #    such placeholder appears anywhere in this file. Deployments that
+  #    run vlm_caption/both against a non-local ollama set base_url by
+  #    editing this file for that environment (workers-YAML operator
+  #    workflow), with a default-bearing form if env-driven.
+  - name: memories-vlm-caption
+    runner: LLM
+    channel: llm
+    settings:
+      ollama:
+        model: qwen3.6:27b
+        pull_model: false
+
+  # 4. WORKFLOW worker that orchestrates resolve → (image embed) →
+  #    (caption → update → caption embed) → upsert. Pinned to the same
+  #    single-slot `embedding_workflow` channel as memories-auto-embedding
+  #    (shares the GPU-bound embedding bottleneck; concurrency=1 prevents
+  #    the wall-clock inflation / deadlock described in
+  #    auto-embedding-workers.yaml). The $file directive inlines
+  #    auto-image-embedding.yaml at registration time.
+  - name: memories-auto-image-embedding
+    runner: WORKFLOW
+    response_type: NO_RESULT
+    channel: embedding_workflow
+    settings:
+      workflow_data:
+        $file: auto-image-embedding.yaml

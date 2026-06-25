@@ -1,0 +1,200 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: auto-reflection-summary-embedding
+  version: "1.0.0"
+
+# F-G11 (a) Summary embedding pipeline for reflection memories.
+#
+# Reflections piggy-back on the existing `memory_vector` LanceDB table
+# (they ARE memories — just with role=ROLE_REFLECTION) but cannot use
+# the generic `auto-embedding.yaml` workflow because:
+#   1. The generic dispatcher rejects ROLE_REFLECTION on the way in
+#      (see `infra/src/infra/memory_vector/dispatcher.rs::is_embeddable`).
+#   2. Reflections need their `summary_embedding_status` sidecar
+#      column kept in sync via `MarkReflectionEmbeddingStatus`. The
+#      generic auto-embedding workflow has nothing equivalent.
+#
+# Net effect: same upsert target (`MemoryVectorService.UpsertEmbedding`,
+# memory_vector table), different status bookkeeping. The try/catch
+# split below ensures `MarkReflectionEmbeddingStatus(kind=SUMMARY)` is
+# called on every terminal branch.
+input:
+  schema:
+    document:
+      type: object
+      required: [memory_id, content]
+      properties:
+        memory_id:
+          type: integer
+        content:
+          type: string
+
+do:
+  # Step 0: gate empty content before spending an embed + upsert round
+  # trip. Mirrors `guardEmptyIntent` in
+  # auto-reflection-intent-embedding.yaml. An empty summary cannot
+  # produce a meaningful vector, so record FAILED("empty_embedding")
+  # directly instead of embedding the empty string. This also keeps the
+  # post-upsert status branch unambiguous: by the time we reach it, a
+  # zero-`success_count` response can only mean a genuine write failure.
+  # A conditional runTask + `then: exit` (NOT a doTask wrapping the
+  # child run): the jobworkerp-rs DSL validator rejects the `if` + `do`
+  # (doTask) form, and `then`/`else` carrying a nested `do` is not a
+  # valid Task at all ("did not match any variant of untagged enum
+  # Task"). Use the taskBase `if` directly on the run, and the flow
+  # directive `then: exit` to short-circuit the rest of the workflow.
+  - markEmptyAsFailed:
+      if: "${ (($workflow.input.content // \"\") | length) == 0 }"
+      run:
+        worker:
+          name: memories-mark-reflection-embedding-status
+          arguments:
+            json_body: >-
+              ${ {
+                reflection_id: { value: $workflow.input.memory_id },
+                kind: "EMBEDDING_KIND_SUMMARY",
+                status: "EMBEDDING_STATUS_FAILED",
+                error_reason: "empty_embedding"
+              } | tojson }
+      then: exit
+
+  - embedAndUpsert:
+      try:
+        do:
+          # Step 1: produce the embedding via the shared
+          # `memories-mm-embedding` (MultimodalEmbeddingRunner) worker
+          # (same model as the regular auto-embedding path so F-S8 query
+          # embeddings live in the same vector space). `embed_text`
+          # chunks long text and returns one Embedding per chunk; unlike
+          # the intent path, reflection summaries can be long, and they
+          # share the N-row `memory_vector` table, so we store EVERY chunk
+          # (mirrors auto-embedding.yaml — no chunk-0-only pick).
+          - generateEmbedding:
+              run:
+                worker:
+                  name: "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}"
+                  using: embed_text
+                  arguments:
+                    text: "${.content}"
+              output:
+                as:
+                  # `?` suppresses jaq's "cannot use null as iterable"
+                  # when `model_info` is absent. Falls back to "unknown"
+                  # so the persisted `embedding_model` is never null —
+                  # callers grep for the value during model migrations.
+                  model_name: "${ .model_info.model_name? // \"unknown\" }"
+                  # One VectorRow per chunk. `to_entries[]` yields the
+                  # 0-based array index as `.key` = contiguous chunk_index
+                  # within (memory_id, vector_kind="text").
+                  text_rows: >-
+                    ${ [ .embeddings | to_entries[] | {
+                          vector_kind: "text",
+                          chunk_index: .key,
+                          begin_position: .value.begin_position,
+                          end_position: .value.end_position,
+                          content: .value.content,
+                          embedding: { values: .value.values }
+                        } ] }
+
+          # Step 2: persist every chunk into the existing memory_vector
+          # table via the N-row `BatchUpsertEmbeddings` rows path
+          # (`memories-upsert-embedding` already targets that RPC).
+          # `replace_kinds: ["text"]` deletes only this memory's existing
+          # text rows before inserting the new chunk set, so a re-embed
+          # leaves no stale rows. The reflection summary has no
+          # role-specific upsert path on purpose — keeping the vector
+          # store schema-compatible lets FindList / HybridSearch see the
+          # reflection summary the same way they see any other memory
+          # embedding (vector_kind="text" is orthogonal to role).
+          #
+          # Unlike the old single skipped-flag upsert contract,
+          # `BatchUpsertEmbeddings` answers `{success_count, failure_count,
+          # errors}` with no skipped flag. Step 3 reads `success_count`
+          # off this response (the intent path reads its own response flag
+          # the same `export.as` way) so the sidecar status reflects what
+          # the server actually wrote, not an inference from the input.
+          # Empty content is already handled by the step-0 guard, so
+          # reaching here with zero `success_count` means the embedding model
+          # returned no usable vector for non-empty content — record
+          # FAILED rather than leaving sidecar OK with no LanceDB row
+          # (which would make FindList / HybridSearch NotFound the row).
+          - upsertSummaryEmbedding:
+              run:
+                worker:
+                  name: memories-upsert-embedding
+                  using: unary
+                  arguments:
+                    json_body: >-
+                      ${ {
+                        memory_id: $workflow.input.memory_id,
+                        embedding_model: .model_name,
+                        replace_kinds: ["text"],
+                        rows: .text_rows
+                      } | tojson }
+              export:
+                as:
+                  # `export.as` evaluates against THIS task's output (the
+                  # upsert response), so `.jsonBody` is the
+                  # BatchUpsertEmbeddings reply. The GRPC runner serialises
+                  # the response with the standard protobuf-JSON mapping,
+                  # so multi-word fields arrive lowerCamelCased: read
+                  # `successCount`, NOT `success_count` (the latter would
+                  # always fall through to 0 and mark every successful
+                  # batch FAILED). Treat a missing / zero count as "no row
+                  # written".
+                  upsert_wrote_nothing: >-
+                    ${ ((.jsonBody // "{}") | fromjson | .successCount // 0) == 0 }
+
+          # Step 3: status bookkeeping — branch on whether the server
+          # actually persisted a row. The DSL has no if/then/else task and
+          # rejects doTask-wrapped branches, so the two outcomes are two
+          # mutually-exclusive conditional runTasks (one `if`, the other
+          # its negation). Exactly one fires per run.
+          - markSummaryStatusEmptyEmbedding:
+              if: "${ $upsert_wrote_nothing }"
+              run:
+                worker:
+                  name: memories-mark-reflection-embedding-status
+                  arguments:
+                    json_body: >-
+                      ${ {
+                        reflection_id: { value: $workflow.input.memory_id },
+                        kind: "EMBEDDING_KIND_SUMMARY",
+                        status: "EMBEDDING_STATUS_FAILED",
+                        error_reason: "empty_embedding"
+                      } | tojson }
+          - markSummaryStatusOk:
+              if: "${ $upsert_wrote_nothing | not }"
+              run:
+                worker:
+                  name: memories-mark-reflection-embedding-status
+                  arguments:
+                    json_body: >-
+                      ${ {
+                        reflection_id: { value: $workflow.input.memory_id },
+                        kind: "EMBEDDING_KIND_SUMMARY",
+                        status: "EMBEDDING_STATUS_OK"
+                      } | tojson }
+      catch:
+        as: err
+        do:
+          # Failure bookkeeping — flip the sidecar status to FAILED so
+          # the operator-facing redispatch RPC can pick this row up.
+          # Best-effort: if MarkReflectionEmbeddingStatus itself fails
+          # we have nowhere left to escalate; the workflow result is
+          # already a failure and the sidecar will stay in PENDING /
+          # the previous state until the next RebuildIndex / manual
+          # intervention.
+          - markStatusFailed:
+              run:
+                worker:
+                  name: memories-mark-reflection-embedding-status
+                  arguments:
+                    json_body: >-
+                      ${ {
+                        reflection_id: { value: $workflow.input.memory_id },
+                        kind: "EMBEDDING_KIND_SUMMARY",
+                        status: "EMBEDDING_STATUS_FAILED",
+                        error_reason: ($err | tostring)
+                      } | tojson }

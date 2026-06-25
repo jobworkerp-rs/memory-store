@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package llm_memory.data;
+
+// Search-result highlight metadata, shared by MemorySearchResult and
+// ThreadSearchResult.
+
+// Server-computed term offsets within a single search-result field.
+//
+// Both UTF-8 byte offsets and UTF-16 code-unit offsets are returned
+// because Rust slices are byte-indexed while JS `String` values are
+// UTF-16 code-unit-indexed. Returning both lets a JS client slice with
+// `String.prototype.slice(utf16_start, utf16_start + utf16_length)`
+// directly, while backends consuming the same payload keep the byte
+// offsets verbatim.
+message HighlightRange {
+  // UTF-8 byte offset within the field's content. Lines up with
+  // `&str` byte indices.
+  uint32 byte_start = 1;
+  uint32 byte_length = 2;
+  // UTF-16 code-unit offset within the field's content. Lines up with
+  // `String.prototype.charCodeAt`. Computed via
+  // `text[..byte_start].encode_utf16().count()` server-side.
+  uint32 utf16_start = 3;
+  uint32 utf16_length = 4;
+}
+
+// Source field that a HighlightField applies to. Currently each
+// search result has at most one source, but the value is modeled as
+// an enum + repeated HighlightField so future field-level expansions
+// (e.g. `metadata`) are wire-compatible.
+enum HighlightSource {
+  HIGHLIGHT_SOURCE_UNSPECIFIED = 0;
+  // `Memory.data.content` (used in MemorySearchResult).
+  HIGHLIGHT_SOURCE_CONTENT = 1;
+  // `Thread.data.description` (used in ThreadSearchResult).
+  HIGHLIGHT_SOURCE_DESCRIPTION = 2;
+}
+
+// Highlight ranges scoped to a single source field.
+message HighlightField {
+  HighlightSource source = 1;
+  repeated HighlightRange ranges = 2;
+}

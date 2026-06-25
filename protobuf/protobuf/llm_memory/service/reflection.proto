@@ -1,0 +1,464 @@
+syntax = "proto3";
+
+package llm_memory.service;
+
+import "google/protobuf/field_mask.proto";
+
+import "llm_memory/data/common.proto";
+import "llm_memory/data/memory.proto";
+import "llm_memory/data/memory_vector.proto";
+import "llm_memory/data/reflection.proto";
+import "llm_memory/data/reflection_filter.proto";
+import "llm_memory/data/thread.proto";
+import "llm_memory/service/common.proto";
+
+// ===== Generate / Finalize =====
+
+message GenerateForThreadRequest {
+  llm_memory.data.ThreadId thread_id = 1;
+  // Skip eligibility shortcut (description present, latest reflection
+  // newer than thread.updated_at, etc.). external_id collisions still
+  // honour F-G3 idempotency: same (thread_id, prompt_version,
+  // reflector_id) returns the existing reflection_id without rewrite.
+  bool force = 2;
+  optional string reflector_id = 3;
+  optional string prompt_version = 4;
+  optional string experiment_id = 5;
+  optional string experiment_variant = 6;
+  // false = synchronous (the workflow runs to completion);
+  // true = enqueue and return job_id immediately.
+  bool async_mode = 7;
+  // Output language for the generated reflection's free-text fields
+  // (BCP-47-ish short code: "ja" | "en"). When unset, the server
+  // resolves REFLECTION_DEFAULT_LANGUAGE, then falls back to "ja".
+  // Language only selects the prompt; it is NOT part of the
+  // (thread_id, prompt_version, reflector_id) idempotency key.
+  optional string output_language = 8;
+}
+
+message GenerateForThreadResponse {
+  oneof result {
+    llm_memory.data.ReflectionId reflection_id = 1;
+    string job_id = 2;
+  }
+}
+
+// FinalizeReflection is an internal RPC invoked from the
+// thread-reflection-single workflow's `callFinalizeReflection` step.
+// Direct external callers are not supported; deployments restrict it
+// at the ingress / ACL layer to reflection_user_id=300000.
+message FinalizeReflectionRequest {
+  llm_memory.data.ThreadId origin_thread_id = 1;
+
+  llm_memory.data.ReflectionLlmOutput parsed_output = 2;
+
+  // F-G10 heuristic score, computed by the workflow from
+  // retry/error/tool_calls counts. Stored alongside score_self.
+  float heuristic_score = 3;
+
+  string reflector_id = 4;
+  string prompt_version = 5;
+  optional string target_model_version = 6;
+
+  // target.* metadata (heuristic score derivation).
+  optional uint32 target_retry_count = 7;
+  optional uint32 target_error_count = 8;
+  optional uint32 target_tool_calls_count = 9;
+  optional uint32 target_window_count = 10;
+  optional uint32 target_window_size = 11;
+  // Number of fact entries dropped during anchor resolution.
+  optional uint32 target_fact_unresolved_count = 12;
+
+  optional string experiment_id = 13;
+  optional string experiment_variant = 14;
+
+  // Set on the F-G9 failure-fallback path (schema_reject / empty_response /
+  // llm_error / merge_error / truncation_failure). Stored under
+  // metadata.reflector.error_kind. Unset on success.
+  optional string reflector_error_kind = 15;
+}
+
+// ===== CRUD =====
+
+message FindReflectionRequest {
+  llm_memory.data.ReflectionId id = 1;
+}
+
+message OptionalReflectionResponse {
+  optional llm_memory.data.Reflection reflection = 1;
+}
+
+message FindReflectionsByThreadIdRequest {
+  llm_memory.data.ThreadId thread_id = 1;
+  // false = active reflection only (latest by created_at);
+  // true = all history in created_at desc.
+  bool include_history = 2;
+}
+
+message UpdateReflectionRequest {
+  llm_memory.data.ReflectionId id = 1;
+  // Only `pinned` is currently writable; other operational fields use
+  // their dedicated RPCs (RecordAppliedTarget, RecordFewShotUsage,
+  // MarkReflectionEmbeddingStatus). dataset_quality is locked to AUTO
+  // in this release per spec §3.7.
+  google.protobuf.FieldMask update_mask = 2;
+  optional bool pinned = 3;
+}
+
+message DeleteReflectionRequest {
+  llm_memory.data.ReflectionId id = 1;
+}
+
+// ===== Search =====
+
+// Sort keys for SearchReflections.
+enum ReflectionListSort {
+  // RELEVANCE on hybrid search; UPDATED_DESC on filter-only search.
+  REFLECTION_LIST_SORT_UNSPECIFIED = 0;
+  REFLECTION_LIST_SORT_RELEVANCE = 1;
+  REFLECTION_LIST_SORT_SCORE_DESC = 2;
+  REFLECTION_LIST_SORT_SCORE_ASC = 3;
+  REFLECTION_LIST_SORT_CREATED_DESC = 4;
+  REFLECTION_LIST_SORT_CREATED_ASC = 5;
+  // F-S5 preset: outcome=FAILURE then score ASC.
+  REFLECTION_LIST_SORT_FAILURE_FIRST = 6;
+}
+
+message SearchReflectionsRequest {
+  // F-S1 hybrid search: query_text and query_vectors are independently
+  // optional (text-only / vector-only / hybrid all valid). At least one
+  // signal is required for a relevance-ranked search; supplying neither
+  // turns the request into a filter-only listing.
+  optional string query_text = 1;
+  repeated llm_memory.data.EmbeddingVector query_vectors = 2;
+  optional llm_memory.data.ReflectionSearchFilter filter = 3;
+  optional ReflectionListSort sort = 4;
+  // F-S6 boost.
+  optional bool boost_pinned_high_score = 5;
+  optional llm_memory.data.HybridSearchOptions hybrid_options = 6;
+  // pagination
+  optional uint32 limit = 7;
+  optional int64 cursor_after_memory_id = 8;
+}
+
+message FindSimilarRequest {
+  oneof reference {
+    llm_memory.data.ThreadId reference_thread_id = 1;
+    llm_memory.data.ReflectionId reference_reflection_id = 2;
+  }
+  uint32 top_k = 3;
+  optional llm_memory.data.ReflectionSearchFilter filter = 4;
+}
+
+message FindSimilarByTextRequest {
+  string intent_text = 1;
+  uint32 top_k = 2;
+  optional llm_memory.data.ReflectionSearchFilter filter = 3;
+}
+
+message MatchSignaturesRequest {
+  llm_memory.data.FailureSignatureIndicators current_indicators = 1;
+  // Same pattern_type matches receive a 0.5x distance bonus.
+  optional llm_memory.data.FailureSignaturePatternType current_pattern_type = 2;
+  uint32 top_k = 3;
+  optional llm_memory.data.ReflectionSearchFilter filter = 4;
+}
+
+// Spec §4.2.4 expects a truncation signal whenever the
+// `REFLECTION_FS_MATCH_SCAN_CAP` is reached; without it, callers
+// cannot tell that an older reflection with a closer indicator
+// distance was silently excluded from ranking. The unary shape
+// is therefore preferred over `stream ReflectionSearchResult`
+// here — top_k is small and bounded, so streaming offered no
+// real benefit.
+message MatchSignaturesResponse {
+  repeated llm_memory.data.ReflectionSearchResult hits = 1;
+  // True when the sidecar scan filled the configured cap; older rows
+  // beyond the cap did not enter the ranking stage.
+  bool is_truncated = 2;
+  // Number of sidecar rows actually scanned (≤ scan cap).
+  uint32 scanned_count = 3;
+}
+
+// ===== Export =====
+
+message ExportReflectionsRequest {
+  optional llm_memory.data.ReflectionSearchFilter filter = 1;
+  // memory_id desc cursor for stable pagination.
+  optional int64 cursor_after_memory_id = 2;
+  optional uint32 batch_size = 3;
+  bool include_facts = 4;
+  bool include_tool_outcomes = 5;
+}
+
+// ===== Aggregate =====
+
+message AggregateFailureModesRequest {
+  optional llm_memory.data.ReflectionSearchFilter filter = 1;
+  bool include_co_occurrence = 2;
+  optional uint32 top_n = 3;
+}
+
+message CoOccurrenceEntry {
+  llm_memory.data.FailureMode mode = 1;
+  uint64 count = 2;
+}
+
+message FailureModeAggregateEntry {
+  llm_memory.data.FailureMode mode = 1;
+  uint64 count = 2;
+  uint64 recurrence_count = 3;
+  repeated CoOccurrenceEntry co_occurring = 4;
+}
+
+message AggregateFailureModesResponse {
+  repeated FailureModeAggregateEntry entries = 1;
+  // True when the co-occurrence pair query hit `CO_OCCURRENCE_PAIR_CAP`
+  // (1000). The natural pair count for the failure-mode dictionary is
+  // ~100, so the cap only fires for extended dictionaries or
+  // pathological filters; the flag lets callers detect that case.
+  bool is_truncated = 2;
+}
+
+enum AggregateScoresGroupBy {
+  AGGREGATE_SCORES_GROUP_BY_UNSPECIFIED = 0;
+  AGGREGATE_SCORES_GROUP_BY_ORIGIN_USER = 1;
+  AGGREGATE_SCORES_GROUP_BY_ORIGIN_CHANNEL = 2;
+  AGGREGATE_SCORES_GROUP_BY_TARGET_MODEL_VERSION = 3;
+  AGGREGATE_SCORES_GROUP_BY_TASK_CATEGORY = 4;
+  AGGREGATE_SCORES_GROUP_BY_REFLECTION_ASPECT = 5;
+  AGGREGATE_SCORES_GROUP_BY_OUTCOME = 6;
+  AGGREGATE_SCORES_GROUP_BY_EXPERIMENT_ID = 7;
+  AGGREGATE_SCORES_GROUP_BY_EXPERIMENT_VARIANT = 8;
+  AGGREGATE_SCORES_GROUP_BY_TIME_BUCKET = 9;
+  AGGREGATE_SCORES_GROUP_BY_SUMMARY_EMBEDDING_STATUS = 10;
+  AGGREGATE_SCORES_GROUP_BY_INTENT_EMBEDDING_STATUS = 11;
+}
+
+message AggregateScoresRequest {
+  optional llm_memory.data.ReflectionSearchFilter filter = 1;
+  repeated AggregateScoresGroupBy group_by = 2;
+  optional uint32 time_bucket_seconds = 3;
+}
+
+message ScoresGroupKey {
+  optional int64 origin_user_id = 1;
+  optional string origin_channel = 2;
+  optional string target_model_version = 3;
+  optional llm_memory.data.TaskCategory task_category = 4;
+  optional llm_memory.data.ReflectionAspect reflection_aspect = 5;
+  optional llm_memory.data.ReflectionOutcome outcome = 6;
+  optional string experiment_id = 7;
+  optional string experiment_variant = 8;
+  optional int64 time_bucket_start = 9;
+  optional llm_memory.data.EmbeddingStatus summary_embedding_status = 10;
+  optional llm_memory.data.EmbeddingStatus intent_embedding_status = 11;
+}
+
+message AggregateScoresEntry {
+  ScoresGroupKey key = 1;
+  uint64 count = 2;
+  float score_avg = 3;
+  float score_min = 4;
+  float score_max = 5;
+  float score_p50 = 6;
+  float score_p95 = 7;
+}
+
+message AggregateScoresResponse {
+  repeated AggregateScoresEntry entries = 1;
+}
+
+message AggregateLessonsRequest {
+  optional llm_memory.data.ReflectionSearchFilter filter = 1;
+  optional uint32 top_n = 2;
+}
+
+message LessonAggregateEntry {
+  string token_or_phrase = 1;
+  uint64 frequency = 2;
+}
+
+message AggregateLessonsResponse {
+  repeated LessonAggregateEntry entries = 1;
+}
+
+message AggregateToolContributionsRequest {
+  optional llm_memory.data.ReflectionSearchFilter filter = 1;
+  bool group_by_tool = 2;
+  bool group_by_contribution = 3;
+  bool group_by_error_kind = 4;
+  bool group_by_origin_user = 5;
+}
+
+message ToolContributionAggregateEntry {
+  optional string tool = 1;
+  optional llm_memory.data.ToolContribution contribution = 2;
+  optional string error_kind = 3;
+  optional int64 origin_user_id = 4;
+  uint64 count = 5;
+  // Phase G stage 6: tool-bucket richness. `recurrence_count` is the
+  // subset of `count` whose sidecar has `is_recurrence=true`;
+  // `contribution_share` is `count / total_for_tool` when
+  // `group_by_tool=true` (otherwise unset because the denominator is
+  // ambiguous). Both fields are optional for forward compatibility:
+  // clients built against Phase F bindings see Phase G servers fill
+  // them, but Phase G clients should treat absence as "not requested".
+  optional uint64 recurrence_count = 6;
+  optional double contribution_share = 7;
+}
+
+message AggregateToolContributionsResponse {
+  repeated ToolContributionAggregateEntry entries = 1;
+}
+
+// ===== Tool stats =====
+
+message GetToolOutcomeStatsRequest {
+  int64 origin_user_id = 1;
+  string tool = 2;
+}
+
+message ToolOutcomeStatEntry {
+  llm_memory.data.ReflectionOutcome outcome = 1;
+  uint64 count = 2;
+  int64 last_updated_at = 3;
+}
+
+message ToolOutcomeStatsResponse {
+  repeated ToolOutcomeStatEntry entries = 1;
+}
+
+message GetToolContributionStatsRequest {
+  int64 origin_user_id = 1;
+  string tool = 2;
+}
+
+message ToolContributionStatEntry {
+  llm_memory.data.ToolContribution contribution = 1;
+  optional string error_kind = 2;
+  uint64 count = 3;
+  int64 last_updated_at = 4;
+}
+
+message ToolContributionStatsResponse {
+  repeated ToolContributionStatEntry entries = 1;
+}
+
+message RebuildDerivedStatsRequest {
+  // Filter rebuild to a single user. Unset rebuilds all rows.
+  optional int64 origin_user_id = 1;
+  bool rebuild_tool_outcome_stats = 2;
+  bool rebuild_tool_contribution_stats = 3;
+}
+
+message RebuildDerivedStatsResponse {
+  uint64 tool_outcome_rows_rebuilt = 1;
+  uint64 tool_contribution_rows_rebuilt = 2;
+  int64 duration_ms = 3;
+}
+
+// ===== Operational state =====
+
+message PinReflectionRequest {
+  llm_memory.data.ReflectionId id = 1;
+  bool pinned = 2;
+}
+
+message RecordAppliedTargetRequest {
+  llm_memory.data.ReflectionId id = 1;
+  string target = 2;
+  optional string mitigation_fingerprint = 3;
+}
+
+message RecordFewShotUsageRequest {
+  llm_memory.data.ReflectionId id = 1;
+  int64 used_in_thread_id = 2;
+}
+
+message UpsertMitigationAppliedRequest {
+  llm_memory.data.ReflectionId id = 1;
+  string target = 2;
+  string fingerprint = 3;
+}
+
+message UpsertMitigationAppliedResponse {
+  // false when an existing (memory_id, target) row already has this
+  // fingerprint (skip = duplicate apply); true on insert or fingerprint
+  // change (= newly applied).
+  bool applied = 1;
+}
+
+message MarkEmbeddingStatusRequest {
+  llm_memory.data.ReflectionId reflection_id = 1;
+  // BOTH is rejected for status-update RPCs (BOTH is redispatch-only).
+  llm_memory.data.EmbeddingKind kind = 2;
+  // PENDING is rejected (PENDING is the initial state set on insert).
+  llm_memory.data.EmbeddingStatus status = 3;
+  optional string error_reason = 4;
+}
+
+// ===== Service =====
+
+service ReflectionService {
+  // Generation pipeline: Generate fans out to the workflow,
+  // FinalizeReflection persists the LLM output (workflow-internal RPC).
+  rpc Generate(GenerateForThreadRequest) returns (GenerateForThreadResponse);
+  rpc FinalizeReflection(FinalizeReflectionRequest)
+      returns (llm_memory.data.ReflectionId);
+
+  // CRUD.
+  rpc Find(FindReflectionRequest) returns (OptionalReflectionResponse);
+  rpc FindByThread(FindReflectionsByThreadIdRequest)
+      returns (stream llm_memory.data.Reflection);
+  rpc Update(UpdateReflectionRequest) returns (SuccessResponse);
+  rpc Delete(DeleteReflectionRequest) returns (SuccessResponse);
+
+  // Search.
+  rpc Search(SearchReflectionsRequest)
+      returns (stream llm_memory.data.ReflectionSearchResult);
+  rpc FindSimilarTrajectories(FindSimilarRequest)
+      returns (stream llm_memory.data.ReflectionSearchResult);
+  rpc FindSimilarByIntentText(FindSimilarByTextRequest)
+      returns (stream llm_memory.data.ReflectionSearchResult);
+  // Phase G stage 5: unary so the response can carry the
+  // `is_truncated` / `scanned_count` truncation signal that the
+  // previous `stream ReflectionSearchResult` shape had nowhere to
+  // put. Streaming was not load-bearing here — top_k is bounded
+  // and small.
+  rpc MatchFailureSignatures(MatchSignaturesRequest)
+      returns (MatchSignaturesResponse);
+
+  // Export.
+  rpc Export(ExportReflectionsRequest)
+      returns (stream llm_memory.data.Reflection);
+
+  // Aggregate.
+  rpc AggregateFailureModes(AggregateFailureModesRequest)
+      returns (AggregateFailureModesResponse);
+  rpc AggregateScores(AggregateScoresRequest)
+      returns (AggregateScoresResponse);
+  rpc AggregateLessons(AggregateLessonsRequest)
+      returns (AggregateLessonsResponse);
+  rpc AggregateToolContributions(AggregateToolContributionsRequest)
+      returns (AggregateToolContributionsResponse);
+
+  // Tool stats (O(1) lookups against derived stats tables).
+  rpc GetToolOutcomeStats(GetToolOutcomeStatsRequest)
+      returns (ToolOutcomeStatsResponse);
+  rpc GetToolContributionStats(GetToolContributionStatsRequest)
+      returns (ToolContributionStatsResponse);
+  rpc RebuildDerivedStats(RebuildDerivedStatsRequest)
+      returns (RebuildDerivedStatsResponse);
+
+  // Operational state mutators.
+  rpc Pin(PinReflectionRequest) returns (SuccessResponse);
+  rpc RecordAppliedTarget(RecordAppliedTargetRequest)
+      returns (SuccessResponse);
+  rpc RecordFewShotUsage(RecordFewShotUsageRequest)
+      returns (SuccessResponse);
+  rpc UpsertMitigationApplied(UpsertMitigationAppliedRequest)
+      returns (UpsertMitigationAppliedResponse);
+  rpc MarkReflectionEmbeddingStatus(MarkEmbeddingStatusRequest)
+      returns (SuccessResponse);
+}

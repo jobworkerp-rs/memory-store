@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package llm_memory.service;
+
+import "llm_memory/data/common.proto";
+import "llm_memory/data/media.proto";
+
+// Media object lifecycle service (image memory feature). Bytes live in
+// external storage (S3 / file / url); the DB holds metadata only.
+service MediaService {
+  // Large files use client streaming: the first message carries an
+  // UploadHeader, subsequent messages carry chunks.
+  rpc Upload(stream UploadRequest)  returns (UploadResponse);
+  // Reference-register an object already PUT to external storage.
+  rpc Register(RegisterRequest)     returns (llm_memory.data.MediaMetadata);
+  rpc Find(FindMediaRequest)        returns (llm_memory.data.MediaMetadata);
+  // Issue a short-lived GET URL (TTL = MEDIA_PRESIGN_TTL_SEC when
+  // unset). Used by client display and the embedding workflow.
+  rpc Resolve(ResolveRequest)       returns (ResolveResponse);
+  // Explicit delete. ref_count > 0 returns FailedPrecondition. Normally
+  // media is deleted via memory deletion's ref_count decrement.
+  rpc Delete(DeleteMediaRequest)    returns (Empty);
+}
+
+// First message = header, subsequent messages = chunks.
+message UploadRequest {
+  oneof payload {
+    UploadHeader header = 1;
+    bytes        chunk  = 2;
+  }
+}
+message UploadHeader {
+  llm_memory.data.ContentType kind = 1;
+  string media_type = 2;
+  optional string alt = 3;
+  optional uint32 width = 4;
+  optional uint32 height = 5;
+}
+message UploadResponse {
+  llm_memory.data.MediaObjectId media_object_id = 1;
+  // true = hit an existing sha256 (b-2 dedup or b-1 promotion/recovery).
+  bool deduplicated = 2;
+}
+
+message RegisterRequest {
+  llm_memory.data.ContentType kind = 1;
+  string media_type = 2;
+  // s3/file: object key WITHIN the server's configured backend/bucket
+  // (e.g. "path/img.png"); the bucket / file root is server config and
+  // is NOT included here. url: the external URL itself.
+  string storage_uri = 3;
+  optional string sha256 = 4;     // s3/file required; url ignored (stored NULL)
+  optional int64  byte_size = 5;  // s3/file required; url optional (unvalidated)
+  optional uint32 width = 6;
+  optional uint32 height = 7;
+  optional string alt = 8;
+  string storage_backend = 9;     // "s3" | "file" | "url"
+}
+
+message FindMediaRequest   { llm_memory.data.MediaObjectId media_object_id = 1; }
+message DeleteMediaRequest { llm_memory.data.MediaObjectId media_object_id = 1; }
+
+message ResolveRequest {
+  llm_memory.data.MediaObjectId media_object_id = 1;
+  optional uint32 ttl_sec = 2;    // unset => MEDIA_PRESIGN_TTL_SEC
+}
+message ResolveResponse {
+  // Absent for unresolvable / promoting (gc_state in {3,4}).
+  optional string url        = 1;
+  optional int64  expires_at = 2;
+  // true = body absent, URL cannot be issued (normal recovery-waiting
+  // state, NOT an error).
+  bool unresolved            = 3;
+}
+
+message Empty {}

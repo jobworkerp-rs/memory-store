@@ -1,0 +1,339 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: agent-chat-import
+  version: "1.0.0"
+
+# Import-only stage extracted from the monolithic agent-chat-pipeline.
+#
+# Topology: local jobworkerp worker (with coding-agent logs at
+# ~/.claude, ~/.codex), remote memories gRPC. This workflow only
+# runs memories-import; summary / personality / reflection live in
+# agent-chat-summary.yaml.
+#
+# Outputs carry the resolved date window so agent-chat-summary can
+# consume the same range without recomputing it. Standalone summary
+# callers (per-host cron split-execution) must reproduce the same
+# expression independently.
+
+input:
+  schema:
+    document:
+      type: object
+      required:
+        - source
+        - user_id
+        - memories_grpc_url
+      properties:
+        # ---- import stage --------------------------------------------------
+        source:
+          type: string
+          enum: ["claude-code", "codex", "plain"]
+          description: memories-import subcommand.
+        user_id:
+          type: integer
+          description: memories-import -u.
+        memories_grpc_url:
+          type: string
+          description: >-
+            memories gRPC URL (e.g. http://host:9100). Used as
+            --server-url; parsed into host/port for symmetry with
+            agent-chat-summary's identically-shaped override.
+        since_date:
+          type: string
+          default: ""
+          description: >-
+            YYYY-MM-DD. Marks the start of the processing window — the
+            import covers everything from this date up to "today" (in
+            the configured tz), inclusive of both ends. Empty =
+            "yesterday in tz" for since_mode="day_start" (the legacy
+            daily-cron case), and "today in tz" for
+            since_mode="now_minus" (the hourly case where today's
+            in-progress summary is being kept fresh). At the day
+            boundary, today's hourly run switches to the new day, so
+            any chat written between the last run of the previous day
+            and 00:00 is captured by that final run only — pick
+            `since_lookback_seconds` comfortably wider than the cron
+            interval so nothing is missed.
+        end_date:
+          type: string
+          default: ""
+          pattern: "^$|^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+          description: >-
+            YYYY-MM-DD. Marks the END (inclusive) of the processing
+            window. Empty (default) lets resolveDateRange auto-derive
+            it from since_date / since_mode. Pass an explicit value to
+            back-fill a fixed historical window without dragging today
+            in (e.g. since_date=2026-04-01 end_date=2026-04-30). Must
+            be on/after since_date; ordering is not re-validated here.
+        since_override:
+          type: string
+          default: ""
+          pattern: "^$|^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+          description: >-
+            UTC integer-seconds ISO 8601 string (e.g.
+            "2026-05-08T08:00:00Z") used verbatim as memories-import
+            --since when non-empty, regardless of since_mode. Other
+            RFC 3339 forms (`+HH:MM` offset, `.123Z` fractional
+            seconds) are rejected here even though memories-import
+            itself would accept them — downstream summary stages rely
+            on the `Z` form to derive a precise `since_ms_utc` for
+            `updated_after_ms`, and silently falling back to day_start
+            would mask the misconfiguration.
+        since_mode:
+          type: string
+          enum: ["day_start", "now_minus"]
+          default: "day_start"
+          description: >-
+            How to derive --since when since_override is empty.
+            "day_start" (default, legacy behaviour) uses
+            "since_date 00:00 +tz" — pairs with the daily summary's
+            day window. "now_minus" uses (now - since_lookback_seconds)
+            in UTC ISO 8601 (Z form) — for short-span periodic runs
+            (e.g. hourly) where day_start would re-import the entire
+            current day on every tick.
+        since_lookback_seconds:
+          type: integer
+          default: 0
+          description: >-
+            Effective only when since_mode="now_minus". The since cutoff
+            becomes (now - this value). 0 silently falls back to
+            day_start, so a misconfigured input cannot accidentally
+            re-import the whole vault. Pick a value comfortably larger
+            than the periodic run interval (e.g. 3900 for hourly =
+            65 minutes) to absorb dispatch jitter.
+        timezone_offset_hours:
+          type: integer
+          minimum: 0
+          maximum: 23
+          default: 9
+          description: >-
+            Day-boundary timezone (0-23). JST (+9) by default.
+            Negative offsets unsupported; use UTC (0) for the Americas.
+        import_command:
+          type: string
+          default: "memories-import"
+          description: memories-import binary path. Absolute path recommended.
+        all_projects_or_sessions:
+          type: boolean
+          default: true
+          description: Add --all-projects / --all-sessions (ignored for plain).
+        claude_dir:
+          type: string
+          default: ""
+          description: Override --claude-dir. Empty = ~/.claude.
+        codex_dir:
+          type: string
+          default: ""
+          description: Override --codex-dir. Empty = ~/.codex.
+        strip_path_prefix:
+          type: string
+          default: ""
+          description: "CSV for memories-import -P (strips host paths from path: labels)."
+        extra_import_args:
+          type: array
+          items: { type: string }
+          default: []
+          description: Extra args appended verbatim (e.g. --prune-missing).
+        # ---- endpoint override (parity with summary side) ------------------
+        memories_grpc_host:
+          type: string
+          default: ""
+          description: >-
+            Currently unused by import (memories-import takes a URL
+            via --server-url), but accepted here so the wrapper can
+            forward the same payload to both import and summary
+            workflows without conditional key omission.
+        memories_grpc_port:
+          type: integer
+          default: 0
+          description: Same rationale as memories_grpc_host.
+
+timeout:
+  after:
+    hours: 2
+
+do:
+  # Step 0: Initialize variables that may be referenced from output.as
+  # even when an early step fails to populate them.
+  - initOutputVars:
+      set:
+        since_date_resolved: "${ null }"
+        end_date_resolved: "${ null }"
+        since_iso: "${ null }"
+        range_start_ms: "${ null }"
+        since_ms_utc: "${ null }"
+        import_succeeded: "${ false }"
+
+  # Step 1: Resolve since_date (range start) and end_date (range end).
+  # `local_now_epoch` is sampled once and reused so the two dates
+  # cannot straddle midnight even on a slow runner.
+  - sampleLocalNow:
+      set:
+        local_now_epoch: "${ now + ($workflow.input.timezone_offset_hours * 3600) }"
+
+  # Empty `since_date` keeps the legacy single-day behaviour:
+  #   - since_mode="day_start" (daily cron): [yesterday, yesterday]
+  #   - since_mode="now_minus" (hourly cron): [today, today]
+  # An explicit `since_date` opens up range mode: [since_date, today].
+  # end_date must NOT default to "today" when since_date is empty —
+  # daily cron would otherwise regenerate today's in-progress summary
+  # on every run. An explicit `end_date` wins over both rules, so a
+  # back-fill of `[since_date, end_date]` does not drag today in.
+  - resolveDateRange:
+      set:
+        since_date_resolved: >-
+          ${ if $workflow.input.since_date != ""
+             then $workflow.input.since_date
+             elif $workflow.input.since_mode == "now_minus"
+             then ($local_now_epoch | strftime("%Y-%m-%d"))
+             else (($local_now_epoch - 86400) | strftime("%Y-%m-%d"))
+             end }
+        end_date_resolved: >-
+          ${ if $workflow.input.end_date != ""
+             then $workflow.input.end_date
+             elif ($workflow.input.since_date != ""
+                   or $workflow.input.since_mode == "now_minus")
+             then ($local_now_epoch | strftime("%Y-%m-%d"))
+             else (($local_now_epoch - 86400) | strftime("%Y-%m-%d"))
+             end }
+
+  # Step 2: Build `--since` value (ISO 8601 with explicit numeric tz
+  # offset, e.g. "2026-05-06T00:00:00+09:00") and the matching
+  # `range_start_ms` for the downstream thread-summary-batch consumer.
+  #
+  # Format the +HH:MM string with leading zero. Negative offsets are
+  # not supported by this format helper — callers wanting non-Asia
+  # timezones must pass a non-negative `timezone_offset_hours`.
+  - buildTzOffsetStr:
+      set:
+        tz_offset_str: >-
+          ${ $workflow.input.timezone_offset_hours as $h
+             | "+" + (if $h < 10 then "0" + ($h | tostring) else ($h | tostring) end)
+                  + ":00" }
+
+  # Three-stage fallback for the import `--since` (spec
+  # `agent-chat-import-incremental-spec.md` §2.3):
+  #   1. since_override non-empty → use verbatim
+  #   2. since_mode="now_minus" with positive lookback → now - N (UTC, Z form)
+  #   3. fallback → "since_date 00:00 +tz" (legacy day_start)
+  #
+  # `range_start_ms` is intentionally INDEPENDENT of since_iso. It
+  # marks the start of the processing range (since_date 00:00 in tz)
+  # and stays fixed there even when --since is pushed forward by
+  # short-span runs. It is used as the lower bound for the downstream
+  # thread-summary-batch's `updated_after_ms` filter.
+  #
+  # `floor` here matters: jaq's `now` returns a float (sub-second
+  # precision). Without it, since_ms_utc carries the fractional part
+  # into thread-summary-batch's `updated_after_ms`, whose schema is
+  # `type: integer` — input validation would reject a value like
+  # `1778194252007.4082`.
+  #
+  # `since_override` is validated explicitly: on parse failure we
+  # `error` rather than silently falling back to 0 (which would widen
+  # `updated_after_ms` to range_start_ms - 1, masking the misconfig).
+  - buildSinceEpoch:
+      set:
+        since_epoch_seconds: >-
+          ${ (if $workflow.input.since_override != ""
+              then (($workflow.input.since_override
+                     | strptime("%Y-%m-%dT%H:%M:%SZ")?
+                     | mktime?)
+                    // error("since_override must be UTC integer-seconds ISO 8601 (Z form), got: \($workflow.input.since_override)"))
+              elif ($workflow.input.since_mode == "now_minus"
+                    and $workflow.input.since_lookback_seconds > 0)
+              then (now - $workflow.input.since_lookback_seconds)
+              else 0
+              end) | floor }
+
+  - buildSinceWindow:
+      set:
+        since_iso: >-
+          ${ if $workflow.input.since_override != ""
+             then $workflow.input.since_override
+             elif ($workflow.input.since_mode == "now_minus"
+                   and $workflow.input.since_lookback_seconds > 0)
+             then ($since_epoch_seconds | strftime("%Y-%m-%dT%H:%M:%SZ"))
+             else $since_date_resolved + "T00:00:00" + $tz_offset_str
+             end }
+        range_start_ms: >-
+          ${ ((($since_date_resolved + "T00:00:00Z")
+                | strptime("%Y-%m-%dT%H:%M:%SZ")
+                | mktime)
+              - ($workflow.input.timezone_offset_hours * 3600)) * 1000 }
+        since_ms_utc: "${ $since_epoch_seconds * 1000 }"
+
+  # Step 3: Build memories-import argv as a single expression
+  # (jaq's `set` evaluates keys in parallel, so cross-key refs like
+  # `$common_args` from another key in the same set are undefined).
+  # Empty-string sentinel = "skip this flag".
+  - buildImportArgs:
+      set:
+        import_args: >-
+          ${ [
+               $workflow.input.source,
+               "-u", ($workflow.input.user_id | tostring),
+               "-v",
+               "--since", $since_iso,
+               "--server-url", $workflow.input.memories_grpc_url
+             ]
+             + (if $workflow.input.source == "claude-code"
+                then
+                  (if $workflow.input.all_projects_or_sessions
+                     then ["--all-projects"] else [] end)
+                  + (if $workflow.input.claude_dir != ""
+                     then ["--claude-dir", $workflow.input.claude_dir]
+                     else [] end)
+                  + (if $workflow.input.strip_path_prefix != ""
+                     then ["-P", $workflow.input.strip_path_prefix]
+                     else [] end)
+                elif $workflow.input.source == "codex"
+                then
+                  (if $workflow.input.all_projects_or_sessions
+                     then ["--all-sessions"] else [] end)
+                  + (if $workflow.input.codex_dir != ""
+                     then ["--codex-dir", $workflow.input.codex_dir]
+                     else [] end)
+                  + (if $workflow.input.strip_path_prefix != ""
+                     then ["-P", $workflow.input.strip_path_prefix]
+                     else [] end)
+                else []
+                end)
+             + $workflow.input.extra_import_args }
+
+  # Step 4: Run memories-import. treat_nonzero_as_error surfaces
+  # memories-import exit 1 as a task failure so a wrapper can stop
+  # before invoking the summary side. We avoid memories-import's
+  # built-in --summarize-after-* because it swallows dispatch failures.
+  - importChats:
+      timeout:
+        after:
+          hours: 2
+      run:
+        function:
+          runnerName: COMMAND
+          settings: {}
+          arguments:
+            command: "${ $workflow.input.import_command }"
+            args: "${ $import_args }"
+            treat_nonzero_as_error: true
+      export:
+        as:
+          import_succeeded: true
+
+output:
+  as:
+    completed: ${ $import_succeeded }
+    since_date: ${ $since_date_resolved }
+    end_date: ${ $end_date_resolved }
+    since_iso: ${ $since_iso }
+    # `range_start_ms` is "since_date 00:00 in tz" expressed in epoch
+    # ms — the start of the processing range, NOT the start of a
+    # single calendar day. For range-mode runs (since_date set), the
+    # processing window extends from this point up to `end_date`'s
+    # 24:00 in tz. Downstream consumers needing a strict per-day
+    # window must compute it themselves from `since_date` / `end_date`.
+    range_start_ms: ${ $range_start_ms }
+    since_ms_utc: ${ $since_ms_utc }
+    import_succeeded: ${ $import_succeeded }

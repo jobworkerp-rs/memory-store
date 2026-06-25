@@ -1,0 +1,420 @@
+syntax = "proto3";
+
+package llm_memory.service;
+
+import "llm_memory/data/common.proto";
+import "llm_memory/data/highlight.proto";
+import "llm_memory/data/media.proto";
+import "llm_memory/data/memory.proto";
+import "llm_memory/data/memory_vector.proto";
+import "llm_memory/data/thread.proto";
+
+// ===== Search requests =====
+
+message VectorSearchRequest {
+  // Query vectors (required, multiple for multi-vector search)
+  repeated llm_memory.data.EmbeddingVector query_vectors = 1;
+  // Search options
+  llm_memory.data.SearchOptions options = 2;
+}
+
+message TextSearchRequest {
+  // Search text (required)
+  string query_text = 1;
+  // Search options
+  llm_memory.data.SearchOptions options = 2;
+  // FTS-specific options
+  llm_memory.data.FullTextSearchOptions fts_options = 3;
+}
+
+message HybridSearchRequest {
+  // Query vectors (required)
+  repeated llm_memory.data.EmbeddingVector query_vectors = 1;
+  // Search text (required)
+  string query_text = 2;
+  // Search options
+  llm_memory.data.SearchOptions options = 3;
+  // Hybrid search strategy
+  llm_memory.data.HybridSearchOptions hybrid_options = 4;
+  // FTS-specific options
+  optional llm_memory.data.FullTextSearchOptions fts_options = 5;
+}
+
+// Image memory Phase 4: semantic vector search where the SERVER builds
+// the query vector with the same MultimodalEmbeddingRunner the rows
+// were embedded with (so cross-modal hits are in the same space). The
+// existing SearchByVector takes a client-supplied vector and is left
+// untouched. Hits are de-duped by memory_id; score_source becomes
+// SCORE_*_EMBED per the matched row's vector_kind (design 3/3 §13.2).
+message SemanticTextSearchRequest {
+  // Free-text query; the server embeds it via embed_text (1 chunk).
+  string query_text = 1;
+  llm_memory.data.SearchOptions options = 2;
+}
+
+// Image memory Phase 4: search by an already-stored media object. The
+// server Resolves it and embeds the bytes via embed_image. Modes:
+//   - none           -> FailedPrecondition (no image vectors / workers)
+//   - query media unresolved (unresolvable / gc_state in {3,4}) ->
+//     FailedPrecondition (cannot embed_image without a body)
+//   - media_object_id not found -> NotFound
+message MediaSearchRequest {
+  llm_memory.data.MediaObjectId media_object_id = 1;
+  llm_memory.data.SearchOptions options = 2;
+}
+
+// ===== Search result =====
+
+message MemorySearchResult {
+  // Memory entity (hydrated from RDB)
+  llm_memory.data.Memory memory = 1;
+  // Relevance score (0.0-1.0, higher is more relevant)
+  float score = 2;
+  // Raw distance value from vector search.
+  // Set to 0.0 for hybrid and aggregation results where original distance is not meaningful.
+  float distance = 3;
+  // Score origin
+  llm_memory.data.ScoreSource score_source = 4;
+
+  // === Representative thread metadata ===
+  //
+  // The five fields below carry the position of this memory within its
+  // representative thread (= the thread with the smallest `thread_id`
+  // the memory is attached to) so the search UI can render
+  // `[parent thread name] [N/M] [role]` without an extra
+  // ThreadService.Find round-trip per hit.
+  //
+  //  - ROLE_SYSTEM protection: when `Memory.role == ROLE_SYSTEM`, all
+  //    five fields are ALWAYS unset. ROLE_SYSTEM memories are shared
+  //    across many threads, so picking a representative thread by
+  //    smallest id could route a cross-user hit to a thread owned by
+  //    a different user. Clients use the unset state to suppress jump UI.
+  //  - Orphan-thread protection: when the representative thread row
+  //    was concurrently deleted, all five fields are unset together.
+  //    The all-or-none invariant is enforced server-side.
+  //  - `thread.description = NULL` case: only `thread_description` is
+  //    unset (the other four remain set), so the client can render a
+  //    generic placeholder while keeping jump UI enabled.
+
+  // Position of this memory inside its representative thread.
+  optional int32 position = 5;
+  // Total number of memories in the same representative thread (N/M display).
+  optional int32 thread_total = 6;
+  // Representative thread ID (always unset for ROLE_SYSTEM).
+  optional llm_memory.data.ThreadId thread_id = 7;
+  // Owner user_id of the representative thread (= Thread.data.user_id).
+  // Required so cross-user search results can be opened in the chat view
+  // by passing both `thread_id` and `user_id`.
+  optional llm_memory.data.UserId thread_owner_user_id = 8;
+  // Free-form description of the representative thread used as the
+  // "parent thread name" label in the search UI.
+  optional string thread_description = 9;
+
+  // Server-computed highlight ranges over `Memory.data.content`.
+  //
+  // Tokenized with the same BM25 tokenizer the inverted index uses
+  // (see `IndexStatsResponse.fts_tokenizer`) so the ranges line up
+  // with what the search engine considers a "matching term" — more
+  // accurate than a client-side `String.includes()` fallback for
+  // languages that need morphological analysis (Japanese / Korean).
+  //
+  // Empty when:
+  //   - vector-only search (`SearchByVector`): no query text;
+  //   - `SearchOptions.include_content = false`: offsets into a
+  //     stripped payload would mislead the client;
+  //   - non-text content type (image / file / etc.) or empty content.
+  //
+  // When non-empty, a single `HighlightField` with
+  // `source = HIGHLIGHT_SOURCE_CONTENT` covers all matches.
+  repeated llm_memory.data.HighlightField highlights = 10;
+
+  // === Image memory Phase 4: matched N-row metadata ===
+  //
+  // A memory now owns N vector rows keyed by
+  // (memory_id, vector_kind, chunk_index). After memory_id de-dup the
+  // server reports which row actually won (max score) so the client can
+  // show "matched in caption / chunk 3" without re-deriving it. Always
+  // reflects the real hit row regardless of RPC; `score_source` (field
+  // 4) is the one that stays generic for SearchByVector / HybridSearch.
+  optional string matched_vector_kind = 11;
+  optional int32 matched_begin_position = 12;   // embed_text char offset
+  optional int32 matched_end_position = 13;
+  optional string matched_content = 14;         // hit chunk excerpt
+}
+
+// ===== Count requests =====
+//
+// CountSearchMatches returns the total number of memories that would
+// match a given search filter, independently of `SearchOptions.limit`.
+//
+// Contract:
+//   - `mode` MUST be set explicitly. UNSPECIFIED is rejected with
+//     invalid_argument so a hybrid request with a missing `mode` is not
+//     silently demoted to TEXT (which would ignore `query_vectors`).
+//   - VECTOR / HYBRID counts are bounded by `MEMORY_COUNT_VECTOR_HARD_CAP`
+//     and report `is_truncated` when the cap is hit.
+enum CountSearchMode {
+  COUNT_SEARCH_MODE_UNSPECIFIED = 0;
+  // Filter only — `query_text` / `query_vectors` are ignored. Backed by
+  // LanceDB `Table::count_rows(filter_sql)` so the result is exact.
+  COUNT_SEARCH_MODE_FILTER_ONLY = 1;
+  // BM25 full-text search. `query_text` is required (empty string is
+  // rejected with invalid_argument).
+  COUNT_SEARCH_MODE_TEXT = 2;
+  // Vector ANN. The server streams up to `MEMORY_COUNT_VECTOR_HARD_CAP`
+  // matches and reports `is_truncated` when the cap is hit. Multi-vector
+  // requests count the union of per-branch ids (aggregation strategy is
+  // irrelevant for membership).
+  COUNT_SEARCH_MODE_VECTOR = 3;
+  // Hybrid (vector + text). Rrf / Weighted strategies count the union
+  // of vector- and text-matched ids; VectorThenFts / FtsThenVector return
+  // the primary-stage count (the final hybrid result is bounded by primary).
+  // `is_truncated` propagates from either branch.
+  COUNT_SEARCH_MODE_HYBRID = 4;
+}
+
+message MemorySearchCountRequest {
+  CountSearchMode mode = 1;
+  // Common filter (same shape as SearchOptions.filter).
+  optional llm_memory.data.MemorySearchFilter filter = 2;
+  // Required for TEXT / HYBRID. Both unset and empty string are rejected
+  // with invalid_argument (the distinction is meaningless for counting).
+  optional string query_text = 3;
+  // Required for VECTOR / HYBRID.
+  repeated llm_memory.data.EmbeddingVector query_vectors = 4;
+  // Hybrid-strategy parameters (HYBRID only).
+  optional llm_memory.data.HybridSearchOptions hybrid_options = 5;
+  // FTS-specific options (TEXT / HYBRID only).
+  optional llm_memory.data.FullTextSearchOptions fts_options = 6;
+}
+
+message MemorySearchCountResponse {
+  // Match count. Interpretation depends on `is_truncated`:
+  //   - `is_truncated == false`: upper bound on what `Search*` would
+  //     stream after RDB hydration (LanceDB index may still hold rows
+  //     for memories deleted from RDB; those are silently dropped on
+  //     the search path). Run `RebuildIndex` to keep the gap small.
+  //   - `is_truncated == true`: lower bound. `total` equals the
+  //     server-side hard cap; the true match count is unknown and
+  //     larger. UIs should switch to "N+" display.
+  uint64 total = 1;
+  // Whether the server stopped counting before exhausting all matches.
+  // Always false for FILTER_ONLY (count_rows scan). For TEXT, true iff
+  // the FTS stream hit `MEMORY_FTS_COUNT_HARD_CAP`. For VECTOR / HYBRID,
+  // true iff the ANN stream / branch-union exceeded
+  // `MEMORY_COUNT_VECTOR_HARD_CAP` (HYBRID also propagates the FTS
+  // branch's truncation flag).
+  bool is_truncated = 2;
+  // Echo back of the request `mode` so clients can interpret
+  // `is_truncated` without retaining the original request.
+  CountSearchMode mode = 3;
+}
+
+// ===== Surrounding memories =====
+
+message SurroundingMemoriesRequest {
+  // Target Memory ID
+  int64 memory_id = 1;
+  // Number of memories before (default: 5)
+  uint32 before_count = 2;
+  // Number of memories after (default: 5)
+  uint32 after_count = 3;
+  // Thread ID that provides the ordering context. Required because a Memory
+  // can belong to multiple threads (e.g. shared ROLE_SYSTEM prompts) and the
+  // caller must specify which thread's position axis to walk.
+  int64 thread_id = 4;
+}
+
+message SurroundingMemoriesResponse {
+  // Memories before target (chronological ascending)
+  repeated llm_memory.data.Memory before = 1;
+  // Memories after target (chronological ascending)
+  repeated llm_memory.data.Memory after = 2;
+  // Target memory
+  llm_memory.data.Memory target = 3;
+  // Whether more memories exist
+  bool has_more_before = 4;
+  bool has_more_after = 5;
+}
+
+// ===== Embedding management =====
+
+message UpsertEmbeddingRequest {
+  // Target Memory ID
+  int64 memory_id = 1;
+  // Embedding vector
+  llm_memory.data.EmbeddingVector embedding = 2;
+  // Model name used for embedding
+  optional string embedding_model = 3;
+}
+
+message UpsertEmbeddingResponse {
+  // True iff the request was processed without error.
+  bool success = 1;
+  // True when the request was intentionally skipped without writing
+  // to LanceDB (currently: empty `embedding.values`, returned by
+  // upstream embedding models that decline very short inputs).
+  // `success` is also true in this case; clients that need to know
+  // whether the vector is actually indexed should branch on `skipped`.
+  bool skipped = 2;
+}
+
+// Image memory Phase 4: one embedding row in the N-row LanceDB schema.
+// A memory owns N of these keyed by (memory_id, vector_kind,
+// chunk_index). The image/caption workflow and the long-text chunker
+// emit several rows per memory in one BatchUpsertEmbeddings call.
+message VectorRow {
+  string vector_kind = 1;   // "text" | "image" | "caption"
+  // 0-based, contiguous within one (memory_id, vector_kind). image is
+  // always 0 (1 image = 1 vector).
+  int32 chunk_index = 2;
+  int32 begin_position = 3; // embed_text char offset (image = 0)
+  int32 end_position = 4;
+  string content = 5;       // this chunk's source text (image = label)
+  llm_memory.data.EmbeddingVector embedding = 6;
+}
+
+// `items=1` is in production use (grpc-admin batch_upsert_embeddings
+// handler, app batch_upsert_embeddings / upsert_embedding, current
+// auto-embedding.yaml step2). It is NOT reserved — that would break
+// wire/API compat. It is kept and the N-row form is added as fields
+// 2..5. Server path (4 cases, made explicit to prevent misreads):
+//   1. rows non-empty AND items empty  -> N-row path (memory_id
+//      required; delete existing rows whose vector_kind is in
+//      replace_kinds, then insert rows).
+//   2. rows empty AND items non-empty  -> legacy 1-row path, written
+//      into the N-row schema via the compat mapping (vector_kind="text",
+//      chunk_index=0). NOT a pass-through.
+//   3. rows empty AND items empty      -> no-op (success_count=0,
+//      failure_count=0, errors=[]). Not an error (reflection etc. may
+//      send an empty set).
+//   4. rows non-empty AND items non-empty -> InvalidArgument (mixing
+//      the two paths is rejected to remove ambiguity).
+message BatchUpsertEmbeddingsRequest {
+  // Legacy path (a set of single embeddings). Kept for back-compat.
+  repeated UpsertEmbeddingRequest items = 1;
+  // === N-row path (active only when rows is non-empty) ===
+  // The fields below only carry meaning on the rows path; ignored on
+  // the items path.
+  optional int64 memory_id = 2;        // target memory of the rows path
+  optional string embedding_model = 3;
+  // (memory_id, vector_kind in replace_kinds) is deleted before the
+  // rows are inserted. MUST include only the kinds this call owns so a
+  // parallel Text vs Media dispatch does not wipe the other's rows
+  // (design 1/3 §3.3.1 kind-isolation).
+  repeated string replace_kinds = 4;
+  repeated VectorRow rows = 5;
+}
+
+message BatchUpsertEmbeddingsResponse {
+  uint32 success_count = 1;
+  uint32 failure_count = 2;
+  repeated string errors = 3;
+}
+
+// ===== Index management =====
+
+message RebuildIndexRequest {
+  // Target user ID (omit for all users)
+  optional int64 user_id = 1;
+  // Target thread ID (omit for all threads)
+  optional int64 thread_id = 2;
+}
+
+message RebuildIndexResponse {
+  uint32 indexed_count = 1;
+  uint32 skipped_count = 2;
+  int64 duration_ms = 3;
+}
+
+// Image memory Phase 4: which embedding kinds a memory should be
+// (re)dispatched for. 1:1 with the Rust DispatchKind. New kinds are
+// appended only (wire back-compat). UNSPECIFIED is rejected.
+enum DispatchKind {
+  DISPATCH_KIND_UNSPECIFIED = 0;  // received => invalid_argument
+  DISPATCH_KIND_TEXT = 1;         // content -> embed_text -> vector_kind=text
+  DISPATCH_KIND_MEDIA = 2;        // media_object -> embed_image (+caption)
+}
+
+message RedispatchEmbeddingsRequest {
+  // Target user ID (omit for all users)
+  optional int64 user_id = 1;
+  // Target thread ID (omit for all threads)
+  optional int64 thread_id = 2;
+  // Page size used while scanning RDB memories (default: 500)
+  optional uint32 batch_size = 3;
+  // Image memory Phase 4: kinds filter. Empty = all kinds. Containing
+  // DISPATCH_KIND_UNSPECIFIED => invalid_argument. Added field
+  // (back-compat: old clients omit it and get all kinds).
+  repeated DispatchKind kinds = 4;
+}
+
+message RedispatchEmbeddingsResponse {
+  // Memory rows whose embedding job was successfully enqueued to jobworkerp.
+  uint32 dispatched_count = 1;
+  // Rows intentionally bypassed (non-embeddable content type, empty
+  // content, missing id/data).
+  uint32 skipped_count = 2;
+  int64 duration_ms = 3;
+  // Rows for which `dispatch()` returned an error.
+  uint32 failed_count = 4;
+}
+
+message GetIndexStatsRequest {}
+
+message IndexStatsResponse {
+  uint64 total_records = 1;
+  uint64 records_with_embedding = 2;
+  uint64 records_without_embedding = 3;
+  uint32 vector_dimension = 4;
+  // Distance metric configured at index creation time.
+  llm_memory.data.DistanceType distance_type = 5;
+  int64 last_optimized_at = 6;
+  // Tokenizer kind currently active on the BM25 index. Lets a
+  // highlight-rendering client decide whether highlight offsets come
+  // from real morphology (`LINDERA_*`) or a coarse character n-gram
+  // fallback (`NGRAM`). UNSPECIFIED only appears when the sender has
+  // not been upgraded.
+  llm_memory.data.FtsTokenizerKind fts_tokenizer = 7;
+  // ngram min / max, set only when `fts_tokenizer == NGRAM` because
+  // the LanceDB FTS builder ignores them for every other kind.
+  optional uint32 fts_ngram_min = 8;
+  optional uint32 fts_ngram_max = 9;
+}
+
+// Vector search service for Memory semantic search
+service MemoryVectorService {
+  // Semantic search (vector similarity)
+  rpc SearchByVector(VectorSearchRequest) returns (stream MemorySearchResult);
+  // Keyword search (BM25 full-text search)
+  rpc SearchByText(TextSearchRequest) returns (stream MemorySearchResult);
+  // Hybrid search (vector + keyword fusion)
+  rpc HybridSearch(HybridSearchRequest) returns (stream MemorySearchResult);
+  // Image memory Phase 4: semantic vector search (server embeds the
+  // text query in the same model space as the rows). Additive — does
+  // not change SearchByVector / SearchByText semantics.
+  rpc SearchSemantic(SemanticTextSearchRequest) returns (stream MemorySearchResult);
+  // Image memory Phase 4: search by a stored media object (server
+  // Resolves + embed_image). Additive.
+  rpc SearchByMedia(MediaSearchRequest) returns (stream MemorySearchResult);
+  // Get surrounding memories (temporal context)
+  rpc GetSurroundingMemories(SurroundingMemoriesRequest) returns (SurroundingMemoriesResponse);
+  // Upsert embedding for a memory (workflow integration).
+  // Empty `embedding.values` is reported via `skipped = true` rather
+  // than failing the RPC.
+  rpc UpsertEmbedding(UpsertEmbeddingRequest) returns (UpsertEmbeddingResponse);
+  // Batch upsert embeddings.
+  rpc BatchUpsertEmbeddings(BatchUpsertEmbeddingsRequest) returns (BatchUpsertEmbeddingsResponse);
+  // Rebuild index (reconcile RDB and LanceDB)
+  rpc RebuildIndex(RebuildIndexRequest) returns (RebuildIndexResponse);
+  // Re-enqueue embedding jobs from RDB after manual LanceDB reset
+  rpc RedispatchEmbeddings(RedispatchEmbeddingsRequest) returns (RedispatchEmbeddingsResponse);
+  // Get index statistics
+  rpc GetIndexStats(GetIndexStatsRequest) returns (IndexStatsResponse);
+  // Count matches for a given search filter.
+  // FILTER_ONLY / TEXT count exactly (TEXT may set `is_truncated` at
+  // `MEMORY_FTS_COUNT_HARD_CAP`); VECTOR / HYBRID count up to
+  // `MEMORY_COUNT_VECTOR_HARD_CAP` and report `is_truncated` when the
+  // ANN stream or branch-union saturates the cap.
+  rpc CountSearchMatches(MemorySearchCountRequest) returns (MemorySearchCountResponse);
+}

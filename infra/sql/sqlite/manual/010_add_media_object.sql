@@ -1,0 +1,11 @@
+-- Manual migration for EXISTING sqlite deployments (pre-media_object).
+--
+-- SQLite does not support `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so this
+-- step is kept manual (run once, by an operator, before the numbered
+-- 004_media_object.sql migration). New deployments do NOT need this: 001
+-- already defines memory.media_object_id.
+--
+-- Run order for a deployment that predates the image memory feature:
+--   1. ALTER below (adds memory.media_object_id).
+--   2. Apply infra/sql/sqlite/004_media_object.sql (table + indexes).
+ALTER TABLE `memory` ADD COLUMN `media_object_id` BIGINT;

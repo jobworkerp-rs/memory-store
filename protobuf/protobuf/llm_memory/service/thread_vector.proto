@@ -1,0 +1,201 @@
+syntax = "proto3";
+
+package llm_memory.service;
+
+import "llm_memory/data/highlight.proto";
+import "llm_memory/data/thread.proto";
+import "llm_memory/data/memory_vector.proto";
+import "llm_memory/data/search_filter.proto";
+import "llm_memory/data/thread_vector.proto";
+import "llm_memory/service/memory_vector.proto";
+
+// ===== Thread search requests =====
+
+message ThreadVectorSearchRequest {
+  // Query vectors (required, multiple for multi-vector search)
+  repeated llm_memory.data.EmbeddingVector query_vectors = 1;
+  // Search options
+  llm_memory.data.ThreadSearchOptions options = 2;
+}
+
+message ThreadTextSearchRequest {
+  // Search text (required)
+  string query_text = 1;
+  // Search options
+  llm_memory.data.ThreadSearchOptions options = 2;
+  // DEPRECATED: Thread FTS uses a fixed column ("description"). This field is ignored.
+  optional llm_memory.data.FullTextSearchOptions fts_options = 3;
+}
+
+message ThreadHybridSearchRequest {
+  // Query vectors (required, exactly one for hybrid search)
+  repeated llm_memory.data.EmbeddingVector query_vectors = 1;
+  // Search text (required)
+  string query_text = 2;
+  // Search options
+  llm_memory.data.ThreadSearchOptions options = 3;
+  // Hybrid search strategy
+  llm_memory.data.HybridSearchOptions hybrid_options = 4;
+  // DEPRECATED: Thread FTS uses a fixed column ("description"). This field is ignored.
+  optional llm_memory.data.FullTextSearchOptions fts_options = 5;
+}
+
+// ===== Thread search result =====
+
+message ThreadSearchResult {
+  // Thread entity (hydrated from RDB, labels included)
+  llm_memory.data.Thread thread = 1;
+  // Relevance score (0.0-1.0, higher is more relevant)
+  float score = 2;
+  // Raw distance value from vector search.
+  // Set to 0.0 for hybrid and aggregation results.
+  float distance = 3;
+  // Score origin
+  llm_memory.data.ScoreSource score_source = 4;
+
+  // Server-computed highlight ranges over
+  // `Thread.data.description`. Mirrors
+  // `MemorySearchResult.highlights`. When non-empty, a single
+  // `HighlightField` with `source = HIGHLIGHT_SOURCE_DESCRIPTION`
+  // covers all matches.
+  //
+  // Empty when:
+  //   - `SearchByVector` (no query text);
+  //   - `ThreadSearchOptions.include_description = false`;
+  //   - description is unset / empty.
+  repeated llm_memory.data.HighlightField highlights = 5;
+}
+
+// ===== Thread embedding management =====
+
+// N-row upsert for a thread's description embedding. A thread now owns N
+// rows keyed by (thread_id, vector_kind, chunk_index), mirroring the
+// memory_vector schema. `vector_kind` is always "text" for threads (no
+// image/caption axis). `VectorRow` is reused from
+// service/memory_vector.proto. Server path:
+//   - rows non-empty -> delete existing rows whose vector_kind is in
+//     replace_kinds, then insert rows.
+//   - rows empty + replace_kinds non-empty -> stale-delete only.
+//   - replace_kinds empty -> InvalidArgument.
+message BatchUpsertThreadEmbeddingsRowsRequest {
+  int64 thread_id = 1;
+  optional string embedding_model = 2;
+  // (thread_id, vector_kind in replace_kinds) is deleted before insert.
+  repeated string replace_kinds = 3;
+  repeated VectorRow rows = 4;
+}
+
+message BatchUpsertThreadEmbeddingsResponse {
+  uint32 success_count = 1;
+  uint32 failure_count = 2;
+  repeated string errors = 3;
+}
+
+// Re-enqueue thread description embedding jobs from RDB after a manual
+// LanceDB reset. Mirrors MemoryVectorService.RedispatchEmbeddings minus
+// the media-kind axis (thread embeddings are text-only).
+message ThreadRedispatchEmbeddingsRequest {
+  // Target user ID (omit for all users)
+  optional int64 user_id = 1;
+  // Page size used while scanning RDB threads (default: 500)
+  optional uint32 batch_size = 2;
+}
+
+message ThreadRedispatchEmbeddingsResponse {
+  // Threads whose embedding job was successfully enqueued to jobworkerp.
+  uint32 dispatched_count = 1;
+  // Threads intentionally bypassed (empty description, missing id/data).
+  uint32 skipped_count = 2;
+  int64 duration_ms = 3;
+  // Threads for which dispatch() returned an error.
+  uint32 failed_count = 4;
+}
+
+// ===== Thread index management =====
+
+message ThreadRebuildIndexRequest {
+  // Deprecated: ignored by implementation. Rebuild always operates globally.
+  optional int64 user_id = 1 [deprecated = true];
+}
+
+message ThreadRebuildIndexResponse {
+  // Threads present in both LanceDB and RDB (intact)
+  uint32 indexed_count = 1;
+  // Orphaned LanceDB entries removed (in LanceDB but not in RDB)
+  uint32 orphaned_count = 2;
+  // Threads in RDB but missing from LanceDB (need embedding upsert)
+  uint32 missing_count = 4;
+  int64 duration_ms = 3;
+}
+
+message ThreadGetIndexStatsRequest {}
+
+message ThreadIndexStatsResponse {
+  uint64 total_records = 1;
+  uint64 records_with_embedding = 2;
+  uint64 records_without_embedding = 3;
+  uint32 vector_dimension = 4;
+  // Distance metric configured at index creation time.
+  llm_memory.data.DistanceType distance_type = 5;
+  int64 last_optimized_at = 6;
+  // Tokenizer kind currently active. At runtime this matches the
+  // memory-side value (both share `MEMORY_FTS_*` env vars), but is
+  // exposed independently for symmetry with IndexStatsResponse.
+  llm_memory.data.FtsTokenizerKind fts_tokenizer = 7;
+  optional uint32 fts_ngram_min = 8;
+  optional uint32 fts_ngram_max = 9;
+}
+
+// ===== Thread count requests =====
+//
+// Symmetric to MemorySearchCountRequest. See that message for the
+// invariants on `mode`, `is_truncated` semantics, and the mode echo-back
+// rationale.
+message ThreadSearchCountRequest {
+  CountSearchMode mode = 1;
+  optional llm_memory.data.ThreadSearchFilter filter = 2;
+  // Required for TEXT / HYBRID. Both unset and empty are rejected.
+  optional string query_text = 3;
+  // Required for VECTOR / HYBRID.
+  repeated llm_memory.data.EmbeddingVector query_vectors = 4;
+  optional llm_memory.data.HybridSearchOptions hybrid_options = 5;
+  // Thread FTS uses a fixed column (the per-chunk "content"); fts_options
+  // is accepted for symmetry but currently has no effect.
+  optional llm_memory.data.FullTextSearchOptions fts_options = 6;
+}
+
+message ThreadSearchCountResponse {
+  // N-row note: unlike MemorySearchCountResponse (which reports
+  // `total == hard_cap` when truncated), the thread TEXT / VECTOR count
+  // de-dups chunk rows to distinct threads, so when the ANN/FTS row
+  // `limit` clips the stream `total` is the distinct-thread LOWER bound
+  // seen so far (not `hard_cap`). A single long thread saturating the row
+  // limit therefore reports `(1, true)` instead of `(hard_cap, true)`.
+  uint64 total = 1;
+  bool is_truncated = 2;
+  CountSearchMode mode = 3;
+}
+
+// Thread vector search service for description-based semantic search
+service ThreadVectorService {
+  // Semantic search on thread descriptions (vector similarity)
+  rpc SearchByVector(ThreadVectorSearchRequest) returns (stream ThreadSearchResult);
+  // Keyword search on thread descriptions (BM25 full-text search)
+  rpc SearchByText(ThreadTextSearchRequest) returns (stream ThreadSearchResult);
+  // Hybrid search (vector + keyword fusion)
+  rpc HybridSearch(ThreadHybridSearchRequest) returns (stream ThreadSearchResult);
+  // N-row upsert of a thread description embedding (chunked).
+  rpc BatchUpsertEmbeddingsRows(BatchUpsertThreadEmbeddingsRowsRequest) returns (BatchUpsertThreadEmbeddingsResponse);
+  // Reconcile RDB and LanceDB: removes orphaned LanceDB entries and reports threads
+  // missing from LanceDB. Missing threads require re-embedding via RedispatchEmbeddings.
+  rpc RebuildIndex(ThreadRebuildIndexRequest) returns (ThreadRebuildIndexResponse);
+  // Re-enqueue thread embedding jobs from RDB after a manual LanceDB reset.
+  rpc RedispatchEmbeddings(ThreadRedispatchEmbeddingsRequest) returns (ThreadRedispatchEmbeddingsResponse);
+  // Get index statistics
+  rpc GetIndexStats(ThreadGetIndexStatsRequest) returns (ThreadIndexStatsResponse);
+  // Count matches for a given search filter.
+  // FILTER_ONLY / TEXT count exactly (TEXT may set `is_truncated` at
+  // `MEMORY_FTS_COUNT_HARD_CAP`); VECTOR / HYBRID count up to
+  // `MEMORY_COUNT_VECTOR_HARD_CAP`. See `MemoryVectorService.CountSearchMatches`.
+  rpc CountSearchMatches(ThreadSearchCountRequest) returns (ThreadSearchCountResponse);
+}

@@ -1,0 +1,141 @@
+syntax = "proto3";
+
+package llm_memory.data;
+
+import "llm_memory/data/common.proto";
+import "llm_memory/data/search_filter.proto";
+
+// Embedding vector wrapper
+message EmbeddingVector {
+  repeated float values = 1;
+}
+
+// Search filter for vector/FTS/hybrid queries
+message MemorySearchFilter {
+  // User ID (recommended for multi-tenant isolation)
+  optional int64 user_id = 1;
+  // formerly thread_id; use `thread_filter` below for thread-scoped queries.
+  reserved 2;
+  reserved "thread_id";
+  // formerly system_id; system prompts are now ROLE_SYSTEM memories.
+  reserved 3;
+  reserved "system_id";
+  // Role filter (OR logic, empty = all roles).
+  repeated MessageRole roles = 4;
+  // Content type filter (OR logic, empty = all types).
+  repeated ContentType content_types = 5;
+  // Time range (milliseconds)
+  optional int64 created_after = 6;
+  optional int64 created_before = 7;
+  // Update-time range filter. Both bounds are exclusive:
+  // `updated_after` matches `updated_at > X`, `updated_before` matches
+  // `updated_at < X`. Backed by the LanceDB `updated_at` column (no
+  // migration required). Combines with `created_after / created_before`
+  // and other filter fields via AND.
+  optional int64 updated_after = 8;
+  optional int64 updated_before = 9;
+  // Filter Memory by attributes of attached Threads. The thread-side fields
+  // (user_id / labels / channel / created_* / updated_*) are independent from
+  // the memory-side filters above, so a memory whose owner differs from the
+  // thread owner (e.g. a shared ROLE_SYSTEM prompt) still matches when both
+  // filters are satisfied independently.
+  //
+  // Size limits (configurable via `MEMORY_THREAD_FILTER_*` env vars):
+  //   - resolved thread_id set > MAX_THREAD_IDS → failed_precondition
+  //   - resolved memory_id set > FTS_MAX_INLINE_IDS → failed_precondition
+  //     (search-side opt-in fallback via FTS_APPROXIMATE_MODE; count is always strict)
+  optional ThreadSearchFilter thread_filter = 10;
+}
+
+// Common search options
+message SearchOptions {
+  // Max results (default: 10)
+  uint32 limit = 1;
+  // Distance function (default: COSINE)
+  optional DistanceType distance_type = 2;
+  // Filter conditions
+  optional MemorySearchFilter filter = 3;
+  // Multi-vector aggregation strategy (default: AVERAGE)
+  optional AggregationStrategy aggregation_strategy = 4;
+  // Include content body in results (server defaults to true when unset)
+  optional bool include_content = 5;
+}
+
+// Full-text search options
+message FullTextSearchOptions {
+  // Target columns (default: ["content"])
+  repeated string search_columns = 1;
+}
+
+// Hybrid search options
+message HybridSearchOptions {
+  // Merge strategy (default: RRF)
+  HybridStrategy strategy = 1;
+  // Vector weight for WEIGHTED strategy (0.0-1.0, default: 0.7)
+  optional float vector_weight = 2;
+  // RRF k parameter (default: 60)
+  optional float rrf_k = 3;
+}
+
+// Distance function
+enum DistanceType {
+  COSINE = 0;
+  L2 = 1;
+  DOT = 2;
+}
+
+// Multi-vector aggregation strategy.
+// Only applicable when query_vectors contains more than one vector.
+enum AggregationStrategy {
+  SUM = 0;              // Sum of scores across all vectors
+  AVERAGE = 1;          // Average score (sum / total vector count)
+  MAX = 2;              // Maximum score from any single vector
+  WEIGHTED_BY_POSITION = 3; // Weight = 1/(vec_index+1): vec[0]→1.0, vec[1]→0.5, ...
+  RANK_FUSION = 4;      // Reciprocal Rank Fusion across per-vector result rankings
+}
+
+// Hybrid search strategy
+enum HybridStrategy {
+  RRF = 0;              // Reciprocal Rank Fusion
+  WEIGHTED = 1;         // Weighted score blending
+  VECTOR_THEN_FTS = 2;  // Vector search then FTS filter
+  FTS_THEN_VECTOR = 3;  // FTS then vector re-rank
+}
+
+// Score origin
+enum ScoreSource {
+  SCORE_VECTOR = 0;   // Vector similarity
+  SCORE_TEXT = 1;      // BM25 text
+  SCORE_HYBRID = 2;    // Hybrid fusion
+  // Phase G stage 5: filter-only listings (no relevance signal). The
+  // top-level `score` carries the sidecar `score` column verbatim so
+  // callers reading `score` see the same value the rows are sorted on,
+  // rather than the misleading "all hits scored 0" of the prior shape.
+  SCORE_FILTER_ONLY = 3;
+  // Image memory Phase 4 (N-row vector schema). Set ONLY by
+  // SearchSemantic / SearchByMedia, where the server itself produced the
+  // query vector with the same MultimodalEmbeddingRunner (so the matched
+  // row's vector_kind is meaningful). SearchByVector keeps SCORE_VECTOR
+  // (client-supplied vector, no model-space guarantee); HybridSearch
+  // keeps SCORE_HYBRID (fused). See design 1/3 §2.6.4 / 3/3 §13.3.
+  SCORE_TEXT_EMBED = 4;     // hit on vector_kind=text
+  SCORE_IMAGE_EMBED = 5;    // hit on vector_kind=image
+  SCORE_CAPTION_EMBED = 6;  // hit on vector_kind=caption
+}
+
+// FTS base tokenizer kind currently active on the server.
+//
+// Exposed via `IndexStatsResponse.fts_tokenizer` /
+// `ThreadIndexStatsResponse.fts_tokenizer` so a highlight-rendering
+// client can decide whether the server is doing real morphological
+// analysis (`LINDERA_*`) or a coarser fallback (`NGRAM` etc.).
+enum FtsTokenizerKind {
+  FTS_TOKENIZER_KIND_UNSPECIFIED = 0;
+  FTS_TOKENIZER_KIND_SIMPLE = 1;
+  FTS_TOKENIZER_KIND_WHITESPACE = 2;
+  FTS_TOKENIZER_KIND_RAW = 3;
+  FTS_TOKENIZER_KIND_NGRAM = 4;
+  FTS_TOKENIZER_KIND_LINDERA_IPADIC = 5;
+  FTS_TOKENIZER_KIND_LINDERA_UNIDIC = 6;
+  FTS_TOKENIZER_KIND_LINDERA_KO_DIC = 7;
+}

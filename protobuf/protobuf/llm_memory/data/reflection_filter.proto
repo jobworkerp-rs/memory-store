@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package llm_memory.data;
+
+import "llm_memory/data/common.proto";
+import "llm_memory/data/reflection.proto";
+import "llm_memory/data/thread.proto";
+
+// Common search/filter shape for ReflectionService search, aggregate,
+// export, and redispatch RPCs. All clauses are AND-combined.
+//
+// `origin_user_id` filters on `thread_reflection_index.origin_user_id`
+// (= elucidates the original thread.user_id, never the reflection
+// memory's own user_id which is fixed at reflection_user_id=300000).
+message ReflectionSearchFilter {
+  optional UserId origin_user_id = 1;
+  optional string origin_channel = 2;
+
+  // Outcome OR-list (empty = any).
+  repeated ReflectionOutcome outcomes = 3;
+
+  optional float score_min = 4;
+  optional float score_max = 5;
+
+  repeated TaskCategory task_categories = 6;
+  optional ReflectionAspect reflection_aspect = 7;
+
+  // failure_modes: ALL semantics (every listed mode must be present).
+  // failure_modes_match_any: ANY semantics (at least one must match).
+  // Use exactly one form per request; mixing is allowed but the two
+  // clauses are AND-combined which is rarely useful. Controlled
+  // vocabulary: the infra layer maps each enum to its short DB key
+  // before binding the EXISTS / IN clause.
+  repeated FailureMode failure_modes = 8;
+  repeated FailureMode failure_modes_match_any = 9;
+
+  // tools_used: ALL semantics (set intersection requirement).
+  repeated string tools_used = 10;
+  repeated string tools_used_match_any = 11;
+
+  optional string prompt_version = 12;
+  optional string target_model_version = 13;
+  optional string experiment_id = 14;
+  optional string experiment_variant = 15;
+
+  optional bool pinned = 16;
+  optional DatasetQuality dataset_quality = 17;
+
+  optional EmbeddingStatus summary_embedding_status = 18;
+  optional EmbeddingStatus intent_embedding_status = 19;
+
+  optional int64 created_after = 20;
+  optional int64 created_before = 21;
+
+  // Restrict to reflections whose origin trajectory equals this
+  // ThreadId. Required by `RedispatchReflectionEmbeddings` (spec
+  // confirmation #38, acceptance criterion "RedispatchReflectionEmbeddings
+  // can filter by origin_user_id / origin_thread_id / prompt_version /
+  // *_embedding_status"). Search/Export/Aggregate may set this too;
+  // the filter is just AND-combined so an unset value preserves
+  // existing semantics. F-S2 `FindByThread` remains the preferred
+  // entry point for "all reflections of one thread" because it
+  // surfaces the active-vs-history flag explicitly.
+  optional ThreadId origin_thread_id = 22;
+}

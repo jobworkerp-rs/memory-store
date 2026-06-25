@@ -1,0 +1,351 @@
+syntax = "proto3";
+
+package llm_memory.data;
+
+import "llm_memory/data/common.proto";
+import "llm_memory/data/memory.proto";
+import "llm_memory/data/memory_vector.proto";
+import "llm_memory/data/thread.proto";
+
+// ===== Enums =====
+
+// Outcome label assigned by the reflection LLM. Mirrors the spec
+// `outcome` field; UNSPECIFIED is reserved for proto3 zero-value.
+enum ReflectionOutcome {
+  REFLECTION_OUTCOME_UNSPECIFIED = 0;
+  REFLECTION_OUTCOME_SUCCESS = 1;
+  REFLECTION_OUTCOME_PARTIAL = 2;
+  REFLECTION_OUTCOME_FAILURE = 3;
+  REFLECTION_OUTCOME_ABORTED = 4;
+  // Recorded when LLM output is unavailable (schema reject / empty / merge
+  // failure) and `record_reflection_failure` is enabled (F-G9 default true).
+  REFLECTION_OUTCOME_UNKNOWN = 5;
+}
+
+enum TaskCategory {
+  TASK_CATEGORY_UNSPECIFIED = 0;
+  TASK_CATEGORY_CODING = 1;
+  TASK_CATEGORY_CONSULTATION = 2;
+  TASK_CATEGORY_RESEARCH = 3;
+  TASK_CATEGORY_CREATIVE = 4;
+  TASK_CATEGORY_GENERAL = 5;
+}
+
+// Aspect of behaviour the reflection focuses on. P3 personality
+// extraction uses INTERACTION_STYLE; default is TASK_OUTCOME.
+enum ReflectionAspect {
+  REFLECTION_ASPECT_UNSPECIFIED = 0;
+  REFLECTION_ASPECT_TASK_OUTCOME = 1;
+  REFLECTION_ASPECT_INTERACTION_STYLE = 2;
+  REFLECTION_ASPECT_BOTH = 3;
+}
+
+// Quality marker for downstream dataset curation. AUTO is the only
+// value emitted in this release; HUMAN_VERIFIED / HUMAN_REJECTED unlock
+// once the human annotation UI ships in a later phase.
+enum DatasetQuality {
+  DATASET_QUALITY_UNSPECIFIED = 0;
+  DATASET_QUALITY_AUTO = 1;
+  DATASET_QUALITY_HUMAN_VERIFIED = 2;
+  DATASET_QUALITY_HUMAN_REJECTED = 3;
+}
+
+// Status of an embedding dispatch (summary or intent). Errors land in
+// the sibling `*_embedding_error` field instead of being encoded into
+// the enum so aggregations stay JOIN-free.
+enum EmbeddingStatus {
+  EMBEDDING_STATUS_UNSPECIFIED = 0;
+  EMBEDDING_STATUS_PENDING = 1;
+  EMBEDDING_STATUS_OK = 2;
+  EMBEDDING_STATUS_FAILED = 3;
+}
+
+// Selector for the two reflection embedding tracks. BOTH is only valid
+// for redispatch RPCs; status-update RPCs reject BOTH explicitly.
+enum EmbeddingKind {
+  EMBEDDING_KIND_UNSPECIFIED = 0;
+  EMBEDDING_KIND_SUMMARY = 1;
+  EMBEDDING_KIND_INTENT = 2;
+  EMBEDDING_KIND_BOTH = 3;
+}
+
+// Role of a fact within the reflection. Determines how the linked
+// turn is interpreted by downstream consumers.
+enum FactKind {
+  FACT_KIND_UNSPECIFIED = 0;
+  FACT_KIND_OUTCOME_EVIDENCE = 1;
+  FACT_KIND_SCORE_DRIVER = 2;
+  FACT_KIND_LESSON_SOURCE = 3;
+  FACT_KIND_KEY_DECISION_POINT = 4;
+  FACT_KIND_EXEMPLAR = 5;
+  FACT_KIND_COUNTER_EXAMPLE = 6;
+  FACT_KIND_CONTEXT_PIVOT = 7;
+}
+
+// Field that a fact link points at within the reflection itself.
+enum FactLinkField {
+  FACT_LINK_FIELD_UNSPECIFIED = 0;
+  FACT_LINK_FIELD_LESSON = 1;
+  FACT_LINK_FIELD_FAILURE_MODE = 2;
+  FACT_LINK_FIELD_KEY_DECISION = 3;
+  FACT_LINK_FIELD_SUCCESS_FACTOR = 4;
+}
+
+// Tool contribution polarity attached to ToolOutcomeEntry.
+enum ToolContribution {
+  TOOL_CONTRIBUTION_UNSPECIFIED = 0;
+  TOOL_CONTRIBUTION_POSITIVE = 1;
+  TOOL_CONTRIBUTION_NEGATIVE = 2;
+  TOOL_CONTRIBUTION_NEUTRAL = 3;
+}
+
+// Controlled vocabulary for `failure_modes`, mirroring the
+// `failure_mode_dictionary` seed. WHY enum (not free string): recurrence
+// / few-shot / mitigation lookups are all exact-match keyed on this set,
+// so language-external values would silently break them — unclassifiable
+// inputs must collapse to FAILURE_MODE_OTHER with raw text salvaged into
+// `failure_modes_other`. NOTE the enum<->DB mapping is not mechanical:
+// the DB stores short lowercase keys (`tool_misuse`) except `OTHER`
+// which stays uppercase (see failure_mode_convert.rs).
+enum FailureMode {
+  FAILURE_MODE_UNSPECIFIED = 0;
+  FAILURE_MODE_TOOL_MISUSE = 1;
+  FAILURE_MODE_LOOP = 2;
+  FAILURE_MODE_SCOPE_DRIFT = 3;
+  FAILURE_MODE_HALLUCINATION = 4;
+  FAILURE_MODE_CONTEXT_OVERFLOW = 5;
+  FAILURE_MODE_DATA_LOSS = 6;
+  FAILURE_MODE_PERMISSION_ISSUE = 7;
+  FAILURE_MODE_AMBIGUOUS_INSTRUCTION = 8;
+  FAILURE_MODE_CONFLICTING_REQUIREMENTS = 9;
+  FAILURE_MODE_MISSING_CONTEXT = 10;
+  FAILURE_MODE_MISLEADING_PREMISE = 11;
+  FAILURE_MODE_GOAL_DRIFT_BY_USER = 12;
+  FAILURE_MODE_TOOL_UNAVAILABLE = 13;
+  FAILURE_MODE_EXTERNAL_SERVICE_FAILURE = 14;
+  FAILURE_MODE_RATE_LIMIT = 15;
+  FAILURE_MODE_OTHER = 16;
+}
+
+// Closed enum used for runtime pattern matching (F-S7).
+enum FailureSignaturePatternType {
+  FAILURE_SIGNATURE_PATTERN_UNSPECIFIED = 0;
+  FAILURE_SIGNATURE_PATTERN_TOOL_LOOP = 1;
+  FAILURE_SIGNATURE_PATTERN_NO_PROGRESS = 2;
+  FAILURE_SIGNATURE_PATTERN_CONTEXT_THRASH = 3;
+  FAILURE_SIGNATURE_PATTERN_ERROR_CASCADE = 4;
+  FAILURE_SIGNATURE_PATTERN_SCOPE_EXPLOSION = 5;
+  FAILURE_SIGNATURE_PATTERN_PREMATURE_COMPLETION = 6;
+  FAILURE_SIGNATURE_PATTERN_USER_CLARIFICATION_LOOP = 7;
+  FAILURE_SIGNATURE_PATTERN_OTHER = 8;
+}
+
+// ===== Identifiers =====
+
+// Reflection ID is identical to the backing memory.id by convention,
+// but tagged with a distinct message type so APIs cannot mix it up
+// with arbitrary MemoryIds.
+message ReflectionId {
+  int64 value = 1;
+}
+
+// ===== Failure signature (F-S7) =====
+
+// Numeric indicators observable from a running thread. All fields are
+// optional so partial updates from the runtime hook can be matched
+// against historical signatures (missing indicators are excluded from
+// the distance calculation).
+message FailureSignatureIndicators {
+  optional uint32 same_tool_repeated_count = 1;
+  optional string same_tool_name = 2;
+  optional uint32 consecutive_errors = 3;
+  optional uint32 no_state_change_turns = 4;
+  optional float  tool_calls_per_turn_ratio = 5;
+  optional uint32 compact_boundary_count = 6;
+  optional uint32 user_clarification_count = 7;
+  optional uint32 turn_count_at_detection = 8;
+  optional uint64 elapsed_ms_at_detection = 9;
+}
+
+message FailureSignature {
+  FailureSignaturePatternType pattern_type = 1;
+  FailureSignatureIndicators indicators = 2;
+  // Per-indicator firing thresholds learned from past data.
+  // Used at runtime to decide when this signature should escalate.
+  map<string, double> trigger_threshold = 3;
+  // Turn indices (global) supporting this signature. Aligns with the
+  // turn anchor logic in reflection_fact.
+  repeated uint32 evidence_turn_indices = 4;
+}
+
+// ===== Facts =====
+
+// Pointer from a fact back into the reflection's structured fields.
+message FactLink {
+  FactLinkField field = 1;
+  uint32 index = 2;
+}
+
+// Fact emitted by the reflection LLM and stored in the
+// `reflection_fact` child table after anchor resolution.
+//
+// `anchor_memory_id` is `optional` because the same proto is reused
+// for both LLM intermediate output (where the anchor is unresolved
+// `turn_index`) and the post-resolution form sent into
+// FinalizeReflection. The app layer rejects FinalizeReflection inputs
+// where any `anchor_memory_id` is unset (see §4.2.7.5 of the design
+// document) so search responses always carry a populated anchor.
+message ReflectionFact {
+  // Global turn index within the original thread (chronological). For
+  // sliding-window reflections this stays global, never window-local.
+  uint32 turn_index = 1;
+  // Resolved memory_id of the anchored turn. App-layer required.
+  optional MemoryId anchor_memory_id = 2;
+  FactKind kind = 3;
+  // 0.0..=1.0 weight attached by the LLM.
+  optional float weight = 4;
+  optional string note = 5;
+  repeated FactLink links = 6;
+}
+
+// ===== Tool outcome =====
+
+message ToolOutcomeEntry {
+  string tool = 1;
+  ToolContribution contribution = 2;
+  optional string error_kind = 3;
+}
+
+// ===== Reflection main view =====
+
+// API-side view of a reflection record. Composed of
+// `thread_reflection_index` columns plus child-table joins; never
+// stored directly. `updated_at` reflects sidecar state changes
+// (pinned / embedding status / applied target / few-shot usage); the
+// backing memory row remains immutable per §3.7 of the spec.
+message ReflectionData {
+  // === Origin references ===
+  ThreadId origin_thread_id = 1;
+  UserId origin_user_id = 2;
+  optional string origin_channel = 3;
+
+  // === Evaluation ===
+  ReflectionOutcome outcome = 4;
+  // Resolved score; equals score_self by default, overridable via
+  // MEMORY_REFLECTION_SCORE_SOURCE env to score_heuristic.
+  float score = 5;
+  float score_self = 6;
+  float score_heuristic = 7;
+
+  // === Free-form ===
+  string summary = 8;
+  string task_intent = 9;
+
+  // === Classification ===
+  TaskCategory task_category = 10;
+  ReflectionAspect reflection_aspect = 11;
+
+  // === Structured ===
+  // Controlled-vocabulary failure modes. Hydrated from the
+  // `reflection_failure_mode` child rows (short DB keys) via the
+  // enum<->db conversion helper.
+  repeated FailureMode failure_modes = 12;
+  // Free-text fallback when failure_modes contains FAILURE_MODE_OTHER.
+  repeated string failure_modes_other = 13;
+  repeated string success_factors = 14;
+  repeated string lessons = 15;
+  repeated string key_decisions = 16;
+  repeated string tools_used = 17;
+  optional string mitigation_hint = 18;
+  optional string mitigation_fingerprint = 19;
+  optional FailureSignature failure_signature = 20;
+  bool is_recurrence = 21;
+
+  // === Derived (post-process expanded into child tables) ===
+  repeated ReflectionFact facts = 22;
+  repeated ToolOutcomeEntry tool_outcomes = 23;
+
+  // === History ===
+  optional ReflectionId previous_reflection_id = 24;
+
+  // === Runtime / operational state ===
+  bool pinned = 25;
+  // Strings shaped like "system_prompt:<memory_id>:<v>" or "personality:<v>".
+  repeated string applied_targets = 26;
+  // Threads that referenced this reflection as a few-shot example.
+  repeated int64 few_shot_used_in_threads = 27;
+  DatasetQuality dataset_quality = 28;
+
+  // === Embedding state (2 tracks) ===
+  EmbeddingStatus summary_embedding_status = 29;
+  optional string summary_embedding_error = 30;
+  EmbeddingStatus intent_embedding_status = 31;
+  optional string intent_embedding_error = 32;
+
+  // === Reproducibility metadata ===
+  string reflector_id = 33;
+  string prompt_version = 34;
+  optional string target_model_version = 35;
+  optional string experiment_id = 36;
+  optional string experiment_variant = 37;
+
+  int64 created_at = 38;
+  // Bumped on operational state changes (sidecar updates), independent
+  // of the immutable backing memory.updated_at.
+  int64 updated_at = 39;
+}
+
+message Reflection {
+  ReflectionId id = 1;
+  ReflectionData data = 2;
+}
+
+// Search hit. `origin_thread_id` is the trajectory under analysis;
+// `aggregate_thread_id` is the reflection_user_id-owned aggregate
+// thread the memory is attached to. Existing MemorySearchResult is
+// intentionally NOT reused (§3.6.1 representative thread mismatch).
+message ReflectionSearchResult {
+  Reflection reflection = 1;
+  optional ThreadId origin_thread_id = 2;
+  optional ThreadId aggregate_thread_id = 3;
+  float score = 4;
+  float distance = 5;
+  ScoreSource score_source = 6;
+}
+
+// ===== LLM output (input-only message for FinalizeReflection) =====
+
+// Strict view of the LLM JSON output (Appendix A schema) plus the
+// post-processed `facts` whose `anchor_memory_id` has been resolved by
+// the workflow's `resolveFactAnchors` step. Fields decided by the app
+// layer (origin_*, embedding status, runtime flags, dataset_quality,
+// is_recurrence, created_at, etc.) are intentionally absent so the
+// FinalizeReflection RPC cannot be coerced into setting them.
+message ReflectionLlmOutput {
+  // Stage 1 (always required in output schema)
+  ReflectionOutcome outcome = 1;
+  float score_self = 2;
+  string summary = 3;
+  string task_intent = 4;
+  TaskCategory task_category = 5;
+  ReflectionAspect reflection_aspect = 6;
+  // Controlled-vocabulary failure modes. The workflow normalizes the
+  // reflector LLM output to FAILURE_MODE_* names (language-external
+  // values collapse to FAILURE_MODE_OTHER) before this RPC, so the
+  // prost JSON decoder only ever sees valid enum names.
+  repeated FailureMode failure_modes = 7;
+  repeated string tools_used = 8;
+
+  // Stage 2 (optional today, may be promoted to required after 3 months)
+  repeated string failure_modes_other = 9;
+  repeated string success_factors = 10;
+  repeated string lessons = 11;
+  repeated string key_decisions = 12;
+  optional string mitigation_hint = 13;
+  optional FailureSignature failure_signature = 14;
+  repeated ToolOutcomeEntry tool_outcomes = 15;
+
+  // Workflow-resolved facts: anchor_memory_id MUST be set on every
+  // entry; otherwise FinalizeReflection rejects with InvalidArgument.
+  repeated ReflectionFact facts = 16;
+}

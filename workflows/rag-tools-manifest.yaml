@@ -1,0 +1,146 @@
+# jobworkerp manifest for memory-recall tools (LLM-facing search).
+#
+# Loaded at startup by `grpc-admin/src/lib.rs::setup_and_start_front_server`
+# when MEMORY_RAG_TOOLS_ENABLED=true. Registered via
+# `jobworkerp_client::client::manifest_yaml::register_manifest_from_yaml`,
+# which upserts the workers first and then the function_set.
+#
+# Prerequisites:
+#   - `memories-mm-embedding` worker MUST already be registered
+#     (auto-embedding pipeline; MEMORY_AUTO_EMBEDDING_ENABLED=true).
+#     The hybrid-search workflows reference it by name and would fail at
+#     workflow-execution time if it is missing.
+#   - MEMORY_GRPC_HOST / MEMORY_GRPC_PORT must point to the memories gRPC
+#     endpoint reachable from the jobworkerp host. Both are required, no
+#     loopback fallback (same rationale as auto-embedding-workers.yaml).
+
+workers:
+  defaults:
+    # LLM tools require synchronous return values.
+    response_type: DIRECT
+    store_failure: true
+    # No external listeners; broadcasting wastes work.
+    broadcast_results: false
+    # Search is read-only: failing fast lets the LLM correct the call
+    # rather than silently waiting through retries.
+    retry_policy:
+      type: NONE
+
+  entries:
+    # All three workers are WORKFLOWs (not raw GRPC) so the LLM sees a
+    # clean per-tool input schema. A direct GRPC worker would expose
+    # GrpcArgs (method / json_body / metadata), turning structured
+    # fields like `query` or `memory_id` into unknown-field noise that
+    # the runner silently zeroes out. See workflows/rag/*.yaml for the
+    # actual schemas the LLM is shown.
+    - name: recall_memories
+      runner: WORKFLOW
+      description: >-
+        Recall stored memories — past chat messages, decisions,
+        notes, and other content the user has previously discussed
+        with you. Use this whenever the user references something from
+        the past: "when did we...", "what did we decide about...",
+        "remind me about...", "have we talked about...", or any
+        question that relies on history rather than your training
+        knowledge. Combines semantic similarity with keyword match
+        (hybrid search) so paraphrased queries still find relevant
+        entries. Required: query (natural language), user_id (tenant
+        id). Optional: limit (default 10), filter (roles,
+        content_types, time ranges, thread_filter), hybrid_strategy
+        (RRF / WEIGHTED / VECTOR_THEN_FTS / FTS_THEN_VECTOR; default
+        RRF). Returns a JSON array of memory entries with relevance
+        scores.
+
+        Example invocation (minimal — `user_id` is an int64 snowflake
+        passed as a decimal string to avoid JS-number precision loss):
+        {"query": "When did we start designing the chat-workflow-app search feature?", "user_id": "1", "limit": 10}
+
+        Example invocation (with filter — restrict to user/assistant
+        text messages created after a given epoch-ms timestamp):
+        {"query": "search feature design", "user_id": "1", "limit": 10, "filter": {"roles": ["ROLE_USER", "ROLE_ASSISTANT"], "content_types": ["TEXT"], "created_after": 1774920000000}}
+      # Channel name is overridable so deployments that name their
+      # dedicated RAG channel differently (or fall back to a shared one)
+      # don't have to fork this YAML. Default `rag` matches the suggested
+      # WORKER_CHANNELS entry in dot.env. Hard requirement: the channel
+      # MUST be pre-registered on jobworkerp's WORKER_CHANNELS — upsert
+      # rejects unknown channels with InvalidParameter.
+      channel: %{MEMORY_RAG_CHANNEL:-rag}
+      settings:
+        workflow_data:
+          $file: rag/search-memories.yaml
+
+    - name: find_conversations
+      runner: WORKFLOW
+      description: >-
+        Find past conversation threads by topic. Use this when the
+        user asks about an entire conversation, project, or document
+        ("the discussion about X", "that thread where we worked on
+        Y") rather than a specific message. Returns thread-level hits;
+        follow up with `recall_memories` (filter by
+        thread_filter.labels) to retrieve the actual messages inside a
+        chosen thread. Required: query, user_id. Optional: limit
+        (default 10), filter (labels, label_match_mode, channel, time
+        ranges), hybrid_strategy. Returns a JSON array of thread
+        entries with relevance scores.
+
+        Example invocation (minimal — `user_id` is an int64 snowflake
+        passed as a decimal string to avoid JS-number precision loss):
+        {"query": "chat-workflow-app search feature design discussion", "user_id": "1", "limit": 5}
+
+        Example invocation (with filter — narrow to threads updated
+        after a given epoch-ms timestamp):
+        {"query": "search feature design", "user_id": "1", "limit": 5, "filter": {"updated_after": 1777003200000}}
+      channel: %{MEMORY_RAG_CHANNEL:-rag}
+      settings:
+        workflow_data:
+          $file: rag/search-threads.yaml
+
+    - name: expand_memory_context
+      runner: WORKFLOW
+      description: >-
+        Expand context around a recalled memory by fetching the
+        messages that came immediately before and after it within the
+        same thread. Use this after `recall_memories` when a hit looks
+        relevant but lacks the surrounding conversation needed to
+        answer the user. Required: memory_id, thread_id (both int64
+        ids passed as decimal STRINGS — copy `memory.id.value` and
+        `thread_id.value` verbatim from a `recall_memories` hit; never
+        coerce them to JS numbers because snowflakes routinely exceed
+        the 2^53-1 safe integer range and would silently round).
+        Optional: before_count (default 5), after_count (default 5).
+        Returns the target memory plus before/after lists in
+        chronological order.
+
+        Example invocation (memory_id and thread_id are int64 ids
+        passed as decimal strings — taken verbatim from a
+        recall_memories hit's `memory.id.value` and `thread_id.value`
+        fields, never invented):
+        {"memory_id": "7444174660348207020", "thread_id": "7444174660348207024", "before_count": 3, "after_count": 3}
+      channel: %{MEMORY_RAG_CHANNEL:-rag}
+      settings:
+        workflow_data:
+          $file: rag/get-surrounding-memories.yaml
+
+function_sets:
+  defaults:
+    category: 0
+
+  entries:
+    - name: memory-recall
+      description: >-
+        Tools for recalling past conversations and stored memories.
+        Use these whenever the user asks about something previously
+        discussed, decided, or implemented — anything that depends on
+        history rather than general knowledge. Pick `recall_memories`
+        for any natural-language question about prior content,
+        `find_conversations` to first locate a relevant thread when
+        the user asks about a whole discussion, and
+        `expand_memory_context` to widen the context window around a
+        recalled hit.
+      targets:
+        - type: WORKER
+          name: recall_memories
+        - type: WORKER
+          name: find_conversations
+        - type: WORKER
+          name: expand_memory_context

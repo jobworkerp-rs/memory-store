@@ -1,0 +1,66 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: auto-thread-embedding
+  version: "1.0.0"
+input:
+  schema:
+    document:
+      type: object
+      properties:
+        thread_id:
+          type: integer
+        content:
+          type: string
+      required: [thread_id, content]
+do:
+  # Step 1: Generate embeddings via the shared `memories-mm-embedding`
+  # (MultimodalEmbeddingRunner) worker, the same one the memory
+  # auto-embedding pipeline uses, so thread and memory vectors share one
+  # model space. `embed_text` chunks long text and returns one Embedding
+  # per chunk; every chunk is stored as its own N-row record (the
+  # `thread_vector` LanceDB table is keyed on
+  # (thread_id, vector_kind, chunk_index)). `text_rows` builds one
+  # VectorRow per chunk; `to_entries[]` yields the 0-based array index as
+  # `.key` (the contiguous chunk_index within vector_kind="text").
+  - generateEmbedding:
+      run:
+        worker:
+          name: "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}"
+          using: embed_text
+          arguments:
+            text: "${.content}"
+      output:
+        as:
+          # `?` suppresses jaq's "cannot use null as iterable" error for
+          # `null | .field`. See auto-embedding.yaml for the full rationale.
+          model_name: "${ .model_info.model_name? // \"unknown\" }"
+          text_rows: >-
+            ${ [ .embeddings | to_entries[] | {
+                  vector_kind: "text",
+                  chunk_index: .key,
+                  begin_position: .value.begin_position,
+                  end_position: .value.end_position,
+                  content: .value.content,
+                  embedding: { values: .value.values }
+                } ] }
+
+  # Step 2: Upsert every chunk row via the N-row
+  # ThreadVectorService/BatchUpsertEmbeddingsRows path.
+  # `replace_kinds: ["text"]` deletes only this thread's existing `text`
+  # rows before inserting the new chunk set, so a shorter rebuild leaves
+  # no stale rows. See auto-embedding.yaml for the rationale on building
+  # the body via a single jq expression.
+  - upsertThreadEmbedding:
+      run:
+        worker:
+          name: memories-upsert-thread-embedding
+          using: unary
+          arguments:
+            json_body: >-
+              ${ {
+                thread_id: $workflow.input.thread_id,
+                embedding_model: (.model_name // "unknown"),
+                replace_kinds: ["text"],
+                rows: .text_rows
+              } | tojson }

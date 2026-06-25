@@ -1,0 +1,195 @@
+syntax = "proto3";
+
+package llm_memory.service;
+
+import "llm_memory/data/common.proto";
+import "llm_memory/data/memory.proto";
+import "llm_memory/data/search_filter.proto";
+import "llm_memory/data/thread.proto";
+import "llm_memory/service/common.proto";
+
+// Response returned on memory creation. Carries the auto-assigned id.
+message CreateMemoryResponse {
+    // Id of the newly created memory.
+    llm_memory.data.MemoryId id = 1;
+}
+
+// Response for a memory lookup. `data` is unset when no row matches.
+message OptionalMemoryResponse {
+    optional llm_memory.data.Memory data = 1;
+}
+
+// Request to fetch the most recent memories for a given user.
+// The stream is ordered by updated_at descending.
+message FindRecentListByUserIdRequest {
+    // Target user id (required).
+    llm_memory.data.UserId user_id = 1;
+    // Upper bound on the returned rows (all rows when unset).
+    optional int32 limit = 2;
+    // Return only rows whose updated_at is strictly greater than this
+    // epoch-milliseconds timestamp.
+    optional int64 updated_after = 3;
+    // Return only rows whose updated_at is less than or equal to this
+    // epoch-milliseconds timestamp.
+    optional int64 updated_before = 4;
+}
+
+// MemoryService-specific conditional list request.
+// Covers the roles / user_id / thread_id filter combinations that
+// the shared FindListRequest cannot express — e.g. fetching only
+// ROLE_SYSTEM memories.
+message FindMemoryListRequest {
+    // Upper bound on the returned rows (all rows when unset).
+    optional int32 limit = 1;
+    // Number of records to skip from the start (0 when unset).
+    optional int64 offset = 2;
+    // MessageRole values to filter on (empty = all roles).
+    repeated llm_memory.data.MessageRole roles = 3;
+    // User id to filter on (all users when unset).
+    optional llm_memory.data.UserId user_id = 4;
+    // Thread id to filter on (all threads when unset).
+    optional int64 thread_id = 5;
+    // Return only rows whose updated_at is strictly greater than this
+    // epoch-milliseconds timestamp.
+    optional int64 updated_after = 6;
+    // Return only rows whose updated_at is less than or equal to this
+    // epoch-milliseconds timestamp.
+    optional int64 updated_before = 7;
+    // External id to filter on (exact match, unset = no filter).
+    optional string external_id = 8;
+    // ContentType values to filter on (empty = all types, OR logic).
+    repeated llm_memory.data.ContentType content_types = 9;
+
+    // Thread-side filter resolved through the thread_memory junction.
+    // Same semantics as MemorySearchFilter.thread_filter. When the resolved
+    // thread set exceeds MEMORY_THREAD_FILTER_MAX_THREAD_IDS the call is
+    // rejected with `failed_precondition`; when it matches zero threads
+    // the response is an empty stream.
+    optional llm_memory.data.ThreadSearchFilter thread_filter = 10;
+    // Memory.created_at strict-greater bound (epoch ms). Combines via AND
+    // with `updated_after` / `updated_before` and the rest of the filter.
+    optional int64 created_after  = 11;
+    // Memory.created_at less-than-or-equal bound (epoch ms).
+    optional int64 created_before = 12;
+    // Sort key applied to the result stream. UNSPECIFIED = UPDATED_DESC (default).
+    optional llm_memory.data.MemoryListSort sort = 13;
+    // External id prefix to filter on (server-side LIKE prefix match).
+    // The server escapes LIKE meta-characters (`%`, `_`, `\`) in the value
+    // before issuing the SQL query, so callers can pass arbitrary strings.
+    // Mutually exclusive with `external_id` (exact match): the server returns
+    // `InvalidArgument` if both are set.
+    optional string external_id_prefix = 14;
+}
+
+// MemoryService-specific count condition. Accepts the same filter
+// fields as FindMemoryListRequest.
+message MemoryCountCondition {
+    // MessageRole values to filter on (empty = all roles).
+    repeated llm_memory.data.MessageRole roles = 1;
+    // User id to filter on (all users when unset).
+    optional llm_memory.data.UserId user_id = 2;
+    // Thread id to filter on (all threads when unset).
+    optional int64 thread_id = 3;
+    // Return only rows whose updated_at is strictly greater than this
+    // epoch-milliseconds timestamp.
+    optional int64 updated_after = 4;
+    // Return only rows whose updated_at is less than or equal to this
+    // epoch-milliseconds timestamp.
+    optional int64 updated_before = 5;
+    // External id to filter on (exact match, unset = no filter).
+    optional string external_id = 6;
+    // ContentType values to filter on (empty = all types, OR logic).
+    repeated llm_memory.data.ContentType content_types = 7;
+
+    // Same thread-side filter as FindMemoryListRequest.thread_filter.
+    // Count is always strict — there is no approximate fallback.
+    optional llm_memory.data.ThreadSearchFilter thread_filter = 8;
+    // Memory.created_at strict-greater bound (epoch ms).
+    optional int64 created_after  = 9;
+    // Memory.created_at less-than-or-equal bound (epoch ms).
+    optional int64 created_before = 10;
+    // External id prefix to filter on (server-side LIKE prefix match).
+    // Same semantics and exclusivity rules as
+    // `FindMemoryListRequest.external_id_prefix`.
+    optional string external_id_prefix = 11;
+    // sort intentionally absent — Count returns a scalar.
+}
+
+// Streaming entry for `MemoryService.FindListByCondition`. Fields 5–9 mirror
+// `MemoryVectorService.MemorySearchResult` (same representative-thread layout
+// and the same all-or-none unset invariant — see that message for details).
+message MemoryListEntry {
+  llm_memory.data.Memory memory = 1;
+
+  reserved 2, 3, 4;
+  reserved "score", "distance", "score_source";
+
+  optional int32 position = 5;
+  optional int32 thread_total = 6;
+  optional llm_memory.data.ThreadId thread_id = 7;
+  // Owner of the representative thread (= Thread.data.user_id). Required
+  // so cross-user list results can be opened by passing both ids.
+  optional llm_memory.data.UserId thread_owner_user_id = 8;
+  optional string thread_description = 9;
+}
+
+// Request for UpdateContentNoDispatch. Only `content` (and updated_at,
+// server-filled) is changed in the same tx; every other field
+// (parent_ids, role, media_object_id, ...) is left untouched.
+message UpdateContentNoDispatchRequest {
+  llm_memory.data.MemoryId id = 1;
+  string content = 2;
+}
+
+// Service that exposes CRUD and search for memories. Used to
+// persist and retrieve LLM conversation history and context.
+service MemoryService {
+  // Create a new memory and return its assigned id.
+  rpc Create(llm_memory.data.MemoryData) returns (CreateMemoryResponse);
+  // Update an existing memory (identified by id). The cache entry
+  // for the memory is cleared as part of the update.
+  rpc Update(llm_memory.data.Memory) returns (SuccessResponse);
+  // Delete the memory with the given id. The cache entry is
+  // cleared as part of the delete.
+  rpc Delete(llm_memory.data.MemoryId) returns (SuccessResponse);
+  // Fetch a single memory by id (cache TTL: 30 seconds).
+  rpc Find(llm_memory.data.MemoryId) returns (OptionalMemoryResponse);
+  // Stream memories in id-descending order with pagination.
+  rpc FindList(FindListRequest) returns (stream llm_memory.data.Memory);
+  // Stream the most recent memories for a user in updated_at
+  // descending order.
+  rpc FindRecentListByUserId(FindRecentListByUserIdRequest) returns (stream llm_memory.data.Memory);
+  // Return the total number of memories matching the condition.
+  rpc Count(FindCondition) returns (CountResponse);
+  // Stream memories filtered by roles / user_id / thread_id, with
+  // representative-thread metadata attached so list-mode UIs can render
+  // parent-thread headers without an extra round trip.
+  // (usable as a replacement for SystemPromptService.FindList).
+  rpc FindListByCondition(FindMemoryListRequest) returns (stream MemoryListEntry);
+  // Return the count of memories filtered by roles / user_id /
+  // thread_id (usable as a replacement for
+  // SystemPromptService.Count).
+  rpc CountByCondition(MemoryCountCondition) returns (CountResponse);
+
+  // Atomically replace ONLY memory.content (and updated_at) WITHOUT
+  // spawning the embedding dispatcher.
+  //
+  // Why a dedicated RPC (do NOT reuse Update(Memory)). The caption
+  // workflow only changes content; funnelling it through Update(Memory)
+  // (which takes a whole Memory) risks wiping parent_ids / role /
+  // media_object_id when the caption worker fails to round-trip those
+  // fields. A Find -> merge -> Update alternative loses concurrent
+  // updates (the caption overwrites whatever else changed in between);
+  // a content-only atomic diff structurally removes that risk.
+  //
+  // Operational responsibility (important). This RPC is for the caption
+  // workflow / memories-internal embedding recompute path ONLY;
+  // Update(Memory) is wire/behaviour unchanged for everyone else. It
+  // does NOT re-dispatch embeddings, so the search index (LanceDB) goes
+  // stale until the caller re-runs embedding: a general client that
+  // rewrites content this way is responsible for issuing
+  // RedispatchEmbeddings to rebuild it (use Update(Memory) for normal
+  // content edits). It is deliberately kept off the RAG manifest
+  // (workflows/rag-tools-manifest.yaml) so agents cannot misuse it.
+  rpc UpdateContentNoDispatch(UpdateContentNoDispatchRequest) returns (SuccessResponse);
+}

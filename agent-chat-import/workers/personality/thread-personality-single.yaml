@@ -1,0 +1,711 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: thread-personality-single
+  version: "1.0.0"
+
+# Per-thread user personality / preference signal extraction.
+#
+# Mirrors thread-summary-single but writes a separate "personality"
+# memory under `personality_user_id` (default 200000) so that summary,
+# daily-work and personality systems remain physically disjoint.
+
+input:
+  schema:
+    document:
+      type: object
+      required: [user_id, thread_id, memories_grpc_host, memories_grpc_port]
+      properties:
+        user_id: { type: integer }
+        thread_id: { type: integer }
+        memories_grpc_host: { type: string, default: "localhost" }
+        memories_grpc_port: { type: integer, default: 9100 }
+        memories_grpc_tls: { type: boolean, default: false }
+        llm_worker_name: { type: string, default: "memories-llm" }
+        min_message_count: { type: integer, default: 4 }
+        min_user_messages:
+          type: integer
+          default: 2
+          description: >-
+            Lower bound on visible ROLE_USER message count after dropping
+            system-injected scaffolding. Threads dominated by ROLE_ASSISTANT
+            or internal agent scaffolding are skipped because they carry no
+            durable user personality signal.
+        max_context_chars: { type: integer, default: 200000 }
+        personality_model: { type: string, default: "qwen3.6:27b" }
+        ollama_base_url: { type: string, default: "http://localhost:11434" }
+        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
+        force_reextract: { type: boolean, default: false }
+        personality_user_id:
+          type: integer
+          default: 200000
+          description: >-
+            Owner user ID for personality memory threads. MUST differ from
+            both `user_id` (avoids recursive pollution: personality threads
+            would otherwise be picked up as input by subsequent runs) and
+            `summary_user_id` (avoids cross-contamination with the summary
+            system).
+        summary_user_id:
+          type: integer
+          default: 100000
+          description: >-
+            Reference value for collision detection only. The personality
+            workflow never reads or writes summary memories — it just
+            ensures `personality_user_id != summary_user_id` so the two
+            collection-points cannot fuse into one.
+
+do:
+  # Initialize variables referenced from `output.as` so an early
+  # `then: exit` does not leave them undefined.
+  - initOutputVars:
+      set:
+        personality_json: "${ null }"
+        skipped: "${ false }"
+        result: "${ null }"
+        truncation_level: "${ \"none\" }"
+
+  # Defensive fallback for callers that bypass the input schema
+  # (e.g. legacy clients without our schema-side defaults).
+  - normalizePersonalityUserId:
+      set:
+        effective_personality_user_id: "${ $workflow.input.personality_user_id // 200000 }"
+        effective_summary_user_id: "${ $workflow.input.summary_user_id // 100000 }"
+
+  # Sharing the owner with the source user would surface personality
+  # threads in that user's listings and feed them back into subsequent
+  # extractions (recursive pollution).
+  - failOnSelfOwnedPersonality:
+      if: "${ $effective_personality_user_id == $workflow.input.user_id }"
+      raise:
+        error:
+          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
+          status: 400
+          title: "personality_user_id must differ from user_id"
+          detail: >-
+            ${ "personality_user_id (" + ($effective_personality_user_id | tostring)
+               + ") must differ from user_id ("
+               + ($workflow.input.user_id | tostring)
+               + ") to prevent recursive personality extraction." }
+
+  # Sharing owner with the summary system would let thread-summary-batch
+  # pick up personality memory threads as summarisation targets when
+  # `min_message_count` is lowered.
+  - failOnSummaryUserCollision:
+      if: "${ $effective_personality_user_id == $effective_summary_user_id }"
+      raise:
+        error:
+          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
+          status: 400
+          title: "personality_user_id must differ from summary_user_id"
+          detail: >-
+            ${ "personality_user_id (" + ($effective_personality_user_id | tostring)
+               + ") must differ from summary_user_id ("
+               + ($effective_summary_user_id | tostring)
+               + ") to keep the two extraction domains disjoint." }
+
+  - fetchThread:
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/Find"
+            json_body: >-
+              ${ { value: $workflow.input.thread_id } | tojson }
+            as_json: true
+      export:
+        as:
+          thread: ${ .jsonBody | fromjson | .data }
+
+  - checkThreadExists:
+      if: "${ $thread == null }"
+      set:
+        skipped: true
+      export:
+        as:
+          result: "skipped: thread not found"
+      then: exit
+
+  # Invariant I5: ThreadService/Find is keyed only on thread_id, so a
+  # misrouted thread_id could otherwise let us extract personality from
+  # another user's conversation. Enforce ownership in the workflow.
+  #
+  # Compare both sides as strings: protobuf `int64` fields (UserId.value)
+  # are JSON-serialized as strings to avoid JS Number precision loss,
+  # while `$workflow.input.user_id` arrives as an integer. A bare `!=`
+  # would treat e.g. "1" != 1 as true and reject every legitimate run.
+  - failOnOwnerMismatch:
+      if: "${ ($thread.data.userId.value | tostring) != ($workflow.input.user_id | tostring) }"
+      raise:
+        error:
+          type: "https://serverlessworkflow.io/spec/1.0.0/errors/authorization"
+          status: 403
+          title: "thread does not belong to input user_id"
+          detail: >-
+            ${ "thread " + ($workflow.input.thread_id | tostring)
+               + " is owned by user " + ($thread.data.userId.value | tostring)
+               + " but workflow input user_id is "
+               + ($workflow.input.user_id | tostring) }
+
+  - fetchMessages:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindMemoriesByThreadId"
+            json_body: >-
+              ${ {
+                thread_id: { value: $workflow.input.thread_id },
+                roles: ["ROLE_USER", "ROLE_ASSISTANT"],
+                content_types: ["TEXT"]
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          # Normalize `.data.content` to "" up front: protobuf JSON
+          # serialization omits empty-string fields, so a memory row
+          # with empty content arrives WITHOUT a `content` key. The
+          # liquid engine (liquid-core 0.26) raises "Unknown index" on
+          # a missing object key rather than rendering empty, so the
+          # downstream `{{ msg.data.content }}` in generatePersonality
+          # would 400 on such rows. Filling it here guarantees the key
+          # exists for every consumer (truncation jq + liquid prompt).
+          raw_messages: >-
+            ${ .jsonBody | fromjson
+               | map(.data.content = (.data.content // "")) }
+
+  # Personality extraction should see the same "conversation" surface the
+  # thread detail UI emphasizes: real user turns plus assistant context, not
+  # Codex-injected AGENTS/CLAUDE/environment blocks or assistant event shadows.
+  - filterVisibleMessages:
+      set:
+        visible_messages: >-
+          ${ $raw_messages
+             | map(select(
+                 (.data.content // "") as $content
+                 | (($content | sub("^\\s+"; "")) as $text
+                    | ((.data.metadata // "{}") | fromjson) as $meta
+                    | ((
+                        $meta.source == "codex"
+                        and $meta.kind == "user"
+                        and $meta.payload_type == "message"
+                        and $meta.block_type == "input_text"
+                        and (
+                          ($text | startswith("# AGENTS.md instructions for "))
+                          or ($text | startswith("# CLAUDE.md instructions for "))
+                          or ($text | startswith("<environment_context>"))
+                          or ($text | startswith("<permissions instructions>"))
+                          or ($text | startswith("<turn_aborted>"))
+                        )
+                      )
+                      or (
+                        $meta.source == "codex"
+                        and $meta.kind == "assistant"
+                        and $meta.payload_type == "agent_message"
+                      )
+                      or ($text | startswith("<command-name>"))
+                      or ($text | startswith("<command-message>"))
+                      or ($text | startswith("<local-command-caveat>"))
+                      or ($text | startswith("<INSTRUCTIONS>"))
+                    ) | not)
+               )) }
+
+  - useVisibleMessages:
+      set:
+        messages: "${ $visible_messages }"
+        # Two-axis gate: total visible messages cover continuity (the same
+        # bar as thread-summary), visible user messages cover signal density
+        # (a thread of mostly assistant logs has nothing to extract).
+        has_enough_messages: >-
+          ${ (($visible_messages | length)
+              >= $workflow.input.min_message_count)
+             and (($visible_messages | map(select(.data.role == "ROLE_USER"))
+                   | length) >= $workflow.input.min_user_messages) }
+
+  - checkMessageCount:
+      if: "${ $has_enough_messages | not }"
+      set:
+        skipped: true
+      export:
+        as:
+          result: "skipped: not enough messages or user messages"
+      then: exit
+
+  # Invariant I1: label set is exactly the 3-tuple
+  # `[PERSONALITY_LABEL, "user:<src>", "thread:<src>"]` so each
+  # (user, thread) pair maps to a unique personality thread regardless
+  # of source-thread labels. Mixing in source-thread labels would let
+  # labels collide across users.
+  - findMemoryThread:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
+            json_body: >-
+              ${ {
+                labels: [
+                  "personality",
+                  "user:" + ($workflow.input.user_id | tostring),
+                  "thread:" + ($workflow.input.thread_id | tostring)
+                ],
+                match_mode: "LABEL_ALL",
+                user_id: $effective_personality_user_id,
+                limit: 1
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          existing_memory_thread_id: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | (if length > 0 then .[0].id.value else null end) }
+
+  - initExistingSignal:
+      set:
+        existing_signal: "${ null }"
+
+  # `external_id = "personality:<thread_id>"` is UNIQUE so we don't
+  # need the metadata-based matching that thread-summary uses.
+  - findExistingSignal:
+      if: "${ $existing_memory_thread_id != null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindMemoriesByThreadId"
+            json_body: >-
+              ${ {
+                thread_id: { value: $existing_memory_thread_id },
+                roles: ["ROLE_ASSISTANT"],
+                content_types: ["TEXT"]
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          existing_signal: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | map(select(.data.externalId
+                     == ("personality:" + ($workflow.input.thread_id | tostring))))
+               | (if length > 0 then .[0] else null end) }
+
+  # Unlike thread-summary, we do NOT consult the source thread's
+  # description here — we never write to it.
+  #
+  # Written as `if/elif/else` instead of a multi-clause `or` because the
+  # original `${ force or (existing == null) or (thread.updatedAt > existing.data.updatedAt) }`
+  # silently produced a non-boolean `eligible` when `existing_signal == null`
+  # (jaq evaluates every `or` arm, and `null.data.updatedAt > null` left
+  # `eligible` as `null` — `null | not` is `true`, so skipIfNotEligible
+  # fired even with `force_reextract=true`). The explicit ladder short-
+  # circuits before the null dereference and keeps `eligible` a strict
+  # boolean.
+  - checkEligibility:
+      set:
+        eligible: >-
+          ${ if ($workflow.input.force_reextract // false) == true then true
+             elif $existing_signal == null then true
+             elif (($thread.data.updatedAt // 0) | tonumber)
+                  > (($existing_signal.data.updatedAt // 0) | tonumber) then true
+             else false
+             end }
+
+  - skipIfNotEligible:
+      if: "${ ($eligible // false) == false }"
+      set:
+        skipped: true
+      export:
+        as:
+          result: >-
+            ${ "skipped: already up to date (force="
+               + (($workflow.input.force_reextract // false) | tostring)
+               + ", existing="
+               + (if $existing_signal == null then "null" else "present" end)
+               + ")" }
+      then: exit
+
+  # Three-stage truncation fallback:
+  #   none                — total fits
+  #   assistant_truncated — USER fits alone, ASSISTANT center-cut
+  #   user_truncated      — USER also exceeds budget; both cut, then
+  #                         tail-truncate the merged sequence.
+  # Truncation markers carry `id: { value: null }` so the LLM prompt
+  # renders them as `[id=null]` (not citable).
+  - computeTruncationLevel:
+      set:
+        user_messages: >-
+          ${ $messages | map(select(.data.role == "ROLE_USER")) }
+        assistant_messages: >-
+          ${ $messages | map(select(.data.role == "ROLE_ASSISTANT")) }
+        total_chars: >-
+          ${ ($messages | map(.data.content | length) | add) // 0 }
+        user_chars: >-
+          ${ ($messages
+              | map(select(.data.role == "ROLE_USER"))
+              | map(.data.content | length) | add) // 0 }
+
+  - truncateMessages:
+      set:
+        truncation_level: >-
+          ${ if $total_chars <= $workflow.input.max_context_chars then "none"
+             elif $user_chars <= $workflow.input.max_context_chars then "assistant_truncated"
+             else "user_truncated"
+             end }
+        truncated_messages: >-
+          ${ if $total_chars <= $workflow.input.max_context_chars then
+               $messages
+             elif $user_chars <= $workflow.input.max_context_chars then
+               # Stage 1: keep all USER, center-cut ASSISTANT.
+               ( ($assistant_messages | length) as $alen
+                 | (($alen / 4) | floor) as $akeep
+                 | ( $user_messages
+                     + ( if $alen > $akeep * 2
+                         then ($assistant_messages[:$akeep])
+                              + [{ id: { value: null },
+                                   data: { role: "ROLE_SYSTEM",
+                                           content: ("... ("
+                                             + (($alen - $akeep * 2) | tostring)
+                                             + " assistant messages omitted) ...") } }]
+                              + ($assistant_messages[($alen - $akeep):])
+                         else $assistant_messages
+                         end ) )
+                   | sort_by(.data.createdAt // 0) )
+             else
+               # Stage 2: USER center-cut + ASSISTANT tail-3, then
+               # tail-truncate if still over budget.
+               ( ($user_messages | length) as $ulen
+                 | (($ulen / 4) | floor) as $ukeep
+                 | ( if $ulen > $ukeep * 2
+                     then ($user_messages[:$ukeep])
+                          + [{ id: { value: null },
+                               data: { role: "ROLE_SYSTEM",
+                                       content: ("... ("
+                                         + (($ulen - $ukeep * 2) | tostring)
+                                         + " user messages omitted) ...") } }]
+                          + ($user_messages[($ulen - $ukeep):])
+                     else $user_messages
+                     end ) as $u_kept
+                 | ( $assistant_messages
+                     | sort_by(.data.createdAt // 0)
+                     | (if length > 3 then .[length - 3:] else . end) ) as $a_tail
+                 | ( ($u_kept + $a_tail) | sort_by(.data.createdAt // 0) ) as $merged
+                 | # Tail-truncate (newest-first wins) if still over budget.
+                   ( $merged | reverse
+                     | reduce .[] as $m (
+                         {acc: [], used: 0};
+                         if .used + ($m.data.content | length)
+                            <= $workflow.input.max_context_chars
+                         then {acc: ([$m] + .acc),
+                               used: (.used + ($m.data.content | length))}
+                         else .
+                         end
+                       )).acc )
+             end }
+
+  - validatePromptContext:
+      if: "${ (($thread_personality_system_prompt // \"\") | length) == 0 or (($thread_personality_user_tail // \"\") | length) == 0 }"
+      raise:
+        error:
+          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
+          status: 500
+          title: "prompt_context_missing"
+          detail: >-
+            ${ if (($thread_personality_system_prompt // "") | length) == 0
+               then "thread_personality_system_prompt is missing"
+               else "thread_personality_user_tail is missing"
+               end }
+
+  # `temperature` lower than thread-summary (0.2 vs 0.3) — stable
+  # confidence/category outputs across re-runs.
+  - generatePersonality:
+      run:
+        function:
+          runnerName: LLM
+          using: completion
+          settings:
+            ollama:
+              base_url: "${$workflow.input.ollama_base_url}"
+              model: "${$workflow.input.personality_model}"
+          options:
+            channel: llm
+            storeSuccess: false
+            storeFailure: true
+          arguments:
+            system_prompt: "${ $thread_personality_system_prompt }"
+            prompt: >-
+              $${## Thread info
+              - labels: {{ thread.data.labels | join: ", " }}
+              - createdAt: {{ thread.data.createdAt }}
+
+              ## Conversation history
+              {% for msg in truncated_messages %}
+              [id={{ msg.id.value }}] [{{ msg.data.role }}] {{ msg.data.content }}
+              {% endfor %}
+
+              {{ thread_personality_user_tail }}}
+            options:
+              max_tokens: 4000
+              temperature: 0.2
+            json_schema: |
+              {
+                "type": "object",
+                "required": ["no_signal"],
+                "properties": {
+                  "no_signal": {"type": "boolean"},
+                  "reason": {"type": "string"},
+                  "interests": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["topic", "confidence", "evidence", "memory_ids"],
+                      "properties": {
+                        "topic": {"type": "string"},
+                        "confidence": {"type": "string", "enum": ["high","medium","low"]},
+                        "evidence": {"type": "string"},
+                        "memory_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 5}
+                      }
+                    }
+                  },
+                  "preferences": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["axis", "preference", "confidence", "evidence", "memory_ids"],
+                      "properties": {
+                        "axis": {"type": "string"},
+                        "preference": {"type": "string"},
+                        "confidence": {"type": "string", "enum": ["high","medium","low"]},
+                        "evidence": {"type": "string"},
+                        "memory_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 5}
+                      }
+                    }
+                  },
+                  "decision_style": {
+                    "type": "object",
+                    "required": ["summary", "traits", "memory_ids"],
+                    "properties": {
+                      "summary": {"type": "string"},
+                      "traits": {"type": "array", "items": {"type": "string"}},
+                      "memory_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 5}
+                    }
+                  },
+                  "communication_style": {
+                    "type": "object",
+                    "required": ["tone", "verbosity", "language_preference", "memory_ids"],
+                    "properties": {
+                      "tone": {"type": "string"},
+                      "verbosity": {"type": "string"},
+                      "language_preference": {"type": "string"},
+                      "notes": {"type": "string"},
+                      "memory_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 5}
+                    }
+                  },
+                  "values_and_beliefs": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["belief", "confidence", "evidence", "memory_ids"],
+                      "properties": {
+                        "belief": {"type": "string"},
+                        "confidence": {"type": "string", "enum": ["high","medium","low"]},
+                        "evidence": {"type": "string"},
+                        "memory_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 5}
+                      }
+                    }
+                  },
+                  "anti_preferences": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["avoid", "confidence", "evidence", "memory_ids"],
+                      "properties": {
+                        "avoid": {"type": "string"},
+                        "confidence": {"type": "string", "enum": ["high","medium","low"]},
+                        "evidence": {"type": "string"},
+                        "memory_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 5}
+                      }
+                    }
+                  }
+                }
+              }
+      export:
+        as:
+          personality_json: ${ .content.text | fromjson }
+
+  # No Step 9 (description update): we deliberately never write to
+  # the source thread's metadata. No Step 11.5 (cleanupStaleSummaries)
+  # either: invariant I1 makes the personality memory thread address
+  # deterministic, so there is no "label-change" migration scenario.
+  - initCreatedMemoryThreadId:
+      set:
+        created_memory_thread_id: "${ null }"
+
+  # Labels here MUST match Step 4 exactly (invariant I1).
+  - createMemoryThread:
+      if: "${ $existing_memory_thread_id == null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/Create"
+            json_body: >-
+              ${ {
+                user_id: { value: $effective_personality_user_id },
+                description: ("personality signals for thread "
+                              + ($workflow.input.thread_id | tostring)
+                              + " (user " + ($workflow.input.user_id | tostring) + ")"),
+                labels: [
+                  "personality",
+                  "user:" + ($workflow.input.user_id | tostring),
+                  "thread:" + ($workflow.input.thread_id | tostring)
+                ],
+                created_at: $thread.data.createdAt,
+                updated_at: $thread.data.updatedAt
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          created_memory_thread_id: ${ .jsonBody | fromjson | .id.value }
+
+  - resolveMemoryThreadId:
+      set:
+        memory_thread_id: "${ $existing_memory_thread_id // $created_memory_thread_id }"
+
+  # Invariant I2: the 5-field metadata layout MUST appear on both the
+  # Update and Add paths. `source_user_id` and `source_thread_id` are
+  # stringified to dodge int64 rounding when downstream tooling reads
+  # metadata as JS Number.
+  - updateSignal:
+      if: "${ $existing_signal != null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryService/Update"
+            json_body: >-
+              ${ {
+                id: $existing_signal.id,
+                data: ($existing_signal.data
+                  | .content = ($personality_json | tojson)
+                  | .metadata = ({
+                      source_user_id: ($workflow.input.user_id | tostring),
+                      source_thread_id: ($workflow.input.thread_id | tostring),
+                      signal_version: "1.0",
+                      no_signal: ($personality_json.no_signal // false),
+                      truncation_level: $truncation_level
+                    } | tojson)
+                  | .externalId = ("personality:" + ($workflow.input.thread_id | tostring))
+                  | .updatedAt = $thread.data.updatedAt)
+              } | tojson }
+            as_json: true
+
+  - addSignalMemory:
+      if: "${ $existing_signal == null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/AddMemory"
+            json_body: >-
+              ${ {
+                thread_id: { value: $memory_thread_id },
+                memory: {
+                  user_id: { value: $effective_personality_user_id },
+                  content: ($personality_json | tojson),
+                  content_type: "TEXT",
+                  role: "ROLE_ASSISTANT",
+                  metadata: ({
+                    source_user_id: ($workflow.input.user_id | tostring),
+                    source_thread_id: ($workflow.input.thread_id | tostring),
+                    signal_version: "1.0",
+                    no_signal: ($personality_json.no_signal // false),
+                    truncation_level: $truncation_level
+                  } | tojson),
+                  external_id: ("personality:" + ($workflow.input.thread_id | tostring)),
+                  created_at: $thread.data.createdAt,
+                  updated_at: $thread.data.updatedAt
+                }
+              } | tojson }
+            as_json: true
+
+  # Tag the personality memory thread with `personality_signal` when
+  # we actually extracted usable signals. The user-personality-merge
+  # workflow uses this label to skip no_signal threads at the
+  # `FindThreadListByLabels` boundary instead of dragging them
+  # through `FindMemoriesByThreadId` only to discard them by
+  # metadata. AddLabels is idempotent so a re-run that already
+  # tagged the thread is a cheap no-op on the server.
+  #
+  # Once applied, we keep the label even if a future re-run flips
+  # back to no_signal=true: the metadata.no_signal filter in
+  # user-personality-merge still suppresses it from the merged
+  # output, and protecting the label guards against the LLM
+  # transiently misclassifying a thread as no_signal.
+  - applySignalLabel:
+      if: "${ ($personality_json.no_signal // false) | not }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/AddLabels"
+            json_body: >-
+              ${ {
+                thread_id: { value: $memory_thread_id },
+                labels: ["personality_signal"]
+              } | tojson }
+            as_json: true
+
+output:
+  as:
+    completed: ${ $personality_json != null }
+    thread_id: ${ $workflow.input.thread_id }
+    no_signal: ${ if $personality_json != null then ($personality_json.no_signal // false) else null end }
+    truncation_level: ${ $truncation_level }
+    skipped: ${ $skipped // false }
+    skip_reason: ${ if ($skipped // false) then $result else null end }
