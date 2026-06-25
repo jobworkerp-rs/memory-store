@@ -1,0 +1,257 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: thread-summary-batch
+  version: "1.0.0"
+
+input:
+  schema:
+    document:
+      type: object
+      required: [user_id, memories_grpc_host, memories_grpc_port]
+      properties:
+        user_id: { type: integer }
+        memories_grpc_host: { type: string, default: "localhost" }
+        memories_grpc_port: { type: integer, default: 9100 }
+        memories_grpc_tls: { type: boolean, default: false }
+        llm_worker_name: { type: string, default: "memories-llm" }
+        thread_ids:
+          type: array
+          items: { type: integer }
+          description: When specified, only these threads are summarized (all threads when omitted).
+        labels_filter:
+          type: array
+          items: { type: string }
+          description: When specified, only threads with these labels are targeted.
+        updated_within_hours:
+          type: integer
+          minimum: 1
+          description: >-
+            When specified, only threads whose `updated_at` is within the
+            past N hours **measured from this workflow's execution time**
+            are targeted (server-side `updated_after` filter, strict `>`).
+            Omit to process all threads as before. `updated_after_ms`
+            takes precedence when both are set, because relative windows
+            drift with dispatch latency.
+        updated_after_ms:
+          type: integer
+          minimum: 0
+          description: >-
+            When specified, an absolute lower bound (epoch ms) for
+            `updated_at`. Takes precedence over `updated_within_hours`.
+            Use this when the caller already knows the absolute boundary
+            (e.g. memories-import passes its `--since` here so the window
+            stays exactly aligned with the imported set even if jobworkerp
+            queueing delays workflow start).
+        updated_before_ms:
+          type: integer
+          minimum: 0
+          description: >-
+            When specified, an absolute upper bound (epoch ms, inclusive
+            `<=`) for `updated_at`. Omit for no upper bound. Pairs with
+            `updated_after_ms` to bound the targeted window on both ends.
+        min_message_count: { type: integer, default: 4 }
+        max_context_chars: { type: integer, default: 200000 }
+        summary_model: { type: string, default: "qwen3.6:27b" }
+        ollama_base_url: { type: string, default: "http://localhost:11434" }
+        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
+        memory_thread_label_prefix: { type: string, default: "summary" }
+        force_resummarize: { type: boolean, default: false }
+        summary_user_id:
+          type: integer
+          default: 100000
+          description: Owner user ID for summary memory threads. Must differ from user_id to prevent recursive summarization.
+
+timeout:
+  after:
+    hours: 24
+
+do:
+  # Step 0a: Defensive fallback for summary_user_id when callers
+  # bypass the input schema (e.g. legacy clients). Schema default
+  # is 100000.
+  - normalizeSummaryUserId:
+      set:
+        effective_summary_user_id: "${ $workflow.input.summary_user_id // 100000 }"
+
+  # Step 0b: Reject summary_user_id == user_id outright. Sharing the
+  # owner would surface summary threads in the source user's listings
+  # and trigger recursive summarization on subsequent batch runs.
+  - failOnSelfOwnedSummary:
+      if: "${ $effective_summary_user_id == $workflow.input.user_id }"
+      raise:
+        error:
+          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
+          status: 400
+          title: "summary_user_id must differ from user_id"
+          detail: >-
+            ${ "summary_user_id (" + ($effective_summary_user_id | tostring)
+               + ") must differ from user_id ("
+               + ($workflow.input.user_id | tostring)
+               + ") to prevent recursive summarization." }
+
+  # Step 0c: Resolve the effective `updated_after` lower bound (epoch ms).
+  # `updated_after_ms` (absolute) wins when supplied; otherwise fall back
+  # to deriving from `updated_within_hours` (relative to *workflow* start).
+  # The relative path is kept for backward compatibility but it can drift
+  # if dispatch is delayed — callers that know the exact boundary should
+  # pass `updated_after_ms` directly. `now` returns seconds; the gRPC
+  # filter expects milliseconds. Null result drops the field from the
+  # request body so the server treats it as "no lower bound".
+  - resolveUpdatedAfter:
+      set:
+        updated_after_ms: >-
+          ${ if $workflow.input.updated_after_ms != null
+             then $workflow.input.updated_after_ms
+             elif $workflow.input.updated_within_hours == null
+             then null
+             else ((now - ($workflow.input.updated_within_hours * 3600))
+                   * 1000 | floor)
+             end }
+
+  # Step 0d: Resolve the optional `updated_before` upper bound. Absolute
+  # epoch ms only (the relative `updated_within_hours` path has no upper
+  # counterpart). Null drops the field so the server treats it as "no
+  # upper bound".
+  - resolveUpdatedBefore:
+      set:
+        updated_before_ms: "${ $workflow.input.updated_before_ms }"
+
+  # Step 1a: Fetch threads by labels (when labels_filter is specified)
+  - fetchByLabels:
+      if: "${ ($workflow.input.labels_filter // []) | length > 0 }"
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
+            json_body: >-
+              ${ ({
+                   labels: $workflow.input.labels_filter,
+                   match_mode: "LABEL_ALL",
+                   user_id: $workflow.input.user_id,
+                   updated_after: $updated_after_ms,
+                   updated_before: $updated_before_ms
+                 }
+                 | if $updated_after_ms == null then del(.updated_after) else . end
+                 | if $updated_before_ms == null then del(.updated_before) else . end
+                 | tojson) }
+            as_json: true
+      export:
+        as:
+          all_threads: ${ .jsonBody | fromjson }
+
+  # Step 1b: Fetch all threads by user (when no labels_filter)
+  - fetchByUser:
+      if: "${ ($workflow.input.labels_filter // []) | length == 0 }"
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindThreadListByUserId"
+            json_body: >-
+              ${ ({
+                   user_id: { value: $workflow.input.user_id },
+                   updated_after: $updated_after_ms,
+                   updated_before: $updated_before_ms
+                 }
+                 | if $updated_after_ms == null then del(.updated_after) else . end
+                 | if $updated_before_ms == null then del(.updated_before) else . end
+                 | tojson) }
+            as_json: true
+      export:
+        as:
+          all_threads: ${ .jsonBody | fromjson }
+
+  # Step 2: Filter by thread_ids if specified
+  - filterThreads:
+      set:
+        target_threads: >-
+          ${ if ($workflow.input.thread_ids // []) | length > 0
+             then $all_threads | map(select(
+               .id.value as $tid | $workflow.input.thread_ids | any(. == $tid)
+             ))
+             else $all_threads
+             end }
+
+  # Step 2.5: Initialize per-thread outcome accumulators so callers can
+  # distinguish "every thread failed" from "some succeeded" / "nothing to
+  # do" by reading succeeded_count / failed_count, mirroring the period
+  # batches' output contract.
+  - initOutcomeAccumulators:
+      set:
+        succeeded_count: "${ 0 }"
+        failed_count: "${ 0 }"
+
+  # Step 3: Invoke the language-specific single-thread summary worker.
+  # Prompt context is baked into the registered worker.
+  - summarizeEach:
+      timeout:
+        after:
+          hours: 24
+      for:
+        each: thread
+        in: "${ $target_threads }"
+      onError: continue
+      do:
+        - invokeSingleWithRetry:
+            try:
+              - invokeSingle:
+                  timeout:
+                    after:
+                      minutes: 120
+                  run:
+                    function:
+                      workerName: '${ "memories-thread-summary-single-" + $workflow.input.output_language }'
+                      arguments:
+                        input: >-
+                          ${ {
+                            user_id: $workflow.input.user_id,
+                            thread_id: ($thread.id.value | tonumber),
+                            memories_grpc_host: $workflow.input.memories_grpc_host,
+                            memories_grpc_port: $workflow.input.memories_grpc_port,
+                            memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                            llm_worker_name: $workflow.input.llm_worker_name,
+
+
+                            min_message_count: $workflow.input.min_message_count,
+                            max_context_chars: $workflow.input.max_context_chars,
+                            summary_model: $workflow.input.summary_model,
+                            ollama_base_url: $workflow.input.ollama_base_url,
+                            output_language: $workflow.input.output_language,
+                            memory_thread_label_prefix: $workflow.input.memory_thread_label_prefix,
+                            force_resummarize: $workflow.input.force_resummarize,
+                            summary_user_id: $effective_summary_user_id
+                          } | tojson }
+              - recordSuccess:
+                  set:
+                    succeeded_count: "${ $succeeded_count + 1 }"
+            catch:
+              as: error
+              do:
+                - logError:
+                    set:
+                      failed_count: "${ $failed_count + 1 }"
+                      last_error: "${ $error }"
+
+output:
+  as:
+    # `completed` reflects "no thread failed". Callers read
+    # processed_threads / succeeded_count / failed_count to decide whether
+    # to treat the run as fully failed vs partial vs nothing-to-do.
+    completed: ${ ($failed_count // 0) == 0 }
+    processed_threads: ${ $target_threads | length }
+    succeeded_count: ${ $succeeded_count // 0 }
+    failed_count: ${ $failed_count // 0 }

@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+package llm;
+
+// Input arguments for the "store" plugin method.
+// Represents an LLM interaction to be stored as a memory.
+message LlmStoreArgs {
+  // Role of a message participant in the conversation.
+  enum MessageRole {
+    // Message from the end user.
+    User = 0;
+    // Message from the LLM assistant.
+    Assistant = 1;
+    // System instruction or prompt.
+    System = 2;
+    // Tool invocation result.
+    Tool = 3;
+  }
+
+  // A tool call made by the assistant.
+  message ToolCall {
+    // Name of the tool that was called.
+    string tool_name = 1;
+    // JSON-encoded arguments passed to the tool.
+    string tool_args = 2;
+  }
+
+  // A single message in the conversation history.
+  message ChatMessage {
+    // Corresponding Memory ID if this message is already stored in memoriesDB.
+    // Null for unsaved messages (e.g. the current prompt being stored).
+    optional int64 memory_id = 1;
+    // Role of the message sender.
+    MessageRole role = 2;
+    // Text content of the message.
+    string content = 3;
+    // Tool calls made in this message (assistant role only).
+    repeated ToolCall tool_calls = 4;
+    // Binary image data attached to this message.
+    repeated bytes images = 5;
+  }
+
+  // LLM generation parameters.
+  message LlmGenerationOptions {
+    // Maximum number of tokens to generate (default: model context size).
+    optional int32 sample_len = 1;
+    // Sampling temperature (higher = more random, lower = more deterministic).
+    optional float temperature = 2;
+    // Nucleus sampling probability cutoff (top-p).
+    optional float top_p = 3;
+    // Penalty for repeating tokens (1.0 = no penalty).
+    optional float repeat_penalty = 4;
+    // Number of recent tokens to consider for repeat penalty.
+    optional int32 repeat_last_n = 5;
+    // Random seed for reproducible generation.
+    optional int32 seed = 6;
+  }
+
+  // The user prompt text to store as a memory.
+  string prompt = 1;
+  // User ID for data management (not used as model input).
+  int64 user_id = 2;
+  // Optional LLM generation parameters.
+  optional LlmGenerationOptions options = 3;
+  // Override the default system prompt with this text.
+  optional string override_system_prompt = 4;
+  // Use chat mode with conversation history.
+  // When false, performs simple causal inference (histories field is ignored).
+  bool use_chat = 5;
+  // Conversation history messages (only used when use_chat is true).
+  repeated ChatMessage histories = 6;
+  // Clear server-side history and send all messages as a fresh request.
+  // Only used when use_chat is true.
+  bool refresh_history = 7;
+  // JSON schema for structured output (currently unimplemented, reserved for future use).
+  optional string schema_json = 8;
+  // Separate thinking/reasoning text from the final output.
+  bool divide_think_tag = 9;
+  // Custom think tag delimiter (used when divide_think_tag is true).
+  optional string think = 10;
+  // SystemPrompt ID. Specifies the system prompt when not using Thread-based API.
+  optional int64 system_prompt_id = 11;
+}

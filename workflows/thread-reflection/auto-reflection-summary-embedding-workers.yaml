@@ -1,0 +1,72 @@
+# Worker definitions for the reflection SUMMARY embedding pipeline
+# (F-G11 (a)). Loaded at startup by `ReflectionSummaryDispatcher::
+# ensure_initialized` via `register_workers_from_yaml`.
+#
+# Why this file is separate from `auto-embedding-workers.yaml` even
+# though both ultimately write to the same `memory_vector` LanceDB
+# table:
+#   - Reflection memories must NOT flow through the generic
+#     auto-embedding path. `EmbeddingJobDispatcher::is_embeddable`
+#     rejects ROLE_REFLECTION (see
+#     `infra/src/infra/memory_vector/dispatcher.rs`). The reflection
+#     summary path is intentionally fire-and-forget through a separate
+#     WORKFLOW worker that wraps the upsert in `try` and reports
+#     status via `MarkReflectionEmbeddingStatus(SUMMARY, OK/FAILED)`.
+#   - That status-reporting RPC has no counterpart in the generic
+#     memory embedding pipeline, so the two YAML files differ in their
+#     task shape, not just their worker names.
+#
+# Prerequisites for this file to register cleanly:
+#   - `memories-mm-embedding` and `memories-upsert-embedding` must
+#     already be registered (i.e. `auto-embedding-workers.yaml` was
+#     loaded first by `EmbeddingJobDispatcher`). The reflection summary
+#     workflow re-uses both workers as-is (the upsert worker already
+#     targets the N-row BatchUpsertEmbeddings RPC); only the WORKFLOW
+#     worker and the status-update GRPC worker are new here.
+
+defaults:
+  response_type: DIRECT
+  store_failure: true
+  broadcast_results: false
+  retry_policy:
+    type: EXPONENTIAL
+    interval: 800
+    max_interval: 60000
+    max_retry: 0 # no retry
+    basis: 2.0
+
+workers:
+  # GRPC worker that calls
+  # ReflectionService/MarkReflectionEmbeddingStatus back on this server.
+  # Both env vars are REQUIRED (see auto-embedding-workers.yaml — no
+  # silent loopback fallback so cross-host deployments fail fast).
+  #
+  # Duplicated under the same name in
+  # `auto-reflection-intent-embedding-workers.yaml` so the intent
+  # dispatcher does not depend on the summary dispatcher booting
+  # cleanly. Keep the two entries byte-identical — jobworkerp upserts
+  # by name and the registrations must agree on every field.
+  - name: memories-mark-reflection-embedding-status
+    runner: GRPC
+    settings:
+      host: %{MEMORY_GRPC_HOST}
+      port: %{MEMORY_GRPC_PORT}
+      use_reflection: true
+      method: llm_memory.service.ReflectionService/MarkReflectionEmbeddingStatus
+      as_json: true
+
+  # WORKFLOW worker that orchestrates the reflection summary path:
+  # embed -> upsert into existing memory_vector -> mark status OK
+  # (catch path -> mark status FAILED).
+  #
+  # Pinned to the dedicated `embedding_workflow` channel for the same
+  # reasons as `memories-auto-embedding`: GPU-bound embedding step
+  # must be single-slot, and sharing the GPU channel would deadlock the
+  # workflow on its own child.
+  - name: memories-auto-reflection-summary-embedding
+    runner: WORKFLOW
+    response_type: NO_RESULT
+    channel: embedding_workflow
+    settings:
+      workflow_data:
+        $file: auto-reflection-summary-embedding.yaml

@@ -1,0 +1,371 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: agent-chat-pipeline
+  version: "2.0.0"
+
+# Thin wrapper around agent-chat-import + agent-chat-summary.
+#
+# As of 1.1.0 the pipeline is split into two reusable sub-workflows:
+#   - agent-chat-import.yaml  (memories-import only)
+#   - agent-chat-summary.yaml (thread-summary + optional daily-work-
+#                              summary + optional personality +
+#                              optional reflection)
+# This wrapper preserves the legacy single-job entry point: it runs
+# import, then forwards import's date-window output to summary so the
+# two stages share an identical processing range without recomputing.
+#
+# Breaking change vs. 1.x (2.0.0):
+#   - daily-work-summary is now opt-in. Pass
+#     `daily_work_summary_batch_yaml` to run it. When omitted,
+#     `daily_summary_enabled=false` and `daily_summary_succeeded=false`
+#     reach output; `completed` no longer gates on daily.
+#   - `agent_chat_import_yaml` / `agent_chat_summary_yaml` now have
+#     Gitea `main` URL defaults (see input schema). Direct callers
+#     no longer need to pass them, but pinning to a tagged ref is
+#     recommended for production cron.
+#
+# Each stage fans out to language-specific workers
+# (`memories-<feature>-single-<lang>`) registered via
+# `memories-import upsert-generation-workers`; only the `*_batch_yaml`
+# paths are passed in.
+#
+# Reflection is opt-in (same idiom as personality): set
+# `thread_reflection_batch_yaml` to enable it. Unlike personality,
+# reflection failure is FATAL (no try/catch) — see
+# agent-chat-summary.yaml's header for the rationale.
+
+input:
+  schema:
+    document:
+      type: object
+      required:
+        - source
+        - user_id
+        - memories_grpc_url
+        - thread_summary_batch_yaml
+      properties:
+        # ---- child workflow paths -----------------------------------------
+        agent_chat_import_yaml:
+          type: string
+          default: "https://raw.githubusercontent.com/jobworkerp-rs/memory-store/main/agent-chat-import/workflows/agent-chat-import/agent-chat-import.yaml"
+          description: >-
+            Absolute path / URL of agent-chat-import.yaml. Defaults to
+            the Gitea `main` ref so JSON-payload callers don't need to
+            pass it; pin to a tagged ref for production cron.
+        agent_chat_summary_yaml:
+          type: string
+          default: "https://raw.githubusercontent.com/jobworkerp-rs/memory-store/main/agent-chat-import/workflows/agent-chat-summary/agent-chat-summary.yaml"
+          description: >-
+            Absolute path / URL of agent-chat-summary.yaml. Defaults to
+            the Gitea `main` ref. Pin to a tagged ref for production
+            cron.
+        # ---- import stage -------------------------------------------------
+        source:
+          type: string
+          enum: ["claude-code", "codex", "plain"]
+        user_id:
+          type: integer
+        memories_grpc_url:
+          type: string
+          description: >-
+            memories gRPC URL (e.g. http://host:9100). Forwarded as-is
+            to both child workflows; each parses host/port from it.
+        since_date:
+          type: string
+          default: ""
+        end_date:
+          type: string
+          default: ""
+          pattern: "^$|^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+          description: >-
+            YYYY-MM-DD. Optional explicit upper bound (inclusive) of
+            the processing window. Empty (default) lets
+            agent-chat-import auto-derive it: today (in tz) when
+            since_date is set, yesterday/today otherwise per
+            since_mode. Pass this to back-fill a fixed historical
+            range (e.g. since_date=2026-04-01 end_date=2026-04-30)
+            without dragging today's in-progress summary in.
+        since_override:
+          type: string
+          default: ""
+          pattern: "^$|^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+          description: >-
+            UTC integer-seconds ISO 8601 (Z form) used verbatim as
+            memories-import --since. Forwarded to agent-chat-import.
+        since_mode:
+          type: string
+          enum: ["day_start", "now_minus"]
+          default: "day_start"
+        since_lookback_seconds:
+          type: integer
+          default: 0
+        timezone_offset_hours:
+          type: integer
+          minimum: 0
+          maximum: 23
+          default: 9
+        import_command:
+          type: string
+          default: "memories-import"
+        all_projects_or_sessions:
+          type: boolean
+          default: true
+        claude_dir:
+          type: string
+          default: ""
+        codex_dir:
+          type: string
+          default: ""
+        strip_path_prefix:
+          type: string
+          default: ""
+        extra_import_args:
+          type: array
+          items: { type: string }
+          default: []
+        # ---- summary stages -----------------------------------------------
+        memories_grpc_host:
+          type: string
+          default: ""
+        memories_grpc_port:
+          type: integer
+          default: 0
+        thread_summary_batch_yaml:
+          type: string
+        daily_work_summary_batch_yaml:
+          type: string
+          default: ""
+          description: >-
+            Absolute path / URL of daily-work-summary-batch.yaml.
+            Empty (default) skips the daily-summary stage entirely.
+        summary_user_id:
+          type: integer
+          default: 100000
+        summary_model:
+          type: string
+          default: "qwen3.6:27b"
+        ollama_base_url:
+          type: string
+          default: "http://localhost:11434"
+        memory_thread_label_prefix:
+          type: string
+          default: "summary"
+        force_resummarize:
+          type: boolean
+          default: false
+        daily_summary_label:
+          type: string
+          default: "daily_summary"
+        extra_labels_filter:
+          type: array
+          items: { type: string }
+          default: []
+        min_thread_count:
+          type: integer
+          default: 1
+        max_context_chars:
+          type: integer
+          default: 200000
+        # ---- personality stage (opt-in) -----------------------------------
+        thread_personality_batch_yaml:
+          type: string
+          default: ""
+        user_personality_merge_yaml:
+          type: string
+          default: ""
+        personality_user_id:
+          type: integer
+          default: 200000
+        personality_model:
+          type: string
+          default: ""
+        min_user_messages:
+          type: integer
+          default: 2
+        force_reextract:
+          type: boolean
+          default: false
+        force_remerge:
+          type: boolean
+          default: false
+        max_signals:
+          type: integer
+          default: 200
+        # ---- reflection stage (opt-in) ------------------------------------
+        thread_reflection_batch_yaml:
+          type: string
+          default: ""
+        reflector_model:
+          type: string
+          default: ""
+        reflector_base_url:
+          type: string
+          default: ""
+        prompt_version:
+          type: string
+          default: "v1"
+        output_language:
+          type: string
+          enum: ["ja", "en"]
+          default: "ja"
+        reflector_id:
+          type: string
+          default: "self"
+        reflection_force:
+          type: boolean
+          default: false
+        context_limit_tokens:
+          type: integer
+          default: 222000
+        single_pass_threshold_tokens:
+          type: integer
+          default: 170000
+        window_size_turns:
+          type: integer
+          default: 80
+        window_overlap_turns:
+          type: integer
+          default: 10
+        merge_max_input_tokens:
+          type: integer
+          default: 100000
+        estimated_tokens_per_turn:
+          type: integer
+          default: 1500
+        experiment_id:
+          type: string
+        experiment_variant:
+          type: string
+
+timeout:
+  after:
+    hours: 26
+
+do:
+  # Step 1: Run import. `with_entries(select(.value != null))` drops
+  # only null values, not empty strings — every property in the
+  # wrapper schema has a non-null default (`""` / `0` / `[]` / `false`),
+  # so this filter is effectively a no-op today and is kept as a guard
+  # for future optional-without-default keys (e.g. `experiment_id`).
+  - runImport:
+      timeout:
+        after:
+          hours: 2
+      run:
+        function:
+          runnerName: WORKFLOW
+          settings:
+            workflow_url: "${ $workflow.input.agent_chat_import_yaml }"
+          arguments:
+            input: >-
+              ${ ({
+                source: $workflow.input.source,
+                user_id: $workflow.input.user_id,
+                memories_grpc_url: $workflow.input.memories_grpc_url,
+                memories_grpc_host: $workflow.input.memories_grpc_host,
+                memories_grpc_port: $workflow.input.memories_grpc_port,
+                since_date: $workflow.input.since_date,
+                end_date: $workflow.input.end_date,
+                since_override: $workflow.input.since_override,
+                since_mode: $workflow.input.since_mode,
+                since_lookback_seconds: $workflow.input.since_lookback_seconds,
+                timezone_offset_hours: $workflow.input.timezone_offset_hours,
+                import_command: $workflow.input.import_command,
+                all_projects_or_sessions: $workflow.input.all_projects_or_sessions,
+                claude_dir: $workflow.input.claude_dir,
+                codex_dir: $workflow.input.codex_dir,
+                strip_path_prefix: $workflow.input.strip_path_prefix,
+                extra_import_args: $workflow.input.extra_import_args
+              } | with_entries(select(.value != null)) | tojson) }
+      # The WORKFLOW runner serializes the child's `output.as` block
+      # as a JSON string in `.output` (see jobworkerp-rs
+      # app-wrapper/src/workflow/runner/unified.rs:243-254). Parse it
+      # back here so subsequent steps can read fields with normal
+      # dotted access (e.g. `$import_result.since_date`).
+      export:
+        as:
+          import_result: ${ .output | fromjson }
+
+  # Step 2: Run summary, feeding it the date window resolved by
+  # import. Reflection / personality opt-in keys are forwarded
+  # verbatim; agent-chat-summary's own opt-in gates handle empty
+  # values.
+  - runSummary:
+      timeout:
+        after:
+          hours: 24
+      run:
+        workflow:
+          workflowUrl: "${ $workflow.input.agent_chat_summary_yaml }"
+          input: >-
+            ${ ({
+                user_id: $workflow.input.user_id,
+                memories_grpc_url: $workflow.input.memories_grpc_url,
+                memories_grpc_host: $workflow.input.memories_grpc_host,
+                memories_grpc_port: $workflow.input.memories_grpc_port,
+                since_date: $import_result.since_date,
+                end_date: $import_result.end_date,
+                range_start_ms: $import_result.range_start_ms,
+                since_ms_utc: $import_result.since_ms_utc,
+                timezone_offset_hours: $workflow.input.timezone_offset_hours,
+                thread_summary_batch_yaml: $workflow.input.thread_summary_batch_yaml,
+                daily_work_summary_batch_yaml: $workflow.input.daily_work_summary_batch_yaml,
+                summary_user_id: $workflow.input.summary_user_id,
+                summary_model: $workflow.input.summary_model,
+                ollama_base_url: $workflow.input.ollama_base_url,
+                memory_thread_label_prefix: $workflow.input.memory_thread_label_prefix,
+                force_resummarize: $workflow.input.force_resummarize,
+                daily_summary_label: $workflow.input.daily_summary_label,
+                extra_labels_filter: $workflow.input.extra_labels_filter,
+                min_thread_count: $workflow.input.min_thread_count,
+                max_context_chars: $workflow.input.max_context_chars,
+                thread_personality_batch_yaml: $workflow.input.thread_personality_batch_yaml,
+                user_personality_merge_yaml: $workflow.input.user_personality_merge_yaml,
+                personality_user_id: $workflow.input.personality_user_id,
+                personality_model: $workflow.input.personality_model,
+                min_user_messages: $workflow.input.min_user_messages,
+                force_reextract: $workflow.input.force_reextract,
+                force_remerge: $workflow.input.force_remerge,
+                max_signals: $workflow.input.max_signals,
+                thread_reflection_batch_yaml: $workflow.input.thread_reflection_batch_yaml,
+                reflector_model: $workflow.input.reflector_model,
+                reflector_base_url: $workflow.input.reflector_base_url,
+                prompt_version: $workflow.input.prompt_version,
+                output_language: $workflow.input.output_language,
+                reflector_id: $workflow.input.reflector_id,
+                reflection_force: $workflow.input.reflection_force,
+                context_limit_tokens: $workflow.input.context_limit_tokens,
+                single_pass_threshold_tokens: $workflow.input.single_pass_threshold_tokens,
+                window_size_turns: $workflow.input.window_size_turns,
+                window_overlap_turns: $workflow.input.window_overlap_turns,
+                merge_max_input_tokens: $workflow.input.merge_max_input_tokens,
+                estimated_tokens_per_turn: $workflow.input.estimated_tokens_per_turn,
+                experiment_id: $workflow.input.experiment_id,
+                experiment_variant: $workflow.input.experiment_variant
+              } | with_entries(select(.value != null))) }
+      export:
+        as:
+          summary_result: ${ .output | fromjson }
+
+output:
+  as:
+    # Preserve every public output key from agent-chat-pipeline 1.0.x
+    # so existing log/UI parsing keeps working, plus the new
+    # reflection keys.
+    completed: ${ $summary_result.completed // false }
+    since_date: ${ $import_result.since_date }
+    end_date: ${ $import_result.end_date }
+    since_iso: ${ $import_result.since_iso }
+    range_start_ms: ${ $import_result.range_start_ms }
+    since_ms_utc: ${ $import_result.since_ms_utc }
+    import_succeeded: ${ $import_result.import_succeeded // false }
+    thread_summary_succeeded: ${ $summary_result.thread_summary_succeeded // false }
+    daily_summary_enabled: ${ $summary_result.daily_summary_enabled // false }
+    daily_summary_succeeded: ${ $summary_result.daily_summary_succeeded // false }
+    personality_enabled: ${ $summary_result.personality_enabled // false }
+    thread_personality_succeeded: ${ $summary_result.thread_personality_succeeded // false }
+    user_personality_merge_succeeded: ${ $summary_result.user_personality_merge_succeeded // false }
+    personality_error: ${ $summary_result.personality_error // null }
+    reflection_enabled: ${ $summary_result.reflection_enabled // false }
+    reflection_succeeded: ${ $summary_result.reflection_succeeded // false }

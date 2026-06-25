@@ -1,0 +1,106 @@
+syntax = "proto3";
+package memory;
+
+// Search request for memory retrieval.
+// Supports three modes based on which fields are provided:
+//   - Vector only (query_vectors set, query_text empty): semantic similarity search
+//   - Text only (query_text set, query_vectors empty): BM25 full-text search
+//   - Hybrid (both set): combined vector + text search with configurable strategy
+message MemorySearchArgs {
+  // Embedding vectors to search by semantic similarity.
+  // Provide one vector for standard search, or multiple for multi-vector aggregation.
+  // Leave empty to use text-only (FTS) search.
+  repeated EmbeddingVector query_vectors = 1;
+  // Free-text query for BM25 full-text search.
+  // Leave empty to use vector-only search.
+  optional string query_text = 2;
+  // Maximum number of results to return (default: 10).
+  optional uint32 limit = 3;
+  // Filter conditions to narrow search scope (user, thread, time range, etc.).
+  optional MemorySearchFilter filter = 4;
+  // Whether to include the full content body in results (default: true).
+  // Set to false to return metadata only, reducing payload size.
+  optional bool include_content = 5;
+  // Strategy and weights for hybrid search.
+  // Only used when both query_vectors and query_text are provided.
+  optional PluginHybridSearchOptions hybrid_options = 6;
+  // Aggregation strategy for multi-vector search.
+  // Only used when multiple query_vectors are provided.
+  // Ignored for single-vector or text-only search.
+  optional AggregationStrategy aggregation_strategy = 7;
+}
+
+// A single embedding vector (list of float values).
+message EmbeddingVector {
+  // Float values representing the embedding (dimension must match the index).
+  repeated float values = 1;
+}
+
+// Filter conditions for narrowing search results.
+// All specified fields are combined with AND logic.
+// Roles and content types within their respective lists use OR logic.
+message MemorySearchFilter {
+  // Filter by user ID (recommended for multi-tenant isolation).
+  optional int64 user_id = 1;
+  // field 2: formerly `thread_id`. Phase 4 moved thread membership into the
+  // `thread_memory` junction table, and thread-scoped searches are now
+  // expressed by resolving the set of memory_ids through the junction first
+  // and narrowing the vector query via ancestor/message-id filters.
+  reserved 2;
+  reserved "thread_id";
+  // field 3: formerly `system_id`. System prompts are now represented as
+  // role=ROLE_SYSTEM memories referenced via parent_ids traversal.
+  reserved 3;
+  reserved "system_id";
+  // Filter by message role (e.g. 0=user, 1=assistant). Multiple values use OR.
+  repeated int32 roles = 4;
+  // Filter by content type (e.g. 0=text, 1=tool, 5=url). Multiple values use OR.
+  repeated int32 content_types = 5;
+  // Return only memories created after this timestamp (epoch milliseconds, exclusive).
+  optional int64 created_after = 6;
+  // Return only memories created before this timestamp (epoch milliseconds, exclusive).
+  optional int64 created_before = 7;
+}
+
+// Hybrid search merge strategy.
+// Determines how vector similarity and text relevance scores are combined.
+// NOTE: Keep in sync with llm_memory.data.HybridStrategy in memories/protobuf/.../memory_vector.proto
+enum HybridStrategy {
+  // Reciprocal Rank Fusion: rank-based merging, robust default.
+  RRF = 0;
+  // Weighted score blending: vector_score * weight + text_score * (1 - weight).
+  WEIGHTED = 1;
+  // Two-phase: vector search first, then re-rank candidates by text relevance.
+  VECTOR_THEN_FTS = 2;
+  // Two-phase: text search first, then re-rank candidates by vector similarity.
+  FTS_THEN_VECTOR = 3;
+}
+
+// Strategy for aggregating scores from multiple query vectors.
+// Only applicable when query_vectors contains more than one vector.
+// NOTE: Keep in sync with llm_memory.data.AggregationStrategy in memories/protobuf/.../memory_vector.proto
+enum AggregationStrategy {
+  // Sum of scores across all vectors. Favors records matching many vectors.
+  SUM = 0;
+  // Average score (sum / total vector count). Penalizes partial matches.
+  AVERAGE = 1;
+  // Maximum score from any single vector. Good for "match any" semantics.
+  MAX = 2;
+  // Weighted sum where earlier vectors in the array receive higher weight.
+  // Weight for vector at index i = 1 / (i + 1).
+  WEIGHTED_BY_POSITION = 3;
+  // Reciprocal Rank Fusion across per-vector result rankings.
+  RANK_FUSION = 4;
+}
+
+// Options for hybrid search (vector + text combined).
+// rrf_k is intentionally omitted: the internal gRPC API supports it, but the
+// plugin interface uses the server-side default (k=60) for simplicity.
+message PluginHybridSearchOptions {
+  // Merge strategy to combine vector and text results (default: RRF).
+  optional HybridStrategy strategy = 1;
+  // Blending weight for the vector score component (0.0 to 1.0, default: 0.7).
+  // Higher values favor vector similarity; lower values favor text relevance.
+  // Used by WEIGHTED, VECTOR_THEN_FTS, and FTS_THEN_VECTOR strategies.
+  optional float vector_weight = 2;
+}

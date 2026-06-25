@@ -1,0 +1,80 @@
+# Worker definitions for the reflection INTENT embedding pipeline
+# (F-G11 (b)). Loaded at startup by `ReflectionIntentDispatcher::
+# ensure_initialized` via `register_workers_from_yaml`.
+#
+# Unlike the summary path, intent embeddings DO NOT reuse the existing
+# memory_vector table: they live in a dedicated
+# `reflection_intent_vector` LanceDB store with its own URI
+# (REFLECTION_LANCEDB_URI). The upsert target is therefore the
+# reflection-specific `ReflectionVectorService/BatchUpsertIntentEmbeddings`
+# RPC (N-row chunk upsert), not `MemoryVectorService/BatchUpsertEmbeddings`.
+#
+# Prerequisites for this file to register cleanly:
+#   - `memories-mm-embedding` must already be registered (i.e.
+#     `auto-embedding-workers.yaml` was loaded first by
+#     `EmbeddingJobDispatcher`). Both summary and intent paths share
+#     the same embedding model so query vectors in F-S8 live in the
+#     same space as the stored ones. Switching that model requires
+#     editing `auto-embedding-workers.yaml` AND running
+#     `RebuildIntentIndex` to reflow the existing reflection vectors.
+#
+# `memories-mark-reflection-embedding-status` is also defined here,
+# duplicating the entry in `auto-reflection-summary-embedding-workers.yaml`.
+# Registering it from both files means the intent dispatcher can boot
+# successfully even when the summary dispatcher's eager init failed
+# (config error / YAML parse error). The two registrations are
+# byte-identical so jobworkerp's upsert is idempotent — whichever
+# dispatcher runs last wins, and they always agree on the worker shape.
+
+defaults:
+  response_type: DIRECT
+  store_failure: true
+  broadcast_results: false
+  retry_policy:
+    type: EXPONENTIAL
+    interval: 800
+    max_interval: 60000
+    max_retry: 0 # no retry
+    basis: 2.0
+
+workers:
+  # GRPC worker shared with the summary embedding workflow. Defined
+  # here too so the intent dispatcher does not silently break when
+  # the summary dispatcher failed to register (e.g. transient config
+  # error at startup). Keep this block byte-identical to the entry
+  # in `auto-reflection-summary-embedding-workers.yaml` so jobworkerp's
+  # upsert is a no-op no matter which file loads second.
+  - name: memories-mark-reflection-embedding-status
+    runner: GRPC
+    settings:
+      host: %{MEMORY_GRPC_HOST}
+      port: %{MEMORY_GRPC_PORT}
+      use_reflection: true
+      method: llm_memory.service.ReflectionService/MarkReflectionEmbeddingStatus
+      as_json: true
+
+  # GRPC worker that calls
+  # ReflectionVectorService/BatchUpsertIntentEmbeddings back on this
+  # server (N-row chunk upsert). Both env vars are REQUIRED — same
+  # fail-fast rationale as the rest of the embedding callbacks.
+  - name: memories-upsert-reflection-intent-embedding
+    runner: GRPC
+    settings:
+      host: %{MEMORY_GRPC_HOST}
+      port: %{MEMORY_GRPC_PORT}
+      use_reflection: true
+      method: llm_memory.service.ReflectionVectorService/BatchUpsertIntentEmbeddings
+      as_json: true
+
+  # WORKFLOW worker for the intent embedding pipeline.
+  #
+  # Same `embedding_workflow` channel as the summary path — both fan
+  # out to the GPU-bound `embedding` channel so serializing them on
+  # the workflow side keeps the GPU queue depth predictable.
+  - name: memories-auto-reflection-intent-embedding
+    runner: WORKFLOW
+    response_type: NO_RESULT
+    channel: embedding_workflow
+    settings:
+      workflow_data:
+        $file: auto-reflection-intent-embedding.yaml

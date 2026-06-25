@@ -1,0 +1,172 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: weekly-work-summary-batch
+  version: "1.0.0"
+
+# Generates weekly-work-summary-single for a week range. Use this for
+# back-fills or manual re-runs over multiple weeks. Cron-style weekly
+# execution should call weekly-work-summary-single directly with no
+# `target_week` (defaults to "last completed week").
+
+input:
+  schema:
+    document:
+      type: object
+      properties:
+        source_user_id: { type: integer, default: 100000 }
+        memories_grpc_host: { type: string, default: "localhost" }
+        memories_grpc_port: { type: integer, default: 9100 }
+        memories_grpc_tls: { type: boolean, default: false }
+        llm_worker_name: { type: string, default: "memories-llm" }
+        start_week:
+          type: string
+          default: ""
+          description: >-
+            ISO 8601 week token "YYYY-Www" or empty. Empty = use
+            last_n_weeks (or fall back to "last completed week only").
+            When non-empty, end_week must also be set; (start, end)
+            wins over last_n_weeks.
+        end_week:
+          type: string
+          default: ""
+          description: Inclusive end week ("YYYY-Www") or empty.
+        last_n_weeks:
+          type: integer
+          default: 0
+          description: >-
+            Last N weeks ending the previous fully-completed week (in
+            tz). 0 = unused (falls back to start/end or "last week
+            only").
+        timezone_offset_hours: { type: integer, minimum: 0, maximum: 23, default: 9 }
+        daily_label: { type: string, default: "daily_summary" }
+        weekly_label: { type: string, default: "weekly_summary" }
+        extra_labels_filter:
+          type: array
+          items: { type: string }
+          default: []
+        min_thread_count: { type: integer, default: 1 }
+        max_context_chars: { type: integer, default: 200000 }
+        summary_model: { type: string, default: "qwen3.6:27b" }
+        ollama_base_url: { type: string, default: "http://localhost:11434" }
+        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
+        force_resummarize: { type: boolean, default: false }
+
+timeout:
+  after:
+    hours: 24
+
+do:
+  # Step 1: Resolve the week list. Modes (in priority order):
+  #   range:       (start_week, end_week) inclusive
+  #   last-N:      last_n_weeks weeks ending the previous completed week
+  #   fallback:    [last_week] only
+  # See weekly-work-summary-single.yaml resolveTargetWeek for the TZ
+  # handling rationale (jq strftime is UTC-only).
+  - resolveLastWeekMonday:
+      set:
+        last_week_monday_epoch: >-
+          ${ (now + ($workflow.input.timezone_offset_hours * 3600)) as $local
+             | ($local | strftime("%u") | tonumber) as $wday
+             | ($local - (($wday - 1) * 86400) - 7 * 86400) }
+
+  - resolveWeekRange:
+      set:
+        week_list: >-
+          ${ if $workflow.input.start_week != ""
+                and $workflow.input.end_week != ""
+             then
+               # Range mode. Convert both ends to Monday-epochs, step by week.
+               # Requires jaq's strptime("%G-W%V-%u").
+               ((($workflow.input.start_week + "-1")
+                 | strptime("%G-W%V-%u") | mktime) as $s
+                | (($workflow.input.end_week + "-1")
+                   | strptime("%G-W%V-%u") | mktime) as $e
+                | [range($s; $e + 1; 7 * 86400)]
+                | map(strftime("%G-W%V")))
+             elif $workflow.input.last_n_weeks > 0
+             then
+               ([range(0; $workflow.input.last_n_weeks)]
+                | map(($last_week_monday_epoch - (. * 7 * 86400))
+                      | strftime("%G-W%V"))
+                | reverse)
+             else
+               [$last_week_monday_epoch | strftime("%G-W%V")]
+             end }
+
+  # Step 1.5: Initialize accumulators so the for-loop below can append
+  # to them and the output block can reference them even when zero
+  # iterations ran.
+  - initOutcomeAccumulators:
+      set:
+        succeeded_weeks: "${ [] }"
+        failed_weeks: "${ [] }"
+        last_error: "${ null }"
+
+  # Step 2: For each week, dispatch weekly-work-summary-single. Failures
+  # in one week must not abort the rest of the range — a missing week
+  # is less bad than dropping the weeks after it. Per-week outcome is
+  # accumulated so the caller can re-run only the failed weeks.
+  - summarizeEachWeek:
+      timeout:
+        after:
+          hours: 24
+      for:
+        each: target_week
+        in: "${ $week_list }"
+      onError: continue
+      do:
+        - invokeSingleWithRetry:
+            try:
+              - invokeSingle:
+                  timeout:
+                    after:
+                      minutes: 30
+                  run:
+                    function:
+                      workerName: '${ "memories-weekly-work-summary-single-" + $workflow.input.output_language }'
+                      arguments:
+                        input: >-
+                          ${ {
+                            source_user_id: $workflow.input.source_user_id,
+                            target_week: $target_week,
+                            timezone_offset_hours: $workflow.input.timezone_offset_hours,
+                            memories_grpc_host: $workflow.input.memories_grpc_host,
+                            memories_grpc_port: $workflow.input.memories_grpc_port,
+                            memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                            llm_worker_name: $workflow.input.llm_worker_name,
+
+
+                            daily_label: $workflow.input.daily_label,
+                            weekly_label: $workflow.input.weekly_label,
+                            extra_labels_filter: $workflow.input.extra_labels_filter,
+                            min_thread_count: $workflow.input.min_thread_count,
+                            max_context_chars: $workflow.input.max_context_chars,
+                            summary_model: $workflow.input.summary_model,
+                            ollama_base_url: $workflow.input.ollama_base_url,
+                            output_language: $workflow.input.output_language,
+                            force_resummarize: $workflow.input.force_resummarize
+                          } | tojson }
+              - recordSuccess:
+                  set:
+                    succeeded_weeks: "${ $succeeded_weeks + [$target_week] }"
+            catch:
+              as: error
+              do:
+                - recordFailure:
+                    set:
+                      failed_weeks: "${ $failed_weeks + [$target_week] }"
+                      last_error: "${ $error }"
+
+output:
+  as:
+    # `completed` reflects "all attempted weeks succeeded".
+    # When false, inspect `failed_weeks` to know what to re-run.
+    completed: ${ ($failed_weeks | length) == 0 }
+    processed_weeks: ${ $week_list | length }
+    succeeded_count: ${ $succeeded_weeks | length }
+    failed_count: ${ $failed_weeks | length }
+    weeks: ${ $week_list }
+    succeeded_weeks: ${ $succeeded_weeks }
+    failed_weeks: ${ $failed_weeks }
+    last_error: ${ $last_error }

@@ -1,0 +1,219 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: thread-reflection-batch
+  version: "1.0.0"
+
+# Batch reflection generator.
+#
+# Discovers threads belonging to a given user (optionally narrowed
+# by labels / time window / explicit thread_id list) and runs the
+# single-thread reflection workflow against each one. Mirrors the
+# shape of `thread-summary-batch.yaml` so operator runbooks can
+# treat the two pipelines symmetrically.
+#
+# Idempotency is handled per-thread in `thread-reflection-single`
+# (the `checkExistsActiveReflection` gate skips threads with an
+# up-to-date reflection unless `force=true`), so this batch can be
+# invoked freely against the full user history; only threads whose
+# `updated_at` is later than their newest matching reflection
+# actually run the reflector LLM.
+
+input:
+  schema:
+    document:
+      type: object
+      required:
+        - user_id
+        - memories_grpc_host
+        - memories_grpc_port
+        - reflector_model
+        - reflector_base_url
+        - prompt_version
+      properties:
+        user_id: { type: integer }
+        memories_grpc_host: { type: string, default: "localhost" }
+        memories_grpc_port: { type: integer, default: 9010 }
+        memories_grpc_tls: { type: boolean, default: false }
+        llm_worker_name: { type: string, default: "memories-llm" }
+        thread_ids:
+          type: array
+          items: { type: integer }
+          description: When specified, only these threads are reflected (all threads when omitted).
+        labels_filter:
+          type: array
+          items: { type: string }
+          description: When specified, only threads with these labels are targeted.
+        updated_within_hours:
+          type: integer
+          minimum: 1
+          description: >-
+            When specified, only threads whose `updated_at` is within the
+            past N hours measured from this workflow's execution time
+            are targeted. `updated_after_ms` takes precedence when both
+            are set.
+        updated_after_ms:
+          type: integer
+          minimum: 0
+          description: >-
+            Absolute lower bound (epoch ms) for `updated_at`. Takes
+            precedence over `updated_within_hours`.
+        reflector_model: { type: string }
+        reflector_base_url: { type: string }
+        prompt_version: { type: string }
+        reflector_id: { type: string, default: "self" }
+        # Output language code (ja|en), used to select the registered
+        # language-specific single worker.
+        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
+        force: { type: boolean, default: false }
+        context_limit_tokens: { type: integer, default: 222000 }
+        single_pass_threshold_tokens: { type: integer, default: 170000 }
+        window_size_turns: { type: integer, default: 80 }
+        window_overlap_turns: { type: integer, default: 10 }
+        merge_max_input_tokens: { type: integer, default: 100000 }
+        estimated_tokens_per_turn: { type: integer, default: 1500 }
+        experiment_id: { type: string }
+        experiment_variant: { type: string }
+
+timeout:
+  after:
+    hours: 24
+
+do:
+  # Step 0: Resolve `updated_after_ms` (absolute wins). Same idiom
+  # as thread-summary-batch — see the rationale there.
+  - resolveUpdatedAfter:
+      set:
+        updated_after_ms: >-
+          ${ if $workflow.input.updated_after_ms != null
+             then $workflow.input.updated_after_ms
+             elif $workflow.input.updated_within_hours == null
+             then null
+             else ((now - ($workflow.input.updated_within_hours * 3600))
+                   * 1000 | floor)
+             end }
+
+  # Step 1a: Fetch by labels when labels_filter is non-empty.
+  - fetchByLabels:
+      if: "${ ($workflow.input.labels_filter // []) | length > 0 }"
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
+            json_body: >-
+              ${ ({
+                   labels: $workflow.input.labels_filter,
+                   match_mode: "LABEL_ALL",
+                   user_id: $workflow.input.user_id,
+                   updated_after: $updated_after_ms
+                 }
+                 | if $updated_after_ms == null then del(.updated_after) else . end
+                 | tojson) }
+            as_json: true
+      export:
+        as:
+          all_threads: ${ .jsonBody | fromjson }
+
+  # Step 1b: Fetch by user when no labels filter.
+  - fetchByUser:
+      if: "${ ($workflow.input.labels_filter // []) | length == 0 }"
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindThreadListByUserId"
+            json_body: >-
+              ${ ({
+                   user_id: { value: $workflow.input.user_id },
+                   updated_after: $updated_after_ms
+                 }
+                 | if $updated_after_ms == null then del(.updated_after) else . end
+                 | tojson) }
+            as_json: true
+      export:
+        as:
+          all_threads: ${ .jsonBody | fromjson }
+
+  # Step 2: Narrow by explicit thread_ids if provided.
+  - filterThreads:
+      set:
+        target_threads: >-
+          ${ if ($workflow.input.thread_ids // []) | length > 0
+             then $all_threads | map(select(
+               .id.value as $tid | $workflow.input.thread_ids | any(. == $tid)
+             ))
+             else $all_threads
+             end }
+
+  # Step 3: Fan out to the single-thread workflow per target.
+  # Errors are caught per-thread so one failing reflection does not
+  # halt the whole batch.
+  - reflectEach:
+      timeout:
+        after:
+          hours: 24
+      for:
+        each: thread
+        in: "${ $target_threads }"
+      onError: continue
+      do:
+        - invokeSingleWithRetry:
+            try:
+              - invokeSingle:
+                  timeout:
+                    after:
+                      minutes: 30
+                  run:
+                    function:
+                      workerName: '${ "memories-thread-reflection-single-" + $workflow.input.output_language }'
+                      arguments:
+                        input: >-
+                          ${ {
+                            user_id: $workflow.input.user_id,
+                            thread_id: ($thread.id.value | tonumber),
+                            memories_grpc_host: $workflow.input.memories_grpc_host,
+                            memories_grpc_port: $workflow.input.memories_grpc_port,
+                            memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                            llm_worker_name: $workflow.input.llm_worker_name,
+
+                            reflector_model: $workflow.input.reflector_model,
+                            reflector_base_url: $workflow.input.reflector_base_url,
+                            prompt_version: $workflow.input.prompt_version,
+                            reflector_id: $workflow.input.reflector_id,
+                            output_language: $workflow.input.output_language,
+                            force: $workflow.input.force,
+                            context_limit_tokens: $workflow.input.context_limit_tokens,
+                            single_pass_threshold_tokens: $workflow.input.single_pass_threshold_tokens,
+                            window_size_turns: $workflow.input.window_size_turns,
+                            window_overlap_turns: $workflow.input.window_overlap_turns,
+                            merge_max_input_tokens: $workflow.input.merge_max_input_tokens,
+                            estimated_tokens_per_turn: $workflow.input.estimated_tokens_per_turn,
+                            experiment_id: $workflow.input.experiment_id,
+                            experiment_variant: $workflow.input.experiment_variant
+                          }
+                          | with_entries(select(.value != null))
+                          | tojson }
+            catch:
+              as: error
+              do:
+                - logError:
+                    set:
+                      last_error: "${ $error }"
+
+output:
+  as:
+    completed: true
+    processed_threads: ${ $target_threads | length }

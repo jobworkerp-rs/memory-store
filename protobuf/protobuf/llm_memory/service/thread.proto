@@ -1,0 +1,406 @@
+syntax = "proto3";
+
+package llm_memory.service;
+
+import "llm_memory/data/common.proto";
+import "llm_memory/data/thread.proto";
+import "llm_memory/data/memory.proto";
+import "llm_memory/service/common.proto";
+
+// Response returned on thread creation. Carries the auto-assigned id.
+message CreateThreadResponse {
+    llm_memory.data.ThreadId id = 1;
+}
+
+// Response returned when a memory is attached to a thread via AddMemory.
+message AddMemoryResponse {
+    llm_memory.data.MemoryId id = 1;
+}
+
+// Response for a thread lookup. `data` is unset when no row matches.
+message OptionalThreadResponse {
+    optional llm_memory.data.Thread data = 1;
+}
+
+// Request to fetch threads owned by a given user.
+// The stream is ordered by `sort` (default: updated_at descending).
+message FindThreadListByUserIdRequest {
+    // Target user id (required).
+    llm_memory.data.UserId user_id = 1;
+    // Upper bound on the returned rows (all rows when unset).
+    optional int32 limit = 2;
+    // Number of records to skip from the start.
+    optional int64 offset = 3;
+
+    // Time-range filters (epoch ms). All bounds combine via AND.
+    // Lower bounds are strict (`> X`), upper bounds are inclusive (`<= X`),
+    // matching the FindMemoryListRequest convention. This differs from
+    // `ThreadSearchFilter` (used by the LanceDB path) where both bounds
+    // are exclusive — the two filter shapes have intentionally distinct
+    // semantics tied to their respective backends.
+    optional int64 created_after  = 4;
+    optional int64 created_before = 5;
+    optional int64 updated_after  = 6;
+    optional int64 updated_before = 7;
+    // Sort key. UNSPECIFIED = UPDATED_DESC (default).
+    optional llm_memory.data.ThreadListSort sort = 8;
+}
+
+// Request to attach a Memory to a Thread.
+// The Thread's updated_at is bumped as part of the call.
+message AddMemoryRequest {
+    // Target thread id (required).
+    llm_memory.data.ThreadId thread_id = 1;
+    // Memory payload to attach. `thread_id` is set server-side.
+    // The Thread's `default_system_memory_id` may be auto-injected
+    // into `parent_ids` — see ThreadData.default_system_memory_id.
+    llm_memory.data.MemoryData memory = 2;
+}
+
+// Paginated request to list the Memories attached to a Thread.
+message FindMemoriesByThreadIdRequest {
+    // Target thread id (required).
+    llm_memory.data.ThreadId thread_id = 1;
+    // Upper bound on the returned rows (all rows when unset).
+    optional int32 limit = 2;
+    // Number of records to skip from the start.
+    optional int64 offset = 3;
+    // MessageRole values to filter on (empty = all roles, OR logic).
+    repeated llm_memory.data.MessageRole roles = 4;
+    // ContentType values to filter on (empty = all types, OR logic).
+    repeated llm_memory.data.ContentType content_types = 5;
+}
+
+// parent_ids ancestor traversal.
+//
+// Starting from `start_memory_id`, walks the parent_ids chain in BFS
+// order and returns every Memory visited, sorted by
+// `thread_memory.position` ascending. The ancestor closure is also
+// scanned for the ROLE_SYSTEM Memory with the largest position,
+// which is returned as the "active system prompt".
+message ResolveAncestorClosureRequest {
+    // Thread to traverse under (required).
+    llm_memory.data.ThreadId thread_id = 1;
+    // Origin memory for the walk (required). Must be registered in
+    // the thread_memory junction under this thread, otherwise the
+    // call fails.
+    llm_memory.data.MemoryId start_memory_id = 2;
+    // Maximum number of hops traversed towards the ancestors
+    // (server default 1024, capped at 4096). The start memory
+    // itself does not count as a hop, so `max_depth = 1` means
+    // "start + its direct parents" and `max_depth = 0` is
+    // invalid_argument. True cycles in the parent graph are
+    // absorbed silently (the visited set prevents re-expansion),
+    // but extremely deep or cycle-amplified graphs can still hit
+    // this limit, which returns InvalidArgument as a safety net.
+    optional uint32 max_depth = 3;
+}
+
+// Lightweight wrapper pairing a Memory with its
+// `thread_memory.position`. Used in the ResolveAncestorClosure
+// response.
+message MemoryWithPosition {
+    llm_memory.data.Memory memory = 1;
+    int32 position = 2;
+}
+
+message ResolveAncestorClosureResponse {
+    // Ancestor closure sorted by thread_memory.position ascending,
+    // including the start memory itself.
+    repeated MemoryWithPosition ordered_memories = 1;
+    // ROLE_SYSTEM memory with the largest position inside the
+    // closure. Unset if none exists.
+    optional MemoryWithPosition system_memory = 2;
+}
+
+// ===== Label types and operation messages =====
+
+// Label with usage count (for distinct/search/co-occurring results)
+message LabelWithCount {
+    string label = 1;
+    int64 thread_count = 2;
+}
+
+message AddLabelsRequest {
+    llm_memory.data.ThreadId thread_id = 1;
+    repeated string labels = 2;
+}
+
+message RemoveLabelsRequest {
+    llm_memory.data.ThreadId thread_id = 1;
+    repeated string labels = 2;
+}
+
+message FindThreadListByLabelsRequest {
+    repeated string labels = 1;
+    optional llm_memory.data.LabelMatchMode match_mode = 2;
+    optional int32 limit = 3;
+    optional int64 offset = 4;
+    // User ID filter. When set, only threads owned by this user are returned.
+    optional int64 user_id = 5;
+
+    // Time-range filters (epoch ms). Applied on top of the label match.
+    // Same convention as FindThreadListByUserIdRequest.
+    optional int64 created_after  = 6;
+    optional int64 created_before = 7;
+    optional int64 updated_after  = 8;
+    optional int64 updated_before = 9;
+    // Sort key. UNSPECIFIED = UPDATED_DESC (default).
+    optional llm_memory.data.ThreadListSort sort = 10;
+}
+
+// Distinct label listing
+message FindDistinctLabelsRequest {
+    optional int64 user_id = 1;
+    optional int32 limit = 2;
+    optional int64 offset = 3;
+
+    // Time-range filters (epoch ms) on the underlying threads.
+    // Applied before label aggregation so the resulting `thread_count`
+    // reflects the filtered population. Same convention as
+    // FindThreadListByUserIdRequest.
+    optional int64 created_after  = 4;
+    optional int64 created_before = 5;
+    optional int64 updated_after  = 6;
+    optional int64 updated_before = 7;
+}
+
+message FindDistinctLabelsResponse {
+    repeated LabelWithCount labels = 1;
+}
+
+// Partial string search (LIKE) for label suggestion
+message SearchLabelsRequest {
+    // Substring to match (WHERE label LIKE '%query%')
+    string query = 1;
+    optional int64 user_id = 2;
+    // Default: 20
+    optional int32 limit = 3;
+
+    // Time-range filters (epoch ms) on the underlying threads.
+    // Same semantics as FindDistinctLabelsRequest above.
+    optional int64 created_after  = 4;
+    optional int64 created_before = 5;
+    optional int64 updated_after  = 6;
+    optional int64 updated_before = 7;
+}
+
+message SearchLabelsResponse {
+    repeated LabelWithCount labels = 1;
+}
+
+// Co-occurring labels: other labels on threads that share
+// all of the specified labels
+message FindCoOccurringLabelsRequest {
+    // Labels to match (AND: threads must have ALL of these)
+    repeated string labels = 1;
+    optional int64 user_id = 2;
+    optional int32 limit = 3;
+    optional int64 offset = 4;
+
+    // Time-range filters (epoch ms) on the underlying threads.
+    // ANDed with the label match so the co-occurrence aggregation
+    // runs only over the time-filtered population.
+    // Same convention as FindThreadListByUserIdRequest.
+    optional int64 created_after  = 5;
+    optional int64 created_before = 6;
+    optional int64 updated_after  = 7;
+    optional int64 updated_before = 8;
+}
+
+message FindCoOccurringLabelsResponse {
+    // Co-occurring labels, excluding the query labels themselves.
+    // Ordered by co_occurrence_count DESC, label ASC.
+    repeated LabelWithCount labels = 1;
+}
+
+// ===== Batch import types =====
+
+// Wrapper used by AddMemoriesBatch to upsert a thread keyed by
+// (user_id, channel). When the call resolves to an existing thread,
+// the optional fields here (description, default_system_memory_id, ...)
+// are ignored.
+message ThreadUpsertByChannel {
+    llm_memory.data.ThreadData thread_data = 1;
+}
+
+// One memory entry inside an AddMemoriesBatch call.
+//
+// IMPORTANT: `memory.parent_ids` MUST be empty. Parent references are
+// expressed via `parent_external_ids` and resolved by the server
+// against the per-batch eid_map (intra-batch refs + memories already
+// attached to the target thread). Sending a non-empty parent_ids
+// returns InvalidArgument. See spec §3.2.2.
+message BatchMemoryInput {
+    llm_memory.data.MemoryData memory = 1;
+    // External-id references to parents. Each must match either:
+    //   * the external_id of another item in this `memories[]` array
+    //     (forward references are allowed — Codex reordered rollouts
+    //     emit `function_call_output` before the matching
+    //     `function_call`, and the server resolves them in a
+    //     post-insert rewire pass); or
+    //   * the external_id of a memory already attached to the target
+    //     thread.
+    // Refs that match neither are silently dropped (warn-logged).
+    repeated string parent_external_ids = 2;
+}
+
+// Request for ThreadService.AddMemoriesBatch.
+message AddMemoriesBatchRequest {
+    // Either reuse an existing thread by id, or upsert by channel.
+    oneof thread_target {
+        llm_memory.data.ThreadId existing_thread_id = 1;
+        ThreadUpsertByChannel upsert = 2;
+    }
+    // Memories to insert in order. Server preserves array order in
+    // thread_memory.position assignment.
+    repeated BatchMemoryInput memories = 3;
+    // When true, external_id collisions return the existing memory_id
+    // and with content overwrite. When false, the call fails on
+    // collision with AlreadyExists. The "existing memory must already
+    // belong to THIS thread" rule applies regardless of this flag.
+    bool upsert_by_external_id = 4;
+    // When > 0, the server sets thread.updated_at to
+    // `max(current, this value)` at the end of the batch — the
+    // override only moves updated_at forward, never backwards, so
+    // differential imports and high-watermark consumers
+    // (`updated_after >= ...` filters, summarize-after) cannot drop
+    // the thread when the source's recorded session time is older
+    // than the live row. 0 means no override (updated_at bumps
+    // naturally as memories are appended).
+    int64 thread_updated_at_override = 5;
+    // Labels to attach idempotently after the batch commits.
+    repeated string labels = 6;
+}
+
+// Per-input outcome inside AddMemoriesBatch. Order matches request.
+message AddMemoryOutcome {
+    llm_memory.data.MemoryId memory_id = 1;
+    // false means an existing memory (matched by external_id) was reused.
+    bool created = 2;
+    // Position assigned in thread_memory. For reused memories that
+    // were already attached, this is the existing position.
+    int32 position = 3;
+    // For created == false: whether the existing memory's parent_ids
+    // was empty when observed. Used by the importer to gate parent
+    // rewire — only fill when previously empty.
+    // For created == true: always false (irrelevant).
+    bool existing_parent_ids_empty = 4;
+    // Parent MemoryIds that this entry's parent_external_ids resolved
+    // to via the server-side eid_map. Order-preserved, deduplicated by
+    // memory_id.value. Unresolvable refs are silently dropped.
+    // For created == true: these were merged into the new memory's
+    // parent_ids before INSERT (informational).
+    // For created == false: importer uses these as the parent_ids
+    // input for UpdateMemoryParents when triggering rewire.
+    repeated llm_memory.data.MemoryId resolved_parent_ids = 5;
+}
+
+message AddMemoriesBatchResponse {
+    llm_memory.data.ThreadId thread_id = 1;
+    // false means an existing thread (matched by channel) was reused.
+    bool thread_created = 2;
+    repeated AddMemoryOutcome outcomes = 3;
+}
+
+// Why an UpdateMemoryParents call was a no-op.
+enum UpdateMemoryParentsSkipReason {
+    UPDATE_MEMORY_PARENTS_SKIP_UNSPECIFIED = 0;
+    // Memory is attached to more than one thread; blocked unless
+    // force_overwrite_when_shared.
+    UPDATE_MEMORY_PARENTS_SKIP_SHARED_MEMORY = 1;
+    // Memory's current parent_ids is non-empty; blocked unless
+    // force_overwrite_when_non_empty.
+    UPDATE_MEMORY_PARENTS_SKIP_ALREADY_HAS_PARENTS = 2;
+}
+
+message UpdateMemoryParentsRequest {
+    llm_memory.data.ThreadId thread_id = 1;
+    llm_memory.data.MemoryId memory_id = 2;
+    // New parent set. Server validates only that each id EXISTS in
+    // the memory table. Dangling refs are silently dropped (matches
+    // the existing ThreadApp::update_memory_parent_ids behavior).
+    repeated llm_memory.data.MemoryId parent_ids = 3;
+    // DANGER: when true, allow overwriting parent_ids of a memory
+    // attached to more than one thread. Default (false) skips with
+    // SHARED_MEMORY.
+    bool force_overwrite_when_shared = 4;
+    // DANGER: when true, allow overwriting non-empty parent_ids.
+    // Default (false) skips with ALREADY_HAS_PARENTS.
+    bool force_overwrite_when_non_empty = 5;
+}
+
+message UpdateMemoryParentsResponse {
+    // false means the call was a no-op due to a guard.
+    bool rewired = 1;
+    // Populated when rewired = false. UNSPECIFIED when rewired = true.
+    UpdateMemoryParentsSkipReason skip_reason = 2;
+}
+
+// Service that exposes CRUD and search for threads. Used to manage
+// conversation threads. Deleting a Thread cascades to all attached
+// Memories.
+service ThreadService {
+    // Create a new thread and return its assigned id.
+    rpc Create(llm_memory.data.ThreadData) returns (CreateThreadResponse);
+    // Update an existing thread (identified by id).
+    rpc Update(llm_memory.data.Thread) returns (SuccessResponse);
+    // Delete the thread with the given id along with every
+    // attached Memory.
+    rpc Delete(llm_memory.data.ThreadId) returns (SuccessResponse);
+    // Fetch a single thread by id.
+    rpc Find(llm_memory.data.ThreadId) returns (OptionalThreadResponse);
+    // Stream threads in id-descending order with pagination.
+    rpc FindList(FindListRequest) returns (stream llm_memory.data.Thread);
+    // Stream threads owned by a user in updated_at descending
+    // order.
+    rpc FindThreadListByUserId(FindThreadListByUserIdRequest) returns (stream llm_memory.data.Thread);
+    // Attach a Memory to a thread and return its assigned id.
+    // Bumps the Thread's updated_at; may auto-inject the Thread's
+    // `default_system_memory_id` into `parent_ids`.
+    rpc AddMemory(AddMemoryRequest) returns (AddMemoryResponse);
+    // Stream the Memories attached to a thread, in created_at
+    // ascending (chronological) order.
+    rpc FindMemoriesByThreadId(FindMemoriesByThreadIdRequest) returns (stream llm_memory.data.Memory);
+    // Return the total number of threads matching the condition.
+    rpc Count(FindCondition) returns (CountResponse);
+    // Walk parent_ids recursively to build the ancestor closure, and
+    // return the ROLE_SYSTEM Memory with the largest position inside
+    // that closure as the "active system prompt". Used by LLM-execution
+    // callers that need both history reconstruction and system-prompt
+    // selection in one trip.
+    rpc ResolveAncestorClosure(ResolveAncestorClosureRequest) returns (ResolveAncestorClosureResponse);
+
+    // ===== Label operations =====
+
+    // Add labels to a thread (idempotent).
+    rpc AddLabels(AddLabelsRequest) returns (SuccessResponse);
+    // Remove labels from a thread (idempotent).
+    rpc RemoveLabels(RemoveLabelsRequest) returns (SuccessResponse);
+    // Find threads by label match (ANY or ALL mode).
+    rpc FindThreadListByLabels(FindThreadListByLabelsRequest) returns (stream llm_memory.data.Thread);
+    // Get distinct labels with usage count.
+    rpc FindDistinctLabels(FindDistinctLabelsRequest) returns (FindDistinctLabelsResponse);
+    // Search labels by substring (LIKE) for suggestion.
+    rpc SearchLabels(SearchLabelsRequest) returns (SearchLabelsResponse);
+    // Find co-occurring labels on threads sharing the specified labels.
+    rpc FindCoOccurringLabels(FindCoOccurringLabelsRequest) returns (FindCoOccurringLabelsResponse);
+
+    // ===== Batch import =====
+
+    // Idempotent batch insertion of memories under a thread. Creates
+    // the thread (by channel) if not present, otherwise reuses it.
+    // Embeddings are dispatched server-side, matching AddMemory
+    // semantics. default_system_memory_id auto-injection is disabled
+    // for this call so the source transcript's parent graph is
+    // preserved verbatim.
+    rpc AddMemoriesBatch(AddMemoriesBatchRequest) returns (AddMemoriesBatchResponse);
+
+    // Re-wire parent_ids of an existing memory. Validates parent
+    // existence, updates memory.parent_ids, and attaches those parents
+    // to thread_memory (junction). All three steps are atomic.
+    // Defaults are safe: parent_ids overwrite is blocked when the
+    // memory is shared across threads or already has non-empty
+    // parent_ids; override flags must be set explicitly.
+    rpc UpdateMemoryParents(UpdateMemoryParentsRequest) returns (UpdateMemoryParentsResponse);
+}

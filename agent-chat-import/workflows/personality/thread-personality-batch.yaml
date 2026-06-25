@@ -1,0 +1,309 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: thread-personality-batch
+  version: "1.0.0"
+
+# Batch driver for thread-personality-single. Mirrors
+# thread-summary-batch (label / user / time-window filtering plus
+# per-thread fan-out through the WORKFLOW runner) and pins the
+# memory thread label to "personality".
+
+input:
+  schema:
+    document:
+      type: object
+      required: [user_id, memories_grpc_host, memories_grpc_port]
+      properties:
+        user_id: { type: integer }
+        memories_grpc_host: { type: string, default: "localhost" }
+        memories_grpc_port: { type: integer, default: 9100 }
+        thread_ids:
+          type: array
+          items: { type: integer }
+          description: When specified, only these threads are processed.
+        labels_filter:
+          type: array
+          items: { type: string }
+          description: When specified, only threads carrying these labels are targeted.
+        updated_within_hours:
+          type: integer
+          minimum: 1
+          description: >-
+            When specified, only threads whose `updated_at` is within the
+            past N hours measured from this workflow's execution time
+            are targeted. `updated_after_ms` takes precedence when both
+            are set.
+        updated_after_ms:
+          type: integer
+          minimum: 0
+          description: >-
+            Absolute lower bound (epoch ms) for `updated_at`. Takes
+            precedence over `updated_within_hours`. memories-import
+            forwards `--since` here so the window stays exactly aligned
+            with the imported set.
+        merge_enabled:
+          type: boolean
+          default: false
+          description: >-
+            When true, invoke the registered user-personality-merge
+            language worker once after the per-thread signal pass.
+            False runs layer-1 signals only.
+        memories_grpc_tls: { type: boolean, default: false }
+        llm_worker_name:
+          type: string
+          default: "memories-llm"
+          description: >-
+            Named worker for LLM completion, forwarded to single +
+            merge invocations.
+        min_message_count: { type: integer, default: 4 }
+        min_user_messages: { type: integer, default: 2 }
+        max_context_chars: { type: integer, default: 200000 }
+        personality_model: { type: string, default: "qwen3.6:27b" }
+        ollama_base_url: { type: string, default: "http://localhost:11434" }
+        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
+        force_reextract: { type: boolean, default: false }
+        personality_user_id:
+          type: integer
+          default: 200000
+          description: Owner user ID for personality memory threads. Spec §2.2.
+        summary_user_id:
+          type: integer
+          default: 100000
+          description: >-
+            Reference value for collision detection only. Forwarded to
+            thread-personality-single so it can fail-fast if
+            `personality_user_id == summary_user_id`.
+
+timeout:
+  after:
+    hours: 24
+
+do:
+  - normalizePersonalityUserId:
+      set:
+        effective_personality_user_id: "${ $workflow.input.personality_user_id // 200000 }"
+        effective_summary_user_id: "${ $workflow.input.summary_user_id // 100000 }"
+        merge_enabled: "${ $workflow.input.merge_enabled // false }"
+        # Default false; flipped to true only when invokeMerge exports it,
+        # so a `try/catch` swallow of merge failure surfaces as merged=false.
+        merge_invoked: "${ false }"
+
+  # See thread-personality-single for the rationale of these two guards.
+  - failOnSelfOwnedPersonality:
+      if: "${ $effective_personality_user_id == $workflow.input.user_id }"
+      raise:
+        error:
+          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
+          status: 400
+          title: "personality_user_id must differ from user_id"
+          detail: >-
+            ${ "personality_user_id (" + ($effective_personality_user_id | tostring)
+               + ") must differ from user_id ("
+               + ($workflow.input.user_id | tostring)
+               + ") to prevent recursive personality extraction." }
+
+  - failOnSummaryUserCollision:
+      if: "${ $effective_personality_user_id == $effective_summary_user_id }"
+      raise:
+        error:
+          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
+          status: 400
+          title: "personality_user_id must differ from summary_user_id"
+          detail: >-
+            ${ "personality_user_id (" + ($effective_personality_user_id | tostring)
+               + ") must differ from summary_user_id ("
+               + ($effective_summary_user_id | tostring)
+               + ") to keep the two extraction domains disjoint." }
+
+  # Resolve effective `updated_after` lower bound (epoch ms): absolute
+  # wins over relative, null clears the field so the server applies
+  # no lower bound. Same shape as thread-summary-batch.
+  - resolveUpdatedAfter:
+      set:
+        updated_after_ms: >-
+          ${ if $workflow.input.updated_after_ms != null
+             then $workflow.input.updated_after_ms
+             elif $workflow.input.updated_within_hours == null
+             then null
+             else ((now - ($workflow.input.updated_within_hours * 3600))
+                   * 1000 | floor)
+             end }
+
+  - fetchByLabels:
+      if: "${ ($workflow.input.labels_filter // []) | length > 0 }"
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: false
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
+            json_body: >-
+              ${ ({
+                   labels: $workflow.input.labels_filter,
+                   match_mode: "LABEL_ALL",
+                   user_id: $workflow.input.user_id,
+                   updated_after: $updated_after_ms
+                 }
+                 | if $updated_after_ms == null then del(.updated_after) else . end
+                 | tojson) }
+            as_json: true
+      export:
+        as:
+          all_threads: ${ .jsonBody | fromjson }
+
+  - fetchByUser:
+      if: "${ ($workflow.input.labels_filter // []) | length == 0 }"
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: false
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindThreadListByUserId"
+            json_body: >-
+              ${ ({
+                   user_id: { value: $workflow.input.user_id },
+                   updated_after: $updated_after_ms
+                 }
+                 | if $updated_after_ms == null then del(.updated_after) else . end
+                 | tojson) }
+            as_json: true
+      export:
+        as:
+          all_threads: ${ .jsonBody | fromjson }
+
+  # Defensive personality-thread filter (invariant I1 guard). Step 0b
+  # already catches `personality_user_id == user_id` under nominal
+  # config; this exists for the misconfigured run where that guard
+  # is bypassed (e.g. lowered `min_message_count`). Match on the
+  # full 3-label tuple `[personality, user:<src>, thread:<id>]` so
+  # we don't accidentally exclude a regular source thread that
+  # happens to carry a literal "personality" label among unrelated
+  # ones — `thread:<id>` only ever appears on personality memory
+  # threads, so AND-ing all three is a precise signature.
+  - filterThreads:
+      set:
+        target_threads: >-
+          ${ ( $all_threads
+               | map(select(
+                   (.data.labels // []) as $lbls
+                   | (
+                       ($lbls | any(. == "personality"))
+                       and ($lbls | any(. == ("user:" + ($workflow.input.user_id | tostring))))
+                       and ($lbls | any(startswith("thread:")))
+                     ) | not
+                 )) ) as $clean
+             | if ($workflow.input.thread_ids // []) | length > 0
+               then $clean | map(select(
+                 .id.value as $tid | $workflow.input.thread_ids | any(. == $tid)
+               ))
+               else $clean
+               end }
+
+  # Per-thread fan-out. `onError: continue` isolates failures so one
+  # bad thread does not block the rest of the batch.
+  - personalityEach:
+      timeout:
+        after:
+          hours: 24
+      for:
+        each: thread
+        in: "${ $target_threads }"
+      onError: continue
+      do:
+        - invokeSingleWithRetry:
+            try:
+              - invokeSingle:
+                  timeout:
+                    after:
+                      minutes: 30
+                  run:
+                    function:
+                      workerName: '${ "memories-thread-personality-single-" + $workflow.input.output_language }'
+                      arguments:
+                        input: >-
+                          ${ {
+                            user_id: $workflow.input.user_id,
+                            thread_id: ($thread.id.value | tonumber),
+                            memories_grpc_host: $workflow.input.memories_grpc_host,
+                            memories_grpc_port: $workflow.input.memories_grpc_port,
+                            memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                            llm_worker_name: $workflow.input.llm_worker_name,
+                            min_message_count: $workflow.input.min_message_count,
+                            min_user_messages: $workflow.input.min_user_messages,
+                            max_context_chars: $workflow.input.max_context_chars,
+                            personality_model: $workflow.input.personality_model,
+                            ollama_base_url: $workflow.input.ollama_base_url,
+                            output_language: $workflow.input.output_language,
+                            force_reextract: $workflow.input.force_reextract,
+                            personality_user_id: $effective_personality_user_id,
+                            summary_user_id: $effective_summary_user_id
+                          } | tojson }
+            catch:
+              as: error
+              do:
+                - logError:
+                    set:
+                      last_error: "${ $error }"
+
+  # Layer 2: aggregate the per-thread signals into the single user-level
+  # profile. Lives inside the batch so both dispatch paths — the import
+  # pipeline and a standalone batch invocation (UI "regenerate
+  # personality" button) — produce a profile without external two-step
+  # orchestration. The merge is internally idempotent, so it can be
+  # invoked unconditionally whenever `merge_enabled` is true.
+  #
+  # `try/catch` keeps a merge failure non-fatal: layer-1 signals are
+  # already persisted, so the batch still reports success and the merge
+  # can be retried on the next run.
+  - userPersonalityMerge:
+      if: "${ $merge_enabled }"
+      timeout:
+        after:
+          hours: 1
+      try:
+        - invokeMerge:
+            run:
+              function:
+                workerName: '${ "memories-user-personality-merge-" + $workflow.input.output_language }'
+                arguments:
+                  input: >-
+                    ${ {
+                      user_id: $workflow.input.user_id,
+                      memories_grpc_host: $workflow.input.memories_grpc_host,
+                      memories_grpc_port: $workflow.input.memories_grpc_port,
+                      memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                      llm_worker_name: $workflow.input.llm_worker_name,
+                      personality_user_id: $effective_personality_user_id,
+                      summary_user_id: $effective_summary_user_id,
+                      max_context_chars: $workflow.input.max_context_chars,
+                      output_language: $workflow.input.output_language,
+                      force_remerge: false,
+                      max_signals: 200
+                    } | tojson }
+            export:
+              as:
+                merge_invoked: true
+      catch:
+        as: error
+        do:
+          - logMergeError:
+              set:
+                merge_error: "${ $error }"
+
+output:
+  as:
+    completed: true
+    processed_threads: ${ $target_threads | length }
+    merge_enabled: ${ $merge_enabled }
+    merged: ${ $merge_invoked }

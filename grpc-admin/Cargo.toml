@@ -1,0 +1,114 @@
+[package]
+name = "grpc-admin"
+version = "0.0.1"
+authors = ["sutr"]
+edition = "2024"
+
+[[bin]]
+name = "front"
+path = "src/bin/front.rs"
+
+# Image memory Phase 4 required deliverable (spec §5.4 / design 3/3 §15):
+# converts existing `metadata.attachment` rows into `media_object`. Reads
+# the attachment JSON's `storage` string directly, so it does NOT depend
+# on the `agent-chat-import` crate (the enum type is not needed — only
+# its serialized discriminant).
+[[bin]]
+name = "migrate-attachment-to-media"
+path = "src/bin/migrate_attachment_to_media.rs"
+
+# Deferred media GC sweep: reclaims orphaned media_object rows / leaked
+# storage objects the immediate ref_count path missed (server restart,
+# crash, storage-delete failure). Reuses the MediaObjectRepository GC
+# scans and MediaApp::finish_delete delete discipline.
+[[bin]]
+name = "cleanup-orphan-media"
+path = "src/bin/cleanup_orphan_media.rs"
+
+# Phase 3's one-shot data migration binary (`migrate_sp_to_memory`) was
+# removed in Phase 4. Phase 4 assumes that every production environment has
+# already run Phase 3 end-to-end; the Phase 4 SQL drop scripts physically
+# remove `memory.thread_id`, which would make Phase 3's legacy INSERT fail.
+
+[dependencies]
+
+command-utils = { path = "../modules/command-utils" }
+infra-utils = { path = "../modules/infra-utils" }
+
+protobuf = { path = "../protobuf" }
+infra = { path = "../infra" }
+app = { path = "../app" }
+
+# Used to upsert RAG worker / function_set definitions on startup when
+# MEMORY_RAG_TOOLS_ENABLED=true. The RAG tools target MemoryVectorService /
+# ThreadVectorService, which are part of the always-on LanceDB stack.
+jobworkerp-client = { path = "../modules/jobworkerp-client" }
+# Needed by rag_tools to inline `$file:` workflow includes with nested
+# env-var expansion before handing the manifest to jobworkerp-client.
+serde_yaml = { version = "0.9" }
+
+
+anyhow = { workspace = true }
+async-stream = { workspace = true }
+# Streaming media Upload chunk type (MediaService).
+bytes = { workspace = true }
+# CLI args for the migrate-attachment-to-media binary.
+clap = { workspace = true }
+debug_stub_derive = { workspace = true }
+dotenvy = { workspace = true }
+futures = { workspace = true }
+# migrate-attachment-to-media: decode inline_base64 payloads before
+# handing the bytes to MediaApp::upload (which hashes / stores them).
+base64 = { workspace = true }
+# Parsing the `metadata.attachment` JSON in migrate-attachment-to-media.
+serde_json = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+sqlx = { workspace = true, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "any",
+    "macros",
+    "chrono",
+] }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+tonic-reflection = { workspace = true }
+tonic-health = { workspace = true }
+tonic-web = { workspace = true }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+    "parking_lot",
+] }
+tracing = { workspace = true }
+#tracing-attributes = { workspace = true }
+#tracing-futures = { workspace = true }
+tracing-subscriber = { workspace = true, features = [
+    "tracing-log",
+    "env-filter",
+] }
+
+
+[features]
+default = ["sqlx/sqlite"]
+postgres = ["sqlx/postgres", "infra/postgres", "infra-utils/postgres", "app/postgres"]
+# Pulls `lindera/lindera-tantivy` into the LanceDB FTS builder for
+# Japanese/Korean tokenization. Requires dictionary files at runtime.
+lindera = ["infra/lindera", "app/lindera"]
+
+[dev-dependencies]
+serial_test = "3"
+# Client-streaming Upload in the #[ignore] image-memory e2e test.
+tokio-stream = { workspace = true }
+# `infra::test_helper::shared_id_generator` (one monotonic Snowflake
+# bucket) for the cleanup-orphan-media sweep e2e: separate
+# IdGeneratorWrapper::new() calls within a millisecond collide on
+# media_object.id.
+infra = { path = "../infra", features = ["test-helper"] }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }

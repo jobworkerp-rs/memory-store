@@ -1,0 +1,167 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: auto-reflection-intent-embedding
+  version: "1.0.0"
+
+# F-G11 (b) Intent embedding pipeline for reflection memories.
+#
+# `task_intent` lives in `reflection.metadata.eval.task_intent` and is
+# semantically distinct from `memory.content` (= summary). To keep
+# `FindSimilarTrajectories` (F-S3) and `FindSimilarByIntentText` (F-S8)
+# from being polluted by post-mortem summary content, intent
+# embeddings are stored in a dedicated LanceDB table
+# (`reflection_intent_vector`, see REFLECTION_LANCEDB_URI).
+#
+# Input shape MUST match `EmbeddingDispatcherCore::build_job_args_json`,
+# which hard-codes `{ "<id_field_name>": <id>, "content": <text> }`
+# across every dispatcher. The intent-side `id_field_name` is
+# `reflection_id` (see `ReflectionIntentDispatcher::SPEC`); the text
+# payload arrives as `content` even though it semantically carries
+# `task_intent`. Renaming `content` to `intent_text` here would make
+# schema validation fail at the auto-dispatch entry point and leave
+# every intent embedding stuck at PENDING.
+#
+# Same try/catch shape as the summary path: status updates fire on
+# every terminal branch. Additionally, an empty intent payload short-
+# circuits to FAILED("empty_intent") BEFORE the try block — embedding
+# the empty string against the LLM produces an indistinguishable
+# zero/near-zero vector that would pollute similarity search.
+input:
+  schema:
+    document:
+      type: object
+      required: [reflection_id, content]
+      properties:
+        reflection_id:
+          type: integer
+        content:
+          type: string
+          description: task_intent text (named `content` to match the dispatcher).
+
+do:
+  # Step 0: gate empty intent payload. The failure-fallback path in
+  # `thread-reflection-single.yaml` may produce a reflection with
+  # task_intent = "" when the original thread lacks a ROLE_USER turn;
+  # we record FAILED rather than embedding the empty string and
+  # silently corrupting the vector store.
+  # A conditional runTask + `then: exit` (NOT a doTask wrapping the
+  # child run): the jobworkerp-rs DSL validator rejects the `if` + `do`
+  # (doTask) form, and `then`/`else` carrying a nested `do` is not a
+  # valid Task at all ("did not match any variant of untagged enum
+  # Task"). Use the taskBase `if` directly on the run, and the flow
+  # directive `then: exit` to short-circuit the rest of the workflow.
+  - markEmptyAsFailed:
+      if: "${ (($workflow.input.content // \"\") | length) == 0 }"
+      run:
+        worker:
+          name: memories-mark-reflection-embedding-status
+          arguments:
+            json_body: >-
+              ${ {
+                reflection_id: { value: $workflow.input.reflection_id },
+                kind: "EMBEDDING_KIND_INTENT",
+                status: "EMBEDDING_STATUS_FAILED",
+                error_reason: "empty_intent"
+              } | tojson }
+      then: exit
+
+  - embedAndUpsert:
+      try:
+        do:
+          - generateIntentEmbedding:
+              run:
+                worker:
+                  name: "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}"
+                  using: embed_text
+                  arguments:
+                    text: "${$workflow.input.content}"
+              # N-row: store every chunk. `embed_text` chunks long text;
+              # `text_rows` builds one VectorRow per chunk (vector_kind
+              # "text", chunk_index from the 0-based array index). A
+              # model-declined short input yields an empty `embeddings`
+              # array → `text_rows == []`, handled as a stale-delete below.
+              output:
+                as:
+                  model_name: "${ .model_info.model_name? // \"unknown\" }"
+                  text_rows: >-
+                    ${ [ .embeddings | to_entries[] | {
+                          vector_kind: "text",
+                          chunk_index: .key,
+                          begin_position: .value.begin_position,
+                          end_position: .value.end_position,
+                          content: .value.content,
+                          embedding: { values: .value.values }
+                        } ] }
+
+          - upsertIntentEmbedding:
+              run:
+                worker:
+                  name: memories-upsert-reflection-intent-embedding
+                  arguments:
+                    json_body: >-
+                      ${ {
+                        reflection_id: { value: $workflow.input.reflection_id },
+                        embedding_model: (.model_name // "unknown"),
+                        replace_kinds: ["text"],
+                        rows: .text_rows
+                      } | tojson }
+              # `BatchUpsertIntentEmbeddings` answers
+              # `{success_count, failure_count, errors}`. success_count==0
+              # means no LanceDB row was written (currently: empty `rows`
+              # because the embedding model declined the input). The next
+              # step branches on this so we never mark the sidecar OK when
+              # no vector was persisted — leaving sidecar
+              # `intent_embedding_status=OK` with no LanceDB row makes
+              # `FindSimilarTrajectories` / `FindSimilarByIntentText`
+              # NotFound the row they should have ranked.
+              export:
+                as:
+                  upsert_skipped: >-
+                    ${ ((.jsonBody // "{}") | fromjson | (.success_count // 0)) == 0 }
+
+          # Status bookkeeping — branch on whether the server actually
+          # persisted a row. The DSL has no if/then/else task and rejects
+          # doTask-wrapped branches, so the two outcomes are two
+          # mutually-exclusive conditional runTasks (one `if`, the other
+          # its negation). Exactly one fires per run.
+          - markIntentStatusEmptyEmbedding:
+              if: "${ $upsert_skipped }"
+              run:
+                worker:
+                  name: memories-mark-reflection-embedding-status
+                  arguments:
+                    json_body: >-
+                      ${ {
+                        reflection_id: { value: $workflow.input.reflection_id },
+                        kind: "EMBEDDING_KIND_INTENT",
+                        status: "EMBEDDING_STATUS_FAILED",
+                        error_reason: "empty_embedding"
+                      } | tojson }
+          - markIntentStatusOk:
+              if: "${ $upsert_skipped | not }"
+              run:
+                worker:
+                  name: memories-mark-reflection-embedding-status
+                  arguments:
+                    json_body: >-
+                      ${ {
+                        reflection_id: { value: $workflow.input.reflection_id },
+                        kind: "EMBEDDING_KIND_INTENT",
+                        status: "EMBEDDING_STATUS_OK"
+                      } | tojson }
+      catch:
+        as: err
+        do:
+          - markIntentStatusFailed:
+              run:
+                worker:
+                  name: memories-mark-reflection-embedding-status
+                  arguments:
+                    json_body: >-
+                      ${ {
+                        reflection_id: { value: $workflow.input.reflection_id },
+                        kind: "EMBEDDING_KIND_INTENT",
+                        status: "EMBEDDING_STATUS_FAILED",
+                        error_reason: ($err | tostring)
+                      } | tojson }

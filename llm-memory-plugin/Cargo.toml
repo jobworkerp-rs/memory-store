@@ -1,0 +1,38 @@
+[package]
+name = "llm-memory-plugin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+infra-utils = { path = "../modules/infra-utils" }
+jobworkerp-client = { path = "../modules/jobworkerp-client" }
+protobuf = { path = "../protobuf" }
+
+clap = { workspace = true }
+anyhow = { workspace = true }
+command-utils = { workspace = true }
+dotenvy = { workspace = true }
+futures = { workspace = true }
+prost = { workspace = true }
+prost-build = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+
+[lints]
+workspace = true

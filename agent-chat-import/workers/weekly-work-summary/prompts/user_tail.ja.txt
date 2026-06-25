@@ -1,0 +1,5 @@
+上記の summary_json は daily-work-summary が生成した構造化要約 (overall_purpose / purpose_groups / by_topic / carryover) を含む JSON 文字列です。
+これらを読み、当週のユーザの作業を目的別・トピック別に再整理し、週内の動向 (trends) を抽出した JSON を返してください。
+自由記述フィールドはすべて日本語で書いてください。
+source_memory_ids には上記の memory_id を文字列としてそのまま入れてください。thread_id ではありません。
+コード、コマンド、ファイルパス、API 名、ツール名、enum 値、ログ断片は英語のまま正確に残してください。

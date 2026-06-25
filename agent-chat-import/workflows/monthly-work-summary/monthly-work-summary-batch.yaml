@@ -1,0 +1,185 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: monthly-work-summary-batch
+  version: "1.0.0"
+
+# Generates monthly-work-summary-single for a month range. Use this for
+# back-fills or manual re-runs over multiple months. Cron-style monthly
+# execution should call monthly-work-summary-single directly with no
+# `target_month` (defaults to "last completed month").
+
+input:
+  schema:
+    document:
+      type: object
+      properties:
+        source_user_id: { type: integer, default: 100000 }
+        memories_grpc_host: { type: string, default: "localhost" }
+        memories_grpc_port: { type: integer, default: 9100 }
+        memories_grpc_tls: { type: boolean, default: false }
+        llm_worker_name: { type: string, default: "memories-llm" }
+        start_month:
+          type: string
+          default: ""
+          description: >-
+            Month token "YYYY-MM" or empty. Empty = use last_n_months
+            (or fall back to "last completed month only"). When
+            non-empty, end_month must also be set; (start, end) wins
+            over last_n_months.
+        end_month:
+          type: string
+          default: ""
+          description: Inclusive end month ("YYYY-MM") or empty.
+        last_n_months:
+          type: integer
+          default: 0
+          description: >-
+            Last N months ending the previous fully-completed month
+            (in tz). 0 = unused (falls back to start/end or "last
+            month only").
+        timezone_offset_hours: { type: integer, minimum: 0, maximum: 23, default: 9 }
+        weekly_label: { type: string, default: "weekly_summary" }
+        monthly_label: { type: string, default: "monthly_summary" }
+        extra_labels_filter:
+          type: array
+          items: { type: string }
+          default: []
+        min_thread_count: { type: integer, default: 1 }
+        max_context_chars: { type: integer, default: 200000 }
+        summary_model: { type: string, default: "qwen3.6:27b" }
+        ollama_base_url: { type: string, default: "http://localhost:11434" }
+        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
+        force_resummarize: { type: boolean, default: false }
+
+timeout:
+  after:
+    hours: 24
+
+do:
+  # Step 1: Resolve the month list. Modes (in priority order):
+  #   range:       (start_month, end_month) inclusive
+  #   last-N:      last_n_months ending the previous completed month
+  #   fallback:    [last_month] only
+  #
+  # Month math runs in "year * 12 + month_index" ordinal space to
+  # avoid DST/leap traps. See monthly-work-summary-single.yaml for
+  # the strftime/mktime UTC-as-if rationale.
+  - resolveLastMonthToken:
+      set:
+        last_month_token: >-
+          ${ ((((now + ($workflow.input.timezone_offset_hours * 3600))
+                 | strftime("%Y-%m-01T00:00:00Z"))
+                | strptime("%Y-%m-%dT%H:%M:%SZ")
+                | mktime) - 1)
+             | strftime("%Y-%m") }
+
+  - resolveMonthRange:
+      set:
+        # Month math runs in "year * 12 + (month - 1)" ordinal space
+        # to avoid leap-year / DST traps. `as $p | ...` binds the
+        # split() result before array indexing because jaq's pipe
+        # precedence inside [...] mishandles `split("-") | [.[0]|...,
+        # .[1]|...]` directly.
+        month_list: >-
+          ${ if $workflow.input.start_month != ""
+                and $workflow.input.end_month != ""
+             then
+               (($workflow.input.start_month | split("-")) as $sp
+                | (($sp[0] | tonumber) * 12 + (($sp[1] | tonumber) - 1)) as $s
+                | ($workflow.input.end_month | split("-")) as $ep
+                | (($ep[0] | tonumber) * 12 + (($ep[1] | tonumber) - 1)) as $e
+                | [range($s; $e + 1)]
+                | map(((. / 12) | floor) as $y
+                      | (. - $y * 12 + 1) as $m
+                      | ($y | tostring) + "-"
+                        + ($m | tostring
+                           | if length == 1 then "0" + . else . end)))
+             elif $workflow.input.last_n_months > 0
+             then
+               (($last_month_token | split("-")) as $lp
+                | (($lp[0] | tonumber) * 12 + (($lp[1] | tonumber) - 1)) as $base
+                | [range(0; $workflow.input.last_n_months)]
+                | map(($base - .) as $idx
+                      | (($idx / 12) | floor) as $y
+                      | ($idx - $y * 12 + 1) as $m
+                      | ($y | tostring) + "-"
+                        + ($m | tostring
+                           | if length == 1 then "0" + . else . end))
+                | reverse)
+             else
+               [$last_month_token]
+             end }
+
+  # Step 1.5: Initialize accumulators so the for-loop below can append
+  # to them and the output block can reference them even when zero
+  # iterations ran.
+  - initOutcomeAccumulators:
+      set:
+        succeeded_months: "${ [] }"
+        failed_months: "${ [] }"
+        last_error: "${ null }"
+
+  # Step 2: For each month, dispatch monthly-work-summary-single.
+  # Failures in one month must not abort the rest of the range.
+  - summarizeEachMonth:
+      timeout:
+        after:
+          hours: 24
+      for:
+        each: target_month
+        in: "${ $month_list }"
+      onError: continue
+      do:
+        - invokeSingleWithRetry:
+            try:
+              - invokeSingle:
+                  timeout:
+                    after:
+                      minutes: 30
+                  run:
+                    function:
+                      workerName: '${ "memories-monthly-work-summary-single-" + $workflow.input.output_language }'
+                      arguments:
+                        input: >-
+                          ${ {
+                            source_user_id: $workflow.input.source_user_id,
+                            target_month: $target_month,
+                            timezone_offset_hours: $workflow.input.timezone_offset_hours,
+                            memories_grpc_host: $workflow.input.memories_grpc_host,
+                            memories_grpc_port: $workflow.input.memories_grpc_port,
+                            memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                            llm_worker_name: $workflow.input.llm_worker_name,
+
+
+                            weekly_label: $workflow.input.weekly_label,
+                            monthly_label: $workflow.input.monthly_label,
+                            extra_labels_filter: $workflow.input.extra_labels_filter,
+                            min_thread_count: $workflow.input.min_thread_count,
+                            max_context_chars: $workflow.input.max_context_chars,
+                            summary_model: $workflow.input.summary_model,
+                            ollama_base_url: $workflow.input.ollama_base_url,
+                            output_language: $workflow.input.output_language,
+                            force_resummarize: $workflow.input.force_resummarize
+                          } | tojson }
+              - recordSuccess:
+                  set:
+                    succeeded_months: "${ $succeeded_months + [$target_month] }"
+            catch:
+              as: error
+              do:
+                - recordFailure:
+                    set:
+                      failed_months: "${ $failed_months + [$target_month] }"
+                      last_error: "${ $error }"
+
+output:
+  as:
+    completed: ${ ($failed_months | length) == 0 }
+    processed_months: ${ $month_list | length }
+    succeeded_count: ${ $succeeded_months | length }
+    failed_count: ${ $failed_months | length }
+    months: ${ $month_list }
+    succeeded_months: ${ $succeeded_months }
+    failed_months: ${ $failed_months }
+    last_error: ${ $last_error }

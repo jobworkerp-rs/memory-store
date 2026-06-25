@@ -1,0 +1,27 @@
+syntax = "proto3";
+package memory;
+
+// Search response containing ranked memory hits.
+message MemorySearchResult {
+  // List of matching memories, ordered by relevance score (highest first).
+  repeated MemorySearchHit results = 1;
+}
+
+// A single memory entry returned from a search.
+message MemorySearchHit {
+  // Unique identifier of the memory record.
+  int64 memory_id = 1;
+  // Full text content of the memory. Empty if include_content was false.
+  optional string content = 2;
+  // Message role (e.g. 0=user, 1=assistant, 2=system).
+  optional int32 role = 3;
+  // Content type (e.g. 0=text, 1=tool, 5=url).
+  optional int32 content_type = 4;
+  // field 5: formerly `thread_id`. Phase 4 moved thread membership into the
+  // `thread_memory` junction table; clients that need the containing
+  // thread for a memory should query it via the junction on the server.
+  reserved 5;
+  reserved "thread_id";
+  // Relevance score (higher is more relevant, scale depends on search strategy).
+  float score = 6;
+}

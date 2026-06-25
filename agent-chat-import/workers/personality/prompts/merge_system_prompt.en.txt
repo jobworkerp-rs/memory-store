@@ -1,0 +1,41 @@
+## Output Language
+Write every free-text field in the output JSON in English. Keep code, commands, file paths, API names, tool names, enum values, `supporting_source_thread_ids`, and `memory_ids` verbatim.
+
+You merge multiple per-thread user personality signals into a single user-level personalization profile.
+
+## Input format
+The input is a JSON array whose elements have this shape:
+{
+  "source_thread_id": "<thread ID serialized as an int64 string>",
+  "signal_updated_at_iso": "<ISO8601 UTC>",
+  "signal_created_at_iso": "<ISO8601 UTC>",
+  "signal": <per-thread personality signal JSON>
+}
+
+`signal` is structured JSON emitted by thread-personality-single and may include `interests`, `preferences`, `decision_style`, `communication_style`, `values_and_beliefs`, `anti_preferences`, and `memory_ids`.
+
+## Merge policy
+- Merge duplicate signals about the same topic or axis. Rejudge `weight` (`high` / `medium` / `low`) based on supporting thread count, confidence, and recency.
+- For conflicting signals, prefer the newer `signal_updated_at_iso` and leave a note when the user's behavior appears context-dependent.
+- `interests`, `preferences`, `values_and_beliefs`, and `anti_preferences` may contain at most 20 entries each. If there are too many, rank by weight and supporting_source_thread_ids count.
+- Every entry must include `supporting_source_thread_ids` with at least 1 and at most 10 source thread IDs. Copy source_thread_id values exactly as strings from the input. Do not alter or invent IDs.
+- Carry `memory_ids` forward from input signals. When entries are merged, union memory IDs and keep at most 10 representative IDs.
+- Do not output `first_seen_at` or `last_seen_at`; the workflow computes them.
+- Do not output `metrics`; the workflow computes them.
+- `summary` must be natural prose, 3 to 5 sentences long, suitable for prepending to a personalization agent's system prompt.
+- Do not record sensitive information such as real names, addresses, contact information, political views, or religious beliefs.
+
+## Free-text fields
+Write the following fields in English:
+- `summary`
+- `interests[].topic`
+- `preferences[].axis`, `preferences[].preference`
+- `decision_style.summary`, `decision_style.traits[]`
+- `communication_style.tone`, `.verbosity`, `.language_preference`, `.notes`
+- `values_and_beliefs[].belief`
+- `anti_preferences[].avoid`
+
+Enum values, IDs, and proper nouns may stay as-is.
+
+## Output
+Return only JSON conforming to the provided JSON Schema. No preamble and no trailing commentary.

@@ -1,0 +1,53 @@
+[package]
+name = "app"
+version = "0.0.1"
+authors = ["sutr"]
+edition = "2024"
+
+[dependencies]
+
+command-utils = { path = "../modules/command-utils" }
+infra-utils = { path = "../modules/infra-utils" }
+memory-utils = { path = "../modules/memory-utils" }
+protobuf = { path = "../protobuf" }
+infra = { path = "../infra" }
+# Jobworkerp client used by:
+#   - ReflectionApp::generate (F-G1) — enqueues the
+#     `memories-thread-reflection-single-ja/en` workflow.
+#   - ReflectionApp::find_similar_by_intent_text (F-S8) — synchronously
+#     embeds the query text via `memories-mm-embedding`.
+jobworkerp-client = { path = "../modules/jobworkerp-client" }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+# base64 for the inline backend's base64<->media_object.metadata side
+# channel; bytes for the streaming Upload chunk type.
+base64 = { workspace = true }
+bytes = { workspace = true }
+envy = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+stretto = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
+# Only the `Request` type used by `Generate`'s async-mode enqueue.
+tonic = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+command-utils = { path = "../modules/command-utils" }
+tempfile = "3"
+# Pull in `infra::test_helper::shared_id_generator()` for tests only.
+# This keeps the helper out of release builds while letting integration
+# tests reuse a single process-wide Snowflake bucket and avoid the
+# CI-flaky `UNIQUE constraint failed: thread.id` race.
+infra = { path = "../infra", features = ["test-helper"] }
+
+[features]
+default = []
+postgres = ["infra/postgres", "infra-utils/postgres"]
+# Propagates to `infra/lindera` → `lance-index/tokenizer-lindera`, enabling
+# Japanese/Korean morphological analysis in the BM25 FTS index.
+lindera = ["infra/lindera"]

@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package llm_memory.data;
+
+import "llm_memory/data/common.proto";
+import "llm_memory/data/memory.proto";
+
+// Unique identifier for a memory rating record.
+message MemoryRatingId { int64 value = 1; }
+
+// Content of a memory rating record, used as input to the
+// Create / Upsert RPCs.
+message MemoryRatingData {
+  // Target memory being rated.
+  llm_memory.data.MemoryId memory_id = 1;
+  // User who produced the rating.
+  llm_memory.data.UserId user_id = 2;
+  // Rating value in [-1.0, +1.0] (-1 = negative, +1 = positive).
+  float rating = 3;
+  // Extension metadata (e.g. sentiment) serialized as JSON.
+  optional string metadata = 4;
+  // Creation time (milliseconds since epoch).
+  int64 created_at = 5;
+  // Last-update time (milliseconds since epoch).
+  int64 updated_at = 6;
+}
+
+// Memory rating entity carrying both the id and its data.
+// Returned by Find / FindByMemoryId / FindByUserId RPCs and accepted
+// as input by the Update RPC.
+message MemoryRating {
+  MemoryRatingId id = 1;
+  MemoryRatingData data = 2;
+}

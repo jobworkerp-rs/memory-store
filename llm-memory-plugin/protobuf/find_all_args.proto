@@ -1,0 +1,11 @@
+syntax = "proto3";
+package memory;
+
+// Request parameters for listing all memories with pagination.
+// Used by the "find_all" plugin method.
+message FindAllArgs {
+    // Maximum number of memories to return. Omit for server default.
+    optional int32 limit = 1;
+    // Number of records to skip from the beginning (for pagination).
+    optional int64 offset = 2;
+}

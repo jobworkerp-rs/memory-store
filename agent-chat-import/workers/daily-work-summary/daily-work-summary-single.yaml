@@ -1,0 +1,575 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: daily-work-summary-single
+  version: "1.0.0"
+
+# Aggregates per-thread summaries (produced by thread-summary-single)
+# for one calendar day into a single "daily work summary" memory.
+#
+# Input is the set of threads owned by `source_user_id` that carry the
+# `summary_label` marker AND were updated within the [day_start, day_end)
+# window. Output is one memory under a daily_summary thread keyed by
+# `external_id = "daily:<YYYY-MM-DD>:<scope_key>"` so re-runs are
+# idempotent and concurrent invocations with different
+# `extra_labels_filter` produce disjoint aggregates.
+#
+# Owner user is shared with thread summaries (default 100000) — both are
+# "summary agent" output. The two layers are distinguished only by the
+# `daily_summary` label, which callers MUST exclude when listing
+# source threads to summarize at the per-thread layer.
+
+input:
+  schema:
+    document:
+      type: object
+      required: []
+      properties:
+        source_user_id:
+          type: integer
+          default: 100000
+          description: Owner of per-thread summaries (the summary-agent user).
+        target_date:
+          type: string
+          default: ""
+          description: >-
+            YYYY-MM-DD. Empty = "yesterday" in the configured tz.
+        timezone_offset_hours:
+          type: integer
+          minimum: 0
+          maximum: 23
+          default: 9
+          description: >-
+            Offset from UTC used to delimit the day boundary (0-23).
+            JST (+9) by default. Negative offsets unsupported.
+        memories_grpc_host: { type: string, default: "localhost" }
+        memories_grpc_port: { type: integer, default: 9100 }
+        memories_grpc_tls: { type: boolean, default: false }
+        llm_worker_name: { type: string, default: "memories-llm" }
+        summary_label:
+          type: string
+          default: "summary"
+          description: >-
+            Marker label of per-thread summary threads (set by
+            thread-summary-single). Threads with this label are the
+            input to this workflow.
+        daily_label:
+          type: string
+          default: "daily_summary"
+          description: >-
+            Marker label written on the daily aggregate thread so it
+            can be filtered out of upstream summarization and queried
+            independently.
+        extra_labels_filter:
+          type: array
+          items: { type: string }
+          default: []
+          description: >-
+            Additional labels AND-matched against the per-thread
+            summary listing. Empty (default) = aggregate across all
+            projects.
+        min_thread_count:
+          type: integer
+          default: 1
+          description: Skip when fewer than N threads matched the day window.
+        max_context_chars:
+          type: integer
+          default: 200000
+          description: >-
+            Hard cap on combined per-thread summary text. Threads are
+            already ordered by updated_at desc; trailing entries are
+            truncated when the cap is exceeded.
+        summary_model: { type: string, default: "qwen3.6:27b" }
+        ollama_base_url: { type: string, default: "http://localhost:11434" }
+        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
+        force_resummarize: { type: boolean, default: false }
+
+do:
+  # Step 0: Initialize variables referenced by `output.as` so early
+  # `then: exit` paths do not crash on undefined variables (same
+  # pattern as thread-summary-single).
+  - initOutputVars:
+      set:
+        summary_json: "${ null }"
+        skipped: "${ false }"
+        result: "${ null }"
+        target_date_resolved: "${ null }"
+        target_memories: "${ [] }"
+
+  # Step 1: Resolve target_date.
+  # jq's `now` is UTC epoch and `strftime` formats AS IF UTC (TZ env
+  # ignored), so shift `now` by tz_offset before strftime to land on
+  # the wall-clock date.
+  - resolveTargetDate:
+      set:
+        tz_offset_seconds: "${ $workflow.input.timezone_offset_hours * 3600 }"
+        target_date_resolved: >-
+          ${ if $workflow.input.target_date == ""
+             then ((now + ($workflow.input.timezone_offset_hours * 3600) - 86400)
+                   | strftime("%Y-%m-%d"))
+             else $workflow.input.target_date
+             end }
+
+  # Step 2: Compute [day_start_ms, day_end_ms) for the wall-clock day.
+  # `mktime` interprets broken-down time AS IF UTC (mirror of
+  # strftime), so subtract tz_offset to convert "<date> 00:00 in
+  # local tz" to its UTC epoch.
+  - computeDayStart:
+      set:
+        day_start_ms: >-
+          ${ ((($target_date_resolved + "T00:00:00Z")
+                | strptime("%Y-%m-%dT%H:%M:%SZ")
+                | mktime) - $tz_offset_seconds) * 1000 }
+
+  - computeDayEnd:
+      set:
+        day_end_ms: "${ $day_start_ms + 86400000 }"
+
+  # Step 3: Alias for readability. Schema-injected default is 100000.
+  - normalizeSourceUserId:
+      set:
+        effective_source_user_id: "${ $workflow.input.source_user_id }"
+
+  # Step 3a: Derive scope_key from extra_labels_filter. memory.external_id
+  # is UNIQUE DB-wide, so distinct filter sets must produce distinct
+  # external_ids; sort+join makes the key order-independent.
+  - deriveScopeKey:
+      set:
+        sorted_extra_labels: "${ $workflow.input.extra_labels_filter | sort }"
+        scope_key: >-
+          ${ if ($workflow.input.extra_labels_filter | length) == 0
+             then "_all"
+             else ($workflow.input.extra_labels_filter | sort | join(","))
+             end }
+
+  # Step 3b: Compose external_id. Split from deriveScopeKey because
+  # jaq evaluates `set` keys in parallel — same-block references would
+  # see undefined.
+  - composeDailyExternalId:
+      set:
+        daily_external_id: >-
+          ${ "daily:" + $target_date_resolved + ":" + $scope_key }
+        daily_thread_labels: >-
+          ${ [$workflow.input.daily_label,
+              "date:" + $target_date_resolved,
+              "scope:" + $scope_key]
+             + $sorted_extra_labels }
+
+  # Step 4: Fetch summary memories in the day window.
+  # Filter on memories (not threads): ThreadService.AddMemory bumps
+  # the parent thread's updated_at to wall-clock, so a thread filter
+  # would surface old conversations whose summary was just written.
+  # The memory's updated_at preserves the original conversation time.
+  - fetchSummaryMemories:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryService/FindListByCondition"
+            json_body: >-
+              ${ {
+                roles: ["ROLE_ASSISTANT"],
+                user_id: { value: $effective_source_user_id },
+                external_id_prefix: "summary:",
+                # API: updated_after is strict (>), updated_before is
+                # inclusive (<=). To express the half-open interval
+                # [day_start_ms, day_end_ms): pass start-1 (becomes >=)
+                # and end-1 (becomes < end). Without the -1 the entry
+                # at exactly day_start_ms is dropped and the entry at
+                # day_end_ms is leaked into the next day.
+                updated_after: ($day_start_ms - 1),
+                updated_before: ($day_end_ms - 1),
+                content_types: ["TEXT"],
+                thread_filter: {
+                  user_id: $effective_source_user_id,
+                  labels: ([$workflow.input.summary_label]
+                           + $sorted_extra_labels),
+                  label_match_mode: "LABEL_ALL"
+                }
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          target_memories: ${ .jsonBody | fromjson }
+
+  # Step 5: Skip if too few source summary memories.
+  - checkMemoryCount:
+      if: "${ ($target_memories | length) < $workflow.input.min_thread_count }"
+      set:
+        skipped: true
+      export:
+        as:
+          result: "skipped: not enough source summary memories for the day"
+      then: exit
+
+  # Step 6: Build LLM input. FindListByCondition defaults to
+  # `MemoryListSort = UPDATED_DESC`, so a greedy prefix walk drops the
+  # oldest entries first when the combined content text would exceed
+  # max_context_chars.
+  #
+  # Each MemoryListEntry carries:
+  #   - memory.data.content   = thread-summary's structured JSON string
+  #     ({category, title, summary, key_decisions, status})
+  #   - thread_description    = "【title】 body" written back to the
+  #     source thread by thread-summary Step 9 (one-glance label).
+  #   - thread_id             = source conversation thread id.
+  # We feed the full structured JSON to the LLM (per user direction:
+  # "詳細なデータを使って要約する").
+  - buildContext:
+      set:
+        truncated_entries: >-
+          ${ ($target_memories | map(.memory.data.content // "" | length) | add // 0) as $total
+             | if $total > $workflow.input.max_context_chars
+               then
+                 ($target_memories | reduce .[] as $e (
+                    {acc: [], used: 0};
+                    if .used + ($e.memory.data.content // "" | length)
+                       <= $workflow.input.max_context_chars
+                    then {acc: (.acc + [$e]),
+                          used: (.used + ($e.memory.data.content // "" | length))}
+                    else .
+                    end
+                  )).acc
+               else $target_memories
+               end }
+
+  # Step 8: Search for an existing daily summary thread for this date
+  # AND scope. The scope:<scope_key> label is what disambiguates
+  # parallel invocations with different extra_labels_filter values.
+  - findDailyThread:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
+            json_body: >-
+              ${ {
+                labels: [$workflow.input.daily_label,
+                         "date:" + $target_date_resolved,
+                         "scope:" + $scope_key],
+                match_mode: "LABEL_ALL",
+                user_id: $effective_source_user_id,
+                limit: 1
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          existing_daily_thread_id: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | (if length > 0 then .[0].id.value else null end) }
+          existing_daily_thread_data: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | (if length > 0 then .[0].data else null end) }
+
+  # Step 8.5: Default for existing_daily_memory (Step 9 may be skipped).
+  - initExistingDailyMemory:
+      set:
+        existing_daily_memory: "${ null }"
+
+  # Step 9: Look up the existing daily memory inside that thread,
+  # keyed by external_id = "daily:<YYYY-MM-DD>:<scope_key>".
+  - findExistingDailyMemory:
+      if: "${ $existing_daily_thread_id != null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindMemoriesByThreadId"
+            json_body: >-
+              ${ {
+                thread_id: { value: $existing_daily_thread_id },
+                roles: ["ROLE_ASSISTANT"],
+                content_types: ["TEXT"]
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          existing_daily_memory: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | map(select(.data.externalId == $daily_external_id))
+               | (if length > 0 then .[0] else null end) }
+
+  # Step 10: Eligibility — skip when an up-to-date daily summary
+  # already exists. "Up to date" = daily memory's updated_at is at
+  # least as recent as the most recent source summary memory.
+  - checkEligibility:
+      set:
+        max_source_updated_at: >-
+          ${ $target_memories | map(.memory.data.updatedAt) | max // 0 }
+        eligible: >-
+          ${ $workflow.input.force_resummarize
+             or ($existing_daily_memory == null)
+             or ($existing_daily_memory.data.updatedAt
+                 < ($target_memories | map(.memory.data.updatedAt) | max // 0)) }
+
+  - skipIfNotEligible:
+      if: "${ $eligible | not }"
+      set:
+        skipped: true
+      export:
+        as:
+          result: "skipped: daily summary already up to date"
+      then: exit
+
+  - validateDailyWorkSummaryPromptContext:
+      if: "${ (($daily_work_summary_system_prompt // \"\") | length) == 0 or (($daily_work_summary_user_tail // \"\") | length) == 0 }"
+      raise:
+        error:
+          type: "https://memories.local/errors/daily-work-summary/prompt_context_missing"
+          status: 422
+          title: "Daily work summary prompt context is missing"
+          detail: >-
+            ${ if (($daily_work_summary_system_prompt // "") | length) == 0
+               then "daily_work_summary_system_prompt is missing"
+               else "daily_work_summary_user_tail is missing"
+               end }
+
+  # Step 11: Generate the daily aggregate via LLM. The system prompt
+  # adds purpose-grouping on top of thread-summary-single's per-thread
+  # categories, which is the value-add of this layer.
+  - generateDailySummary:
+      run:
+        function:
+          runnerName: LLM
+          using: completion
+          settings:
+            ollama:
+              base_url: "${$workflow.input.ollama_base_url}"
+              model: "${$workflow.input.summary_model}"
+          options:
+            channel: llm
+            storeSuccess: false
+            storeFailure: true
+          arguments:
+            system_prompt: "${ $daily_work_summary_system_prompt }"
+            prompt: >-
+              $${## Target date
+              {{ target_date_resolved }}
+
+              ## Daily thread summaries ({{ truncated_entries | size }} entries / {{ target_memories | size }} source entries)
+
+              {% for e in truncated_entries %}
+              ---
+              memory_id: {{ e.memory.id.value }}
+              thread_id: {{ e.threadId.value }}
+              thread_description: {{ e.threadDescription }}
+              memory_updated_at: {{ e.memory.data.updatedAt }}
+              summary_json: {{ e.memory.data.content }}
+              {% endfor %}
+
+              {{ daily_work_summary_user_tail }}}
+            options:
+              max_tokens: 8000
+              temperature: 0.3
+            json_schema: |
+              {
+                "type": "object",
+                "required": ["overall_purpose", "purpose_groups", "by_topic", "carryover"],
+                "properties": {
+                  "overall_purpose": { "type": "string" },
+                  "purpose_groups": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["purpose", "bullets", "source_memory_ids", "status"],
+                      "properties": {
+                        "purpose": { "type": "string" },
+                        "bullets": { "type": "array", "items": { "type": "string" } },
+                        "source_memory_ids": { "type": "array", "items": { "type": "string" } },
+                        "status": { "type": "string", "enum": ["resolved", "ongoing", "abandoned"] }
+                      }
+                    }
+                  },
+                  "by_topic": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["topic", "bullets"],
+                      "properties": {
+                        "topic": { "type": "string" },
+                        "bullets": { "type": "array", "items": { "type": "string" } }
+                      }
+                    }
+                  },
+                  "carryover": { "type": "array", "items": { "type": "string" } }
+                }
+              }
+      export:
+        as:
+          summary_json: ${ .content.text | fromjson }
+
+  # Step 11.5: Default for created_daily_thread_id (Step 12 may skip).
+  - initCreatedDailyThreadId:
+      set:
+        created_daily_thread_id: "${ null }"
+
+  # Step 12: Create the daily aggregate thread when missing.
+  - createDailyThread:
+      if: "${ $existing_daily_thread_id == null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/Create"
+            json_body: >-
+              ${ {
+                user_id: { value: $effective_source_user_id },
+                description: ($target_date_resolved + " の作業要約 ("
+                              + ($target_memories | length | tostring)
+                              + " スレッド)"),
+                labels: $daily_thread_labels,
+                created_at: $day_start_ms,
+                updated_at: $max_source_updated_at
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          created_daily_thread_id: ${ .jsonBody | fromjson | .id.value }
+
+  - resolveDailyThreadId:
+      set:
+        daily_thread_id: "${ $existing_daily_thread_id // $created_daily_thread_id }"
+        daily_metadata_json: >-
+          ${ {
+              daily_date: $target_date_resolved,
+              scope: $scope_key,
+              extra_labels: $sorted_extra_labels,
+              source_memory_count: ($target_memories | length),
+              source_memory_ids: ($target_memories
+                | map(.memory.id.value | tostring)),
+              source_thread_ids: ($target_memories
+                | map(.threadId.value | tostring) | unique),
+              summary_version: "1.0"
+            } | tojson }
+
+  # Step 13-a: Update existing daily memory in place (preserves
+  # external_id UNIQUE invariant on re-summarize).
+  - updateDailyMemory:
+      if: "${ $existing_daily_memory != null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryService/Update"
+            json_body: >-
+              ${ {
+                id: $existing_daily_memory.id,
+                data: ($existing_daily_memory.data
+                  | .content = ($summary_json | tojson)
+                  | .metadata = $daily_metadata_json
+                  | .externalId = $daily_external_id
+                  | .updatedAt = $max_source_updated_at)
+              } | tojson }
+            as_json: true
+
+  # Step 13-b: Add new daily memory.
+  - addDailyMemory:
+      if: "${ $existing_daily_memory == null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/AddMemory"
+            json_body: >-
+              ${ {
+                thread_id: { value: $daily_thread_id },
+                memory: {
+                  user_id: { value: $effective_source_user_id },
+                  content: ($summary_json | tojson),
+                  content_type: "TEXT",
+                  role: "ROLE_ASSISTANT",
+                  metadata: $daily_metadata_json,
+                  external_id: $daily_external_id,
+                  created_at: $day_start_ms,
+                  updated_at: $max_source_updated_at
+                }
+              } | tojson }
+            as_json: true
+
+  # Step 14: Refresh ThreadData.description with the freshly written
+  # overall_purpose. Reuse the thread data exported from
+  # findDailyThread (existing path) or build it from inputs (newly
+  # created path) so the previous Find→Update RPC pair collapses to
+  # a single Update.
+  - resolveDailyThreadData:
+      set:
+        daily_thread_data: >-
+          ${ if $existing_daily_thread_data != null
+             then $existing_daily_thread_data
+             else {
+               user_id: { value: $effective_source_user_id },
+               labels: $daily_thread_labels,
+               created_at: $day_start_ms,
+               updated_at: $max_source_updated_at
+             }
+             end }
+
+  - writeBackDescription:
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/Update"
+            json_body: >-
+              ${ {
+                id: { value: $daily_thread_id },
+                data: ($daily_thread_data
+                  | .description = ($target_date_resolved
+                                    + " — " + $summary_json.overall_purpose)
+                  | .updatedAt = $max_source_updated_at)
+              } | tojson }
+            as_json: true
+
+output:
+  as:
+    completed: ${ $summary_json != null }
+    target_date: ${ $target_date_resolved }
+    source_memory_count: ${ $target_memories | length }
+    source_thread_count: >-
+      ${ $target_memories | map(.threadId.value) | unique | length }
+    purpose_group_count: >-
+      ${ if $summary_json != null then ($summary_json.purpose_groups | length) else 0 end }
+    skipped: ${ $skipped // false }
+    skip_reason: ${ if ($skipped // false) then $result else null end }

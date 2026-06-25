@@ -1,0 +1,42 @@
+# Build output — must not be shipped into the build context.
+target/
+
+# Local dev databases / WAL files.
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.sqlite3.bak
+*.sqlite3.bak.*
+*.sqlite3.bak2
+*.sqlite3.bak3
+*.sqlite3.bak4
+*.sqlite3.old
+
+# Local data + logs.
+data/
+log/
+*.log
+
+# Editor / agent metadata.
+.git/
+.gitea/
+.github/
+.codex/
+.claude/
+
+# Frontend / node noise (none expected, but cheap to exclude).
+node_modules/
+
+# Local env file (never bake secrets into images).
+.env
+.env.*
+
+# Docs & specs are not needed at build time. Keep workflows/ — they ARE shipped.
+docs/
+
+# Plan / scratch markdown.
+yaml-workers.md
+AGENTS.md
+CLAUDE.md
+README.md
+README_ja.md

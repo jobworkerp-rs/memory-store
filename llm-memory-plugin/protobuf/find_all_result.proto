@@ -1,0 +1,43 @@
+syntax = "proto3";
+package memory;
+
+// Response for the "find_all" plugin method.
+// Contains a list of memory items with full metadata.
+message FindAllResult {
+    // List of memory items in storage order.
+    repeated MemoryItem memories = 1;
+}
+
+// A memory record with full metadata fields.
+message MemoryItem {
+    // Unique identifier of the memory.
+    int64 id = 1;
+    // field 2: formerly `system_id`. System prompts are now represented as
+    // role=ROLE_SYSTEM memories referenced through `parent_ids`.
+    reserved 2;
+    reserved "system_id";
+    // IDs of parent memories (for conversation threading).
+    repeated int64 parent_ids = 3;
+    // ID of the user who created this memory.
+    int64 user_id = 4;
+    // Full text content of the memory.
+    string content = 5;
+    // Content type (e.g. 0=text, 1=tool, 5=url).
+    int32 content_type = 6;
+    reserved 7;
+    // Optional JSON parameters associated with the memory.
+    optional string params = 8;
+    // Optional JSON metadata for extensible attributes.
+    optional string metadata = 9;
+    // Creation timestamp (epoch milliseconds).
+    int64 created_at = 10;
+    // Last update timestamp (epoch milliseconds).
+    int64 updated_at = 11;
+    // field 12: formerly `thread_id`. Phase 4 moved thread membership to the
+    // `thread_memory` junction table on the memories DB side. Clients that
+    // need to enumerate memories of a thread should use the thread-scoped
+    // RPCs (ThreadService.FindMemoriesByThreadId / ResolveAncestorClosure)
+    // which resolve membership through the junction.
+    reserved 12;
+    reserved "thread_id";
+}

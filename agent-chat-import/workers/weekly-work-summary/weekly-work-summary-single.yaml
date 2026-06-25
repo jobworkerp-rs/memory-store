@@ -1,0 +1,608 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: weekly-work-summary-single
+  version: "1.0.0"
+
+# Aggregates per-day summaries (produced by daily-work-summary-single)
+# for one ISO 8601 week into a single "weekly work summary" memory.
+#
+# Input is the set of memories owned by `source_user_id` carrying the
+# `daily_label` marker AND whose memory.updated_at falls within
+# [week_start, week_end) (Monday 00:00 local — next Monday 00:00 local).
+# Output is one memory under a weekly_summary thread keyed by
+# `external_id = "weekly:<YYYY-Www>:<scope_key>"` so re-runs are
+# idempotent and concurrent invocations with different
+# `extra_labels_filter` produce disjoint aggregates.
+#
+# Owner user is shared with daily summaries (default 100000) — both are
+# "summary agent" output. The two layers are distinguished only by the
+# `weekly_summary` label, which monthly callers MUST use to list
+# weekly source memories without leaking other layers.
+#
+# Requires jaq >= 3.x runtime: ISO week strptime "%G-W%V-%u" is not
+# supported by vanilla jq.
+
+input:
+  schema:
+    document:
+      type: object
+      required: []
+      properties:
+        source_user_id:
+          type: integer
+          default: 100000
+          description: Owner of per-day summaries (the summary-agent user).
+        target_week:
+          type: string
+          default: ""
+          description: >-
+            ISO 8601 week token "YYYY-Www" (week zero-padded to 2 digits).
+            Empty = "last completed week" in the configured tz.
+        timezone_offset_hours:
+          type: integer
+          minimum: 0
+          maximum: 23
+          default: 9
+          description: >-
+            Offset from UTC used to delimit the week boundary (0-23).
+            JST (+9) by default. Negative offsets unsupported.
+        memories_grpc_host: { type: string, default: "localhost" }
+        memories_grpc_port: { type: integer, default: 9100 }
+        memories_grpc_tls: { type: boolean, default: false }
+        llm_worker_name: { type: string, default: "memories-llm" }
+        daily_label:
+          type: string
+          default: "daily_summary"
+          description: >-
+            Marker label of per-day summary threads (set by
+            daily-work-summary-single). Threads with this label are the
+            input to this workflow.
+        weekly_label:
+          type: string
+          default: "weekly_summary"
+          description: >-
+            Marker label written on the weekly aggregate thread so it
+            can be filtered out of upstream summarization and queried
+            independently.
+        extra_labels_filter:
+          type: array
+          items: { type: string }
+          default: []
+          description: >-
+            Additional labels AND-matched against the per-day summary
+            listing. Empty (default) = aggregate across all projects.
+        min_thread_count:
+          type: integer
+          default: 1
+          description: >-
+            Skip when fewer than N daily summary memories matched the
+            week window. Name kept for parity with daily; counts source
+            *memories*, not threads.
+        max_context_chars:
+          type: integer
+          default: 200000
+          description: >-
+            Hard cap on combined per-day summary text. Daily summaries
+            are already ordered by updated_at desc; trailing entries
+            are truncated when the cap is exceeded.
+        summary_model: { type: string, default: "qwen3.6:27b" }
+        ollama_base_url: { type: string, default: "http://localhost:11434" }
+        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
+        force_resummarize: { type: boolean, default: false }
+
+do:
+  # Step 0: Initialize variables referenced by `output.as` so early
+  # `then: exit` paths do not crash on undefined variables (same
+  # pattern as daily-work-summary-single).
+  - initOutputVars:
+      set:
+        summary_json: "${ null }"
+        skipped: "${ false }"
+        result: "${ null }"
+        target_week_resolved: "${ null }"
+        target_memories: "${ [] }"
+
+  # Step 1: Resolve target_week.
+  # When empty, "last completed week" = (this week's Monday in tz) - 7
+  # days, formatted with %G-W%V (ISO year + ISO week).
+  # jq's `now` is UTC epoch and `strftime` formats AS IF UTC (TZ env
+  # ignored), so shift `now` by tz_offset before strftime to land on
+  # the wall-clock week.
+  - resolveTargetWeek:
+      set:
+        tz_offset_seconds: "${ $workflow.input.timezone_offset_hours * 3600 }"
+        target_week_resolved: >-
+          ${ if $workflow.input.target_week == ""
+             then ((now + ($workflow.input.timezone_offset_hours * 3600)) as $local
+                   | ($local | strftime("%u") | tonumber) as $wday
+                   | ($local - (($wday - 1) * 86400) - 7 * 86400)
+                   | strftime("%G-W%V"))
+             else $workflow.input.target_week
+             end }
+
+  # Step 2: Compute [week_start_ms, week_end_ms) for the wall-clock week.
+  # `mktime` interprets broken-down time AS IF UTC (mirror of strftime),
+  # so subtract tz_offset to convert "<Monday> 00:00 in local tz" to
+  # its UTC epoch.
+  # Requires jaq's strptime("%G-W%V-%u") — vanilla jq returns 1899.
+  - computeWeekStart:
+      set:
+        week_start_ms: >-
+          ${ ((($target_week_resolved + "-1")
+                | strptime("%G-W%V-%u")
+                | mktime) - $tz_offset_seconds) * 1000 }
+
+  - computeWeekEnd:
+      set:
+        week_end_ms: "${ $week_start_ms + 7 * 86400000 }"
+
+  # Step 3: Alias for readability. Schema-injected default is 100000.
+  - normalizeSourceUserId:
+      set:
+        effective_source_user_id: "${ $workflow.input.source_user_id }"
+
+  # Step 3a: Derive scope_key from extra_labels_filter. memory.external_id
+  # is UNIQUE DB-wide, so distinct filter sets must produce distinct
+  # external_ids; sort+join makes the key order-independent.
+  - deriveScopeKey:
+      set:
+        sorted_extra_labels: "${ $workflow.input.extra_labels_filter | sort }"
+        scope_key: >-
+          ${ if ($workflow.input.extra_labels_filter | length) == 0
+             then "_all"
+             else ($workflow.input.extra_labels_filter | sort | join(","))
+             end }
+
+  # Step 3b: Compose external_id. Split from deriveScopeKey because
+  # jaq evaluates `set` keys in parallel — same-block references would
+  # see undefined.
+  - composeWeeklyExternalId:
+      set:
+        weekly_external_id: >-
+          ${ "weekly:" + $target_week_resolved + ":" + $scope_key }
+        weekly_thread_labels: >-
+          ${ [$workflow.input.weekly_label,
+              "iso_week:" + $target_week_resolved,
+              "scope:" + $scope_key]
+             + $sorted_extra_labels }
+
+  # Step 4: Fetch daily summary memories in the week window.
+  # Filter on memories (not threads): ThreadService.AddMemory bumps
+  # the parent thread's updated_at to wall-clock, so a thread filter
+  # would surface old conversations whose summary was just written.
+  # The memory's updated_at preserves the original conversation time.
+  - fetchDailyMemories:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryService/FindListByCondition"
+            json_body: >-
+              ${ {
+                roles: ["ROLE_ASSISTANT"],
+                user_id: { value: $effective_source_user_id },
+                external_id_prefix: "daily:",
+                # API: updated_after is strict (>), updated_before is
+                # inclusive (<=). To express the half-open interval
+                # [week_start_ms, week_end_ms): pass start-1 (becomes >=)
+                # and end-1 (becomes < end). Without the -1 the entry
+                # at exactly week_start_ms is dropped and the entry at
+                # week_end_ms is leaked into the next week.
+                updated_after: ($week_start_ms - 1),
+                updated_before: ($week_end_ms - 1),
+                content_types: ["TEXT"],
+                thread_filter: {
+                  user_id: $effective_source_user_id,
+                  labels: ([$workflow.input.daily_label]
+                           + $sorted_extra_labels),
+                  label_match_mode: "LABEL_ALL"
+                }
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          target_memories: ${ .jsonBody | fromjson }
+
+  # Step 5: Skip if too few source daily summary memories.
+  - checkMemoryCount:
+      if: "${ ($target_memories | length) < $workflow.input.min_thread_count }"
+      set:
+        skipped: true
+      export:
+        as:
+          result: "skipped: not enough source summary memories for the week"
+      then: exit
+
+  # Step 6: Build LLM input. FindListByCondition defaults to
+  # `MemoryListSort = UPDATED_DESC`, so a greedy prefix walk drops the
+  # oldest entries first when the combined content text would exceed
+  # max_context_chars.
+  #
+  # Each MemoryListEntry carries:
+  #   - memory.data.content   = daily-summary's structured JSON string
+  #     ({overall_purpose, purpose_groups, by_topic, carryover})
+  #   - thread_description    = "<date> — <overall_purpose>" written
+  #     back to the daily aggregate thread by daily-work-summary Step 14.
+  #   - thread_id             = daily aggregate thread id.
+  # We feed the full structured JSON to the LLM so trends can be
+  # inferred from purpose_groups.status transitions across days.
+  - buildContext:
+      set:
+        truncated_entries: >-
+          ${ ($target_memories | map(.memory.data.content // "" | length) | add // 0) as $total
+             | if $total > $workflow.input.max_context_chars
+               then
+                 ($target_memories | reduce .[] as $e (
+                    {acc: [], used: 0};
+                    if .used + ($e.memory.data.content // "" | length)
+                       <= $workflow.input.max_context_chars
+                    then {acc: (.acc + [$e]),
+                          used: (.used + ($e.memory.data.content // "" | length))}
+                    else .
+                    end
+                  )).acc
+               else $target_memories
+               end }
+
+  # Step 8: Search for an existing weekly summary thread for this week
+  # AND scope. The scope:<scope_key> label is what disambiguates
+  # parallel invocations with different extra_labels_filter values.
+  - findWeeklyThread:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
+            json_body: >-
+              ${ {
+                labels: [$workflow.input.weekly_label,
+                         "iso_week:" + $target_week_resolved,
+                         "scope:" + $scope_key],
+                match_mode: "LABEL_ALL",
+                user_id: $effective_source_user_id,
+                limit: 1
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          existing_weekly_thread_id: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | (if length > 0 then .[0].id.value else null end) }
+          existing_weekly_thread_data: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | (if length > 0 then .[0].data else null end) }
+
+  # Step 8.5: Default for existing_weekly_memory (Step 9 may be skipped).
+  - initExistingWeeklyMemory:
+      set:
+        existing_weekly_memory: "${ null }"
+
+  # Step 9: Look up the existing weekly memory inside that thread,
+  # keyed by external_id = "weekly:<YYYY-Www>:<scope_key>".
+  - findExistingWeeklyMemory:
+      if: "${ $existing_weekly_thread_id != null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindMemoriesByThreadId"
+            json_body: >-
+              ${ {
+                thread_id: { value: $existing_weekly_thread_id },
+                roles: ["ROLE_ASSISTANT"],
+                content_types: ["TEXT"]
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          existing_weekly_memory: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | map(select(.data.externalId == $weekly_external_id))
+               | (if length > 0 then .[0] else null end) }
+
+  # Step 10: Eligibility — skip when an up-to-date weekly summary
+  # already exists. "Up to date" = weekly memory's updated_at is at
+  # least as recent as the most recent source daily memory.
+  # Split into two setTasks because jaq's `set` evaluates keys in
+  # parallel, so `eligible` cannot reference `$max_source_updated_at`
+  # defined in the same block.
+  - computeMaxSourceUpdatedAt:
+      set:
+        max_source_updated_at: >-
+          ${ $target_memories | map(.memory.data.updatedAt) | max // 0 }
+
+  - checkEligibility:
+      set:
+        eligible: >-
+          ${ $workflow.input.force_resummarize
+             or ($existing_weekly_memory == null)
+             or ($existing_weekly_memory.data.updatedAt < $max_source_updated_at) }
+
+  - skipIfNotEligible:
+      if: "${ $eligible | not }"
+      set:
+        skipped: true
+      export:
+        as:
+          result: "skipped: weekly summary already up to date"
+      then: exit
+
+  - validateWeeklyWorkSummaryPromptContext:
+      if: "${ (($weekly_work_summary_system_prompt // \"\") | length) == 0 or (($weekly_work_summary_user_tail // \"\") | length) == 0 }"
+      raise:
+        error:
+          type: "https://memories.local/errors/weekly-work-summary/prompt_context_missing"
+          status: 422
+          title: "Weekly work summary prompt context is missing"
+          detail: >-
+            ${ if (($weekly_work_summary_system_prompt // "") | length) == 0
+               then "weekly_work_summary_system_prompt is missing"
+               else "weekly_work_summary_user_tail is missing"
+               end }
+
+  # Step 11: Generate the weekly aggregate via LLM. The system prompt
+  # adds week-over-week trend detection on top of daily-work-summary's
+  # purpose grouping, which is the value-add of this layer.
+  - generateWeeklySummary:
+      run:
+        function:
+          runnerName: LLM
+          using: completion
+          settings:
+            ollama:
+              base_url: "${$workflow.input.ollama_base_url}"
+              model: "${$workflow.input.summary_model}"
+          options:
+            channel: llm
+            storeSuccess: false
+            storeFailure: true
+          arguments:
+            system_prompt: "${ $weekly_work_summary_system_prompt }"
+            prompt: >-
+              $${## Target week
+              {{ target_week_resolved }}
+
+              ## Weekly daily summaries ({{ truncated_entries | size }} entries / {{ target_memories | size }} source entries)
+
+              {% for e in truncated_entries %}
+              ---
+              memory_id: {{ e.memory.id.value }}
+              thread_id: {{ e.threadId.value }}
+              thread_description: {{ e.threadDescription }}
+              memory_updated_at: {{ e.memory.data.updatedAt }}
+              summary_json: {{ e.memory.data.content }}
+              {% endfor %}
+
+              {{ weekly_work_summary_user_tail }}}
+            options:
+              max_tokens: 8000
+              temperature: 0.3
+            json_schema: |
+              {
+                "type": "object",
+                "required": ["overall_purpose", "purpose_groups", "by_topic", "trends", "carryover"],
+                "properties": {
+                  "overall_purpose": { "type": "string" },
+                  "purpose_groups": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["purpose", "bullets", "source_memory_ids", "status"],
+                      "properties": {
+                        "purpose": { "type": "string" },
+                        "bullets": { "type": "array", "items": { "type": "string" } },
+                        "source_memory_ids": { "type": "array", "items": { "type": "string" } },
+                        "status": { "type": "string", "enum": ["resolved", "ongoing", "abandoned"] }
+                      }
+                    }
+                  },
+                  "by_topic": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["topic", "bullets"],
+                      "properties": {
+                        "topic": { "type": "string" },
+                        "bullets": { "type": "array", "items": { "type": "string" } }
+                      }
+                    }
+                  },
+                  "trends": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {
+                      "type": "object",
+                      "required": ["kind", "topic", "summary"],
+                      "properties": {
+                        "kind": { "type": "string", "enum": ["continued", "new", "completed"] },
+                        "topic": { "type": "string" },
+                        "summary": { "type": "string" },
+                        "source_memory_ids": { "type": "array", "items": { "type": "string" } }
+                      }
+                    }
+                  },
+                  "carryover": { "type": "array", "items": { "type": "string" } }
+                }
+              }
+      export:
+        as:
+          summary_json: ${ .content.text | fromjson }
+
+  # Step 11.5: Default for created_weekly_thread_id (Step 12 may skip).
+  - initCreatedWeeklyThreadId:
+      set:
+        created_weekly_thread_id: "${ null }"
+
+  # Step 12: Create the weekly aggregate thread when missing.
+  - createWeeklyThread:
+      if: "${ $existing_weekly_thread_id == null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/Create"
+            json_body: >-
+              ${ {
+                user_id: { value: $effective_source_user_id },
+                description: ($target_week_resolved + " の作業要約 ("
+                              + ($target_memories | length | tostring)
+                              + " 日次)"),
+                labels: $weekly_thread_labels,
+                created_at: $week_start_ms,
+                updated_at: $max_source_updated_at
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          created_weekly_thread_id: ${ .jsonBody | fromjson | .id.value }
+
+  - resolveWeeklyThreadId:
+      set:
+        weekly_thread_id: "${ $existing_weekly_thread_id // $created_weekly_thread_id }"
+        weekly_metadata_json: >-
+          ${ {
+              iso_week: $target_week_resolved,
+              scope: $scope_key,
+              extra_labels: $sorted_extra_labels,
+              source_memory_count: ($target_memories | length),
+              source_memory_ids: ($target_memories
+                | map(.memory.id.value | tostring)),
+              source_thread_ids: ($target_memories
+                | map(.threadId.value | tostring) | unique),
+              summary_version: "1.0"
+            } | tojson }
+
+  # Step 13-a: Update existing weekly memory in place (preserves
+  # external_id UNIQUE invariant on re-summarize).
+  - updateWeeklyMemory:
+      if: "${ $existing_weekly_memory != null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryService/Update"
+            json_body: >-
+              ${ {
+                id: $existing_weekly_memory.id,
+                data: ($existing_weekly_memory.data
+                  | .content = ($summary_json | tojson)
+                  | .metadata = $weekly_metadata_json
+                  | .externalId = $weekly_external_id
+                  | .updatedAt = $max_source_updated_at)
+              } | tojson }
+            as_json: true
+
+  # Step 13-b: Add new weekly memory.
+  - addWeeklyMemory:
+      if: "${ $existing_weekly_memory == null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/AddMemory"
+            json_body: >-
+              ${ {
+                thread_id: { value: $weekly_thread_id },
+                memory: {
+                  user_id: { value: $effective_source_user_id },
+                  content: ($summary_json | tojson),
+                  content_type: "TEXT",
+                  role: "ROLE_ASSISTANT",
+                  metadata: $weekly_metadata_json,
+                  external_id: $weekly_external_id,
+                  created_at: $week_start_ms,
+                  updated_at: $max_source_updated_at
+                }
+              } | tojson }
+            as_json: true
+
+  # Step 14: Refresh ThreadData.description with the freshly written
+  # overall_purpose. Reuse the thread data exported from
+  # findWeeklyThread (existing path) or build it from inputs (newly
+  # created path) so the previous Find→Update RPC pair collapses to
+  # a single Update.
+  - resolveWeeklyThreadData:
+      set:
+        weekly_thread_data: >-
+          ${ if $existing_weekly_thread_data != null
+             then $existing_weekly_thread_data
+             else {
+               user_id: { value: $effective_source_user_id },
+               labels: $weekly_thread_labels,
+               created_at: $week_start_ms,
+               updated_at: $max_source_updated_at
+             }
+             end }
+
+  - writeBackDescription:
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/Update"
+            json_body: >-
+              ${ {
+                id: { value: $weekly_thread_id },
+                data: ($weekly_thread_data
+                  | .description = ($target_week_resolved
+                                    + " — " + $summary_json.overall_purpose)
+                  | .updatedAt = $max_source_updated_at)
+              } | tojson }
+            as_json: true
+
+output:
+  as:
+    completed: ${ $summary_json != null }
+    target_week: ${ $target_week_resolved }
+    source_memory_count: ${ $target_memories | length }
+    source_thread_count: >-
+      ${ $target_memories | map(.threadId.value) | unique | length }
+    purpose_group_count: >-
+      ${ if $summary_json != null then ($summary_json.purpose_groups | length) else 0 end }
+    trend_count: >-
+      ${ if $summary_json != null then ($summary_json.trends | length) else 0 end }
+    skipped: ${ $skipped // false }
+    skip_reason: ${ if ($skipped // false) then $result else null end }

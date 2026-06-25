@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+package memory;
+
+// Plugin configuration for connecting to the memory gRPC service.
+// Passed to the plugin's load() method on initialization.
+message LlmMemoryPluginSettings {
+    // URL of the memory gRPC service (default: "http://localhost:9010").
+    optional string server_url = 1;
+}

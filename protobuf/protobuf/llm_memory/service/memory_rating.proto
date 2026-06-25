@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package llm_memory.service;
+
+import "llm_memory/data/common.proto";
+import "llm_memory/data/memory.proto";
+import "llm_memory/data/memory_rating.proto";
+import "llm_memory/service/common.proto";
+
+// Response returned on memory-rating creation. Carries the
+// auto-assigned id.
+message CreateMemoryRatingResponse {
+    llm_memory.data.MemoryRatingId id = 1;
+}
+
+// Response for a memory-rating lookup. `data` is unset when no row
+// matches.
+message OptionalMemoryRatingResponse {
+    optional llm_memory.data.MemoryRating data = 1;
+}
+
+// Request to fetch ratings for a given memory id.
+message FindMemoryRatingsByMemoryIdRequest {
+    llm_memory.data.MemoryId memory_id = 1;
+}
+
+// Request to fetch ratings authored by a given user.
+message FindMemoryRatingsByUserIdRequest {
+    llm_memory.data.UserId user_id = 1;
+    optional int32 limit = 2;
+}
+
+// Request to fetch the rating for a (memory_id, user_id) pair.
+message FindMemoryRatingByMemoryAndUserRequest {
+    llm_memory.data.MemoryId memory_id = 1;
+    llm_memory.data.UserId user_id = 2;
+}
+
+// Service that exposes CRUD for memory ratings. Used to persist
+// and retrieve signals such as like / dislike on LLM messages.
+service MemoryRatingService {
+  // Create a new rating and return its assigned id.
+  rpc Create(llm_memory.data.MemoryRatingData) returns (CreateMemoryRatingResponse);
+  // Upsert a rating for a given (memory_id, user_id) pair: update
+  // if present, otherwise create.
+  rpc Upsert(llm_memory.data.MemoryRatingData) returns (CreateMemoryRatingResponse);
+  // Update an existing rating (identified by id).
+  rpc Update(llm_memory.data.MemoryRating) returns (SuccessResponse);
+  // Delete the rating with the given id.
+  rpc Delete(llm_memory.data.MemoryRatingId) returns (SuccessResponse);
+  // Fetch a single rating by id.
+  rpc Find(llm_memory.data.MemoryRatingId) returns (OptionalMemoryRatingResponse);
+  // Stream all ratings attached to a given memory id.
+  rpc FindByMemoryId(FindMemoryRatingsByMemoryIdRequest) returns (stream llm_memory.data.MemoryRating);
+  // Stream all ratings authored by a given user.
+  rpc FindByUserId(FindMemoryRatingsByUserIdRequest) returns (stream llm_memory.data.MemoryRating);
+  // Fetch the single rating for a (memory_id, user_id) pair.
+  rpc FindByMemoryIdAndUserId(FindMemoryRatingByMemoryAndUserRequest) returns (OptionalMemoryRatingResponse);
+  // Return the total number of ratings.
+  rpc Count(FindCondition) returns (CountResponse);
+}

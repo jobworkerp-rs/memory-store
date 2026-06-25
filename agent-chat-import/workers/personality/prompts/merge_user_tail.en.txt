@@ -1,0 +1,4 @@
+Merge the signals above and return a unified personality profile JSON for the target user.
+Write every free-text field in English.
+Copy each source_thread_id value from the input into supporting_source_thread_ids exactly as a string. Do not modify or infer it.
+Keep code, commands, file paths, API names, tool names, enum values, and log fragments verbatim in English.

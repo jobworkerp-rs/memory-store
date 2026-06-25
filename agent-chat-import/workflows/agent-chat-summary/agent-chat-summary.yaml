@@ -1,0 +1,586 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: agent-chat-summary
+  version: "2.0.0"
+
+# Summary stage extracted from the monolithic agent-chat-pipeline.
+#
+# Runs thread-summary, then OPTIONALLY daily-work-summary, then
+# OPTIONALLY reflection (= summaryBranch) while optionally fanning
+# out personality extraction (= personalityBranch) on the same
+# updated_after_ms window.
+#
+# Breaking change vs. 1.x: daily-work-summary is now opt-in
+# (same idiom as personality/reflection). Pass `daily_work_summary_batch_yaml`
+# to enable it. When omitted, the stage is skipped and
+# `daily_summary_enabled` / `daily_summary_succeeded` report false.
+#
+# Coupling with agent-chat-import is intentional state-only: this
+# workflow takes the date window as input (since_date / end_date /
+# range_start_ms / since_ms_utc) rather than recomputing it, so the
+# wrapper can forward exact import output and split-execution cron
+# scripts can pass the same values they passed to memories-import.
+#
+# Failure semantics:
+#   summaryBranch (致命):  threadSummaryBatch failure or
+#                          dailyWorkSummary failure or
+#                          reflectionStage failure → branch fails →
+#                          fork fails → workflow fails.
+#   personalityBranch:     branch-level try/catch keeps the failure
+#                          non-fatal (personality is supplementary).
+#
+# The asymmetry is intentional: reflection is also LLM-driven and
+# heavy, but unlike personality it is the explicit final stage of
+# the chat-log-processing pipeline and operators want surface-level
+# failure visibility.
+
+input:
+  schema:
+    document:
+      type: object
+      required:
+        - user_id
+        - memories_grpc_url
+        - since_date
+        - end_date
+        - range_start_ms
+        - since_ms_utc
+        - thread_summary_batch_yaml
+      properties:
+        # ---- subject / endpoint -------------------------------------------
+        user_id:
+          type: integer
+          description: Owner user_id of the threads to be summarized/reflected.
+        memories_grpc_url:
+          type: string
+          description: >-
+            memories gRPC URL (e.g. http://host:9100). Parsed into
+            host/port for inner WORKFLOW runners. Override via
+            memories_grpc_host / memories_grpc_port for split-DNS
+            setups (NAT-traversal etc.).
+        memories_grpc_host:
+          type: string
+          default: ""
+          description: Empty = parse from memories_grpc_url.
+        memories_grpc_port:
+          type: integer
+          default: 0
+          description: Empty (= 0) = parse from memories_grpc_url.
+        memories_grpc_tls:
+          type: string
+          default: ""
+          description: >-
+            Empty sentinel = derive from memories_grpc_url scheme.
+            Pass "true" / "false" to override when the URL scheme does
+            not match the transport (e.g. plaintext gRPC behind an
+            HTTPS-terminating proxy).
+        llm_worker_name:
+          type: string
+          default: "memories-llm"
+          description: >-
+            Named LLM worker forwarded to all downstream child
+            workflows.
+        # ---- date window (supplied by caller; agent-chat-import emits
+        #      these on completion) -------------------------------------
+        since_date:
+          type: string
+          description: YYYY-MM-DD. Start of the processing window.
+        end_date:
+          type: string
+          description: YYYY-MM-DD. End of the processing window.
+        range_start_ms:
+          type: integer
+          description: >-
+            since_date 00:00 in tz, expressed in epoch ms. Used as the
+            lower bound of `updated_after_ms` for thread-summary-batch
+            and thread-reflection-batch.
+        since_ms_utc:
+          type: integer
+          description: >-
+            UTC `--since` cutoff in epoch ms. 0 = day_start fallback.
+            `updated_after_ms` becomes max(since_ms_utc, range_start_ms) - 1.
+        timezone_offset_hours:
+          type: integer
+          minimum: 0
+          maximum: 23
+          default: 9
+          description: Forwarded to daily-work-summary-batch for day boundary.
+        # ---- summary inner workflows --------------------------------------
+        thread_summary_batch_yaml:
+          type: string
+          description: Absolute path / URL of thread-summary-batch.yaml.
+        daily_work_summary_batch_yaml:
+          type: string
+          default: ""
+          description: >-
+            Absolute path / URL of daily-work-summary-batch.yaml.
+            Empty (default) skips the daily-summary stage entirely.
+        # ---- summary tuning -----------------------------------------------
+        summary_user_id:
+          type: integer
+          default: 100000
+          description: Summary memory owner. Must differ from user_id.
+        summary_model:
+          type: string
+          default: "qwen3.6:27b"
+        ollama_base_url:
+          type: string
+          default: "http://localhost:11434"
+        memory_thread_label_prefix:
+          type: string
+          default: "summary"
+          description: thread-summary marker label.
+        force_resummarize:
+          type: boolean
+          default: false
+          description: Forwarded to both summary stages.
+        daily_summary_label:
+          type: string
+          default: "daily_summary"
+        extra_labels_filter:
+          type: array
+          items: { type: string }
+          default: []
+          description: Forwarded to daily-work-summary-single (order-independent).
+        min_thread_count:
+          type: integer
+          default: 1
+        max_context_chars:
+          type: integer
+          default: 200000
+        # ---- personality stage (opt-in) -----------------------------------
+        thread_personality_batch_yaml:
+          type: string
+          default: ""
+          description: >-
+            Absolute path / URL of thread-personality-batch.yaml. Empty
+            disables both personality stages.
+        user_personality_merge_yaml:
+          type: string
+          default: ""
+          description: >-
+            Layer-2 merge enable flag (legacy-compat string). Any
+            non-empty value enables the user-level merge; empty (default)
+            runs the per-thread layer only. The path itself is no longer
+            dispatched — the merge runs via the registered
+            user-personality-merge language worker.
+        personality_user_id:
+          type: integer
+          default: 200000
+          description: >-
+            Owner user_id for personality memories. MUST differ from
+            both `user_id` and `summary_user_id`.
+        personality_model:
+          type: string
+          default: ""
+          description: >-
+            LLM model for personality extraction / merge. Empty falls
+            back to `summary_model`.
+        min_user_messages:
+          type: integer
+          default: 2
+          description: ROLE_USER lower bound for thread-personality-single.
+        force_reextract:
+          type: boolean
+          default: false
+          description: Forwarded to thread-personality-batch.
+        force_remerge:
+          type: boolean
+          default: false
+          description: Forwarded to user-personality-merge.
+        max_signals:
+          type: integer
+          default: 200
+          description: max_signals cap for user-personality-merge.
+        # ---- reflection stage (opt-in) ------------------------------------
+        # Set `thread_reflection_batch_yaml` to enable the reflection
+        # stage at the end of summaryBranch. Reflection runs over the
+        # same updated_after_ms window as thread-summary; if you need
+        # label/thread-id scoping, invoke thread-reflection-batch.yaml
+        # directly instead.
+        thread_reflection_batch_yaml:
+          type: string
+          default: ""
+          description: >-
+            Absolute path / URL of thread-reflection-batch.yaml. Empty
+            disables the reflection stage.
+        reflector_model:
+          type: string
+          default: ""
+          description: >-
+            Reflector LLM model. Empty falls back to `summary_model`
+            so single-model deployments don't need extra config.
+        reflector_base_url:
+          type: string
+          default: ""
+          description: >-
+            Reflector LLM endpoint. Empty falls back to
+            `ollama_base_url`.
+        prompt_version:
+          type: string
+          default: "v1"
+          description: >-
+            Reflection prompt revision tag. Forwarded as-is to
+            thread-reflection-batch. Bump when changing the reflector
+            prompt to keep experiment cohorts distinguishable.
+        output_language:
+          type: string
+          enum: ["ja", "en"]
+          default: "ja"
+        reflector_id:
+          type: string
+          default: "self"
+        reflection_force:
+          type: boolean
+          default: false
+          description: >-
+            Forwarded as `force` to thread-reflection-batch. Distinct
+            from `force_resummarize` / `force_reextract` to avoid
+            coupling the three idempotency gates.
+        context_limit_tokens:
+          type: integer
+          default: 222000
+        single_pass_threshold_tokens:
+          type: integer
+          default: 170000
+        window_size_turns:
+          type: integer
+          default: 80
+        window_overlap_turns:
+          type: integer
+          default: 10
+        merge_max_input_tokens:
+          type: integer
+          default: 100000
+        estimated_tokens_per_turn:
+          type: integer
+          default: 1500
+        experiment_id:
+          type: string
+          description: Optional experiment cohort tag. Forwarded only when set.
+        experiment_variant:
+          type: string
+          description: Optional variant tag. Forwarded only when set.
+
+timeout:
+  after:
+    hours: 24
+
+do:
+  # Step 0: Initialize variables that may be referenced from output.as
+  # even when an early `then: exit` or branch failure skips later steps.
+  - initOutputVars:
+      set:
+        thread_summary_succeeded: "${ false }"
+        daily_summary_succeeded: "${ false }"
+        thread_personality_succeeded: "${ false }"
+        personality_batch_result: "${ null }"
+        personality_error: "${ null }"
+        reflection_succeeded: "${ false }"
+
+  # Step 1: Parse memories_grpc_url into host/port for inner WORKFLOW
+  # runners (which take host/port, not URL). The optional schema
+  # inputs `memories_grpc_host` ("" sentinel) / `memories_grpc_port`
+  # (0 sentinel) override the parsed values for split-DNS setups.
+  - parseMemoriesUrl:
+      set:
+        parsed_url: >-
+          ${ $workflow.input.memories_grpc_url
+             | capture("^(?<scheme>https?)://(?<host>[^:/]+)(?::(?<port>[0-9]+))?(?:/.*)?$") }
+
+  - resolveMemoriesEndpoint:
+      set:
+        memories_host: >-
+          ${ if $workflow.input.memories_grpc_host == ""
+             then $parsed_url.host
+             else $workflow.input.memories_grpc_host
+             end }
+        memories_port: >-
+          ${ if $workflow.input.memories_grpc_port == 0
+             then ($parsed_url.port
+                   // (if $parsed_url.scheme == "https" then "443" else "80" end)
+                   | tonumber)
+             else $workflow.input.memories_grpc_port
+             end }
+        # Derive tls from URL scheme by default. Explicit
+        # `memories_grpc_tls` ("true" / "false") wins so split-transport
+        # setups can override.
+        memories_tls: >-
+          ${ if $workflow.input.memories_grpc_tls == ""
+             then ($parsed_url.scheme == "https")
+             else ($workflow.input.memories_grpc_tls == "true")
+             end }
+
+  # Step 2: Resolve downstream wiring — personality / reflection
+  # opt-in gates and the LLM endpoint/model fallback chains. The
+  # `// ""` coalesce defends against schema-skipped null values.
+  - resolveDownstreamWiring:
+      set:
+        effective_personality_model: >-
+          ${ if ($workflow.input.personality_model // "") != ""
+             then $workflow.input.personality_model
+             else $workflow.input.summary_model
+             end }
+        personality_enabled: >-
+          ${ ($workflow.input.thread_personality_batch_yaml // "") != "" }
+        effective_reflector_model: >-
+          ${ if ($workflow.input.reflector_model // "") != ""
+             then $workflow.input.reflector_model
+             else $workflow.input.summary_model
+             end }
+        effective_reflector_base_url: >-
+          ${ if ($workflow.input.reflector_base_url // "") != ""
+             then $workflow.input.reflector_base_url
+             else $workflow.input.ollama_base_url
+             end }
+        reflection_enabled: >-
+          ${ ($workflow.input.thread_reflection_batch_yaml // "") != "" }
+        daily_summary_enabled: >-
+          ${ ($workflow.input.daily_work_summary_batch_yaml // "") != "" }
+        # `updated_after_ms` strict-`>` boundary, so `-1` keeps threads
+        # updated AT the boundary included (parity with the legacy
+        # day_start path). The max of (since_ms_utc, range_start_ms)
+        # lets short-span runs with `since_mode="now_minus"` actually
+        # narrow the fetch.
+        updated_after_ms_effective: >-
+          ${ (if $workflow.input.since_ms_utc > $workflow.input.range_start_ms
+              then $workflow.input.since_ms_utc
+              else $workflow.input.range_start_ms end) - 1 }
+
+  # Layered onto $personality_enabled so the precondition is defined
+  # once. `set` evaluates keys in parallel so the reference has to
+  # live in a separate step.
+  - resolvePersonalityMergeFlag:
+      set:
+        personality_merge_enabled: >-
+          ${ $personality_enabled
+             and ($workflow.input.user_personality_merge_yaml // "") != "" }
+
+  # Step 3: Run the summary and personality pipelines concurrently.
+  # The two systems own disjoint user_id spaces (summary_user_id vs
+  # personality_user_id) and never read each other's data, so a fork
+  # is safe.
+  #
+  # summaryBranch runs threadSummaryBatch → dailyWorkSummary →
+  # reflectionStage serially. reflection is at the end (not before
+  # daily-summary) because it does not consume summary output —
+  # ordering only matters for failure visibility: with no try/catch,
+  # a reflection failure fails the whole branch (and hence the
+  # workflow) after daily-summary has already succeeded. Operators
+  # see "summary done, reflection failed" rather than "everything
+  # rolled back".
+  #
+  # personalityBranch keeps its existing branch-level try/catch so
+  # personality failures stay non-fatal (logged via `personality_error`).
+  - downstreamStages:
+      timeout:
+        after:
+          hours: 24
+      fork:
+        branches:
+          - summaryBranch:
+              do:
+                - threadSummaryBatch:
+                    timeout:
+                      after:
+                        hours: 24
+                    run:
+                      function:
+                        runnerName: WORKFLOW
+                        settings:
+                          workflow_url: "${ $workflow.input.thread_summary_batch_yaml }"
+                        # Batch parent → `llm_batch` (≥2). Its child
+                        # single workers run on the channel baked into
+                        # their registered worker definition (MG6: the
+                        # batch fans out via `workerName`, default
+                        # `workflow_lang`). Putting the parent on the same
+                        # channel as its children deadlocks — the only slot
+                        # is held by the parent waiting for child jobs that
+                        # can never start.
+                        options:
+                          channel: llm_batch
+                        arguments:
+                          input: >-
+                            ${ {
+                              user_id: $workflow.input.user_id,
+                              memories_grpc_host: $memories_host,
+                              memories_grpc_port: $memories_port,
+                              memories_grpc_tls: $memories_tls,
+                              llm_worker_name: $workflow.input.llm_worker_name,
+                              updated_after_ms: $updated_after_ms_effective,
+                              summary_model: $workflow.input.summary_model,
+                              ollama_base_url: $workflow.input.ollama_base_url,
+                              output_language: $workflow.input.output_language,
+                              memory_thread_label_prefix: $workflow.input.memory_thread_label_prefix,
+                              force_resummarize: $workflow.input.force_resummarize,
+                              summary_user_id: $workflow.input.summary_user_id,
+                              min_message_count: 4,
+                              max_context_chars: $workflow.input.max_context_chars
+                            } | tojson }
+                    export:
+                      as:
+                        thread_summary_succeeded: true
+
+                - dailyWorkSummary:
+                    if: "${ $daily_summary_enabled }"
+                    timeout:
+                      after:
+                        hours: 24
+                    run:
+                      function:
+                        runnerName: WORKFLOW
+                        settings:
+                          workflow_url: "${ $workflow.input.daily_work_summary_batch_yaml }"
+                        options:
+                          channel: llm_batch
+                        arguments:
+                          input: >-
+                            ${ {
+                              source_user_id: $workflow.input.summary_user_id,
+                              start_date: $workflow.input.since_date,
+                              end_date: $workflow.input.end_date,
+                              timezone_offset_hours: $workflow.input.timezone_offset_hours,
+                              memories_grpc_host: $memories_host,
+                              memories_grpc_port: $memories_port,
+                              memories_grpc_tls: $memories_tls,
+                              llm_worker_name: $workflow.input.llm_worker_name,
+                              summary_label: $workflow.input.memory_thread_label_prefix,
+                              daily_label: $workflow.input.daily_summary_label,
+                              extra_labels_filter: $workflow.input.extra_labels_filter,
+                              min_thread_count: $workflow.input.min_thread_count,
+                              max_context_chars: $workflow.input.max_context_chars,
+                              summary_model: $workflow.input.summary_model,
+                              ollama_base_url: $workflow.input.ollama_base_url,
+                              output_language: $workflow.input.output_language,
+                              force_resummarize: $workflow.input.force_resummarize
+                            } | tojson }
+                    export:
+                      as:
+                        daily_summary_succeeded: true
+
+                # Reflection stage (opt-in, fatal). No try/catch — a
+                # reflection failure halts summaryBranch and fails the
+                # workflow.
+                #
+                # `with_entries(select(.value != null))` here is
+                # NEEDED (unlike the two preceding stages) because
+                # `experiment_id` / `experiment_variant` have no
+                # `default` in the input schema, so they arrive as
+                # null when callers omit them — and the
+                # thread-reflection-batch schema declares them as
+                # `type: string`, which rejects null.
+                - reflectionStage:
+                    if: "${ $reflection_enabled }"
+                    timeout:
+                      after:
+                        hours: 24
+                    run:
+                      function:
+                        runnerName: WORKFLOW
+                        settings:
+                          workflow_url: "${ $workflow.input.thread_reflection_batch_yaml }"
+                        options:
+                          channel: llm_batch
+                        arguments:
+                          input: >-
+                            ${ ({
+                                user_id: $workflow.input.user_id,
+                                memories_grpc_host: $memories_host,
+                                memories_grpc_port: $memories_port,
+                                memories_grpc_tls: $memories_tls,
+                                llm_worker_name: $workflow.input.llm_worker_name,
+                                updated_after_ms: $updated_after_ms_effective,
+                                reflector_model: $effective_reflector_model,
+                                reflector_base_url: $effective_reflector_base_url,
+                                prompt_version: $workflow.input.prompt_version,
+                                output_language: $workflow.input.output_language,
+                                reflector_id: $workflow.input.reflector_id,
+                                force: $workflow.input.reflection_force,
+                                context_limit_tokens: $workflow.input.context_limit_tokens,
+                                single_pass_threshold_tokens: $workflow.input.single_pass_threshold_tokens,
+                                window_size_turns: $workflow.input.window_size_turns,
+                                window_overlap_turns: $workflow.input.window_overlap_turns,
+                                merge_max_input_tokens: $workflow.input.merge_max_input_tokens,
+                                estimated_tokens_per_turn: $workflow.input.estimated_tokens_per_turn,
+                                experiment_id: $workflow.input.experiment_id,
+                                experiment_variant: $workflow.input.experiment_variant
+                              } | with_entries(select(.value != null)) | tojson) }
+                    export:
+                      as:
+                        reflection_succeeded: true
+
+          - personalityBranch:
+              if: "${ $personality_enabled }"
+              try:
+                - threadPersonalityBatch:
+                    timeout:
+                      after:
+                        hours: 24
+                    run:
+                      function:
+                        runnerName: WORKFLOW
+                        settings:
+                          workflow_url: "${ $workflow.input.thread_personality_batch_yaml }"
+                        options:
+                          channel: llm_batch
+                        arguments:
+                          input: >-
+                            ${ {
+                              user_id: $workflow.input.user_id,
+                              memories_grpc_host: $memories_host,
+                              memories_grpc_port: $memories_port,
+                              memories_grpc_tls: $memories_tls,
+                              llm_worker_name: $workflow.input.llm_worker_name,
+                              merge_enabled: $personality_merge_enabled,
+                              updated_after_ms: $updated_after_ms_effective,
+                              personality_model: $effective_personality_model,
+                              ollama_base_url: $workflow.input.ollama_base_url,
+                              output_language: $workflow.input.output_language,
+                              force_reextract: $workflow.input.force_reextract,
+                              personality_user_id: $workflow.input.personality_user_id,
+                              summary_user_id: $workflow.input.summary_user_id,
+                              min_message_count: 4,
+                              min_user_messages: $workflow.input.min_user_messages,
+                              max_context_chars: $workflow.input.max_context_chars
+                            } | tojson }
+                    # User-level merge is dispatched from inside
+                    # thread-personality-batch when `merge_enabled` is set
+                    # there. The batch returns `merged` reflecting
+                    # whether invokeMerge actually succeeded (try/catch
+                    # failures keep it false), so callers can distinguish
+                    # "merge disabled" from "merge silently failed".
+                    export:
+                      as:
+                        thread_personality_succeeded: true
+                        personality_batch_result: ${ .output | fromjson }
+              catch:
+                as: error
+                do:
+                  - recordPersonalityError:
+                      set:
+                        personality_error: "${ $error }"
+
+output:
+  as:
+    # `completed` is true when:
+    #   - thread-summary succeeded, AND
+    #   - daily-summary either disabled or succeeded, AND
+    #   - reflection either disabled or succeeded.
+    # Daily-summary is now opt-in (2.0.0): when disabled, it does
+    # not gate completion. reflectionStage is fatal so a false
+    # `reflection_succeeded` with `reflection_enabled=true` cannot
+    # actually reach this point — keeping the term documents intent.
+    completed: >-
+      ${ $thread_summary_succeeded
+         and (($daily_summary_enabled | not) or $daily_summary_succeeded)
+         and (($reflection_enabled | not) or $reflection_succeeded) }
+    thread_summary_succeeded: ${ $thread_summary_succeeded }
+    daily_summary_enabled: ${ $daily_summary_enabled // false }
+    daily_summary_succeeded: ${ $daily_summary_succeeded }
+    personality_enabled: ${ $personality_enabled // false }
+    thread_personality_succeeded: ${ $thread_personality_succeeded // false }
+    user_personality_merge_succeeded: ${ $personality_batch_result.merged // false }
+    personality_error: ${ $personality_error // null }
+    reflection_enabled: ${ $reflection_enabled // false }
+    reflection_succeeded: ${ $reflection_succeeded // false }

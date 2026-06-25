@@ -1,0 +1,52 @@
+# Worker definitions for the thread description auto-embedding pipeline.
+#
+# `memories-mm-embedding` is intentionally NOT redefined here: it is the
+# shared embedding worker owned by auto-embedding-workers.yaml, and is
+# registered first by the thread dispatcher (see
+# infra/src/infra/thread_vector/dispatcher.rs). Keeping the shared worker
+# in a single source of truth prevents last-write-wins drift between the
+# memory side and thread side YAML.
+
+defaults:
+  response_type: DIRECT
+  store_failure: true
+  # See auto-embedding-workers.yaml for the rationale: pipeline-internal
+  # workers do not need result broadcasting.
+  broadcast_results: false
+  retry_policy:
+    type: EXPONENTIAL
+    interval: 800
+    max_interval: 60000
+    max_retry: 0 # no retry
+    basis: 2.0
+
+workers:
+  # GRPC worker that calls ThreadVectorService/BatchUpsertEmbeddingsRows
+  # back on this server (N-row chunk upsert). Both env vars are REQUIRED —
+  # see auto-embedding-workers.yaml for the rationale (no silent fallback
+  # to loopback for cross-host deployments).
+  - name: memories-upsert-thread-embedding
+    runner: GRPC
+    settings:
+      host: %{MEMORY_GRPC_HOST}
+      port: %{MEMORY_GRPC_PORT}
+      use_reflection: true
+      method: llm_memory.service.ThreadVectorService/BatchUpsertEmbeddingsRows
+      as_json: true
+
+  # WORKFLOW worker for the thread embedding pipeline.
+  #
+  # Pinned to the dedicated `embedding_workflow` channel (concurrency=1)
+  # for the same reasons as `memories-auto-embedding` — see the longer
+  # rationale in auto-embedding-workers.yaml. Both workflow workers share
+  # the same single-slot channel, which is intentional: they both fan out
+  # into the same GPU-bound `embedding` worker, so allowing them to run
+  # in parallel only redistributes the same bottleneck while making
+  # individual workflow runs more likely to hit the 600s timeout.
+  - name: memories-auto-thread-embedding
+    runner: WORKFLOW
+    response_type: NO_RESULT
+    channel: embedding_workflow
+    settings:
+      workflow_data:
+        $file: auto-thread-embedding.yaml

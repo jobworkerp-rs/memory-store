@@ -1,0 +1,3 @@
+Read the conversation history above and return a thread summary as JSON.
+Write every free-text field in English.
+Keep code, commands, file paths, API names, tool names, enum values, and log fragments verbatim in English.

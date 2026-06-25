@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package llm_memory.data;
+
+import "llm_memory/data/common.proto";
+import "llm_memory/data/media.proto";
+import "llm_memory/data/thread.proto";
+
+// Content of a memory record, used as input to the Create RPC.
+message MemoryData {
+  // formerly system_id; system prompts are now ROLE_SYSTEM memories referenced via parent_ids.
+  reserved 1;
+  reserved "system_id";
+  // MemoryIds of every message passed to the LLM as input. Only stores
+  // MemoryIds that exist in memoriesDB.
+  repeated MemoryId parent_ids = 2;
+  // Owning user of this memory. Used by filters such as
+  // FindRecentListByUserId.
+  llm_memory.data.UserId user_id = 3;
+  // Actual text content of the memory (prompt to the LLM, the
+  // response, etc.).
+  string content = 4;
+  // Content type (TEXT, TOOL, IMAGE, ...).
+  ContentType content_type = 5;
+  // formerly channel (now on Thread).
+  reserved 6;
+  reserved "channel";
+  // LLM inference parameters serialized as JSON (temperature, top_p, ...).
+  optional string params = 7;
+  // Extra metadata for workflows and similar, serialized as JSON.
+  optional string metadata = 8;
+  // Creation time (milliseconds since epoch). Server fills the current time when 0 is sent.
+  int64 created_at = 9;
+  // Last-update time (milliseconds since epoch). Server fills the current time when 0 is sent.
+  int64 updated_at = 10;
+  // formerly thread_id; thread membership is managed via the thread_memory junction
+  // (populated automatically by ThreadService.AddMemory).
+  reserved 11;
+  reserved "thread_id";
+  // Role of the message sender (User / Assistant / System / Tool).
+  MessageRole role = 12;
+  // External identifier for deduplication on import.
+  // Format: "{source}:{unique_id}" (e.g. "claude_code:{session_id}:{uuid}")
+  // UNIQUE constraint in the database prevents duplicate imports.
+  optional string external_id = 13;
+  // Optional reference to a media_object (image memory feature). Present
+  // only when this memory carries a media body. content_type-independent
+  // (any content_type may carry media; see spec §3.2.1). Reserved 1/6/11
+  // are unused so 14 keeps wire backward compatibility.
+  optional MediaObjectId media_object_id = 14;
+  // Output-only thread memberships resolved from the thread_memory junction.
+  // Create / Update ignore this field; use ThreadService.AddMemory or
+  // ThreadService.AddMemoriesBatch to attach memories to threads.
+  repeated ThreadId thread_ids = 15;
+}
+
+// Unique identifier for a memory record.
+message MemoryId { int64 value = 1; }
+
+// Memory entity carrying both the id and its data.
+// Returned by Find / FindList / FindRecentListByUserId RPCs and
+// accepted as input by the Update RPC.
+message Memory {
+  MemoryId id = 1;
+  MemoryData data = 2;
+  // Output-only enrichment. Populated by the server (join + Resolve) when
+  // data.media_object_id is set; never sent by clients. The cacheable
+  // metadata and the short-lived presigned_url have a clear boundary
+  // (spec §4.2.2 / §4.2.2.1).
+  optional MediaPayload media = 3;
+}

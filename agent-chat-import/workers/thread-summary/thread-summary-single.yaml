@@ -1,0 +1,539 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: thread-summary-single
+  version: "1.0.0"
+
+input:
+  schema:
+    document:
+      type: object
+      required: [user_id, thread_id, memories_grpc_host, memories_grpc_port]
+      properties:
+        user_id: { type: integer }
+        thread_id: { type: integer }
+        memories_grpc_host: { type: string, default: "localhost" }
+        memories_grpc_port: { type: integer, default: 9100 }
+        memories_grpc_tls: { type: boolean, default: false }
+        llm_worker_name: { type: string, default: "memories-llm" }
+        min_message_count: { type: integer, default: 4 }
+        max_context_chars: { type: integer, default: 200000 }
+        summary_model: { type: string, default: "qwen3.6:27b" }
+        ollama_base_url: { type: string, default: "http://localhost:11434" }
+        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
+        memory_thread_label_prefix: { type: string, default: "summary" }
+        force_resummarize: { type: boolean, default: false }
+        summary_user_id:
+          type: integer
+          default: 100000
+          description: Owner user ID for summary memory threads. Must differ from user_id to prevent recursive summarization.
+
+do:
+  # Step 0: Initialize variables that may be referenced from `output.as`
+  # even when an early `then: exit` skips later steps. Without this,
+  # output transformation evaluates `$summary_json.title` against an
+  # undefined variable and fails the workflow with "undefined variable".
+  #
+  # `skipped` / `result` are the symmetric case: skip gates below set
+  # them on early-exit paths, but the normal completion path never
+  # touches them, so `output.as` would reference undefined variables
+  # whenever the workflow finishes successfully without skipping.
+  - initOutputVars:
+      set:
+        summary_json: "${ null }"
+        skipped: "${ false }"
+        result: "${ null }"
+
+  # Step 0a: Defensive fallback for summary_user_id when callers
+  # bypass the input schema (e.g. legacy clients). Schema default
+  # is 100000.
+  - normalizeSummaryUserId:
+      set:
+        effective_summary_user_id: "${ $workflow.input.summary_user_id // 100000 }"
+
+  # Step 0b: Reject summary_user_id == user_id outright. Sharing the
+  # owner would surface summary threads in the source user's listings
+  # and trigger recursive summarization on subsequent batch runs.
+  - failOnSelfOwnedSummary:
+      if: "${ $effective_summary_user_id == $workflow.input.user_id }"
+      raise:
+        error:
+          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
+          status: 400
+          title: "summary_user_id must differ from user_id"
+          detail: >-
+            ${ "summary_user_id (" + ($effective_summary_user_id | tostring)
+               + ") must differ from user_id ("
+               + ($workflow.input.user_id | tostring)
+               + ") to prevent recursive summarization." }
+
+  # Step 1: Fetch the target thread
+  - fetchThread:
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/Find"
+            json_body: >-
+              ${ { value: $workflow.input.thread_id } | tojson }
+            as_json: true
+      export:
+        as:
+          thread: ${ .jsonBody | fromjson | .data }
+
+  # Step 1.5: Skip if thread does not exist.
+  # Implemented as a setTask (not a doTask wrapping a child setTask)
+  # because the jobworkerp-rs DSL validator currently rejects the
+  # equivalent doTask form even though the spec permits it (see
+  # docs/jobworkerp-workflow-validator-bug.md).
+  - checkThreadExists:
+      if: "${ $thread == null }"
+      set:
+        skipped: true
+      export:
+        as:
+          result: "skipped: thread not found"
+      then: exit
+
+  # Step 2: Fetch chat history (USER + ASSISTANT, TEXT only)
+  - fetchMessages:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindMemoriesByThreadId"
+            json_body: >-
+              ${ {
+                thread_id: { value: $workflow.input.thread_id },
+                roles: ["ROLE_USER", "ROLE_ASSISTANT"],
+                content_types: ["TEXT"]
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          # Normalize `.data.content` to "" up front: protobuf JSON
+          # serialization omits empty-string fields, so a memory row
+          # with empty content arrives WITHOUT a `content` key. The
+          # liquid engine (liquid-core 0.26) raises "Unknown index" on
+          # a missing object key rather than rendering empty, so the
+          # downstream `{{ msg.data.content }}` in generateSummary
+          # would 400 on such rows. Filling it here guarantees the key
+          # exists for every consumer (truncation jq + liquid prompt).
+          messages: >-
+            ${ .jsonBody | fromjson
+               | map(.data.content = (.data.content // "")) }
+          has_enough_messages: >-
+            ${ (.jsonBody | fromjson | length)
+               >= $workflow.input.min_message_count }
+
+  # Step 3: Skip if not enough messages. Same setTask shape as
+  # `checkThreadExists` for the same validator-bug reason.
+  - checkMessageCount:
+      if: "${ $has_enough_messages | not }"
+      set:
+        skipped: true
+      export:
+        as:
+          result: "skipped: not enough messages"
+      then: exit
+
+  # Step 4: Search for existing memory thread by labels
+  - findMemoryThread:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
+            json_body: >-
+              ${ {
+                labels: ( ($thread.data.labels
+                           // ["thread_" + ($workflow.input.thread_id | tostring)])
+                          + [$workflow.input.memory_thread_label_prefix] ),
+                match_mode: "LABEL_ALL",
+                user_id: $effective_summary_user_id,
+                limit: 1
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          existing_memory_thread_id: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | (if length > 0 then .[0].id.value else null end) }
+
+  # Step 4.5: Initialize default for existing_summary_memory
+  # (findExistingSummary may be skipped when no memory thread exists)
+  - initExistingSummary:
+      set:
+        existing_summary_memory: "${ null }"
+
+  # Step 5: Search for existing summary memory (for dedup + re-summarize check)
+  - findExistingSummary:
+      if: "${ $existing_memory_thread_id != null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindMemoriesByThreadId"
+            json_body: >-
+              ${ {
+                thread_id: { value: $existing_memory_thread_id },
+                roles: ["ROLE_ASSISTANT"],
+                content_types: ["TEXT"]
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          existing_summary_memory: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | map(select(
+                   (((.data.metadata // "{}") | fromjson).source_thread_id | tostring)
+                   == ($workflow.input.thread_id | tostring)
+                 ))
+               | (if length > 0 then .[0] else null end) }
+
+  # Step 6: Determine eligibility for (re-)summarization
+  - checkEligibility:
+      set:
+        eligible: >-
+          ${ $workflow.input.force_resummarize
+             or ($thread.data.description // "") == ""
+             or ($existing_summary_memory == null)
+             or ($thread.data.updatedAt
+                 > $existing_summary_memory.data.updatedAt) }
+
+  # Same setTask shape as the other skip gates above.
+  - skipIfNotEligible:
+      if: "${ $eligible | not }"
+      set:
+        skipped: true
+      export:
+        as:
+          result: "skipped: already up to date"
+      then: exit
+
+  # Step 7: Truncate messages if total content exceeds max_context_chars
+  # Keeps first 1/4 and last 1/4 of messages, drops the middle.
+  - truncateMessages:
+      set:
+        truncated_messages: >-
+          ${ if ($messages | map(.data.content | length) | add // 0)
+                > $workflow.input.max_context_chars
+             then
+               ( ($messages | length) as $len
+                 | (($len / 4) | floor) as $keep
+                 | ($messages[:$keep])
+                   + [{ data: { role: "ROLE_SYSTEM",
+                        content: ("... (" + (($len - $keep * 2) | tostring) + " messages omitted) ...") } }]
+                   + ($messages[($len - $keep):]) )
+             else $messages
+             end }
+
+  - validateSummaryPromptContext:
+      if: "${ (($summary_system_prompt // \"\") | length) == 0 or (($summary_user_tail // \"\") | length) == 0 }"
+      raise:
+        error:
+          type: "https://memories.local/errors/summary/prompt_context_missing"
+          status: 422
+          title: "Summary prompt context is missing"
+          detail: >-
+            ${ if (($summary_system_prompt // "") | length) == 0
+               then "summary_system_prompt is missing"
+               else "summary_user_tail is missing"
+               end }
+
+  # Step 8: Generate summary via LLM completion
+  - generateSummary:
+      run:
+        function:
+          runnerName: LLM
+          using: completion
+          settings:
+            ollama:
+              base_url: "${$workflow.input.ollama_base_url}"
+              model: "${$workflow.input.summary_model}"
+          options:
+            channel: llm
+            storeSuccess: false
+            storeFailure: true
+          arguments:
+            system_prompt: "${ $summary_system_prompt }"
+            prompt: >-
+              $${## Thread info
+              - labels: {{ thread.data.labels | join: ", " }}
+              - createdAt: {{ thread.data.createdAt }}
+
+              ## Conversation history
+              {% for msg in truncated_messages %}
+              [{{ msg.data.role }}] {{ msg.data.content }}
+              {% endfor %}
+
+              {{ summary_user_tail }}}
+            options:
+              max_tokens: 20000
+              temperature: 0.3
+            json_schema: |
+              {
+                "type": "object",
+                "required": ["category", "title", "summary", "key_decisions", "status"],
+                "properties": {
+                  "category": {"type": "string", "enum": ["coding","consultation","research","creative","general"]},
+                  "title": {"type": "string"},
+                  "summary": {"type": "string"},
+                  "key_decisions": {"type": "array", "items": {"type": "string"}},
+                  "status": {"type": "string", "enum": ["resolved","ongoing","abandoned"]}
+                }
+              }
+      export:
+        as:
+          summary_json: ${ .content.text | fromjson }
+
+  # Step 9: Update ThreadData.description with summary title + text
+  - updateThreadDescription:
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/Update"
+            json_body: >-
+              ${ {
+                id: { value: $workflow.input.thread_id },
+                data: ($thread.data | .description = (
+                  "【" + $summary_json.title + "】 " + $summary_json.summary
+                ))
+              } | tojson }
+            as_json: true
+
+  # Step 9.5: Initialize default for created_memory_thread_id
+  # (createMemoryThread may be skipped when memory thread already exists)
+  - initCreatedMemoryThreadId:
+      set:
+        created_memory_thread_id: "${ null }"
+
+  # Step 10: Create memory thread if none exists
+  - createMemoryThread:
+      if: "${ $existing_memory_thread_id == null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/Create"
+            json_body: >-
+              ${ {
+                user_id: { value: $effective_summary_user_id },
+                description: (($thread.data.labels
+                               // ["thread_" + ($workflow.input.thread_id | tostring)])
+                              | join(", ")) + " の要約集",
+                labels: ( ($thread.data.labels
+                           // ["thread_" + ($workflow.input.thread_id | tostring)])
+                          + [$workflow.input.memory_thread_label_prefix] ),
+                created_at: $thread.data.createdAt,
+                updated_at: $thread.data.updatedAt
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          created_memory_thread_id: ${ .jsonBody | fromjson | .id.value }
+
+  # Step 11: Resolve which memory thread ID to use
+  - resolveMemoryThreadId:
+      set:
+        memory_thread_id: "${ $existing_memory_thread_id // $created_memory_thread_id }"
+
+  # Step 11.5: Clean up stale summaries from old memory threads
+  # (label-change scenario). Must run BEFORE Step 12-b because the
+  # `external_id = "summary:<thread_id>"` UNIQUE index would otherwise
+  # reject AddMemory and abort the workflow before any cleanup ran.
+  #
+  # Skip when the existing summary lives in the same memory thread we
+  # are about to write to — Step 12-a's Update path will refresh it
+  # in-place with no UNIQUE conflict.
+  - cleanupStaleSummaries:
+      if: >-
+        ${ ($existing_summary_memory != null
+                and $existing_memory_thread_id == $memory_thread_id) | not }
+      do:
+        - findAllSummaryThreads:
+            run:
+              function:
+                runnerName: GRPC
+                using: streaming
+                settings:
+                  host: "${$workflow.input.memories_grpc_host}"
+                  port: ${$workflow.input.memories_grpc_port}
+                  tls: ${$workflow.input.memories_grpc_tls}
+                  useReflection: true
+                arguments:
+                  method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
+                  json_body: >-
+                    ${ {
+                      labels: [$workflow.input.memory_thread_label_prefix],
+                      match_mode: "LABEL_ANY",
+                      user_id: $effective_summary_user_id
+                    } | tojson }
+                  as_json: true
+            export:
+              as:
+                all_summary_threads: ${ .jsonBody | fromjson }
+
+        - iterateSummaryThreads:
+            for:
+              each: st
+              in: >-
+                ${ $all_summary_threads
+                   | map(select(.id.value != $memory_thread_id)) }
+            do:
+              - searchStale:
+                  run:
+                    function:
+                      runnerName: GRPC
+                      using: streaming
+                      settings:
+                        host: "${$workflow.input.memories_grpc_host}"
+                        port: ${$workflow.input.memories_grpc_port}
+                        tls: ${$workflow.input.memories_grpc_tls}
+                        useReflection: true
+                      arguments:
+                        method: "/llm_memory.service.ThreadService/FindMemoriesByThreadId"
+                        json_body: >-
+                          ${ {
+                            thread_id: { value: $st.id.value },
+                            roles: ["ROLE_ASSISTANT"],
+                            content_types: ["TEXT"]
+                          } | tojson }
+                        as_json: true
+                  export:
+                    as:
+                      stale_memories: >-
+                        ${ ((.jsonBody // "[]") | fromjson)
+                           | map(select(
+                               (((.data.metadata // "{}") | fromjson).source_thread_id | tostring)
+                               == ($workflow.input.thread_id | tostring)
+                             )) }
+
+              - deleteStale:
+                  for:
+                    each: stale
+                    in: "${ $stale_memories }"
+                  do:
+                    - deleteOne:
+                        run:
+                          function:
+                            runnerName: GRPC
+                            using: unary
+                            settings:
+                              host: "${$workflow.input.memories_grpc_host}"
+                              port: ${$workflow.input.memories_grpc_port}
+                              tls: ${$workflow.input.memories_grpc_tls}
+                              useReflection: true
+                            arguments:
+                              method: "/llm_memory.service.MemoryService/Delete"
+                              json_body: >-
+                                ${ $stale.id | tojson }
+                              as_json: true
+
+  # Step 12-a: Update existing summary memory
+  - updateSummary:
+      if: "${ $existing_summary_memory != null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryService/Update"
+            json_body: >-
+              ${ {
+                id: $existing_summary_memory.id,
+                data: ($existing_summary_memory.data
+                  | .content = ($summary_json | tojson)
+                  | .metadata = ({
+                      source_thread_id: ($workflow.input.thread_id | tostring),
+                      category: $summary_json.category,
+                      summary_version: "1.0"
+                    } | tojson)
+                  | .externalId = ("summary:" + ($workflow.input.thread_id | tostring))
+                  | .updatedAt = $thread.data.updatedAt)
+              } | tojson }
+            as_json: true
+
+  # Step 12-b: Add new summary memory
+  - addSummaryMemory:
+      if: "${ $existing_summary_memory == null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/AddMemory"
+            json_body: >-
+              ${ {
+                thread_id: { value: $memory_thread_id },
+                memory: {
+                  user_id: { value: $effective_summary_user_id },
+                  content: ($summary_json | tojson),
+                  content_type: "TEXT",
+                  role: "ROLE_ASSISTANT",
+                  metadata: ({
+                    source_thread_id: ($workflow.input.thread_id | tostring),
+                    category: $summary_json.category,
+                    summary_version: "1.0"
+                  } | tojson),
+                  external_id: ("summary:" + ($workflow.input.thread_id | tostring)),
+                  created_at: $thread.data.createdAt,
+                  updated_at: $thread.data.updatedAt
+                }
+              } | tojson }
+            as_json: true
+
+output:
+  as:
+    completed: ${ $summary_json != null }
+    thread_id: ${ $workflow.input.thread_id }
+    summary_title: ${ if $summary_json != null then $summary_json.title else null end }
+    skipped: ${ $skipped // false }
+    skip_reason: ${ if ($skipped // false) then $result else null end }

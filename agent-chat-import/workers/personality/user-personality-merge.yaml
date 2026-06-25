@@ -1,0 +1,783 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: user-personality-merge
+  version: "1.0.0"
+
+# Layer 2: aggregate per-thread personality signals into a single
+# user-level profile memory.
+#
+# Reads layer-1 signals owned by `personality_user_id` (default 200000),
+# filters by `metadata.source_user_id == input.user_id` (invariant I6),
+# asks an LLM to merge them, then post-processes per-entry first/last
+# seen timestamps in jq so the LLM cannot fabricate dates. The result
+# is upserted under `external_id = "personality_profile:<user_id>"` —
+# one memory per source user, in a single profile thread tagged with
+# `[PERSONALITY_PROFILE_LABEL, "user:<source_user_id>"]` (invariant I3).
+
+input:
+  schema:
+    document:
+      type: object
+      required: [user_id, memories_grpc_host, memories_grpc_port]
+      properties:
+        user_id:
+          type: integer
+          description: Source user whose layer-1 signals are merged.
+        memories_grpc_host: { type: string, default: "localhost" }
+        memories_grpc_port: { type: integer, default: 9100 }
+        memories_grpc_tls: { type: boolean, default: false }
+        llm_worker_name: { type: string, default: "memories-llm" }
+        personality_user_id: { type: integer, default: 200000 }
+        summary_user_id:
+          type: integer
+          default: 100000
+          description: >-
+            Reference value for collision detection only. Same purpose
+            as in thread-personality-single — keep the two extraction
+            domains disjoint.
+        max_context_chars: { type: integer, default: 200000 }
+        merge_model: { type: string, default: "qwen3.6:27b" }
+        ollama_base_url: { type: string, default: "http://localhost:11434" }
+        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
+        force_remerge: { type: boolean, default: false }
+        max_signals:
+          type: integer
+          default: 200
+          description: >-
+            Upper bound on layer-1 signals fed into the LLM. Excess
+            signals are dropped from the oldest end (signal_updated_at
+            ascending) so the most recent preferences always win.
+
+timeout:
+  after:
+    hours: 6
+
+do:
+  - normalizePersonalityUserId:
+      set:
+        effective_personality_user_id: "${ $workflow.input.personality_user_id // 200000 }"
+        effective_summary_user_id: "${ $workflow.input.summary_user_id // 100000 }"
+
+  # See thread-personality-single for the rationale of these two guards.
+  - failOnSelfOwnedPersonality:
+      if: "${ $effective_personality_user_id == $workflow.input.user_id }"
+      raise:
+        error:
+          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
+          status: 400
+          title: "personality_user_id must differ from user_id"
+          detail: >-
+            ${ "personality_user_id (" + ($effective_personality_user_id | tostring)
+               + ") must differ from user_id ("
+               + ($workflow.input.user_id | tostring)
+               + ") to prevent recursive personality extraction." }
+
+  - failOnSummaryUserCollision:
+      if: "${ $effective_personality_user_id == $effective_summary_user_id }"
+      raise:
+        error:
+          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
+          status: 400
+          title: "personality_user_id must differ from summary_user_id"
+          detail: >-
+            ${ "personality_user_id (" + ($effective_personality_user_id | tostring)
+               + ") must differ from summary_user_id ("
+               + ($effective_summary_user_id | tostring)
+               + ") to keep the two extraction domains disjoint." }
+
+  # Initialised early so an early `then: exit` does not leave
+  # `output.as` referencing undefined variables. `truncated_signals`
+  # / `no_signal_count` are referenced from `output.as` and would
+  # otherwise be undefined on the skip paths
+  # (`skipIfNoSignals` / `skipIfNotEligible`) and on a
+  # `countTotalPersonalityMemories` failure.
+  - initOutputVars:
+      set:
+        profile_json: "${ null }"
+        skipped: "${ false }"
+        result: "${ null }"
+        truncated_signals: "${ [] }"
+        total_personality_memory_count: "${ 0 }"
+        no_signal_count: "${ 0 }"
+
+  # Invariant I3: profile thread is uniquely identified by the 2-tuple
+  # [PERSONALITY_PROFILE_LABEL, "user:<src>"].
+  - findProfileThread:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
+            json_body: >-
+              ${ {
+                labels: ["personality_profile",
+                         "user:" + ($workflow.input.user_id | tostring)],
+                match_mode: "LABEL_ALL",
+                user_id: $effective_personality_user_id,
+                limit: 1
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          existing_profile_thread_id: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | (if length > 0 then .[0].id.value else null end) }
+          existing_profile_thread_data: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | (if length > 0 then .[0].data else null end) }
+
+  - initExistingProfile:
+      set:
+        existing_profile: "${ null }"
+
+  - findExistingProfile:
+      if: "${ $existing_profile_thread_id != null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindMemoriesByThreadId"
+            json_body: >-
+              ${ {
+                thread_id: { value: $existing_profile_thread_id },
+                roles: ["ROLE_ASSISTANT"],
+                content_types: ["TEXT"]
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          existing_profile: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | map(select(.data.externalId
+                     == ("personality_profile:" + ($workflow.input.user_id | tostring))))
+               | (if length > 0 then .[0] else null end) }
+
+  # Invariant I6: the LABEL_ALL filter pre-narrows to this source
+  # user; the metadata.source_user_id check below is a belt-and-braces
+  # against label mistagging.
+  #
+  # Including `personality_signal` here drops no_signal threads at
+  # the gRPC boundary instead of fetching their memories only to
+  # filter them out client-side. thread-personality-single tags
+  # threads with this label whenever it stores a signal whose
+  # `no_signal == false`.
+  - findSignalThreads:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
+            json_body: >-
+              ${ {
+                labels: ["personality",
+                         "user:" + ($workflow.input.user_id | tostring),
+                         "personality_signal"],
+                match_mode: "LABEL_ALL",
+                user_id: $effective_personality_user_id
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          signal_threads: ${ .jsonBody | fromjson }
+
+  # Total personality memory count (signal + no_signal) for this
+  # source user, scoped through `thread_filter` so we don't pull in
+  # other users' personality memories. Used to derive
+  # `no_signal_thread_count = total - len(valid_signals)` without
+  # requiring a separate `personality_none` label.
+  - countTotalPersonalityMemories:
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryService/CountByCondition"
+            json_body: >-
+              ${ {
+                roles: ["ROLE_ASSISTANT"],
+                user_id: { value: $effective_personality_user_id },
+                external_id_prefix: "personality:",
+                content_types: ["TEXT"],
+                thread_filter: {
+                  user_id: $effective_personality_user_id,
+                  labels: ["personality",
+                           "user:" + ($workflow.input.user_id | tostring)],
+                  label_match_mode: "LABEL_ALL"
+                }
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          total_personality_memory_count: >-
+            ${ ((.jsonBody // "{}") | fromjson | (.total // 0) | tonumber) }
+
+  # `signal_threads` is empty for users that have never had a layer-1
+  # personality memory written. In that case the for-loop below never
+  # runs, so its export.as never binds `$accumulated_signals` —
+  # and the downstream `filterAndDedupeSignals` would then trip on
+  # "undefined variable $accumulated_signals". Pre-bind it here so
+  # both the empty-loop path and the populated-loop path leave the
+  # variable defined.
+  - initAccumulatedSignals:
+      set:
+        accumulated_signals: "${ [] }"
+
+  # Each personality thread produces at most one signal memory
+  # (deterministic external_id), so the per-thread fetch is a union;
+  # we still dedupe defensively below to absorb the rare case where
+  # two threads share the same `source_thread_id`.
+  - fetchSignalMemories:
+      for:
+        each: t
+        in: "${ $signal_threads }"
+      do:
+        - fetchOne:
+            run:
+              function:
+                runnerName: GRPC
+                using: streaming
+                settings:
+                  host: "${$workflow.input.memories_grpc_host}"
+                  port: ${$workflow.input.memories_grpc_port}
+                  tls: ${$workflow.input.memories_grpc_tls}
+                  useReflection: true
+                arguments:
+                  method: "/llm_memory.service.ThreadService/FindMemoriesByThreadId"
+                  json_body: >-
+                    ${ {
+                      thread_id: { value: $t.id.value },
+                      roles: ["ROLE_ASSISTANT"],
+                      content_types: ["TEXT"]
+                    } | tojson }
+                  as_json: true
+            export:
+              as:
+                accumulated_signals: >-
+                  ${ $accumulated_signals
+                     + ((.jsonBody // "[]") | fromjson) }
+
+  # Invariant I6 second leg: filter by metadata.source_user_id.
+  # `accumulated_signals` already contains only `personality_signal`-
+  # tagged threads (filtered at findSignalThreads), so every entry
+  # surviving the source_user_id check should have
+  # `metadata.no_signal == false`. The metadata.no_signal filter in
+  # `buildSignalEntries` below stays as a belt-and-braces guard
+  # against the rare retro-tagging case (a thread originally signal,
+  # later re-extracted as no_signal but still carrying the
+  # `personality_signal` label since we never strip it).
+  - filterAndDedupeSignals:
+      set:
+        all_personality_memories: >-
+          ${ ($accumulated_signals // [])
+             | map(select(.data.externalId != null
+                          and ((.data.metadata // "{}") | fromjson | .source_user_id // null)
+                              == ($workflow.input.user_id | tostring))) }
+
+  # Workflow-side ISO8601 conversion keeps the LLM out of date math.
+  # Dedupe by source_thread_id (retain max updatedAt). `no_signal`
+  # entries are dropped here as a belt-and-braces guard — under
+  # nominal config the personality_signal label filter already
+  # excluded them at the gRPC boundary.
+  #
+  # Protobuf encodes int64 fields as JSON strings ("1777936211226"),
+  # so updatedAt / createdAt must be coerced via tonumber before any
+  # arithmetic or numeric ordering — otherwise group_by / max_by /
+  # `/ 1000` operate on strings and either misorder or fail outright.
+  - buildSignalEntries:
+      set:
+        signal_entries: >-
+          ${ ($all_personality_memories
+              | map({
+                  raw: .,
+                  meta: ((.data.metadata // "{}") | fromjson),
+                  signal: ((.data.content // "{}") | fromjson),
+                  updated_at_ms: ((.data.updatedAt // 0) | tonumber),
+                  created_at_ms: ((.data.createdAt // 0) | tonumber)
+                })
+              | map(select((.meta.no_signal // false) == false))
+              | group_by(.meta.source_thread_id // "")
+              | map(max_by(.updated_at_ms))
+              | map({
+                  source_thread_id: (.meta.source_thread_id | tostring),
+                  signal_updated_at_iso: ((.updated_at_ms / 1000)
+                                          | floor
+                                          | strftime("%Y-%m-%dT%H:%M:%SZ")),
+                  signal_created_at_iso: ((.created_at_ms / 1000)
+                                          | floor
+                                          | strftime("%Y-%m-%dT%H:%M:%SZ")),
+                  raw_updated_at: .updated_at_ms,
+                  signal: .signal
+                })
+              | sort_by(.raw_updated_at)
+              | reverse) }
+
+  # `no_signal_count = total personality memories − valid signals`.
+  # Both numerator and denominator are scoped to this source user
+  # via the same external_id_prefix and label filters, and both
+  # count in units of "1 memory per source thread" (external_id is
+  # UNIQUE per source thread), so the subtraction is well-defined.
+  # Clamp to >= 0 to absorb the harmless transient where a fresh
+  # thread was created between the count RPC and the fetch (the
+  # newly-fetched signal would not be in the count yet).
+  - computeNoSignalCount:
+      set:
+        no_signal_count: >-
+          ${ [($total_personality_memory_count - ($signal_entries | length)), 0] | max }
+
+  # `existing_profile.data.updatedAt` is a JSON-string (proto int64),
+  # so it must be coerced to number before the `>` comparison too —
+  # string ordering would compare lexicographically and silently
+  # report a wrong eligibility result.
+  #
+  # Written as an explicit if/elif/else ladder rather than a multi-arm
+  # `or` so jaq cannot return a non-boolean from `null.data.updatedAt`
+  # in the third arm when `$existing_profile` is null. Same defensive
+  # shape as thread-personality-single.yaml's `checkEligibility`.
+  - checkEligibility:
+      set:
+        max_signal_updated_at: >-
+          ${ ($signal_entries | map(.raw_updated_at) | max) // 0 }
+        eligible: >-
+          ${ if ($workflow.input.force_remerge // false) == true then true
+             elif $existing_profile == null then true
+             elif (($signal_entries | map(.raw_updated_at) | max // 0) | tonumber)
+                  > (($existing_profile.data.updatedAt // 0) | tonumber) then true
+             else false
+             end }
+
+  - skipIfNoSignals:
+      if: "${ ($signal_entries | length) == 0 }"
+      set:
+        skipped: true
+      export:
+        as:
+          result: "skipped: no valid layer-1 signals"
+      then: exit
+
+  - skipIfNotEligible:
+      if: "${ ($eligible // false) == false }"
+      set:
+        skipped: true
+      export:
+        as:
+          result: >-
+            ${ "skipped: profile already up to date (force_remerge="
+               + (($workflow.input.force_remerge // false) | tostring)
+               + ", existing_profile="
+               + (if $existing_profile == null then "null" else "present" end)
+               + ")" }
+      then: exit
+
+  # `signal_entries` is already sorted updated-at desc, so a greedy
+  # prefix walk drops the oldest entries first when over budget.
+  # `signals_lookup` is keyed off `truncated_signals` (not the wider
+  # `capped_signals`) so the per-entry validator in Step 6.5 only
+  # accepts source_thread_ids that the LLM actually saw — otherwise
+  # an LLM hallucination citing a trimmed-out ID could silently pass
+  # validation.
+  #
+  # Split into three steps because jaq evaluates keys in a single
+  # `set` block in parallel — sibling keys cannot reference one
+  # another. Same constraint as `resolvePersonalityWiring` in
+  # agent-chat-pipeline.yaml.
+  - capSignals:
+      set:
+        capped_signals: >-
+          ${ ($signal_entries | .[: $workflow.input.max_signals]) }
+
+  - truncateSignals:
+      set:
+        truncated_signals: >-
+          ${ ($capped_signals | map((.signal | tojson | length)) | add // 0) as $total
+             | if $total > $workflow.input.max_context_chars
+               then ($capped_signals
+                     | reduce .[] as $e (
+                         {acc: [], used: 0};
+                         (($e.signal | tojson | length)) as $sz
+                         | if .used + $sz <= $workflow.input.max_context_chars
+                           then {acc: (.acc + [$e]), used: (.used + $sz)}
+                           else .
+                           end
+                       )).acc
+               else $capped_signals
+               end }
+
+  # jaq does not implement standard jq's INDEX/1, so we build the
+  # lookup map by hand via from_entries.
+  - buildSignalsLookup:
+      set:
+        signals_lookup: >-
+          ${ ($truncated_signals
+              | map({key: .source_thread_id, value: .})
+              | from_entries) }
+
+  # Schema makes `supporting_source_thread_ids` required (so the
+  # per-entry date computation below has something to anchor on) and
+  # excludes `first_seen_at` / `last_seen_at` from required (we
+  # overwrite them after the LLM call).
+  - validatePromptContext:
+      if: "${ (($user_personality_merge_system_prompt // \"\") | length) == 0 or (($user_personality_merge_user_tail // \"\") | length) == 0 }"
+      raise:
+        error:
+          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
+          status: 500
+          title: "prompt_context_missing"
+          detail: >-
+            ${ if (($user_personality_merge_system_prompt // "") | length) == 0
+               then "user_personality_merge_system_prompt is missing"
+               else "user_personality_merge_user_tail is missing"
+               end }
+
+  - mergeProfile:
+      run:
+        function:
+          runnerName: LLM
+          using: completion
+          settings:
+            ollama:
+              base_url: "${$workflow.input.ollama_base_url}"
+              model: "${$workflow.input.merge_model}"
+          options:
+            channel: llm
+            storeSuccess: false
+            storeFailure: true
+          arguments:
+            system_prompt: "${ $user_personality_merge_system_prompt }"
+            prompt: >-
+              $${## Target user ID: {{ workflow.input.user_id }}
+              ## Input signal count: {{ truncated_signals | size }}
+
+              ## Input signals
+              {{ truncated_signals | json_encode }}
+
+              {{ user_personality_merge_user_tail }}}
+            options:
+              max_tokens: 20000
+              temperature: 0.3
+            json_schema: |
+              {
+                "type": "object",
+                "required": ["profile_version", "summary"],
+                "properties": {
+                  "profile_version": { "type": "string" },
+                  "summary": { "type": "string" },
+                  "interests": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {
+                      "type": "object",
+                      "required": ["topic", "weight", "supporting_source_thread_ids", "memory_ids"],
+                      "properties": {
+                        "topic": { "type": "string" },
+                        "weight": { "type": "string", "enum": ["high","medium","low"] },
+                        "supporting_source_thread_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 10 },
+                        "memory_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 10 }
+                      }
+                    }
+                  },
+                  "preferences": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {
+                      "type": "object",
+                      "required": ["axis", "preference", "weight", "supporting_source_thread_ids", "memory_ids"],
+                      "properties": {
+                        "axis": { "type": "string" },
+                        "preference": { "type": "string" },
+                        "weight": { "type": "string", "enum": ["high","medium","low"] },
+                        "supporting_threads": { "type": "integer" },
+                        "supporting_source_thread_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 10 },
+                        "memory_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 10 }
+                      }
+                    }
+                  },
+                  "decision_style": {
+                    "type": "object",
+                    "required": ["summary", "traits", "supporting_source_thread_ids", "memory_ids"],
+                    "properties": {
+                      "summary": { "type": "string" },
+                      "traits": { "type": "array", "items": { "type": "string" } },
+                      "supporting_source_thread_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 10 },
+                      "memory_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 10 }
+                    }
+                  },
+                  "communication_style": {
+                    "type": "object",
+                    "required": ["tone", "verbosity", "language_preference", "supporting_source_thread_ids", "memory_ids"],
+                    "properties": {
+                      "tone": { "type": "string" },
+                      "verbosity": { "type": "string" },
+                      "language_preference": { "type": "string" },
+                      "notes": { "type": "string" },
+                      "supporting_source_thread_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 10 },
+                      "memory_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 10 }
+                    }
+                  },
+                  "values_and_beliefs": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {
+                      "type": "object",
+                      "required": ["belief", "weight", "supporting_source_thread_ids", "memory_ids"],
+                      "properties": {
+                        "belief": { "type": "string" },
+                        "weight": { "type": "string", "enum": ["high","medium","low"] },
+                        "supporting_threads": { "type": "integer" },
+                        "supporting_source_thread_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 10 },
+                        "memory_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 10 }
+                      }
+                    }
+                  },
+                  "anti_preferences": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {
+                      "type": "object",
+                      "required": ["avoid", "weight", "supporting_source_thread_ids", "memory_ids"],
+                      "properties": {
+                        "avoid": { "type": "string" },
+                        "weight": { "type": "string", "enum": ["high","medium","low"] },
+                        "supporting_threads": { "type": "integer" },
+                        "supporting_source_thread_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 10 },
+                        "memory_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 10 }
+                      }
+                    }
+                  }
+                }
+              }
+      export:
+        as:
+          llm_profile: ${ .content.text | fromjson }
+
+  # The LLM may hallucinate `supporting_source_thread_ids`; for each
+  # entry we keep only IDs present in the input set, then recompute
+  # `first_seen_at` / `last_seen_at` from the input ISO8601 strings.
+  # Lex min/max == temporal min/max because the format is fixed-width
+  # `%Y-%m-%dT%H:%M:%SZ`. Entries whose IDs are entirely fabricated
+  # are dropped; for single-object fields (decision_style /
+  # communication_style) the whole key is removed.
+  # Metrics are always overwritten with workflow-side values so the
+  # LLM cannot drift the counts.
+  # `enrich_array` caps each array at 20 entries as a belt-and-braces
+  # guard for the JSON Schema `maxItems: 20` constraint. The LLM is
+  # also told to self-cap, but a non-compliant model would otherwise
+  # let the profile grow unbounded across re-runs. Ranking key:
+  # weight (high>medium>low), then supporting_source_thread_ids count
+  # — same priority order the LLM is asked to apply.
+  - confirmEntryDates:
+      set:
+        profile_json: >-
+          ${ ($signals_lookup) as $by_id
+             | def weight_rank(w):
+                 if w == "high" then 0
+                 elif w == "medium" then 1
+                 elif w == "low" then 2
+                 else 3 end;
+               def enrich_array(arr):
+                 arr // []
+                 | map(. as $e
+                       | (($e.supporting_source_thread_ids // [])
+                          | map(select($by_id[.] != null))) as $vids
+                       | if ($vids | length) == 0 then empty
+                         else ($vids
+                               | map($by_id[.].signal_updated_at_iso)) as $iso
+                              | $e + {
+                                  supporting_source_thread_ids: $vids,
+                                  first_seen_at: ($iso | min),
+                                  last_seen_at: ($iso | max)
+                                }
+                         end)
+                 | sort_by([weight_rank(.weight),
+                            (0 - ((.supporting_source_thread_ids // []) | length))])
+                 | .[: 20];
+               def enrich_object(obj):
+                 if obj == null then null
+                 else ((obj.supporting_source_thread_ids // [])
+                       | map(select($by_id[.] != null))) as $vids
+                       | if ($vids | length) == 0 then null
+                         else ($vids
+                               | map($by_id[.].signal_updated_at_iso)) as $iso
+                             | obj + {
+                                 supporting_source_thread_ids: $vids,
+                                 first_seen_at: ($iso | min),
+                                 last_seen_at: ($iso | max)
+                               }
+                         end
+                 end;
+               $llm_profile
+               | .interests = enrich_array(.interests)
+               | .preferences = enrich_array(.preferences)
+               | .values_and_beliefs = enrich_array(.values_and_beliefs)
+               | .anti_preferences = enrich_array(.anti_preferences)
+               | (.decision_style |= enrich_object(.))
+               | (if .decision_style == null then del(.decision_style) else . end)
+               | (.communication_style |= enrich_object(.))
+               | (if .communication_style == null then del(.communication_style) else . end)
+               | .metrics = {
+                   source_thread_count: ($truncated_signals | length),
+                   no_signal_thread_count: $no_signal_count,
+                   earliest_signal_at: ($truncated_signals | map(.signal_updated_at_iso) | min),
+                   latest_signal_at:   ($truncated_signals | map(.signal_updated_at_iso) | max)
+                 } }
+
+  - initCreatedProfileThreadId:
+      set:
+        created_profile_thread_id: "${ null }"
+
+  - createProfileThread:
+      if: "${ $existing_profile_thread_id == null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/Create"
+            json_body: >-
+              ${ {
+                user_id: { value: $effective_personality_user_id },
+                description: ("personality profile for user "
+                              + ($workflow.input.user_id | tostring)),
+                labels: ["personality_profile",
+                         "user:" + ($workflow.input.user_id | tostring)],
+                created_at: $max_signal_updated_at,
+                updated_at: $max_signal_updated_at
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          created_profile_thread_id: ${ .jsonBody | fromjson | .id.value }
+
+  - resolveProfileThreadId:
+      set:
+        profile_thread_id: "${ $existing_profile_thread_id // $created_profile_thread_id }"
+        profile_metadata_json: >-
+          ${ {
+              source_user_id: ($workflow.input.user_id | tostring),
+              signal_count: ($truncated_signals | length),
+              no_signal_count: $no_signal_count,
+              profile_version: "1.0"
+            } | tojson }
+        profile_external_id: >-
+          ${ "personality_profile:" + ($workflow.input.user_id | tostring) }
+
+  # Invariant I4: profile metadata MUST appear identically on both
+  # update and add paths.
+  - updateProfile:
+      if: "${ $existing_profile != null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryService/Update"
+            json_body: >-
+              ${ {
+                id: $existing_profile.id,
+                data: ($existing_profile.data
+                  | .content = ($profile_json | tojson)
+                  | .metadata = $profile_metadata_json
+                  | .externalId = $profile_external_id
+                  | .updatedAt = $max_signal_updated_at)
+              } | tojson }
+            as_json: true
+
+  # MemoryService/Update only touches the memory row; it does not
+  # propagate to the parent thread's updated_at like ThreadService/
+  # AddMemory does. Without this step the profile thread would
+  # appear stale after a re-merge — daily-work-summary-single uses
+  # the same ThreadService/Update pattern for the same reason.
+  # Skipped on the create path because ThreadService/Create
+  # (createProfileThread above) already seeded updatedAt with
+  # $max_signal_updated_at.
+  - touchProfileThreadUpdatedAt:
+      if: "${ $existing_profile != null and $existing_profile_thread_data != null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/Update"
+            json_body: >-
+              ${ {
+                id: { value: $existing_profile_thread_id },
+                data: ($existing_profile_thread_data
+                  | .updatedAt = $max_signal_updated_at)
+              } | tojson }
+            as_json: true
+
+  - addProfileMemory:
+      if: "${ $existing_profile == null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/AddMemory"
+            json_body: >-
+              ${ {
+                thread_id: { value: $profile_thread_id },
+                memory: {
+                  user_id: { value: $effective_personality_user_id },
+                  content: ($profile_json | tojson),
+                  content_type: "TEXT",
+                  role: "ROLE_ASSISTANT",
+                  metadata: $profile_metadata_json,
+                  external_id: $profile_external_id,
+                  created_at: $max_signal_updated_at,
+                  updated_at: $max_signal_updated_at
+                }
+              } | tojson }
+            as_json: true
+
+output:
+  as:
+    completed: ${ $profile_json != null }
+    user_id: ${ $workflow.input.user_id }
+    signal_count: ${ $truncated_signals | length }
+    no_signal_count: ${ $no_signal_count }
+    skipped: ${ $skipped // false }
+    skip_reason: ${ if ($skipped // false) then $result else null end }
