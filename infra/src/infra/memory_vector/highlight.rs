@@ -406,7 +406,7 @@ fn lindera_tokens(text: &str, kind: FtsTokenizerKind) -> Vec<TokenSpan<'static>>
             .map(|t| TokenSpan {
                 byte_start: t.byte_start,
                 byte_end: t.byte_end,
-                text: Cow::Owned(t.text.into_owned()),
+                text: Cow::Owned(t.surface.into_owned()),
             })
             .collect(),
         Err(e) => {
@@ -444,10 +444,7 @@ mod lindera_cache {
     use std::path::PathBuf;
     use std::sync::{Arc, OnceLock};
 
-    use lindera::dictionary::load_dictionary_from_path;
-    use lindera::mode::Mode;
-    use lindera::segmenter::Segmenter;
-    use lindera::tokenizer::Tokenizer;
+    use lindera::tokenizer::{Tokenizer, TokenizerBuilder};
 
     use super::FtsTokenizerKind;
 
@@ -471,17 +468,32 @@ mod lindera_cache {
     }
 
     fn build(kind: FtsTokenizerKind) -> CacheEntry {
-        let dict_path = dict_path_for(kind)?;
-        match load_dictionary_from_path(&dict_path) {
-            Ok(dictionary) => {
-                let segmenter = Segmenter::new(Mode::Normal, dictionary, None);
-                Some(Arc::new(Tokenizer::new(segmenter)))
-            }
+        // Mirror lance-tokenizer 8.0's `LinderaTokenizer::from_file`
+        // (which drives the actual index): build from the on-disk
+        // `config.yml` via `TokenizerBuilder::from_file` so highlight-side
+        // tokenization matches the segmenter mode / dictionary the index
+        // was written with. Constructing a `Segmenter` by hand here would
+        // risk diverging from whatever the config file specifies.
+        let config_path = config_path_for(kind)?;
+        let builder = match TokenizerBuilder::from_file(&config_path) {
+            Ok(b) => b,
             Err(e) => {
                 tracing::warn!(
-                    "compute_highlights: failed to load Lindera dictionary at {:?}: {}; \
+                    "compute_highlights: failed to load Lindera config at {:?}: {}; \
                      highlights for this kind will be skipped",
-                    dict_path,
+                    config_path,
+                    e
+                );
+                return None;
+            }
+        };
+        match builder.build() {
+            Ok(tokenizer) => Some(Arc::new(tokenizer)),
+            Err(e) => {
+                tracing::warn!(
+                    "compute_highlights: failed to build Lindera tokenizer from {:?}: {}; \
+                     highlights for this kind will be skipped",
+                    config_path,
                     e
                 );
                 None
@@ -489,9 +501,9 @@ mod lindera_cache {
         }
     }
 
-    /// Mirrors lance-index's `LinderaBuilder::load`:
-    /// `$LANCE_LANGUAGE_MODEL_HOME/lindera/<dict>/`.
-    fn dict_path_for(kind: FtsTokenizerKind) -> Option<PathBuf> {
+    /// Mirrors lance-index's Lindera loading:
+    /// `$LANCE_LANGUAGE_MODEL_HOME/lindera/<dict>/config.yml`.
+    fn config_path_for(kind: FtsTokenizerKind) -> Option<PathBuf> {
         let model_home = std::env::var("LANCE_LANGUAGE_MODEL_HOME").unwrap_or_else(|_| {
             std::env::var("HOME")
                 .map(|h| format!("{h}/lance/language_models"))
@@ -503,7 +515,12 @@ mod lindera_cache {
             FtsTokenizerKind::LinderaKoDic => "ko-dic",
             _ => return None,
         };
-        Some(PathBuf::from(model_home).join("lindera").join(dict_subdir))
+        Some(
+            PathBuf::from(model_home)
+                .join("lindera")
+                .join(dict_subdir)
+                .join("config.yml"),
+        )
     }
 }
 

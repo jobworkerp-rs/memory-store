@@ -42,8 +42,10 @@ input:
           maximum: 23
           default: 9
           description: >-
-            Offset from UTC used to delimit the month boundary (0-23).
-            JST (+9) by default. Negative offsets unsupported.
+            Fallback fixed offset from UTC for the month boundary (0-23),
+            used only when the worker's TZ env var is unset. JST (+9) by
+            default; negative/DST offsets unsupported. Set the jobworkerp
+            worker's TZ (e.g. TZ=Asia/Tokyo) for DST-aware boundaries.
         memories_grpc_host: { type: string, default: "localhost" }
         memories_grpc_port: { type: integer, default: 9100 }
         memories_grpc_tls: { type: boolean, default: false }
@@ -96,33 +98,51 @@ do:
         target_month_resolved: "${ null }"
         target_memories: "${ [] }"
 
-  # Step 1: Resolve target_month.
-  # When empty, "last completed month" = today's-month-1st 00:00 UTC
-  # minus 1 second, formatted with %Y-%m. Built in two steps because
-  # jq's strftime renders AS IF UTC; offsetting `now` by tz_offset
-  # first lands us on the wall-clock month.
-  - resolveTargetMonth:
+  # Step 0.5: Expose the fallback fixed offset (seconds). The TZ-vs-offset
+  # choice is read inline via `env.TZ` per expression (see
+  # daily-work-summary-single for the rationale).
+  - normalizeTimezone:
       set:
         tz_offset_seconds: "${ $workflow.input.timezone_offset_hours * 3600 }"
+
+  # Step 1: Resolve target_month.
+  # When empty, "last completed month" = this month's 1st 00:00 local
+  # minus 1 second, formatted with %Y-%m. Offset path shifts `now` by
+  # tz_offset before the UTC-as-if strftime/mktime; TZ path renders the
+  # local 1st via strflocaltime, converts to a DST-aware UTC epoch with
+  # the localtime offset correction, backs up one second, and reformats.
+  - resolveTargetMonth:
+      set:
         target_month_resolved: >-
-          ${ if $workflow.input.target_month == ""
-             then ((((now + ($workflow.input.timezone_offset_hours * 3600))
+          ${ if $workflow.input.target_month != ""
+             then $workflow.input.target_month
+             elif (env.TZ // "") != ""
+             then (((now | strflocaltime("%Y-%m-01T00:00:00"))
+                    | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $e
+                   | ($e | localtime | mktime) as $b
+                   | (($e - ($b - $e)) - 1 | strflocaltime("%Y-%m")))
+             else ((((now + $tz_offset_seconds)
                      | strftime("%Y-%m-01T00:00:00Z"))
                     | strptime("%Y-%m-%dT%H:%M:%SZ")
                     | mktime) - 1
                    | strftime("%Y-%m"))
-             else $workflow.input.target_month
              end }
 
-  # Step 2: Compute month_start_ms (1st 00:00 in local tz). Same TZ
-  # rationale as daily/weekly: mktime is UTC-as-if, so subtract
-  # tz_offset.
+  # Step 2: Compute month_start_ms (1st 00:00 in local tz). Offset path
+  # subtracts tz_offset from UTC-as-if mktime; TZ path applies the
+  # localtime offset correction to the local "<month>-01 00:00".
   - computeMonthStart:
       set:
         month_start_ms: >-
-          ${ ((($target_month_resolved + "-01T00:00:00Z")
-                | strptime("%Y-%m-%dT%H:%M:%SZ")
-                | mktime) - $tz_offset_seconds) * 1000 }
+          ${ (if (env.TZ // "") != ""
+              then (($target_month_resolved + "-01T00:00:00")
+                    | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $e
+                   | ($e | localtime | mktime) as $b
+                   | ($e - ($b - $e))
+              else ((($target_month_resolved + "-01T00:00:00Z")
+                     | strptime("%Y-%m-%dT%H:%M:%SZ")
+                     | mktime) - $tz_offset_seconds)
+              end) * 1000 }
 
   # Step 2b: Compute next-month token via string math, then re-parse
   # for month_end_ms. This sidesteps DOM overflow / leap-year traps
@@ -151,9 +171,15 @@ do:
   - computeMonthEndMs:
       set:
         month_end_ms: >-
-          ${ ((($next_month_token + "-01T00:00:00Z")
-                | strptime("%Y-%m-%dT%H:%M:%SZ")
-                | mktime) - $tz_offset_seconds) * 1000 }
+          ${ (if (env.TZ // "") != ""
+              then (($next_month_token + "-01T00:00:00")
+                    | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $e
+                   | ($e | localtime | mktime) as $b
+                   | ($e - ($b - $e))
+              else ((($next_month_token + "-01T00:00:00Z")
+                     | strptime("%Y-%m-%dT%H:%M:%SZ")
+                     | mktime) - $tz_offset_seconds)
+              end) * 1000 }
 
   # Step 3: Alias for readability. Schema-injected default is 100000.
   - normalizeSourceUserId:

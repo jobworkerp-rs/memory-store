@@ -43,7 +43,7 @@ output: { since_date, end_date, since_iso, range_start_ms, since_ms_utc, import_
 |---|---|---|
 | `since_date` | `since_mode` 依存 | `YYYY-MM-DD`。**処理範囲の起点**。省略時は range が 1 日に潰れる (`day_start` → `[昨日, 昨日]`、`now_minus` → `[今日, 今日]`) |
 | `end_date` | 自動算出 | `YYYY-MM-DD`。**処理範囲の終点 (inclusive)**。省略時は `since_date` 設定時 → 今日 (tz基準)、未設定時は `since_mode` で `[昨日, 昨日]` か `[今日, 今日]` に潰す既存挙動を維持。明示指定すると履歴 back-fill (`since_date=2026-04-01`, `end_date=2026-04-30`) ができ、今日の in-progress summary を巻き込まない |
-| `timezone_offset_hours` | `9` | 日界算出用 (`+0` 〜 `+23` のみ対応) |
+| `timezone_offset_hours` | `9` | 日界算出用のフォールバック固定オフセット (`+0` 〜 `+23`)。**worker の `TZ` 環境変数が未設定のときのみ**使われる。DST/負オフセットは worker の `TZ` (例 `TZ=Asia/Tokyo`) で対応 |
 | `since_override` | `""` | UTC 整数秒 ISO 8601 (`2026-05-08T08:00:00Z`)。memories-import `--since` にそのまま渡す。`+HH:MM` オフセットや小数秒は受理しない |
 | `since_mode` | `"day_start"` | `"day_start"` (互換) または `"now_minus"` (短スパン用)。`since_override` 非空時は無視される |
 | `since_lookback_seconds` | `0` | `since_mode="now_minus"` 時のみ有効。`now - this value` を `--since` にする |
@@ -140,5 +140,5 @@ agent-chat-import/workflows/agent-chat-import/run-import.sh \
 ## 注意事項
 
 - **memories-import バイナリは事前にビルド済みであること** (`cargo build --release -p agent-chat-import`)
-- **negative timezone offset は未対応** (現状 `+0` 〜 `+23` のみ)
+- **フォールバックの `timezone_offset_hours` は負オフセット・夏時間非対応** (`+0` 〜 `+23`)。負オフセットや DST が必要なら jobworkerp worker の `TZ` 環境変数を設定する (例 `TZ=America/New_York`)
 - **本ワークフロー単体は summary を起動しない**。summary 側を別途 enqueue するか、`agent-chat-pipeline.yaml` の wrapper を使う

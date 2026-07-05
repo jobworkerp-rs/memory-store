@@ -2911,7 +2911,7 @@ mod test {
             collect_eids(by_prefix),
             ["obsidian:s1:abc".to_string(), "obsidian:s2:def".to_string()]
                 .into_iter()
-                .collect()
+                .collect::<std::collections::HashSet<String>>()
         );
 
         // (b) `obsidian-private` is NOT included by `obsidian:` lookup.
@@ -2951,7 +2951,9 @@ mod test {
             .await?;
         assert_eq!(
             collect_eids(by_underscore),
-            ["under_score:s1:jkl".to_string()].into_iter().collect()
+            ["under_score:s1:jkl".to_string()]
+                .into_iter()
+                .collect::<std::collections::HashSet<String>>()
         );
 
         // (c2) backslash is treated as literal in the prefix.
@@ -2974,7 +2976,9 @@ mod test {
             .await?;
         assert_eq!(
             collect_eids(by_backslash),
-            ["with\\backslash:s1:pqr".to_string()].into_iter().collect()
+            ["with\\backslash:s1:pqr".to_string()]
+                .into_iter()
+                .collect::<std::collections::HashSet<String>>()
         );
 
         // Cleanup

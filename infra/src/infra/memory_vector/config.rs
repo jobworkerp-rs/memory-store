@@ -702,8 +702,15 @@ impl FtsConfig {
         let canonical = serde_json::to_string(&root)
             .expect("BTreeMap<String, Value> is statically serializable");
 
+        // sha2 0.11 returns `hybrid_array::Array`, which no longer implements
+        // `LowerHex`; hex-encode the bytes manually instead of `{:x}`.
+        use std::fmt::Write;
         let digest = Sha256::digest(canonical.as_bytes());
-        format!("sha256:{digest:x}")
+        let hex = digest.iter().fold(String::with_capacity(64), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        });
+        format!("sha256:{hex}")
     }
 
     /// Build an `FtsConfig` from a preset table keyed by tokenizer kind.

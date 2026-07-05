@@ -40,8 +40,10 @@ input:
           maximum: 23
           default: 9
           description: >-
-            Offset from UTC used to delimit the day boundary (0-23).
-            JST (+9) by default. Negative offsets unsupported.
+            Fallback fixed offset from UTC for the day boundary (0-23),
+            used only when the worker's TZ env var is unset. JST (+9) by
+            default; negative/DST offsets unsupported. Set the jobworkerp
+            worker's TZ (e.g. TZ=Asia/Tokyo) for DST-aware boundaries.
         memories_grpc_host: { type: string, default: "localhost" }
         memories_grpc_port: { type: integer, default: 9100 }
         memories_grpc_tls: { type: boolean, default: false }
@@ -96,30 +98,51 @@ do:
         target_date_resolved: "${ null }"
         target_memories: "${ [] }"
 
-  # Step 1: Resolve target_date.
-  # jq's `now` is UTC epoch and `strftime` formats AS IF UTC (TZ env
-  # ignored), so shift `now` by tz_offset before strftime to land on
-  # the wall-clock date.
-  - resolveTargetDate:
+  # Step 0.5: Expose the fallback fixed offset (seconds) for the branches
+  # below. The TZ-vs-offset choice itself is read inline per expression
+  # via `env.TZ` — `set` evaluates keys in parallel, so it cannot be a
+  # shared variable in this same step.
+  - normalizeTimezone:
       set:
         tz_offset_seconds: "${ $workflow.input.timezone_offset_hours * 3600 }"
+
+  # Step 1: Resolve target_date ("yesterday" on the local calendar).
+  # When the worker's TZ env var is set, jq's `localtime`/`strflocaltime`
+  # honour it (DST-aware); otherwise fall back to the fixed offset.
+  # Yesterday must be derived on the local CALENDAR, not by `now - 86400`
+  # before formatting: on a DST spring-forward day the 24h-earlier instant
+  # is still today's local date. Anchor today at 12:00 UTC-as-if (immune
+  # to the ±1h shift), step back a day, reformat.
+  - resolveTargetDate:
+      set:
         target_date_resolved: >-
-          ${ if $workflow.input.target_date == ""
-             then ((now + ($workflow.input.timezone_offset_hours * 3600) - 86400)
-                   | strftime("%Y-%m-%d"))
-             else $workflow.input.target_date
+          ${ if $workflow.input.target_date != ""
+             then $workflow.input.target_date
+             elif (env.TZ // "") != ""
+             then ((now | strflocaltime("%Y-%m-%d")) as $today
+                   | (($today + "T12:00:00Z") | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime)
+                   | ((. - 86400) | strftime("%Y-%m-%d")))
+             else ((now + $tz_offset_seconds - 86400) | strftime("%Y-%m-%d"))
              end }
 
   # Step 2: Compute [day_start_ms, day_end_ms) for the wall-clock day.
-  # `mktime` interprets broken-down time AS IF UTC (mirror of
-  # strftime), so subtract tz_offset to convert "<date> 00:00 in
-  # local tz" to its UTC epoch.
+  # `mktime` interprets broken-down time AS IF UTC. Offset path: subtract
+  # the fixed offset. TZ path: get the UTC-as-if epoch, then correct by
+  # the local offset — mktime(localtime(E)) - E is that offset at E, so
+  # E - (that - E) is the true local-wall-clock epoch (DST-aware; the
+  # 00:00 boundary is far from DST transition times so this is exact).
   - computeDayStart:
       set:
         day_start_ms: >-
-          ${ ((($target_date_resolved + "T00:00:00Z")
-                | strptime("%Y-%m-%dT%H:%M:%SZ")
-                | mktime) - $tz_offset_seconds) * 1000 }
+          ${ (if (env.TZ // "") != ""
+              then (($target_date_resolved + "T00:00:00")
+                    | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $e
+                   | ($e | localtime | mktime) as $b
+                   | ($e - ($b - $e))
+              else ((($target_date_resolved + "T00:00:00Z")
+                     | strptime("%Y-%m-%dT%H:%M:%SZ")
+                     | mktime) - $tz_offset_seconds)
+              end) * 1000 }
 
   - computeDayEnd:
       set:

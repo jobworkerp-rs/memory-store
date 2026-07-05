@@ -108,8 +108,10 @@ input:
           maximum: 23
           default: 9
           description: >-
-            Day-boundary timezone (0-23). JST (+9) by default.
-            Negative offsets unsupported; use UTC (0) for the Americas.
+            Fallback fixed offset for the day boundary (0-23), used only
+            when the worker's TZ env var is unset. JST (+9) by default;
+            negative/DST offsets unsupported. Set the jobworkerp worker's
+            TZ (e.g. TZ=America/New_York) for DST-aware / negative zones.
         import_command:
           type: string
           default: "memories-import"
@@ -166,10 +168,14 @@ do:
         import_succeeded: "${ false }"
 
   # Step 1: Resolve since_date (range start) and end_date (range end).
-  # `local_now_epoch` is sampled once and reused so the two dates
-  # cannot straddle midnight even on a slow runner.
+  # `now_epoch` is sampled once and reused so the two dates cannot
+  # straddle midnight even on a slow runner. The offset path shifts it
+  # into wall-clock (`now + offset`); the TZ path keeps raw UTC and lets
+  # `strflocaltime` apply the worker's zone. The TZ-vs-offset choice is
+  # read inline via `env.TZ` per expression.
   - sampleLocalNow:
       set:
+        now_epoch: "${ now }"
         local_now_epoch: "${ now + ($workflow.input.timezone_offset_hours * 3600) }"
 
   # Empty `since_date` keeps the legacy single-day behaviour:
@@ -182,9 +188,21 @@ do:
   # back-fill of `[since_date, end_date]` does not drag today in.
   - resolveDateRange:
       set:
+        # TZ "yesterday" must be computed on the local CALENDAR, not by
+        # subtracting 86400 UTC seconds: on a DST spring-forward day the
+        # 24h-earlier instant still falls on today's local date, dropping a
+        # day. Anchor today's local date at 12:00 UTC-as-if (immune to the
+        # ±1h DST shift), step back one day, then reformat.
         since_date_resolved: >-
           ${ if $workflow.input.since_date != ""
              then $workflow.input.since_date
+             elif (env.TZ // "") != ""
+             then (if $workflow.input.since_mode == "now_minus"
+                   then ($now_epoch | strflocaltime("%Y-%m-%d"))
+                   else (($now_epoch | strflocaltime("%Y-%m-%d")) as $today
+                         | (($today + "T12:00:00Z") | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime)
+                         | ((. - 86400) | strftime("%Y-%m-%d")))
+                   end)
              elif $workflow.input.since_mode == "now_minus"
              then ($local_now_epoch | strftime("%Y-%m-%d"))
              else (($local_now_epoch - 86400) | strftime("%Y-%m-%d"))
@@ -192,6 +210,14 @@ do:
         end_date_resolved: >-
           ${ if $workflow.input.end_date != ""
              then $workflow.input.end_date
+             elif (env.TZ // "") != ""
+             then (if ($workflow.input.since_date != ""
+                       or $workflow.input.since_mode == "now_minus")
+                   then ($now_epoch | strflocaltime("%Y-%m-%d"))
+                   else (($now_epoch | strflocaltime("%Y-%m-%d")) as $today
+                         | (($today + "T12:00:00Z") | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime)
+                         | ((. - 86400) | strftime("%Y-%m-%d")))
+                   end)
              elif ($workflow.input.since_date != ""
                    or $workflow.input.since_mode == "now_minus")
              then ($local_now_epoch | strftime("%Y-%m-%d"))
@@ -202,15 +228,27 @@ do:
   # offset, e.g. "2026-05-06T00:00:00+09:00") and the matching
   # `range_start_ms` for the downstream thread-summary-batch consumer.
   #
-  # Format the +HH:MM string with leading zero. Negative offsets are
-  # not supported by this format helper — callers wanting non-Asia
-  # timezones must pass a non-negative `timezone_offset_hours`.
+  # memories-import --since parses RFC 3339 numeric offsets only, not
+  # IANA names, so the zone is resolved to a numeric offset here.
+  # TZ path: the offset in effect ON since_date (DST-aware). The localtime
+  # correction gives that day's 00:00 UTC epoch, and strflocaltime("%:z")
+  # renders its offset (e.g. "+01:00" vs "+02:00" across a DST edge, or a
+  # negative "-04:00" for the Americas).
+  # Offset path: a fixed "+HH:00" from timezone_offset_hours. This helper
+  # only formats non-negative offsets, so west-of-UTC zones require the TZ
+  # path (i.e. setting the worker's TZ).
   - buildTzOffsetStr:
       set:
         tz_offset_str: >-
-          ${ $workflow.input.timezone_offset_hours as $h
-             | "+" + (if $h < 10 then "0" + ($h | tostring) else ($h | tostring) end)
-                  + ":00" }
+          ${ if (env.TZ // "") != ""
+             then (($since_date_resolved + "T00:00:00")
+                   | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $e
+                  | ($e | localtime | mktime) as $b
+                  | (($e - ($b - $e)) | strflocaltime("%:z"))
+             else ($workflow.input.timezone_offset_hours as $h
+                   | "+" + (if $h < 10 then "0" + ($h | tostring) else ($h | tostring) end)
+                        + ":00")
+             end }
 
   # Three-stage fallback for the import `--since` (spec
   # `agent-chat-import-incremental-spec.md` §2.3):
@@ -258,10 +296,16 @@ do:
              else $since_date_resolved + "T00:00:00" + $tz_offset_str
              end }
         range_start_ms: >-
-          ${ ((($since_date_resolved + "T00:00:00Z")
-                | strptime("%Y-%m-%dT%H:%M:%SZ")
-                | mktime)
-              - ($workflow.input.timezone_offset_hours * 3600)) * 1000 }
+          ${ (if (env.TZ // "") != ""
+              then (($since_date_resolved + "T00:00:00")
+                    | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $e
+                   | ($e | localtime | mktime) as $b
+                   | ($e - ($b - $e))
+              else ((($since_date_resolved + "T00:00:00Z")
+                     | strptime("%Y-%m-%dT%H:%M:%SZ")
+                     | mktime)
+                    - ($workflow.input.timezone_offset_hours * 3600))
+              end) * 1000 }
         since_ms_utc: "${ $since_epoch_seconds * 1000 }"
 
   # Step 3: Build memories-import argv as a single expression

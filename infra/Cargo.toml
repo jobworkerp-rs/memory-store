@@ -58,7 +58,15 @@ sha2 = { workspace = true }
 # so adding it here only widens the scope to this crate without changing
 # the resolved version (kept in sync with `Cargo.lock`). Kept optional so
 # the (non-lindera) builds skip the dictionary-link overhead.
-lindera = { version = "0.44", optional = true }
+#
+# MUST track the lindera major that `lance-index`'s `tokenizer-lindera`
+# resolves to (currently 3.x via `lance-tokenizer`). If the highlight side
+# and the index side pull different lindera majors, the tokenizer output
+# diverges (different token boundaries) AND lindera is compiled twice.
+# `highlight.rs` mirrors `lance-tokenizer`'s `LinderaTokenizer::from_file`
+# path (`TokenizerBuilder::from_file(<dict>/config.yml)`), so bumping this
+# must be validated against that source.
+lindera = { version = "3.0", optional = true }
 # Snowball/Porter stemmer used by the highlight path to mirror
 # lance-index/tantivy's English stemming when MEMORY_FTS_TOKENIZER is
 # `simple`/`whitespace` (preset enables `stem = true`). Pinned to the
@@ -96,7 +104,7 @@ serial_test = "3"
 # presigned URL to assert the body matches (spec §6.1). minio is plain
 # HTTP so no TLS feature is needed; kept out of default features so the
 # aws-sdk-s3 hyper stack stays the only HTTP client in release builds.
-reqwest = { version = "0.12", default-features = false }
+reqwest = { version = "0.13", default-features = false }
 # `no-env-filter` lets `#[traced_test]` capture events regardless of
 # RUST_LOG — required for startup_error tests that assert on level=ERROR
 # events without forcing the test runner to set RUST_LOG.

@@ -62,13 +62,29 @@ do:
   #   last-N:      last_n_weeks weeks ending the previous completed week
   #   fallback:    [last_week] only
   # See weekly-work-summary-single.yaml resolveTargetWeek for the TZ
-  # handling rationale (jq strftime is UTC-only).
+  # handling rationale (jq strftime is UTC-only). Only the "last week
+  # Monday" anchor is tz-sensitive; the range/last-N stepping runs in
+  # UTC-as-if seconds (tz-invariant).
+  #
+  # `last_week_monday_epoch` is an anchor fed to the UTC-as-if
+  # `strftime("%G-W%V")`. Offset path shifts `now` by the fixed offset;
+  # TZ path anchors today's local date (via strflocaltime) at 12:00
+  # UTC-as-if and does the weekday/back-off arithmetic there. It must not
+  # subtract UTC seconds from `now`: near a DST transition that slips an
+  # hour and can land on the previous ISO week. Noon anchors keep the
+  # stepped weeks aligned so downstream `strftime("%G-W%V")` round-trips.
   - resolveLastWeekMonday:
       set:
         last_week_monday_epoch: >-
-          ${ (now + ($workflow.input.timezone_offset_hours * 3600)) as $local
-             | ($local | strftime("%u") | tonumber) as $wday
-             | ($local - (($wday - 1) * 86400) - 7 * 86400) }
+          ${ if (env.TZ // "") != ""
+             then ((now | strflocaltime("%Y-%m-%d")) as $today
+                   | ($today + "T12:00:00Z" | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) as $noon
+                   | ($noon | strftime("%u") | tonumber) as $wday
+                   | ($noon - (($wday - 1) * 86400) - 7 * 86400))
+             else ((now + ($workflow.input.timezone_offset_hours * 3600)) as $local
+                   | ($local | strftime("%u") | tonumber) as $wday
+                   | ($local - (($wday - 1) * 86400) - 7 * 86400))
+             end }
 
   - resolveWeekRange:
       set:

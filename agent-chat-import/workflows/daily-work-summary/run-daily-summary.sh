@@ -30,7 +30,12 @@
 #   --summary-model <name>             default: qwen3.6:27b
 #   --ollama-base-url <url>            default: http://192.168.1.2:11434
 #   --output-language <ja|en>          default: MEMORY_DEFAULT_LANGUAGE or ja
-#   --timezone-offset-hours <int>      default: 9 (JST)
+#   --timezone-offset-hours <int>      default: 9 (JST). Fallback fixed
+#                                      offset, applied only when the
+#                                      jobworkerp worker's TZ env var is
+#                                      unset. For DST or west-of-UTC zones
+#                                      set the worker's TZ (e.g.
+#                                      TZ=Asia/Tokyo).
 #   --force-resummarize                flag (default off)
 #
 # Workflow paths:

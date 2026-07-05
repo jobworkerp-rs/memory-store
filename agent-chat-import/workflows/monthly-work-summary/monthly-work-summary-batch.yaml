@@ -65,14 +65,24 @@ do:
   # Month math runs in "year * 12 + month_index" ordinal space to
   # avoid DST/leap traps. See monthly-work-summary-single.yaml for
   # the strftime/mktime UTC-as-if rationale.
+  # `last_month_token` anchor: offset path shifts `now` by the fixed
+  # offset; TZ path renders this month's local 1st via strflocaltime,
+  # converts to a DST-aware UTC epoch with the localtime offset
+  # correction, backs up one second into last month, and reformats.
   - resolveLastMonthToken:
       set:
         last_month_token: >-
-          ${ ((((now + ($workflow.input.timezone_offset_hours * 3600))
-                 | strftime("%Y-%m-01T00:00:00Z"))
-                | strptime("%Y-%m-%dT%H:%M:%SZ")
-                | mktime) - 1)
-             | strftime("%Y-%m") }
+          ${ if (env.TZ // "") != ""
+             then (((now | strflocaltime("%Y-%m-01T00:00:00"))
+                    | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $e
+                   | ($e | localtime | mktime) as $b
+                   | (($e - ($b - $e)) - 1 | strflocaltime("%Y-%m")))
+             else (((((now + ($workflow.input.timezone_offset_hours * 3600))
+                      | strftime("%Y-%m-01T00:00:00Z"))
+                     | strptime("%Y-%m-%dT%H:%M:%SZ")
+                     | mktime) - 1)
+                   | strftime("%Y-%m"))
+             end }
 
   - resolveMonthRange:
       set:

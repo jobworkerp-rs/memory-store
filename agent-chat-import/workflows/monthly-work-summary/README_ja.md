@@ -255,6 +255,6 @@ batch は `output_language` に応じて `memories-monthly-work-summary-single-j
 - **月跨ぎ ISO 週の月帰属**: 1 つの ISO 週が暦月をまたぐ場合 (例: 2026-W18 = 2026-04-27 〜 2026-05-03)、その週の memory `updated_at` は週内最後の日次活動の時刻になる。本ワークフローの月境界フィルタは `[month_start_ms, month_end_ms)` の範囲で `updated_at` を絞るため、跨る週は **最終日次活動が属する月** に帰属する。たとえば「2026-W18 の最終 daily activity が 2026-05-02」なら、当該週次要約は 2026-05 月の入力に含まれる。これは仕様（運用上のシンプルさを優先）であり、必要なら週月曜の暦月で帰属させる代替実装を別 PR で追加検討する
 - **下位層が空の場合**: `weekly_summary` メモリが対象月に 1 件もない場合は `skipped: true, skip_reason: "skipped: not enough source summary memories for the month"` で正常終了する。エラーではない
 - **`extra_labels_filter` を変えると別スレッドができる**。daily/weekly と同じ仕様
-- **タイムゾーンの取り扱い**。`timezone_offset_hours` は時単位（0..23）
+- **タイムゾーンの取り扱い**。月境界は jq を評価する jobworkerp worker の `TZ` 環境変数（例 `TZ=Asia/Tokyo`）で決まり、夏時間 (DST) と負オフセットに対応する。`TZ` 未設定時のフォールバック `timezone_offset_hours` は時単位（0..23）
 - **LLM のコンテキスト長**。月 4-5 週分の週次 JSON が入る。`max_context_chars=200000` は十分
 - **cron 順序**: weekly が完了してから monthly を回すこと。例: weekly を月曜 03:30 JST、monthly を毎月 1 日 04:00 JST

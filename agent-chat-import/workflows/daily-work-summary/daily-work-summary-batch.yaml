@@ -60,11 +60,28 @@ do:
   #   last-N:      last_n_days days ending yesterday
   #   fallback:    [yesterday] only
   # See daily-work-summary-single.yaml resolveTargetDate for the TZ
-  # handling rationale (jq strftime is UTC-only).
+  # handling rationale (jq strftime is UTC-only). Only the "yesterday"
+  # anchor is tz-sensitive; the range/last-N stepping is done in
+  # UTC-as-if seconds (tz-invariant) so it needs no branching.
+  #
+  # `yesterday_epoch` is an anchor that, when fed to the UTC-as-if
+  # `strftime`, renders yesterday's wall-clock date. Offset path shifts
+  # `now` by the fixed offset; TZ path derives TODAY's local date (via
+  # strflocaltime) and steps back one calendar day. It must not subtract
+  # 86400 UTC seconds before formatting: on a DST spring-forward day that
+  # lands on today's local date. Anchoring today at 12:00 UTC-as-if
+  # (immune to the ±1h shift) and subtracting a day yields yesterday's
+  # date; downstream `strftime` round-trips because every stepped anchor
+  # stays at noon.
   - resolveYesterdayEpoch:
       set:
         yesterday_epoch: >-
-          ${ now + ($workflow.input.timezone_offset_hours * 3600) - 86400 }
+          ${ if (env.TZ // "") != ""
+             then ((now | strflocaltime("%Y-%m-%d")) as $today
+                   | (($today + "T12:00:00Z") | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime)
+                   | (. - 86400))
+             else (now + ($workflow.input.timezone_offset_hours * 3600) - 86400)
+             end }
 
   - resolveDateRange:
       set:

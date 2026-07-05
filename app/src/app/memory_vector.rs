@@ -2456,17 +2456,17 @@ mod test {
     };
     use infra_utils::infra::test::{TEST_RUNTIME, setup_test_rdb_from};
     use protobuf::llm_memory::data::{MediaObjectId, MemoryData, UserId};
-    use rand::Rng;
+    use rand::RngExt;
 
     fn random_embedding(dim: usize) -> Vec<f32> {
-        let mut rng = rand::thread_rng();
-        (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect()
+        let mut rng = rand::rng();
+        (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect()
     }
 
     fn similar_embedding(base: &[f32], noise: f32) -> Vec<f32> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         base.iter()
-            .map(|&v| v + rng.gen_range(-noise..noise))
+            .map(|&v| v + rng.random_range(-noise..noise))
             .collect()
     }
 

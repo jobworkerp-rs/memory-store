@@ -22,7 +22,7 @@ use protobuf::llm_memory::data::{
 };
 use std::collections::HashSet;
 use std::{sync::Arc, time::Duration};
-use stretto::AsyncCache;
+use stretto::TokioCache;
 
 /// Common time-range and sort options for the thread list endpoints
 /// (`find_thread_list_by_user_id`, `find_threads_by_labels`).
@@ -1502,8 +1502,8 @@ pub struct ThreadAppImpl {
     /// re-parsing env on every request. Shared with `MemoryAppImpl` /
     /// `MemoryVectorAppImpl` via the same `MEMORY_THREAD_FILTER_*` knobs.
     thread_filter_config: super::thread_filter_resolver::ThreadFilterConfig,
-    thread_cache: AsyncCache<Arc<String>, Thread>,
-    memory_cache: AsyncCache<Arc<String>, Memory>,
+    thread_cache: TokioCache<Arc<String>, Thread>,
+    memory_cache: TokioCache<Arc<String>, Memory>,
     key_lock: RwLockWithKey<Arc<String>>,
     default_ttl: Duration,
     embedding_dispatcher:
@@ -1533,8 +1533,8 @@ impl ThreadAppImpl {
         thread_label_repository: ThreadLabelRepositoryImpl,
         memory_repository: MemoryRepositoryImpl,
         memory_rating_repository: MemoryRatingRepositoryImpl,
-        thread_cache: AsyncCache<Arc<String>, Thread>,
-        memory_cache: AsyncCache<Arc<String>, Memory>,
+        thread_cache: TokioCache<Arc<String>, Thread>,
+        memory_cache: TokioCache<Arc<String>, Memory>,
         embedding_dispatcher: Option<
             Arc<infra::infra::memory_vector::dispatcher::EmbeddingJobDispatcher>,
         >,
@@ -2410,7 +2410,7 @@ impl ThreadApp for ThreadAppImpl {
 }
 
 impl UseMemoryCache<Arc<String>, Thread> for ThreadAppImpl {
-    fn cache(&self) -> &AsyncCache<Arc<String>, Thread> {
+    fn cache(&self) -> &TokioCache<Arc<String>, Thread> {
         &self.thread_cache
     }
 

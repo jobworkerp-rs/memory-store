@@ -43,8 +43,11 @@ importChats (COMMAND: memories-import)
 | `user_id` | Import owner user ID |
 | `memories_grpc_url` | Passed to `memories-import --server-url` |
 
-Common optional inputs include `since_date`, `end_date`, `timezone`,
-`since_mode`, `source_args`, `labels`, and source-specific path options.
+Common optional inputs include `since_date`, `end_date`,
+`timezone_offset_hours`, `since_mode`, `source_args`, `labels`, and
+source-specific path options. Day boundaries follow the jobworkerp
+worker's `TZ` environment variable (DST-aware) when set, falling back to
+`timezone_offset_hours` otherwise.
 
 ## Example
 

@@ -45,8 +45,10 @@ input:
           maximum: 23
           default: 9
           description: >-
-            Offset from UTC used to delimit the week boundary (0-23).
-            JST (+9) by default. Negative offsets unsupported.
+            Fallback fixed offset from UTC for the week boundary (0-23),
+            used only when the worker's TZ env var is unset. JST (+9) by
+            default; negative/DST offsets unsupported. Set the jobworkerp
+            worker's TZ (e.g. TZ=Asia/Tokyo) for DST-aware boundaries.
         memories_grpc_host: { type: string, default: "localhost" }
         memories_grpc_port: { type: integer, default: 9100 }
         memories_grpc_tls: { type: boolean, default: false }
@@ -103,35 +105,59 @@ do:
         target_week_resolved: "${ null }"
         target_memories: "${ [] }"
 
+  # Step 0.5: Expose the fallback fixed offset (seconds). The TZ-vs-offset
+  # choice is read inline via `env.TZ` per expression (see
+  # daily-work-summary-single for the rationale).
+  - normalizeTimezone:
+      set:
+        tz_offset_seconds: "${ $workflow.input.timezone_offset_hours * 3600 }"
+
   # Step 1: Resolve target_week.
   # When empty, "last completed week" = (this week's Monday in tz) - 7
   # days, formatted with %G-W%V (ISO year + ISO week).
-  # jq's `now` is UTC epoch and `strftime` formats AS IF UTC (TZ env
-  # ignored), so shift `now` by tz_offset before strftime to land on
-  # the wall-clock week.
+  # TZ path: the weekday/week math must run on the local CALENDAR, not by
+  # subtracting UTC seconds from `now` — near a DST transition a 7-day
+  # UTC subtraction lands an hour off and can slip to the previous ISO
+  # week (e.g. Mon 00:30 right after spring-forward). Anchor today's local
+  # date (via strflocaltime) at 12:00 UTC-as-if (immune to the ±1h shift)
+  # and do the weekday/back-off arithmetic in that tz-invariant space.
   - resolveTargetWeek:
       set:
-        tz_offset_seconds: "${ $workflow.input.timezone_offset_hours * 3600 }"
         target_week_resolved: >-
-          ${ if $workflow.input.target_week == ""
-             then ((now + ($workflow.input.timezone_offset_hours * 3600)) as $local
+          ${ if $workflow.input.target_week != ""
+             then $workflow.input.target_week
+             elif (env.TZ // "") != ""
+             then ((now | strflocaltime("%Y-%m-%d")) as $today
+                   | ($today + "T12:00:00Z" | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) as $noon
+                   | ($noon | strftime("%u") | tonumber) as $wday
+                   | (($noon - (($wday - 1) * 86400) - 7 * 86400)
+                      | strftime("%G-W%V")))
+             else ((now + $tz_offset_seconds) as $local
                    | ($local | strftime("%u") | tonumber) as $wday
-                   | ($local - (($wday - 1) * 86400) - 7 * 86400)
-                   | strftime("%G-W%V"))
-             else $workflow.input.target_week
+                   | (($local - (($wday - 1) * 86400) - 7 * 86400)
+                      | strftime("%G-W%V")))
              end }
 
   # Step 2: Compute [week_start_ms, week_end_ms) for the wall-clock week.
-  # `mktime` interprets broken-down time AS IF UTC (mirror of strftime),
-  # so subtract tz_offset to convert "<Monday> 00:00 in local tz" to
-  # its UTC epoch.
+  # `mktime` interprets broken-down time AS IF UTC. Offset path: subtract
+  # tz_offset. TZ path: normalize the Monday to YYYY-MM-DD first (date is
+  # tz-invariant), then apply the localtime offset correction to turn its
+  # local 00:00 into a DST-aware UTC epoch.
   # Requires jaq's strptime("%G-W%V-%u") — vanilla jq returns 1899.
   - computeWeekStart:
       set:
         week_start_ms: >-
-          ${ ((($target_week_resolved + "-1")
-                | strptime("%G-W%V-%u")
-                | mktime) - $tz_offset_seconds) * 1000 }
+          ${ (if (env.TZ // "") != ""
+              then (($target_week_resolved + "-1")
+                    | strptime("%G-W%V-%u")
+                    | strftime("%Y-%m-%dT00:00:00")
+                    | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $e
+                   | ($e | localtime | mktime) as $b
+                   | ($e - ($b - $e))
+              else ((($target_week_resolved + "-1")
+                     | strptime("%G-W%V-%u")
+                     | mktime) - $tz_offset_seconds)
+              end) * 1000 }
 
   - computeWeekEnd:
       set:

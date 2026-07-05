@@ -105,6 +105,11 @@ input:
           minimum: 0
           maximum: 23
           default: 9
+          description: >-
+            Fallback fixed offset for day/week/month boundaries, used only
+            when the worker's TZ env var is unset. Set the jobworkerp
+            worker's TZ (e.g. TZ=Asia/Tokyo) for DST-aware boundaries.
+            Forwarded to import and summary stages.
         import_command:
           type: string
           default: "memories-import"

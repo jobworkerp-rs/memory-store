@@ -10,7 +10,7 @@ use protobuf::llm_memory::data::{
     MemoryId, MemoryRating, MemoryRatingData, MemoryRatingId, UserId,
 };
 use std::{sync::Arc, time::Duration};
-use stretto::AsyncCache;
+use stretto::TokioCache;
 
 #[async_trait]
 pub trait MemoryRatingApp:
@@ -145,7 +145,7 @@ pub trait MemoryRatingApp:
 
 pub struct MemoryRatingAppImpl {
     memory_rating_repository: MemoryRatingRepositoryImpl,
-    memory_cache: AsyncCache<Arc<String>, MemoryRating>,
+    memory_cache: TokioCache<Arc<String>, MemoryRating>,
     key_lock: RwLockWithKey<Arc<String>>,
     default_ttl: Duration,
 }
@@ -154,7 +154,7 @@ impl MemoryRatingAppImpl {
     const DEFAULT_TTL_SEC: u64 = 60;
     pub fn new(
         memory_rating_repository: MemoryRatingRepositoryImpl,
-        memory_cache: AsyncCache<Arc<String>, MemoryRating>,
+        memory_cache: TokioCache<Arc<String>, MemoryRating>,
     ) -> Self {
         Self {
             memory_rating_repository,
@@ -174,7 +174,7 @@ impl UseMemoryRatingRepository for MemoryRatingAppImpl {
 impl MemoryRatingApp for MemoryRatingAppImpl {}
 
 impl UseMemoryCache<Arc<String>, MemoryRating> for MemoryRatingAppImpl {
-    fn cache(&self) -> &AsyncCache<Arc<String>, MemoryRating> {
+    fn cache(&self) -> &TokioCache<Arc<String>, MemoryRating> {
         &self.memory_cache
     }
 

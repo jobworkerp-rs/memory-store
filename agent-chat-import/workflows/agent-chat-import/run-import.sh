@@ -31,7 +31,14 @@
 #   --since-mode <day_start|now_minus> default: day_start
 #   --since-lookback-seconds <s>       default: 0 (effective only when
 #                                      since_mode=now_minus)
-#   --tz <hours>                       default: 9
+#   --tz <hours>                       default: 9. Fallback fixed offset,
+#                                      applied only when the jobworkerp
+#                                      worker's TZ env var is unset. For
+#                                      DST or west-of-UTC zones, set the
+#                                      worker's TZ (e.g. TZ=Asia/Tokyo);
+#                                      the boundary jq runs in the worker,
+#                                      so this flag only controls the
+#                                      fallback.
 #   --memories-grpc-host <host>        rarely needed; carried for parity
 #   --memories-grpc-port <port>        rarely needed; carried for parity
 #   --import-command <path>            default: target/release/memories-import.

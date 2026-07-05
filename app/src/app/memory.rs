@@ -23,7 +23,7 @@ use protobuf::llm_memory::data::{
     Memory, MemoryData, MemoryId, Thread, ThreadSearchFilter, UserId,
 };
 use std::{sync::Arc, time::Duration};
-use stretto::AsyncCache;
+use stretto::TokioCache;
 
 use crate::app::memory_vector::{RepresentativeThreadInfo, enrich_memories_with_thread_info};
 use crate::app::thread_filter_resolver::{self, ThreadFilterConfig};
@@ -444,8 +444,8 @@ pub struct MemoryAppImpl {
     /// Shared with `MemoryVectorAppImpl` via the same env knobs to keep
     /// the LanceDB and RDB resolve paths in lockstep.
     thread_filter_config: ThreadFilterConfig,
-    thread_cache: AsyncCache<Arc<String>, Thread>,
-    memory_cache: AsyncCache<Arc<String>, Memory>,
+    thread_cache: TokioCache<Arc<String>, Thread>,
+    memory_cache: TokioCache<Arc<String>, Memory>,
     key_lock: RwLockWithKey<Arc<String>>,
     default_ttl: Duration,
     embedding_dispatcher:
@@ -520,8 +520,8 @@ impl MemoryAppImpl {
         thread_repository: ThreadRepositoryImpl,
         thread_memory_repository: ThreadMemoryRepositoryImpl,
         thread_label_repository: ThreadLabelRepositoryImpl,
-        thread_cache: AsyncCache<Arc<String>, Thread>,
-        memory_cache: AsyncCache<Arc<String>, Memory>,
+        thread_cache: TokioCache<Arc<String>, Thread>,
+        memory_cache: TokioCache<Arc<String>, Memory>,
         embedding_dispatcher: Option<
             Arc<infra::infra::memory_vector::dispatcher::EmbeddingJobDispatcher>,
         >,
@@ -1014,7 +1014,7 @@ pub(crate) async fn hydrate_media_list(
 }
 
 impl UseMemoryCache<Arc<String>, Memory> for MemoryAppImpl {
-    fn cache(&self) -> &AsyncCache<Arc<String>, Memory> {
+    fn cache(&self) -> &TokioCache<Arc<String>, Memory> {
         &self.memory_cache
     }
 
@@ -1049,7 +1049,7 @@ mod tests {
         }
     }
 
-    fn cache<V: Send + Sync + 'static>() -> AsyncCache<Arc<String>, V> {
+    fn cache<V: Send + Sync + 'static>() -> TokioCache<Arc<String>, V> {
         memory_utils::cache::stretto::new_memory_cache::<Arc<String>, V>(
             &memory_utils::cache::stretto::MemoryCacheConfig::default(),
         )

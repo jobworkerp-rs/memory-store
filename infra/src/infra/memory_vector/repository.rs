@@ -404,6 +404,39 @@ pub(crate) async fn drop_embedding_vector_index(table: &Table) -> anyhow::Result
     }
 }
 
+/// Drop the existing FTS inverted index on the `content` column, if any.
+///
+/// Needed by the search-time recovery path under lance 8.0: when the
+/// index is still registered in the table manifest but its `_indices`
+/// sidecar files were removed externally, `create_index(...).replace(true)`
+/// sees a manifest entry with the same definition and does NOT rewrite
+/// the (now missing) sidecar, so the retry hits the same
+/// `_indices/<uuid>/tokens.lance not found`. Dropping the stale manifest
+/// entry first forces the subsequent `create_index` to materialize a
+/// fresh index directory. A "not found" race is tolerated (idempotent).
+pub(crate) async fn drop_fts_index(table: &Table) -> anyhow::Result<()> {
+    let indices = table
+        .list_indices()
+        .await
+        .map_err(|e| anyhow::anyhow!("list_indices failed before dropping FTS index: {e}"))?;
+    let Some(idx) = indices.iter().find(|i| {
+        i.columns.iter().any(|c| c == FTS_INDEX_COLUMN) && matches!(i.index_type, IndexType::FTS)
+    }) else {
+        return Ok(());
+    };
+    match table.drop_index(&idx.name).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("not found") || msg.contains("does not exist") {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("LanceDB drop FTS index failed: {e}"))
+            }
+        }
+    }
+}
+
 /// Apply the shared ANN query options to a `nearest_to(...)` query so
 /// every vector path (memory/thread, search/count) behaves identically.
 ///
@@ -1240,6 +1273,7 @@ impl MemoryVectorRepositoryImpl {
                         // synchronizes with any in-flight ensure call.
                         self.fts_init_ready.store(false, Ordering::Release);
                         *guard = None;
+                        self.drop_stale_fts_index_and_reload().await?;
                         self.rebuild_fts_index_locked(&mut guard).await?;
                     }
                     attempted_recovery = true;
@@ -2255,6 +2289,28 @@ impl MemoryVectorRepositoryImpl {
         Ok(())
     }
 
+    /// Drop the stale FTS index and refresh the table handle, in
+    /// preparation for a rebuild.
+    ///
+    /// Under lance 8.0 a manifest-registered index whose `_indices`
+    /// sidecar files are gone is not rewritten by
+    /// `create_index(...).replace(true)`; dropping the stale entry first
+    /// forces the subsequent rebuild to materialize fresh index files.
+    /// The DDL is serialized against a concurrent `create_index` via the
+    /// shared ddl lock, and a drop failure is logged but tolerated (the
+    /// rebuild proceeds regardless).
+    async fn drop_stale_fts_index_and_reload(&self) -> anyhow::Result<()> {
+        let _ddl = self.index_ddl_lock.lock().await;
+        let table = self.table.load_full();
+        if let Err(drop_err) = drop_fts_index(&table).await {
+            tracing::warn!(
+                "FTS recovery: dropping stale index failed ({drop_err}); \
+                 proceeding to rebuild anyway"
+            );
+        }
+        self.reload_table().await
+    }
+
     /// Track writes and trigger maintenance on two independent cadences.
     ///
     /// The single monotonic `operation_count` feeds two gates that never
@@ -2714,6 +2770,19 @@ fn short_fp(fp: &str) -> &str {
 /// - `"Index for column X is not an inverted index"` (the column has
 ///   a non-FTS index, e.g. BTree, but no inverted index)
 ///
+/// Additional pattern for lance-index 8.0.0: when the index is still
+/// registered in the manifest but its on-disk sidecar files were
+/// removed (backup restore / manual `_indices` delete / partial
+/// corruption), `list_indices()` keeps reporting the index, so the
+/// startup existence check passes, but the query fails at IO time with
+/// `Object at location .../_indices/<uuid>/<file>.lance not found`.
+/// The inverted-index sidecar files are `tokens.lance`, `invert.lance`,
+/// `docs.lance`, `metadata.lance` (lance-index 8.0.0
+/// `scalar/inverted/index.rs`). We anchor on the `_indices` path
+/// segment plus a "not found" IO error so a generic dataset-level
+/// "not found" (e.g. a dropped table) does not over-match into a
+/// spurious FTS rebuild.
+///
 /// When lance-index errors change, this list must be updated in lock
 /// step. The runtime recovery is bounded to one attempt per call, so
 /// a stale match is at most a single wasted rebuild, not an infinite
@@ -2721,7 +2790,15 @@ fn short_fp(fp: &str) -> &str {
 /// meaningful.
 fn is_missing_fts_index_error(err: &anyhow::Error) -> bool {
     let msg = err.to_string().to_lowercase();
-    msg.contains("inverted index has been created") || msg.contains("is not an inverted index")
+    if msg.contains("inverted index has been created") || msg.contains("is not an inverted index") {
+        return true;
+    }
+    // lance-index 8.0: index registered in manifest but sidecar file
+    // gone. Require both the `_indices` path segment and a not-found
+    // signal to avoid matching unrelated IO errors.
+    let missing =
+        msg.contains("not found") || msg.contains("no such file") || msg.contains("does not exist");
+    missing && msg.contains("_indices")
 }
 
 /// Rewrite a `create_index` failure into an operator-friendly message when
@@ -2827,7 +2904,7 @@ pub fn aggregate_scores(
 #[cfg(test)]
 mod test {
     use super::*;
-    use rand::Rng;
+    use rand::RngExt;
 
     // === try_claim_gate: the core two-gate maintenance logic ===
 
@@ -2999,14 +3076,14 @@ mod test {
     }
 
     fn random_embedding(dim: usize) -> Vec<f32> {
-        let mut rng = rand::thread_rng();
-        (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect()
+        let mut rng = rand::rng();
+        (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect()
     }
 
     fn similar_embedding(base: &[f32], noise: f32) -> Vec<f32> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         base.iter()
-            .map(|&v| v + rng.gen_range(-noise..noise))
+            .map(|&v| v + rng.random_range(-noise..noise))
             .collect()
     }
 

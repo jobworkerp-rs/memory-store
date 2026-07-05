@@ -272,6 +272,6 @@ batch は `output_language` に応じて `memories-weekly-work-summary-single-ja
 - **jaq 必須**: 週境界の `strptime("%G-W%V-%u")` を vanilla jq に渡すと 1899 年 epoch を返してしまう。jobworkerp の workflow runtime は jaq (>= 3.x) を使うため動作するが、ローカルで `jq` を使ったデバッグ時は注意
 - **ISO W53 の入力検証**: `2027-W53-1` のように該当年に W53 が存在しない場合、jaq の strptime が `invalid ISO 8601 week date` エラーで失敗する。batch では `onError: continue` により他の週は影響を受けず `failed_weeks` に記録される
 - **`extra_labels_filter` を変えると別スレッドができる**。daily と同じ仕様
-- **タイムゾーンの取り扱い**。`timezone_offset_hours` は時単位（0..23）なので半端なオフセットや負のオフセットには未対応
+- **タイムゾーンの取り扱い**。週境界は jq を評価する jobworkerp worker の `TZ` 環境変数（例 `TZ=Asia/Tokyo`）で決まり、夏時間 (DST) と負オフセットに対応する。`TZ` 未設定時のフォールバック `timezone_offset_hours` は時単位（0..23）なので半端なオフセットや負オフセットには未対応
 - **LLM のコンテキスト長**。週 7 日分の日次 JSON が入るので daily より小さく済む。`max_context_chars=200000` は十分すぎる既定値
 - **monthly との連携**: 本ワークフローの出力 (`weekly_summary` ラベル) は `monthly-work-summary-single` の入力になる。週次の生成完了後に月次を回す cron 順序が望ましい

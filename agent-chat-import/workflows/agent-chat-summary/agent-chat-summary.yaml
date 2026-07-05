@@ -105,7 +105,11 @@ input:
           minimum: 0
           maximum: 23
           default: 9
-          description: Forwarded to daily-work-summary-batch for day boundary.
+          description: >-
+            Fallback fixed offset forwarded to daily-work-summary-batch,
+            used only when the worker's TZ env var is unset. Set the
+            jobworkerp worker's TZ (e.g. TZ=Asia/Tokyo) for DST-aware
+            boundaries.
         # ---- summary inner workflows --------------------------------------
         thread_summary_batch_yaml:
           type: string

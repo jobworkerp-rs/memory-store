@@ -91,7 +91,9 @@ summary 系と personality 系は所有者 `user_id` が完全に分離されて
 |---|---|---|
 | `since_date` | `since_mode` 依存 | `YYYY-MM-DD`。**処理範囲の起点**で、`[since_date, 今日 (tz基準)]` の全日が import / thread-summary / daily-summary の対象になる。省略時は range が 1 日に潰れて既存挙動と等価 (`since_mode="day_start"` で `[昨日, 昨日]`、`since_mode="now_minus"` で `[今日, 今日]`)。**今日を範囲端に含めたい場合は明示指定が必要** (省略時は今日の未確定 daily を毎回再生成しないよう端を切り落とす) |
 | `end_date` | 自動算出 | `YYYY-MM-DD`。**処理範囲の終点 (inclusive)**。省略時は既存挙動 (`since_date` 指定時 → 今日、未指定時 → `since_mode` で昨日/今日に潰す) を維持。明示指定すると `[since_date, end_date]` の固定窓だけを処理対象にできる。例: `since_date=2026-04-01 end_date=2026-04-30` で 4 月分だけ back-fill (今日の in-progress daily を巻き込まない) |
-| `timezone_offset_hours` | `9` | 日界算出用 (現状 `+0` 〜 `+23` のみ対応) |
+| `timezone_offset_hours` | `9` | 日界算出用のフォールバック固定オフセット (`+0` 〜 `+23`)。**worker の `TZ` 環境変数が未設定のときのみ**使われる。DST/負オフセット非対応 |
+
+> **タイムゾーン**: 日界は workflow の jq を評価する **jobworkerp worker プロセスの `TZ` 環境変数**で決まる (例 `TZ=Asia/Tokyo`)。`TZ` が設定されていれば `localtime`/`strflocaltime` がそれを反映し、夏時間 (DST) と負オフセット (例 `America/New_York`) に対応する。未設定なら `timezone_offset_hours` にフォールバック。`TZ` は worker のデプロイ環境 (その `.env` や `docker run -e TZ=...`) に設定する必要があり、この workflow の入力では渡せない。
 | `since_override` | `""` | RFC 3339 文字列。memories-import `--since` にそのまま渡す。UTC `Z` 形式推奨 (後述) |
 | `since_mode` | `"day_start"` | `"day_start"` (現行互換) または `"now_minus"` (短スパン用)。`since_override` 非空時は無視される |
 | `since_lookback_seconds` | `0` | `since_mode="now_minus"` 時のみ有効。`now - this value` を `--since` にする。`0` は `day_start` フォールバック |
@@ -261,6 +263,6 @@ jobworkerp-client -a http://localhost:9000 job enqueue-workflow \
 
 - **memories-import バイナリは事前にビルド済みであること** (`cargo build --release -p agent-chat-import`)。`import_command` を絶対パスで指定推奨
 - **`memories_grpc_url` だけ指定すれば host/port は自動抽出される**。memories-import の `--server-url` (URL 形式必須) と後段 WORKFLOW runner の GRPC 呼び出し (host/port 分離形式) を1つの URL でまかなう。`memories_grpc_host`/`_port` は両者が異なる必要がある特殊環境用の override
-- **negative timezone offset は未対応** (`buildSinceWindow` で `+HH:00` の文字列を素直に組み立てているため)。必要になったら拡張
+- **フォールバックの `timezone_offset_hours` は負オフセット非対応** (`buildSinceWindow` が `+HH:00` を素直に組み立てるため)。負オフセットや夏時間が必要なら worker の `TZ` 環境変数を設定する (例 `TZ=America/New_York`)。`TZ` 設定時は `strflocaltime("%:z")` がその日の実オフセット (`-04:00` 等) を算出するため制約は解消される
 - **range が長い (= 過去全期間 back-fill) と LLM 呼び出し回数が線形に増える**。daily-work-summary-batch は per-day で直列に `daily-work-summary-single` を起動するので、`since_date=2024-01-01` のような指定は数百回の LLM 呼び出しを発生させうる。force_resummarize 無し時は差分判定で活動のない日はスキップされるため、初期 import の 2 周目以降は安価
 - **memories-import は `external_id` でデデュプリケートされる**ため、`since_date` を広めに取って同じ範囲を複数回流しても二重登録にはならない

@@ -262,5 +262,5 @@ batch は `output_language` に応じて `memories-daily-work-summary-single-ja`
 
 - **`thread-summary-batch` は `daily_summary` ラベル付きスレッドを除外していない**。デフォルト（`labels_filter` 未指定）で全スレッドを引いてくるため、本ワークフローの出力スレッドが次の thread-summary-batch 実行で再要約対象になり得る。当面は `thread-summary-batch` 起動時に `labels_filter: ["coding_agent"]` などプロジェクト側ラベルを必ず指定する運用で回避する。恒久対応はサーバ側の除外フィルタ追加 or batch ワークフローの改修（別 PR）。
 - **`extra_labels_filter` を変えると別スレッドができる**。同一日に「全 project 横断」と「`agent:claude_code` のみ」の両方を実行すると、`labels` が異なる 2 本の集約スレッドが作られる。狙ったとおりなら問題ないが、運用は揃えたほうが listing が綺麗。
-- **タイムゾーンの取り扱い**。`timezone_offset_hours` は秒単位ではなく時単位なので、半端なオフセット（IST 等）には未対応。必要になったら拡張する。
+- **タイムゾーンの取り扱い**。日界は jq を評価する jobworkerp worker の `TZ` 環境変数（例 `TZ=Asia/Tokyo`）で決まり、夏時間 (DST) と負オフセットに対応する。`TZ` 未設定時のフォールバック `timezone_offset_hours` は時単位（0..23）なので、半端なオフセット（IST 等）や負オフセットには未対応。それらが必要なら worker の `TZ` を設定する。
 - **LLM のコンテキスト長**。`max_context_chars=200000` は Qwen3.6:27b（256k トークン）を想定。モデルを変える場合は調整すること。

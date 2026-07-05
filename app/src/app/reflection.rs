@@ -36,7 +36,7 @@ use protobuf::llm_memory::service::{
     RedispatchReflectionEmbeddingsResponse, ReflectionListSort, ToolContributionStatsResponse,
     ToolOutcomeStatsResponse,
 };
-use stretto::AsyncCache;
+use stretto::TokioCache;
 
 use infra::infra::memory::rdb::MemoryRepositoryImpl;
 use infra::infra::reflection::aggregate_thread::ThreadAggregateKeyRepositoryImpl;
@@ -363,7 +363,7 @@ pub struct ReflectionAppImpl {
     /// `MemoryApp::find_memory` cannot read the row back from the 30s
     /// TTL window. Optional so test wiring that does not exercise
     /// cross-app cache invariants can pass `None`.
-    pub(crate) memory_cache: Option<AsyncCache<Arc<String>, Memory>>,
+    pub(crate) memory_cache: Option<TokioCache<Arc<String>, Memory>>,
 }
 
 impl ReflectionAppImpl {
@@ -395,7 +395,7 @@ impl ReflectionAppImpl {
         summary_dispatcher: Option<Arc<ReflectionSummaryDispatcher>>,
         intent_dispatcher: Option<Arc<ReflectionIntentDispatcher>>,
         jobworkerp_client: Option<Arc<JobworkerpClientWrapper>>,
-        memory_cache: Option<AsyncCache<Arc<String>, Memory>>,
+        memory_cache: Option<TokioCache<Arc<String>, Memory>>,
     ) -> Self {
         let norm_table = load_norm_table(&signature_norm_repo).await;
         Self {

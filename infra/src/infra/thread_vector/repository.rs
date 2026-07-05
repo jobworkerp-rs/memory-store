@@ -12,7 +12,8 @@ pub use crate::infra::memory_vector::repository::IndexStats;
 use crate::infra::memory_vector::repository::apply_vector_query_options;
 use crate::infra::memory_vector::repository::ensure_vector_index_inner;
 use crate::infra::memory_vector::repository::{
-    InFlightGuard, compact_with, create_index_with_retry, prune_with, try_claim_gate,
+    InFlightGuard, compact_with, create_index_with_retry, drop_fts_index, prune_with,
+    try_claim_gate,
 };
 use arc_swap::ArcSwap;
 use arrow_array::{
@@ -611,6 +612,7 @@ impl ThreadVectorRepositoryImpl {
                         let mut guard = self.fts_init_state.lock().await;
                         self.fts_init_ready.store(false, Ordering::Release);
                         *guard = None;
+                        self.drop_stale_fts_index_and_reload().await?;
                         self.rebuild_fts_index_locked(&mut guard).await?;
                     }
                     attempted_recovery = true;
@@ -1515,6 +1517,23 @@ impl ThreadVectorRepositoryImpl {
         Ok(())
     }
 
+    /// Drop the stale FTS index and refresh the table handle, in
+    /// preparation for a rebuild. See
+    /// `memory_vector::repository::MemoryVectorRepositoryImpl::drop_stale_fts_index_and_reload`
+    /// for the lance 8.0 rationale (a manifest-registered index whose
+    /// sidecar files are gone is not rewritten by `replace(true)`).
+    async fn drop_stale_fts_index_and_reload(&self) -> anyhow::Result<()> {
+        let _ddl = self.index_ddl_lock.lock().await;
+        let table = self.table.load_full();
+        if let Err(drop_err) = drop_fts_index(&table).await {
+            tracing::warn!(
+                "FTS recovery: dropping stale index failed ({drop_err}); \
+                 proceeding to rebuild anyway"
+            );
+        }
+        self.reload_table().await
+    }
+
     /// Track writes and trigger maintenance on two independent cadences.
     /// Mirrors `MemoryVectorRepositoryImpl::track_operation`: the heavy
     /// compact+index gate is **spawned** under an [`InFlightGuard`] (at most
@@ -1685,7 +1704,9 @@ fn dedup_thread_hits(hits: Vec<ThreadVectorSearchHit>) -> Vec<ThreadVectorSearch
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infra::memory_vector::config::{DistanceType, FtsConfig, VectorIndexConfig};
+    use crate::infra::memory_vector::config::{
+        DistanceType, FtsConfig, FtsTokenizerKind, VectorIndexConfig,
+    };
 
     fn search_hit(thread_id: i64, score: f32) -> ThreadVectorSearchHit {
         ThreadVectorSearchHit {
@@ -1826,6 +1847,40 @@ mod tests {
             };
             (config, Self { path })
         }
+
+        fn config_with_fts(dim: usize, fts: FtsConfig) -> (ThreadVectorDBConfig, Self) {
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = format!("/tmp/test_thread_lancedb_fts_{ts}_{n}");
+            let config = ThreadVectorDBConfig {
+                uri: path.clone(),
+                table_name: "test_threads".to_string(),
+                vector_size: dim,
+                distance_type: DistanceType::Cosine,
+                optimize: crate::infra::memory_vector::repository::test_optimize_config(),
+                fts,
+                vector_index: VectorIndexConfig::default(),
+            };
+            (config, Self { path })
+        }
+
+        /// Reopen the same on-disk table (no Drop cleanup on the returned
+        /// config — the caller keeps the original TestDb alive).
+        fn config_reusing_path(&self, dim: usize, fts: FtsConfig) -> ThreadVectorDBConfig {
+            ThreadVectorDBConfig {
+                uri: self.path.clone(),
+                table_name: "test_threads".to_string(),
+                vector_size: dim,
+                distance_type: DistanceType::Cosine,
+                optimize: crate::infra::memory_vector::repository::test_optimize_config(),
+                fts,
+                vector_index: VectorIndexConfig::default(),
+            }
+        }
     }
 
     impl Drop for TestDb {
@@ -1847,9 +1902,9 @@ mod tests {
     }
 
     fn rand_chunk(thread_id: i64, dim: usize) -> ThreadVectorRecord {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let embedding: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        let embedding: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect();
         chunk_record(thread_id, 0, embedding)
     }
 
@@ -2036,6 +2091,64 @@ mod tests {
             updated_at: 1,
             indexed_at: 1,
         }
+    }
+
+    fn chunk_record_with_content(
+        thread_id: i64,
+        chunk_index: i32,
+        content: &str,
+        embedding: Vec<f32>,
+    ) -> ThreadVectorRecord {
+        ThreadVectorRecord {
+            content: content.to_string(),
+            ..chunk_record(thread_id, chunk_index, embedding)
+        }
+    }
+
+    /// lance 8.0 regression: an FTS index still registered in the table
+    /// manifest but whose `_indices` sidecar files were removed externally
+    /// (backup restore / manual delete) must be recovered by the
+    /// search-time path. `create_index(...).replace(true)` alone does NOT
+    /// rewrite the missing sidecar under lance 8.0 — the recovery path
+    /// drops the stale index first, then rebuilds. Without the drop the
+    /// search would keep failing with `_indices/<uuid>/tokens.lance not
+    /// found`.
+    #[tokio::test]
+    async fn thread_fts_missing_index_recovered_at_search_time() -> anyhow::Result<()> {
+        let dim = 8;
+        let fts = FtsConfig::apply_preset(FtsTokenizerKind::Ngram);
+        let (config, db) = TestDb::config_with_fts(dim, fts.clone());
+
+        {
+            let repo = ThreadVectorRepositoryImpl::new(config).await?;
+            repo.batch_upsert(vec![chunk_record_with_content(
+                1,
+                0,
+                "テスト",
+                vec![0.1; dim],
+            )])
+            .await?;
+            let hits = repo.search_by_text("テス", None, 10).await?;
+            assert!(!hits.is_empty(), "baseline search must hit before drift");
+        }
+
+        // Externally remove the `_indices` directory to simulate the
+        // sidecar-gone / manifest-stale drift mode.
+        let indices_dir = std::path::PathBuf::from(&db.path).join("test_threads.lance/_indices");
+        if indices_dir.exists() {
+            std::fs::remove_dir_all(&indices_dir)?;
+        }
+
+        // Reopen and search: the recovery path must drop the stale index
+        // and rebuild so the query succeeds instead of erroring on the
+        // missing sidecar.
+        let repo2 = ThreadVectorRepositoryImpl::new(db.config_reusing_path(dim, fts)).await?;
+        let hits = repo2.search_by_text("テス", None, 10).await?;
+        assert!(
+            !hits.is_empty(),
+            "search must recover and hit after _indices removal"
+        );
+        Ok(())
     }
 
     /// N-row batch_upsert stores every chunk under the 3-column merge key.
