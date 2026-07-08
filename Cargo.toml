@@ -31,13 +31,13 @@ async-trait = { version = "0.1" }
 #bindgen = "0.70"
 # Media storage (image memory feature): S3/minio backend + base64 for the
 # test-only inline backend.
-# `default-https-client` + `rustls` are REQUIRED: without an HTTP client
-# implementation every S3 call fails with "dispatch failure" (no
-# connector wired). minio is plain HTTP but real AWS is HTTPS, so the
-# rustls TLS connector is kept. (Phase 1 shipped s3.rs without these and
-# the gap only surfaced under the Phase 3 minio roundtrip tests.)
+# `default-https-client` is REQUIRED: without an HTTP client implementation
+# every S3 call fails with "dispatch failure" (no connector wired). Do not
+# also enable aws-sdk-s3's legacy `rustls` feature; it pulls the old rustls
+# 0.21 stack while the default client already provides the current rustls
+# connector needed for HTTPS AWS endpoints and plain-HTTP minio tests.
 aws-config = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
-aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "rustls"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
 aws-credential-types = { version = "1" }
 base64 = { version = "0.22" }
 bytes = { version = "1" }

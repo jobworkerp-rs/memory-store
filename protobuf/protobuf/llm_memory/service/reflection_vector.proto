@@ -8,10 +8,9 @@ import "llm_memory/data/reflection_filter.proto";
 import "llm_memory/service/common.proto";
 import "llm_memory/service/memory_vector.proto";
 
-// Intent-vector specific RPCs for reflections. Summary embeddings
-// reuse the existing MemoryVectorService.UpsertEmbedding because they
-// land in the existing memory_vector LanceDB table (only the dispatcher
-// differs); intent embeddings live in the dedicated
+// Intent-vector specific RPCs for reflections. Reflection search-document
+// embeddings use the generic MemoryVectorService text path and land in
+// memory_vector; intent embeddings live in the dedicated
 // reflection_intent_vector table and need their own surface.
 
 // N-row upsert for a reflection's intent embedding. A reflection now
@@ -34,12 +33,15 @@ message BatchUpsertIntentEmbeddingsRowsRequest {
 message RedispatchReflectionEmbeddingsRequest {
   // SUMMARY / INTENT / BOTH selector. UNSPECIFIED is rejected.
   llm_memory.data.EmbeddingKind kind = 1;
-  // Filter the reflections to redispatch (origin_user_id /
-  // origin_thread_id / prompt_version / *_embedding_status / period).
-  // Existing MemoryVectorService.RedispatchEmbeddings cannot be reused
-  // because it filters by user_id (which is reflection_user_id=300000
-  // for every reflection memory).
+  // Filter the reflections to redispatch. SUMMARY and BOTH are a
+  // compatibility path for sidecar-filtered search-document redispatch
+  // and require a non-empty filter; all reflection search documents
+  // should be redispatched via MemoryVectorService.RedispatchEmbeddings
+  // with user_id=300000. INTENT may omit the filter and defaults to
+  // PENDING/FAILED intent statuses.
   optional llm_memory.data.ReflectionSearchFilter filter = 2;
+  // SUMMARY/BOTH use this as an internal memory_id-desc page size.
+  // INTENT uses it as the maximum number of rows returned by one call.
   optional uint32 batch_size = 3;
 }
 

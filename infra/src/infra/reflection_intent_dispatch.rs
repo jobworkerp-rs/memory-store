@@ -124,7 +124,8 @@ mod tests {
              normalize_embeddings argument"
         );
         // N-row: every chunk is stored via the rows path. The
-        // empty-embedding status branch now keys on success_count==0.
+        // empty-embedding status branch must read protobuf JSON's
+        // lowerCamelCase field name.
         assert!(
             yaml.contains("text_rows")
                 && yaml.contains("replace_kinds")
@@ -134,6 +135,16 @@ mod tests {
         assert!(
             !yaml.contains("embeddings[0]"),
             "intent path must store all chunks, not just embeddings[0]"
+        );
+        assert!(
+            yaml.contains(".successCount") && !yaml.contains(".success_count"),
+            "intent workflow must read `successCount` from GRPC jsonBody; \
+             protobuf JSON does not expose snake_case response fields"
+        );
+        assert!(
+            yaml.matches("using: unary").count() >= 5,
+            "all intent workflow GRPC worker calls must specify using: unary \
+             so the WORKFLOW runner does not try the nonexistent GRPC method `run`"
         );
     }
 

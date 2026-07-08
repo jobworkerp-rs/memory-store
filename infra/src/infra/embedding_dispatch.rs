@@ -224,7 +224,10 @@ pub fn dispatch_kinds(
     use protobuf::llm_memory::data::{ContentType, MessageRole};
     let role_ok = matches!(
         MessageRole::try_from(role),
-        Ok(MessageRole::RoleUser | MessageRole::RoleAssistant | MessageRole::RoleSystem)
+        Ok(MessageRole::RoleUser
+            | MessageRole::RoleAssistant
+            | MessageRole::RoleSystem
+            | MessageRole::RoleReflection)
     );
     if !role_ok {
         return SmallVec::new();

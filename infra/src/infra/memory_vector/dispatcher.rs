@@ -238,6 +238,7 @@ mod tests {
             MessageRole::RoleUser,
             MessageRole::RoleAssistant,
             MessageRole::RoleSystem,
+            MessageRole::RoleReflection,
         ] {
             let k = dispatch_kinds(
                 "hello",
@@ -256,13 +257,11 @@ mod tests {
         use protobuf::llm_memory::data::{ContentType, MessageRole};
         let text = ContentType::Text as i32;
         // UNSPECIFIED rejected (must be an explicit speaker); TOOL/META
-        // rejected; REFLECTION rejected so reflection memories don't
-        // double-dispatch through this generic path.
+        // rejected.
         for role in [
             MessageRole::RoleUnspecified,
             MessageRole::RoleTool,
             MessageRole::RoleMeta,
-            MessageRole::RoleReflection,
         ] {
             let k = dispatch_kinds(
                 "hello",

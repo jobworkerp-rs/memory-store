@@ -1,4 +1,4 @@
-# llm-memories
+# memory-store
 
 Memory management service for LLM applications. It provides persistent
 conversation context, vector semantic search, thread-based conversation
@@ -221,7 +221,7 @@ is combined with `MEMORY_IMAGE_SEARCH_MODE != none`.
 | `REFLECTION_USER_ID` | `300000` | Owner user ID for reflection memories |
 | `REFLECTION_LANCEDB_URI` | `${MEMORY_LANCEDB_URI}/reflection_intent` | Reflection intent vector store URI |
 | `REFLECTION_VECTOR_SIZE` | `MEMORY_VECTOR_SIZE` | Intent embedding dimension |
-| `MEMORY_REFLECTION_DISPATCH_ENABLED` | `false` | Enable dispatch from `ReflectionService.Generate` and finalize |
+| `MEMORY_REFLECTION_DISPATCH_ENABLED` | `false` | Enable reflection generation and intent embedding dispatch |
 | `MEMORY_REFLECTION_REFLECTOR_MODEL` | none | Model used to generate reflections |
 | `MEMORY_REFLECTION_REFLECTOR_BASE_URL` | none | LLM endpoint for reflection generation |
 | `REFLECTION_DEFAULT_LANGUAGE` | `ja` | Default reflection language |
@@ -296,11 +296,7 @@ cargo run --release --bin cleanup-orphan-media -- --help
 
 - [yaml-workers.md](yaml-workers.md): memories-specific jobworkerp worker YAML
 - [agent-chat-import/README.md](agent-chat-import/README.md): import CLI and generation worker registration
-- [docs/vectordb-rebuild-runbook.md](docs/vectordb-rebuild-runbook.md): vector DB rebuild runbook
-- [docs/vectordb-optimize-tuning.md](docs/vectordb-optimize-tuning.md): LanceDB optimize/prune tuning
-- [docs/image-memory-api-guide.md](docs/image-memory-api-guide.md): image memory API
 - [docs/image-memory-operations-guide.md](docs/image-memory-operations-guide.md): image memory operations
-- [docs/thread-reflection-guide.md](docs/thread-reflection-guide.md): thread reflection guide
 
 ## License
 

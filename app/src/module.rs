@@ -320,6 +320,9 @@ impl AppModule {
             repositories.create_reflection_dictionary_repository(),
             repositories.create_reflection_signature_norm_repository(),
             reflection_intent_vector_repo,
+            embedding_dispatcher
+                .clone()
+                .map(|d| d as Arc<dyn infra::infra::memory_vector::dispatcher::EmbeddingDispatch>),
             reflection_summary_dispatcher,
             reflection_intent_dispatcher,
             reflection_jobworkerp_client,

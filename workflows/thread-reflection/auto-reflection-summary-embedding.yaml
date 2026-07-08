@@ -49,6 +49,7 @@ do:
       run:
         worker:
           name: memories-mark-reflection-embedding-status
+          using: unary
           arguments:
             json_body: >-
               ${ {
@@ -156,6 +157,7 @@ do:
               run:
                 worker:
                   name: memories-mark-reflection-embedding-status
+                  using: unary
                   arguments:
                     json_body: >-
                       ${ {
@@ -169,6 +171,7 @@ do:
               run:
                 worker:
                   name: memories-mark-reflection-embedding-status
+                  using: unary
                   arguments:
                     json_body: >-
                       ${ {
@@ -190,6 +193,7 @@ do:
               run:
                 worker:
                   name: memories-mark-reflection-embedding-status
+                  using: unary
                   arguments:
                     json_body: >-
                       ${ {

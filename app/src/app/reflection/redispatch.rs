@@ -1,11 +1,10 @@
 //! F-G11 — bulk re-dispatch of reflection embeddings.
 //!
-//! `kind=SUMMARY` re-runs the summary dispatcher (memory_vector
-//! upsert), `kind=INTENT` re-runs the intent dispatcher
-//! (reflection_intent_vector upsert), `kind=BOTH` runs both. The
-//! filter narrows by origin_user_id / origin_thread_id /
-//! prompt_version / *_embedding_status / period so operators can
-//! pick a slice without touching healthy rows.
+//! `kind=SUMMARY` is a deprecated compatibility path that applies the
+//! reflection sidecar filter, then enqueues the generic memory text
+//! embedding workflow. `kind=INTENT` remains the dedicated
+//! reflection-intent path. `kind=BOTH` combines both only when the
+//! caller supplies a non-empty sidecar filter.
 //!
 //! Dispatch failures are counted but never propagated as errors —
 //! the workflow YAML is responsible for marking
@@ -17,7 +16,9 @@ use anyhow::Result;
 use infra::error::LlmMemoryError;
 use infra::infra::memory::rdb::MemoryRepository;
 use infra::infra::reflection::rdb::ThreadReflectionIndexRepository;
-use infra::infra::reflection::rows::{ReflectionSortKey, ResolvedReflectionSearchFilter};
+use infra::infra::reflection::rows::{
+    ReflectionSortKey, ResolvedReflectionSearchFilter, ThreadReflectionIndexRow,
+};
 use protobuf::llm_memory::data::{EmbeddingKind, ReflectionSearchFilter};
 use protobuf::llm_memory::service::RedispatchReflectionEmbeddingsResponse;
 
@@ -40,6 +41,7 @@ pub async fn redispatch(
     }
 
     let started = std::time::Instant::now();
+    validate_filter_presence(kind, filter)?;
     let resolved = filter
         .map(super::search::resolve_filter)
         .unwrap_or_default();
@@ -49,20 +51,14 @@ pub async fn redispatch(
     let mut skipped = 0u32;
     let mut failed = 0u32;
 
-    // Without an explicit filter, narrow to non-OK rows so a careless
-    // call does not re-dispatch every reflection in the system. Callers
-    // may override by setting the corresponding filter fields. For
-    // `kind=BOTH` with no status filter we run two queries (summary
-    // PENDING / intent PENDING) and union the results so an
-    // intent-only-pending row is not silently dropped.
-    let rows = collect_rows(app, &resolved, kind, limit).await?;
+    let work_items = collect_work_items(app, &resolved, kind, limit).await?;
 
-    for row in rows {
+    for item in work_items {
         let memory = app
             .memory_repo
             .find(
                 &protobuf::llm_memory::data::MemoryId {
-                    value: row.memory_id,
+                    value: item.row.memory_id,
                 },
                 false,
             )
@@ -75,18 +71,16 @@ pub async fn redispatch(
             skipped += 1;
             continue;
         };
-        let summary = memory_data.content.as_str();
+        let search_document = memory_data.content.as_str();
         let task_intent = extract_task_intent(memory_data.metadata.as_deref());
 
-        let want_summary =
-            matches!(kind, EmbeddingKind::Summary | EmbeddingKind::Both) && !summary.is_empty();
-        let want_intent =
-            matches!(kind, EmbeddingKind::Intent | EmbeddingKind::Both) && !task_intent.is_empty();
+        let want_summary = item.want_summary && !search_document.is_empty();
+        let want_intent = item.want_intent && !task_intent.is_empty();
 
         match dispatch_one(
             app,
-            row.memory_id,
-            summary,
+            item.row.memory_id,
+            search_document,
             &task_intent,
             want_summary,
             want_intent,
@@ -107,22 +101,31 @@ pub async fn redispatch(
     })
 }
 
+#[derive(Debug)]
+struct WorkItem {
+    row: ThreadReflectionIndexRow,
+    want_summary: bool,
+    want_intent: bool,
+}
+
 async fn dispatch_one(
     app: &ReflectionAppImpl,
     memory_id: i64,
-    summary: &str,
+    search_document: &str,
     task_intent: &str,
     want_summary: bool,
     want_intent: bool,
 ) -> Result<bool> {
     let mut any = false;
-    if want_summary && let Some(d) = &app.summary_dispatcher {
-        match d.dispatch(memory_id, summary).await {
+    if want_summary && let Some(d) = &app.memory_embedding_dispatcher {
+        match d.dispatch(memory_id, search_document).await {
             Ok(_) => any = true,
             Err(e) => {
-                tracing::warn!("redispatch summary failed for memory_id={memory_id}: {e:?}");
+                tracing::warn!(
+                    "redispatch reflection search-document failed for memory_id={memory_id}: {e:?}"
+                );
                 return Err(
-                    LlmMemoryError::OtherError(format!("summary dispatch failed: {e:?}")).into(),
+                    LlmMemoryError::OtherError(format!("text dispatch failed: {e:?}")).into(),
                 );
             }
         }
@@ -141,78 +144,245 @@ async fn dispatch_one(
     Ok(any)
 }
 
-/// Resolve the rows to redispatch with default narrowing applied.
-///
-/// SUMMARY / INTENT collapse to a single search with the matching
-/// `*_embedding_status = PENDING` predicate added when the caller has
-/// not pinned a status. BOTH with no status filter on either side runs
-/// two queries (summary PENDING / intent PENDING) and unions the rows
-/// so an intent-only-pending reflection is not dropped just because
-/// summary already moved to OK. An explicit override (e.g. caller
-/// pinned `summary_embedding_status=OK` to backfill for a new model)
-/// short-circuits the union and goes through the single-query path
-/// untouched.
-async fn collect_rows(
+async fn collect_work_items(
     app: &ReflectionAppImpl,
     resolved: &ResolvedReflectionSearchFilter,
     kind: EmbeddingKind,
     limit: i64,
-) -> Result<Vec<infra::infra::reflection::rows::ThreadReflectionIndexRow>> {
-    use protobuf::llm_memory::data::EmbeddingStatus;
-    let pending = EmbeddingStatus::Pending as i32;
+) -> Result<Vec<WorkItem>> {
+    match kind {
+        EmbeddingKind::Summary => Ok(scan_all_pages(app, resolved, limit)
+            .await?
+            .into_iter()
+            .map(|row| WorkItem {
+                row,
+                want_summary: true,
+                want_intent: false,
+            })
+            .collect()),
+        EmbeddingKind::Intent => Ok(collect_intent_rows(app, resolved, limit)
+            .await?
+            .into_iter()
+            .map(|row| WorkItem {
+                row,
+                want_summary: false,
+                want_intent: true,
+            })
+            .collect()),
+        EmbeddingKind::Both => collect_both_work_items(app, resolved, limit).await,
+        EmbeddingKind::Unspecified => unreachable!("validated by caller"),
+    }
+}
 
-    let needs_union = matches!(kind, EmbeddingKind::Both)
-        && resolved.summary_embedding_status.is_none()
-        && resolved.intent_embedding_status.is_none();
+async fn collect_both_work_items(
+    app: &ReflectionAppImpl,
+    resolved: &ResolvedReflectionSearchFilter,
+    page_size: i64,
+) -> Result<Vec<WorkItem>> {
+    let summary_rows = scan_all_pages(app, resolved, page_size).await?;
 
-    if !needs_union {
-        let mut filter = resolved.clone();
-        match kind {
-            EmbeddingKind::Summary if filter.summary_embedding_status.is_none() => {
-                filter.summary_embedding_status = Some(pending);
-            }
-            EmbeddingKind::Intent if filter.intent_embedding_status.is_none() => {
-                filter.intent_embedding_status = Some(pending);
-            }
-            _ => {}
+    // When the caller pins `intent_embedding_status`, the intent scan
+    // applies the exact same filter as the summary scan and returns an
+    // identical row set. Reuse the summary rows instead of paging the
+    // whole filtered set a second time.
+    if resolved.intent_embedding_status.is_some() {
+        let mut out: Vec<_> = summary_rows
+            .into_iter()
+            .map(|row| WorkItem {
+                row,
+                want_summary: true,
+                want_intent: true,
+            })
+            .collect();
+        out.sort_by_key(|item| std::cmp::Reverse(item.row.memory_id));
+        return Ok(out);
+    }
+
+    let intent_rows = collect_intent_rows_all_pages(app, resolved, page_size).await?;
+
+    let mut by_id: std::collections::BTreeMap<i64, WorkItem> = std::collections::BTreeMap::new();
+    for row in summary_rows {
+        by_id.insert(
+            row.memory_id,
+            WorkItem {
+                row,
+                want_summary: true,
+                want_intent: false,
+            },
+        );
+    }
+    for row in intent_rows {
+        by_id
+            .entry(row.memory_id)
+            .and_modify(|item| item.want_intent = true)
+            .or_insert(WorkItem {
+                row,
+                want_summary: false,
+                want_intent: true,
+            });
+    }
+    let mut out: Vec<_> = by_id.into_values().collect();
+    out.sort_by_key(|item| std::cmp::Reverse(item.row.memory_id));
+    Ok(out)
+}
+
+async fn collect_intent_rows(
+    app: &ReflectionAppImpl,
+    resolved: &ResolvedReflectionSearchFilter,
+    limit: i64,
+) -> Result<Vec<ThreadReflectionIndexRow>> {
+    let mut rows = collect_intent_rows_for_page(app, resolved, limit, None).await?;
+    if rows.len() as i64 > limit {
+        rows.truncate(limit as usize);
+    }
+    Ok(rows)
+}
+
+async fn collect_intent_rows_all_pages(
+    app: &ReflectionAppImpl,
+    resolved: &ResolvedReflectionSearchFilter,
+    page_size: i64,
+) -> Result<Vec<ThreadReflectionIndexRow>> {
+    // A pinned `intent_embedding_status` uses the same filter as the
+    // summary scan, so page it once. The sole caller already handles this
+    // case, but keep the branch as a defensive fallback rather than a
+    // panic so a future caller cannot trigger a redundant double scan.
+    if resolved.intent_embedding_status.is_some() {
+        return scan_all_pages(app, resolved, page_size).await;
+    }
+
+    let mut out = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = collect_intent_rows_for_page(app, resolved, page_size, cursor).await?;
+        if page.is_empty() {
+            break;
         }
+        cursor = page.last().map(|r| r.memory_id);
+        out.extend(page);
+    }
+    Ok(out)
+}
+
+async fn collect_intent_rows_for_page(
+    app: &ReflectionAppImpl,
+    resolved: &ResolvedReflectionSearchFilter,
+    limit: i64,
+    cursor: Option<i64>,
+) -> Result<Vec<ThreadReflectionIndexRow>> {
+    use protobuf::llm_memory::data::EmbeddingStatus;
+
+    if resolved.intent_embedding_status.is_some() {
+        let mut filter = resolved.clone();
+        filter.memory_id_lt = cursor;
         return app
             .index_repo
-            .search_index(&filter, ReflectionSortKey::CreatedAtDesc, limit, 0)
+            .search_index(&filter, ReflectionSortKey::MemoryIdDesc, limit, 0)
             .await;
     }
 
-    let mut summary_filter = resolved.clone();
-    summary_filter.summary_embedding_status = Some(pending);
-    let mut intent_filter = resolved.clone();
-    intent_filter.intent_embedding_status = Some(pending);
+    let mut pending_filter = resolved.clone();
+    pending_filter.intent_embedding_status = Some(EmbeddingStatus::Pending as i32);
+    pending_filter.memory_id_lt = cursor;
+    let mut failed_filter = resolved.clone();
+    failed_filter.intent_embedding_status = Some(EmbeddingStatus::Failed as i32);
+    failed_filter.memory_id_lt = cursor;
 
-    let summary_rows = app
+    let pending_rows = app
         .index_repo
-        .search_index(&summary_filter, ReflectionSortKey::CreatedAtDesc, limit, 0)
+        .search_index(&pending_filter, ReflectionSortKey::MemoryIdDesc, limit, 0)
         .await?;
-    let intent_rows = app
+    let failed_rows = app
         .index_repo
-        .search_index(&intent_filter, ReflectionSortKey::CreatedAtDesc, limit, 0)
+        .search_index(&failed_filter, ReflectionSortKey::MemoryIdDesc, limit, 0)
         .await?;
-
-    // Union by memory_id. Each per-side query is already capped at
-    // `limit` rows of newest-first results, so the union after sorting
-    // and re-capping retains the newest `limit` distinct rows that hit
-    // either pending side. Older rows past the cap surface in the next
-    // batch run.
-    let mut seen = std::collections::HashSet::with_capacity(summary_rows.len() + intent_rows.len());
-    let mut merged = Vec::with_capacity(summary_rows.len() + intent_rows.len());
-    for row in summary_rows.into_iter().chain(intent_rows) {
-        if seen.insert(row.memory_id) {
-            merged.push(row);
-        }
+    let mut by_id = std::collections::BTreeMap::new();
+    for row in pending_rows.into_iter().chain(failed_rows) {
+        by_id.insert(row.memory_id, row);
     }
-    merged.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+    let mut merged: Vec<_> = by_id.into_values().collect();
+    merged.sort_by_key(|row| std::cmp::Reverse(row.memory_id));
     if merged.len() as i64 > limit {
         merged.truncate(limit as usize);
     }
     Ok(merged)
+}
+
+async fn scan_all_pages(
+    app: &ReflectionAppImpl,
+    resolved: &ResolvedReflectionSearchFilter,
+    page_size: i64,
+) -> Result<Vec<ThreadReflectionIndexRow>> {
+    let mut out = Vec::new();
+    let mut cursor = None;
+    loop {
+        let mut filter = resolved.clone();
+        filter.memory_id_lt = cursor;
+        let page = app
+            .index_repo
+            .search_index(&filter, ReflectionSortKey::MemoryIdDesc, page_size, 0)
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().map(|r| r.memory_id);
+        out.extend(page);
+    }
+    Ok(out)
+}
+
+fn validate_filter_presence(
+    kind: EmbeddingKind,
+    filter: Option<&ReflectionSearchFilter>,
+) -> Result<()> {
+    if matches!(kind, EmbeddingKind::Summary | EmbeddingKind::Both)
+        && filter.is_none_or(is_empty_filter)
+    {
+        return Err(LlmMemoryError::InvalidArgument(
+            "RedispatchReflectionEmbeddings(kind=SUMMARY/BOTH) requires a non-empty reflection \
+             filter (filter absent or empty filter is rejected); use \
+             MemoryVectorService.RedispatchEmbeddings(user_id=300000, kinds=[TEXT]) for all \
+             reflection search-document embeddings"
+                .into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn is_empty_filter(filter: &ReflectionSearchFilter) -> bool {
+    filter.origin_user_id.is_none()
+        && filter.origin_channel.as_deref().is_none_or(str::is_empty)
+        && filter.outcomes.is_empty()
+        && filter.score_min.is_none()
+        && filter.score_max.is_none()
+        && filter.task_categories.is_empty()
+        && filter.reflection_aspect.is_none()
+        && filter.failure_modes.is_empty()
+        && filter.failure_modes_match_any.is_empty()
+        && !has_non_empty_string(&filter.tools_used)
+        && !has_non_empty_string(&filter.tools_used_match_any)
+        && filter.prompt_version.as_deref().is_none_or(str::is_empty)
+        && filter
+            .target_model_version
+            .as_deref()
+            .is_none_or(str::is_empty)
+        && filter.experiment_id.as_deref().is_none_or(str::is_empty)
+        && filter
+            .experiment_variant
+            .as_deref()
+            .is_none_or(str::is_empty)
+        && filter.pinned.is_none()
+        && filter.dataset_quality.is_none()
+        && filter.summary_embedding_status.is_none()
+        && filter.intent_embedding_status.is_none()
+        && filter.created_after.is_none()
+        && filter.created_before.is_none()
+        && filter.origin_thread_id.is_none()
+}
+
+fn has_non_empty_string(values: &[String]) -> bool {
+    values.iter().any(|v| !v.is_empty())
 }
 
 fn extract_task_intent(metadata: Option<&str>) -> String {

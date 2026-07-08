@@ -162,5 +162,10 @@ mod tests {
             "summary workflow must keep MarkReflectionEmbeddingStatus(SUMMARY) \
              on OK and FAILED branches"
         );
+        assert!(
+            yaml.matches("using: unary").count() >= 5,
+            "all summary workflow GRPC worker calls must specify using: unary \
+             so the WORKFLOW runner does not try the nonexistent GRPC method `run`"
+        );
     }
 }

@@ -2,8 +2,8 @@
 //! for a finalized reflection.
 //!
 //! Spec §3.5 / §3.6 / §3.7: the reflection memory is owned by
-//! `REFLECTION_USER_ID`, content carries the LLM-generated `summary`,
-//! and `external_id` follows
+//! `REFLECTION_USER_ID`, content carries the search document, and
+//! `external_id` follows
 //! `reflection:<thread>:<prompt_version>:<reflector_id>` so the
 //! existing `memory.external_id` UNIQUE index covers F-G3 idempotency
 //! without a new migration.
@@ -15,8 +15,9 @@
 
 use anyhow::Result;
 use infra::error::LlmMemoryError;
+use infra::infra::reflection::failure_mode_convert;
 use protobuf::llm_memory::data::{
-    ContentType, MemoryData, MessageRole, ReflectionLlmOutput, UserId,
+    ContentType, FailureMode, MemoryData, MessageRole, ReflectionLlmOutput, UserId,
 };
 use protobuf::llm_memory::service::FinalizeReflectionRequest;
 use serde_json::{Map, Value, json};
@@ -75,7 +76,7 @@ pub fn build_parts(
         user_id: Some(UserId {
             value: REFLECTION_USER_ID,
         }),
-        content: parsed.summary.clone(),
+        content: build_reflection_search_document(parsed),
         content_type: ContentType::Text as i32,
         params: None,
         metadata: Some(metadata_json),
@@ -99,6 +100,146 @@ pub fn build_parts(
         score_resolved: resolved,
         task_intent: parsed.task_intent.clone(),
     })
+}
+
+pub(crate) fn build_reflection_search_document(parsed: &ReflectionLlmOutput) -> String {
+    let mut failure_modes: Vec<String> = parsed
+        .failure_modes
+        .iter()
+        .filter_map(|mode| failure_mode_convert::db_name_from_i32(*mode).map(str::to_string))
+        .collect();
+    failure_modes.extend(
+        parsed
+            .failure_modes_other
+            .iter()
+            .map(|mode| mode.trim())
+            .filter(|mode| !mode.is_empty())
+            .map(str::to_string),
+    );
+    build_reflection_search_document_from_parts(
+        &parsed.summary,
+        &parsed.task_intent,
+        &parsed.lessons,
+        &parsed.key_decisions,
+        &parsed.success_factors,
+        &failure_modes,
+        parsed.mitigation_hint.as_deref(),
+    )
+}
+
+pub fn build_reflection_search_document_from_metadata(metadata: &str) -> Result<String> {
+    let root: Value = serde_json::from_str(metadata)
+        .map_err(|e| LlmMemoryError::OtherError(format!("reflection metadata parse: {e}")))?;
+    let eval = root
+        .get("eval")
+        .ok_or_else(|| LlmMemoryError::OtherError("reflection metadata missing eval".into()))?;
+
+    let summary = json_string(eval, "summary");
+    let task_intent = json_string(eval, "task_intent");
+    let lessons = json_string_array(eval, "lessons");
+    let key_decisions = json_string_array(eval, "key_decisions");
+    let success_factors = json_string_array(eval, "success_factors");
+    let mut failure_modes =
+        metadata_failure_modes_to_db_keys(json_string_array(eval, "failure_modes"));
+    failure_modes.extend(json_string_array(eval, "failure_modes_other"));
+    let mitigation_hint = json_string(eval, "mitigation_hint");
+
+    Ok(build_reflection_search_document_from_parts(
+        &summary,
+        &task_intent,
+        &lessons,
+        &key_decisions,
+        &success_factors,
+        &failure_modes,
+        (!mitigation_hint.is_empty()).then_some(mitigation_hint.as_str()),
+    ))
+}
+
+fn metadata_failure_modes_to_db_keys(modes: Vec<String>) -> Vec<String> {
+    modes
+        .into_iter()
+        .filter_map(|mode| {
+            let mode = mode.trim();
+            if mode.is_empty() {
+                return None;
+            }
+            if let Some(parsed) = FailureMode::from_str_name(mode) {
+                return failure_mode_from_metadata_enum(parsed);
+            }
+            if let Some(parsed) = failure_mode_convert::from_db_name(mode) {
+                return failure_mode_from_metadata_enum(parsed);
+            }
+            Some(mode.to_string())
+        })
+        .collect()
+}
+
+fn failure_mode_from_metadata_enum(mode: FailureMode) -> Option<String> {
+    match mode {
+        FailureMode::Unspecified => None,
+        _ => Some(failure_mode_convert::to_db_name(mode).to_string()),
+    }
+}
+
+fn build_reflection_search_document_from_parts(
+    summary: &str,
+    task_intent: &str,
+    lessons: &[String],
+    key_decisions: &[String],
+    success_factors: &[String],
+    failure_modes: &[String],
+    mitigation_hint: Option<&str>,
+) -> String {
+    let mut sections = Vec::new();
+    push_scalar_section(&mut sections, "Summary", summary);
+    push_scalar_section(&mut sections, "Intent", task_intent);
+    push_list_section(&mut sections, "Lessons", lessons);
+    push_list_section(&mut sections, "Key decisions", key_decisions);
+    push_list_section(&mut sections, "Success factors", success_factors);
+    push_list_section(&mut sections, "Failure modes", failure_modes);
+
+    if let Some(hint) = mitigation_hint {
+        push_scalar_section(&mut sections, "Mitigation", hint);
+    }
+    sections.join("\n\n")
+}
+
+fn json_string(parent: &Value, key: &str) -> String {
+    parent
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn json_string_array(parent: &Value, key: &str) -> Vec<String> {
+    parent
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn push_scalar_section(sections: &mut Vec<String>, title: &str, value: &str) {
+    let value = value.trim();
+    if !value.is_empty() {
+        sections.push(format!("{title}:\n{value}"));
+    }
+}
+
+fn push_list_section(sections: &mut Vec<String>, title: &str, values: &[String]) {
+    let lines: Vec<String> = values
+        .iter()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| format!("- {v}"))
+        .collect();
+    if !lines.is_empty() {
+        sections.push(format!("{title}:\n{}", lines.join("\n")));
+    }
 }
 
 fn build_metadata_json(
@@ -248,4 +389,106 @@ fn build_failure_signature_view(fs: &protobuf::llm_memory::data::FailureSignatur
         "trigger_threshold": fs.trigger_threshold,
         "evidence_turn_indices": fs.evidence_turn_indices,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protobuf::llm_memory::data::{
+        FailureMode, ReflectionAspect, ReflectionOutcome, TaskCategory, ToolOutcomeEntry,
+    };
+
+    fn parsed() -> ReflectionLlmOutput {
+        ReflectionLlmOutput {
+            outcome: ReflectionOutcome::Success as i32,
+            score_self: 0.9,
+            summary: "Shipped the cache fix.".into(),
+            task_intent: "Reduce stale reads after reflection deletes.".into(),
+            task_category: TaskCategory::Coding as i32,
+            reflection_aspect: ReflectionAspect::TaskOutcome as i32,
+            failure_modes: vec![],
+            tools_used: vec!["Read".into()],
+            failure_modes_other: vec!["stale cache".into()],
+            success_factors: vec!["Added focused regression tests.".into()],
+            lessons: vec!["Invalidate shared cache before returning.".into()],
+            key_decisions: vec!["Use the existing cache key helper.".into()],
+            mitigation_hint: Some("Check cross-app cache owners.".into()),
+            failure_signature: None,
+            tool_outcomes: vec![ToolOutcomeEntry {
+                tool: "Read".into(),
+                contribution: 1,
+                error_kind: None,
+            }],
+            facts: vec![],
+        }
+    }
+
+    #[test]
+    fn search_document_includes_non_empty_sections_as_plain_text() {
+        let doc = build_reflection_search_document(&parsed());
+
+        assert!(doc.contains("Summary:\nShipped the cache fix."));
+        assert!(doc.contains("Intent:\nReduce stale reads"));
+        assert!(doc.contains("Lessons:\n- Invalidate shared cache"));
+        assert!(doc.contains("Key decisions:\n- Use the existing cache key helper."));
+        assert!(doc.contains("Success factors:\n- Added focused regression tests."));
+        assert!(doc.contains("Failure modes:\n- stale cache"));
+        assert!(doc.contains("Mitigation:\nCheck cross-app cache owners."));
+        assert!(!doc.contains("\"summary\""));
+        assert!(!doc.contains("task_intent"));
+    }
+
+    #[test]
+    fn search_document_omits_empty_sections() {
+        let mut p = parsed();
+        p.task_intent.clear();
+        p.lessons.clear();
+        p.key_decisions.clear();
+        p.success_factors.clear();
+        p.failure_modes_other.clear();
+        p.mitigation_hint = None;
+
+        let doc = build_reflection_search_document(&p);
+
+        assert_eq!(doc, "Summary:\nShipped the cache fix.");
+    }
+
+    #[test]
+    fn search_document_drops_unresolvable_failure_modes() {
+        let mut p = parsed();
+        p.failure_modes = vec![FailureMode::Unspecified as i32, 9999];
+        p.failure_modes_other.clear();
+
+        let doc = build_reflection_search_document(&p);
+
+        assert!(!doc.contains("__failure_mode_sentinel_no_match__"));
+        assert!(!doc.contains("Failure modes:"));
+    }
+
+    #[test]
+    fn search_document_from_metadata_converts_failure_modes_like_finalize() {
+        let mut p = parsed();
+        p.failure_modes = vec![FailureMode::ToolMisuse as i32];
+        p.failure_modes_other = vec!["custom mode".into()];
+        let finalize_doc = build_reflection_search_document(&p);
+        let metadata = json!({
+            "eval": {
+                "summary": p.summary,
+                "task_intent": p.task_intent,
+                "lessons": p.lessons,
+                "key_decisions": p.key_decisions,
+                "success_factors": p.success_factors,
+                "failure_modes": ["FAILURE_MODE_TOOL_MISUSE"],
+                "failure_modes_other": p.failure_modes_other,
+                "mitigation_hint": p.mitigation_hint,
+            }
+        })
+        .to_string();
+
+        let backfill_doc = build_reflection_search_document_from_metadata(&metadata).unwrap();
+
+        assert_eq!(backfill_doc, finalize_doc);
+        assert!(backfill_doc.contains("Failure modes:\n- tool_misuse\n- custom mode"));
+        assert!(!backfill_doc.contains("FAILURE_MODE_TOOL_MISUSE"));
+    }
 }

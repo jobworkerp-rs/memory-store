@@ -6,7 +6,9 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use infra::infra::memory::rdb::MemoryRepositoryImpl;
+use infra::infra::memory_vector::dispatcher::{DispatchError, EmbeddingDispatch};
 use infra::infra::reflection::aggregate_thread::ThreadAggregateKeyRepositoryImpl;
 use infra::infra::reflection::applied_target::ReflectionAppliedTargetRepositoryImpl;
 use infra::infra::reflection::dictionary::FailureModeDictionaryRepositoryImpl;
@@ -33,6 +35,33 @@ use protobuf::llm_memory::service::{FinalizeReflectionRequest, ReflectionListSor
 
 use crate::app::REFLECTION_USER_ID;
 use crate::app::reflection::{ReflectionApp, ReflectionAppImpl};
+
+#[derive(Debug, Default)]
+struct RecordingEmbeddingDispatcher {
+    calls: std::sync::Mutex<Vec<(i64, String)>>,
+}
+
+impl RecordingEmbeddingDispatcher {
+    fn calls(&self) -> Vec<(i64, String)> {
+        self.calls.lock().expect("recording mutex poisoned").clone()
+    }
+}
+
+#[async_trait]
+impl EmbeddingDispatch for RecordingEmbeddingDispatcher {
+    async fn dispatch(
+        &self,
+        memory_id: i64,
+        content: &str,
+    ) -> std::result::Result<Option<jobworkerp_client::jobworkerp::data::JobId>, DispatchError>
+    {
+        self.calls
+            .lock()
+            .expect("recording mutex poisoned")
+            .push((memory_id, content.to_string()));
+        Ok(None)
+    }
+}
 
 async fn setup_pool() -> &'static RdbPool {
     let pool = if cfg!(feature = "postgres") {
@@ -93,6 +122,13 @@ async fn reset_reflection_state(pool: &'static RdbPool) {
 /// fire-and-forget post-commit dispatch stage is a no-op — exactly
 /// the runtime posture we want for unit tests.
 async fn build_app(pool: &'static RdbPool) -> ReflectionAppImpl {
+    build_app_with_memory_dispatcher(pool, None).await
+}
+
+async fn build_app_with_memory_dispatcher(
+    pool: &'static RdbPool,
+    memory_embedding_dispatcher: Option<Arc<dyn EmbeddingDispatch>>,
+) -> ReflectionAppImpl {
     let id_gen = infra::test_helper::shared_id_generator();
     ReflectionAppImpl::new(
         pool,
@@ -112,6 +148,7 @@ async fn build_app(pool: &'static RdbPool) -> ReflectionAppImpl {
         FailureModeDictionaryRepositoryImpl::new(pool),
         FailureSignatureIndicatorNormRepositoryImpl::new(pool),
         None,
+        memory_embedding_dispatcher,
         None,
         None,
         None,
@@ -179,6 +216,10 @@ async fn seed_origin(pool: &'static RdbPool, user_id: i64) -> Result<(i64, i64)>
 const P1: &str = "$1";
 #[cfg(not(feature = "postgres"))]
 const P1: &str = "?";
+#[cfg(feature = "postgres")]
+const P2: &str = "$2";
+#[cfg(not(feature = "postgres"))]
+const P2: &str = "?";
 
 // `memory.metadata` is JSONB on postgres / TEXT on sqlite. The sqlx
 // postgres driver refuses to decode JSONB into `Option<String>`
@@ -367,6 +408,48 @@ fn happy_parsed(anchor_memory_id: i64) -> ReflectionLlmOutput {
             links: vec![],
         }],
     }
+}
+
+#[test]
+fn run_finalize_dispatches_search_document_to_generic_embedding() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let pool = setup_pool().await;
+        let origin_user_id: i64 = 999_700;
+        let (origin_thread_id, anchor_memory_id) = seed_origin(pool, origin_user_id).await?;
+        let dispatcher = Arc::new(RecordingEmbeddingDispatcher::default());
+        let app = build_app_with_memory_dispatcher(pool, Some(dispatcher.clone())).await;
+
+        let req = make_request(
+            origin_thread_id,
+            anchor_memory_id,
+            "test_reflector_generic_dispatch",
+            "20260510",
+            happy_parsed(anchor_memory_id),
+        );
+        let id = app.finalize_generated_reflection(&req).await?;
+
+        let calls = dispatcher.calls();
+        assert_eq!(calls.len(), 1, "finalize must dispatch text embedding once");
+        assert_eq!(calls[0].0, id.value);
+        assert!(
+            calls[0]
+                .1
+                .contains("Summary:\nthe agent shipped the feature")
+        );
+        assert!(
+            calls[0]
+                .1
+                .contains("Intent:\nimplement reflection feature end to end")
+        );
+        assert!(calls[0].1.contains("Lessons:\n- always run tests"));
+        assert_ne!(
+            calls[0].1, "the agent shipped the feature",
+            "generic embedding must receive the search document, not summary only"
+        );
+
+        cleanup_finalize_state(pool, origin_thread_id, origin_user_id, &[anchor_memory_id]).await;
+        Ok(())
+    })
 }
 
 /// Test 3 — `facts[].anchor_memory_id` unset must surface as
@@ -1130,10 +1213,10 @@ fn run_finalize_tool_outcome_stats_matches_rebuild() -> Result<()> {
     })
 }
 
-/// Smoke test for F-G11. With no dispatcher configured every matching
-/// reflection must surface as `skipped`, never as `failed`. The
-/// status-based default narrowing must hold so callers without an
-/// explicit filter only see PENDING / FAILED rows.
+/// Smoke test for the deprecated SUMMARY compatibility path. With no
+/// dispatcher configured every matching reflection must surface as
+/// `skipped`, never as `failed`, but only when the caller supplies a
+/// non-empty sidecar filter.
 #[test]
 fn run_redispatch_with_no_dispatcher_counts_as_skipped() -> Result<()> {
     TEST_RUNTIME.block_on(async {
@@ -1152,18 +1235,102 @@ fn run_redispatch_with_no_dispatcher_counts_as_skipped() -> Result<()> {
         );
         let _ = app.finalize_generated_reflection(&req).await?;
 
+        let filter = protobuf::llm_memory::data::ReflectionSearchFilter {
+            origin_user_id: Some(UserId {
+                value: origin_user_id,
+            }),
+            ..Default::default()
+        };
         let resp = app
-            .redispatch_reflection_embeddings(EmbeddingKind::Both, None, Some(50))
+            .redispatch_reflection_embeddings(EmbeddingKind::Summary, Some(&filter), Some(50))
             .await?;
         // No dispatcher wired → every row is "skipped" without
         // surfacing as a failure (a failure would mean the dispatch
         // call itself errored, not that the dispatcher was absent).
         assert_eq!(resp.failed_count, 0);
-        // SUMMARY status defaults to PENDING when not specified, so
-        // exactly one row matches.
         assert!(resp.skipped_count >= 1, "expected at least one skipped row");
 
         cleanup_finalize_state(pool, origin_thread_id, origin_user_id, &[anchor_memory_id]).await;
+        Ok(())
+    })
+}
+
+#[test]
+fn run_redispatch_summary_keyset_scan_reaches_all_filtered_rows() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let pool = setup_pool().await;
+        let origin_user_id: i64 = 999_712;
+        let (origin_thread_id, anchor_memory_id) = seed_origin(pool, origin_user_id).await?;
+        let app = build_app(pool).await;
+
+        let mut reflection_ids = Vec::new();
+        for idx in 0..3 {
+            let req = make_request(
+                origin_thread_id,
+                anchor_memory_id,
+                &format!("test_reflector_keyset_{idx}"),
+                "20260510",
+                happy_parsed(anchor_memory_id),
+            );
+            reflection_ids.push(app.finalize_generated_reflection(&req).await?.value);
+        }
+
+        // Deliberately break created_at monotonicity relative to memory_id.
+        // The compatibility path must page by memory_id DESC, not by
+        // created_at with a memory_id-only cursor.
+        let p1 = P1;
+        let p2 = P2;
+        sqlx::query::<Rdb>(sqlx::AssertSqlSafe(format!(
+            "UPDATE thread_reflection_index SET created_at = {p1} WHERE memory_id = {p2}"
+        )))
+        .bind(1_600_000_000_000_i64)
+        .bind(reflection_ids[2])
+        .execute(pool)
+        .await?;
+
+        let filter = protobuf::llm_memory::data::ReflectionSearchFilter {
+            origin_user_id: Some(UserId {
+                value: origin_user_id,
+            }),
+            ..Default::default()
+        };
+        let resp = app
+            .redispatch_reflection_embeddings(EmbeddingKind::Summary, Some(&filter), Some(1))
+            .await?;
+
+        assert_eq!(resp.failed_count, 0);
+        assert_eq!(
+            resp.skipped_count, 3,
+            "batch_size=1 must be an internal page size, not a total cap"
+        );
+
+        cleanup_finalize_state(pool, origin_thread_id, origin_user_id, &[anchor_memory_id]).await;
+        Ok(())
+    })
+}
+
+#[test]
+fn run_redispatch_summary_rejects_empty_filter() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let pool = setup_pool().await;
+        let app = build_app(pool).await;
+
+        let err = app
+            .redispatch_reflection_embeddings(EmbeddingKind::Summary, None, Some(50))
+            .await
+            .expect_err("SUMMARY without a filter must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("filter") && msg.contains("RedispatchEmbeddings"),
+            "error must point callers to the generic redispatch path, got {msg}"
+        );
+
+        let empty = protobuf::llm_memory::data::ReflectionSearchFilter::default();
+        let err = app
+            .redispatch_reflection_embeddings(EmbeddingKind::Summary, Some(&empty), Some(50))
+            .await
+            .expect_err("SUMMARY with an empty filter must be rejected");
+        assert!(format!("{err:#}").contains("empty filter"));
         Ok(())
     })
 }
@@ -1212,11 +1379,16 @@ fn run_redispatch_both_includes_intent_only_pending() -> Result<()> {
         tx.commit().await?;
         assert!(updated, "summary status flip must succeed");
 
-        // BOTH with no explicit status filter MUST still surface this
-        // row (skipped, since no dispatcher is wired) — otherwise the
-        // intent-only-pending case is silently dropped.
+        // BOTH requires a non-empty sidecar filter because the summary
+        // compatibility path does not advance by status.
+        let filter = protobuf::llm_memory::data::ReflectionSearchFilter {
+            origin_user_id: Some(UserId {
+                value: origin_user_id,
+            }),
+            ..Default::default()
+        };
         let resp = app
-            .redispatch_reflection_embeddings(EmbeddingKind::Both, None, Some(50))
+            .redispatch_reflection_embeddings(EmbeddingKind::Both, Some(&filter), Some(50))
             .await?;
         assert_eq!(resp.failed_count, 0);
         assert!(

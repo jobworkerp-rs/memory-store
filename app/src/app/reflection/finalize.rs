@@ -166,7 +166,13 @@ pub async fn finalize(
     };
 
     // ===== Phase 4: fire-and-forget dispatch =====
-    dispatch_embeddings(app, memory_id, &parsed.summary, &parsed.task_intent).await;
+    dispatch_embeddings(
+        app,
+        memory_id,
+        &parts.memory_data.content,
+        &parsed.task_intent,
+    )
+    .await;
 
     Ok(ReflectionId { value: memory_id })
 }
@@ -582,14 +588,16 @@ fn is_unique_violation(err: &anyhow::Error) -> bool {
 async fn dispatch_embeddings(
     app: &ReflectionAppImpl,
     memory_id: i64,
-    summary: &str,
+    search_document: &str,
     task_intent: &str,
 ) {
-    if let Some(d) = &app.summary_dispatcher {
-        match d.dispatch(memory_id, summary).await {
+    if let Some(d) = &app.memory_embedding_dispatcher
+        && !search_document.is_empty()
+    {
+        match d.dispatch(memory_id, search_document).await {
             Ok(_) => {}
             Err(e) => tracing::warn!(
-                "reflection summary dispatch failed for memory_id={memory_id}: {e:?}"
+                "reflection generic text dispatch failed for memory_id={memory_id}: {e:?}"
             ),
         }
     }

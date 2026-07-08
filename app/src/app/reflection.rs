@@ -55,6 +55,7 @@ use infra::infra::thread_label::rdb::ThreadLabelRepositoryImpl;
 use infra::infra::thread_memory::rdb::ThreadMemoryRepositoryImpl;
 use infra_utils::infra::rdb::RdbPool;
 
+use infra::infra::memory_vector::dispatcher::EmbeddingDispatch;
 use infra::infra::reflection_intent_dispatch::ReflectionIntentDispatcher;
 use infra::infra::reflection_intent_vector::repository::ReflectionIntentVectorRepository;
 use infra::infra::reflection_summary_dispatch::ReflectionSummaryDispatcher;
@@ -345,6 +346,11 @@ pub struct ReflectionAppImpl {
     /// LanceDB intent-vector store consumed by F-S3 / F-S8 and
     /// `upsert_intent_embedding`.
     pub(crate) intent_vector_repo: Option<ReflectionIntentVectorRepository>,
+    pub(crate) memory_embedding_dispatcher: Option<Arc<dyn EmbeddingDispatch>>,
+    /// Legacy summary dispatcher is retained during the compatibility
+    /// window, but new summary/search-document dispatch uses the generic
+    /// memory dispatcher.
+    #[allow(dead_code)]
     pub(crate) summary_dispatcher: Option<Arc<ReflectionSummaryDispatcher>>,
     pub(crate) intent_dispatcher: Option<Arc<ReflectionIntentDispatcher>>,
     /// jobworkerp client used by F-G1 `Generate` (enqueue the
@@ -392,6 +398,7 @@ impl ReflectionAppImpl {
         dictionary_repo: FailureModeDictionaryRepositoryImpl,
         signature_norm_repo: FailureSignatureIndicatorNormRepositoryImpl,
         intent_vector_repo: Option<ReflectionIntentVectorRepository>,
+        memory_embedding_dispatcher: Option<Arc<dyn EmbeddingDispatch>>,
         summary_dispatcher: Option<Arc<ReflectionSummaryDispatcher>>,
         intent_dispatcher: Option<Arc<ReflectionIntentDispatcher>>,
         jobworkerp_client: Option<Arc<JobworkerpClientWrapper>>,
@@ -417,6 +424,7 @@ impl ReflectionAppImpl {
             signature_norm_repo,
             norm_table,
             intent_vector_repo,
+            memory_embedding_dispatcher,
             summary_dispatcher,
             intent_dispatcher,
             jobworkerp_client,
