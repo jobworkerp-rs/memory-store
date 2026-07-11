@@ -29,6 +29,14 @@ pub async fn setup_and_start_front_server() -> Result<()> {
         .fatal()
     });
 
+    if let Err(e) = infra::infra::embedding_dispatch::validate_document_prefix_configuration() {
+        StartupError::ConfigLoadFailed {
+            component: "MEMORY_EMBEDDING_DOCUMENT_PREFIX".into(),
+            message: format!("{e:#}"),
+        }
+        .fatal();
+    }
+
     // The server handles user-driven memory writes that auto-dispatch
     // embedding jobs, so the callback env *must* be valid before the
     // first request lands. Importer / dry-run binaries that don't

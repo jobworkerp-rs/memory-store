@@ -68,7 +68,13 @@ do:
           name: "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}"
           using: embed_text
           arguments:
-            text: "${ .query }"
+            # MEMORY_EMBEDDING_QUERY_PREFIX_JAQ is not an operator-facing env
+            # var: `workflow_env_overrides` (grpc-admin/src/rag_tools.rs)
+            # injects it as a Jaq string literal while registering this
+            # workflow, built from MEMORY_EMBEDDING_QUERY_PREFIX, so remote
+            # jobworkerp does not need that env var in its own environment.
+            text: >-
+              ${ %{MEMORY_EMBEDDING_QUERY_PREFIX_JAQ:-""} + .query }
       output:
         as:
           values: "${ .embeddings[0].values }"

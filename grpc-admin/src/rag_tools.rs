@@ -30,6 +30,14 @@ fn manifest_path_from_env() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_MANIFEST_PATH))
 }
 
+fn workflow_env_overrides() -> HashMap<String, String> {
+    let prefix = infra::infra::embedding_dispatch::embedding_query_prefix();
+    HashMap::from([(
+        infra::infra::embedding_dispatch::EMBEDDING_QUERY_PREFIX_JAQ_ENV.to_string(),
+        infra::infra::embedding_dispatch::query_prefix_jaq_literal(prefix.as_deref()),
+    )])
+}
+
 /// jobworkerp-client expands `%{VAR}` only on the manifest YAML itself,
 /// not on the bodies pulled in via `$file:` (documented as "No nested
 /// expansion" in worker-yaml.md). Our workflow YAMLs reference
@@ -61,47 +69,20 @@ async fn read_manifest_with_inlined_includes(
     // sit at YAML positions where the raw `%` would otherwise be rejected by
     // the YAML scanner (it reserves `%` for directives at the start of a
     // line / scalar).
-    let expanded_outer = yaml_common::expand_env(&raw)
+    let overrides = workflow_env_overrides();
+    let expanded_outer = yaml_common::expand_env_with_overrides(&raw, &overrides)
         .map_err(|e| anyhow::anyhow!("env expansion failed on manifest YAML: {e}"))?;
 
     let mut doc: serde_yaml::Value = serde_yaml::from_str(&expanded_outer)
         .map_err(|e| anyhow::anyhow!("manifest YAML parse error: {e}"))?;
 
-    yaml_common::resolve_includes(&mut doc, &base_dir)
+    yaml_common::resolve_includes_with_overrides(&mut doc, &base_dir, &overrides)
         .await
         .map_err(|e| anyhow::anyhow!("failed to resolve $file: includes: {e}"))?;
-
-    expand_env_in_string_scalars(&mut doc)?;
 
     let serialized = serde_yaml::to_string(&doc)
         .map_err(|e| anyhow::anyhow!("failed to re-serialize manifest YAML: {e}"))?;
     Ok((serialized, base_dir))
-}
-
-/// Walk every string scalar in `value` and apply `%{VAR}` expansion.
-/// Targets workflow_data bodies that `resolve_includes` just inlined as
-/// opaque string scalars — those are the only place a literal
-/// `%{MEMORY_GRPC_HOST}` would survive without this pass.
-fn expand_env_in_string_scalars(value: &mut serde_yaml::Value) -> anyhow::Result<()> {
-    match value {
-        serde_yaml::Value::String(s) => {
-            let expanded = yaml_common::expand_env(s)
-                .map_err(|e| anyhow::anyhow!("env expansion failed in inlined content: {e}"))?;
-            *s = expanded;
-        }
-        serde_yaml::Value::Mapping(map) => {
-            for (_, v) in map.iter_mut() {
-                expand_env_in_string_scalars(v)?;
-            }
-        }
-        serde_yaml::Value::Sequence(seq) => {
-            for v in seq.iter_mut() {
-                expand_env_in_string_scalars(v)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 async fn register(yaml_path: &Path) -> anyhow::Result<manifest_yaml::ManifestResult> {
@@ -207,6 +188,44 @@ mod tests {
         assert!(
             raw.contains("12345"),
             "MEMORY_GRPC_PORT must be substituted into the inlined workflow body"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn inlined_workflows_receive_the_memories_query_prefix_literal() {
+        // SAFETY: #[serial] guards against concurrent env access.
+        unsafe {
+            std::env::set_var("MEMORY_GRPC_HOST", "test-host");
+            std::env::set_var("MEMORY_GRPC_PORT", "12345");
+            std::env::set_var(
+                "MEMORY_EMBEDDING_QUERY_PREFIX",
+                "literal %{RAG_PREFIX_MUST_NOT_EXPAND}",
+            );
+        }
+        let path = std::path::Path::new(DEFAULT_MANIFEST_PATH);
+        let (raw, _base) = read_manifest_with_inlined_includes(path).await.unwrap();
+
+        let final_manifest = yaml_common::expand_env(&raw);
+        // SAFETY: cleanup; #[serial] keeps the env access exclusive.
+        unsafe {
+            std::env::remove_var("MEMORY_GRPC_HOST");
+            std::env::remove_var("MEMORY_GRPC_PORT");
+            std::env::remove_var("MEMORY_EMBEDDING_QUERY_PREFIX");
+        }
+
+        assert!(
+            raw.contains("RAG_PREFIX_MUST_NOT_EXPAND"),
+            "the registration process must bake the query-prefix marker into RAG workflows: {raw}"
+        );
+        assert!(
+            final_manifest.is_ok(),
+            "the registration process must preserve a literal %{{...}} query prefix through final manifest expansion: {final_manifest:?}"
+        );
+        assert!(
+            !raw.contains("%{MEMORY_EMBEDDING_QUERY_PREFIX_JAQ")
+                && std::env::var_os("MEMORY_EMBEDDING_QUERY_PREFIX_JAQ").is_none(),
+            "the registration process must expand the workflow placeholder without mutating the process environment"
         );
     }
 

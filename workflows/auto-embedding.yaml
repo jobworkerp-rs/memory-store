@@ -35,6 +35,10 @@ do:
           name: "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}"
           using: embed_text
           arguments:
+            # No document prefix here: the Rust-side `validate_document_prefix_configuration`
+            # (infra/src/infra/embedding_dispatch.rs) rejects MEMORY_EMBEDDING_DOCUMENT_PREFIX
+            # at startup, since this runner chunks `text` internally and a prepended prefix
+            # would corrupt persisted chunk offsets.
             text: "${ .content }"
       output:
         as:

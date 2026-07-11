@@ -179,6 +179,8 @@ runner's `model_info.model_name` and recorded in vector metadata.
 | `MEMORY_GRPC_HOST` | required | Host that embedding workflows use to call back into this server |
 | `MEMORY_GRPC_PORT` | required | Callback port |
 | `MEMORY_MM_EMBEDDING_WORKER` | `memories-mm-embedding` | Shared jobworkerp worker for text, image, and query embeddings |
+| `MEMORY_EMBEDDING_DOCUMENT_PREFIX` | unset | Unsupported: startup rejects a non-empty value because the current runner cannot apply it to each chunk while preserving source offsets |
+| `MEMORY_EMBEDDING_QUERY_PREFIX` | unset | Prefix prepended to semantic, hybrid, RAG, and intent query text before embedding; RAG embeds it at registration so jobworkerp need not define it |
 | `MEMORY_IMAGE_WORKERS_YAML` | `workflows/auto-image-embedding-workers.yaml` | Image embedding worker YAML |
 
 `GRPC_ADDR` is the listen address for this process. `MEMORY_GRPC_HOST` and

@@ -40,6 +40,18 @@ pub const MM_EMBEDDING_WORKER_ENV: &str = "MEMORY_MM_EMBEDDING_WORKER";
 /// Default worker name when [`MM_EMBEDDING_WORKER_ENV`] is unset.
 pub const MM_EMBEDDING_WORKER_DEFAULT: &str = "memories-mm-embedding";
 
+/// Reserved model-specific prefix for text stored in the vector index.
+///
+/// The current runner only accepts a whole `text` value and chunks it
+/// internally, so this setting is rejected until the runner exposes a
+/// chunk-aware document-prefix contract.
+pub const EMBEDDING_DOCUMENT_PREFIX_ENV: &str = "MEMORY_EMBEDDING_DOCUMENT_PREFIX";
+/// Model-specific prefix for text used as a retrieval query.
+pub const EMBEDDING_QUERY_PREFIX_ENV: &str = "MEMORY_EMBEDDING_QUERY_PREFIX";
+/// Placeholder name for the JSON/Jaq string literal supplied through an
+/// explicit YAML expansion context during workflow registration.
+pub const EMBEDDING_QUERY_PREFIX_JAQ_ENV: &str = "MEMORY_EMBEDDING_QUERY_PREFIX_JAQ";
+
 /// The `%{ENV:-default}` placeholder the storage workflow YAMLs embed so
 /// jobworkerp's `expand_env` resolves the worker name from the same env
 /// var the Rust query paths use. Kept here so the YAML-pinning tests can
@@ -59,6 +71,56 @@ pub const MM_EMBEDDING_WORKER_PLACEHOLDER: &str =
 pub fn mm_embedding_worker_name() -> String {
     std::env::var(MM_EMBEDDING_WORKER_ENV)
         .unwrap_or_else(|_| MM_EMBEDDING_WORKER_DEFAULT.to_string())
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+pub fn embedding_query_prefix() -> Option<String> {
+    nonempty_env(EMBEDDING_QUERY_PREFIX_ENV)
+}
+
+/// Encode a query prefix as a JSON string, which is also a valid Jaq string
+/// literal. This keeps every character in an operator-provided prefix out of
+/// the workflow's Jaq source syntax. Percent signs use JSON's Unicode escape
+/// form because the caller (`workflow_env_overrides` in
+/// `grpc-admin/src/rag_tools.rs`) splices this literal into a workflow
+/// manifest that still undergoes a `%{...}` expansion pass; escaping here
+/// keeps the operator-provided prefix from being reinterpreted by that pass.
+pub fn query_prefix_jaq_literal(prefix: Option<&str>) -> String {
+    serde_json::to_string(prefix.unwrap_or_default())
+        .expect("serializing a Rust string to JSON cannot fail")
+        .replace('%', "\\u0025")
+}
+
+/// Reject document prefixes until the runner can apply them per chunk while
+/// preserving source offsets.
+pub fn validate_document_prefix_configuration() -> Result<()> {
+    if nonempty_env(EMBEDDING_DOCUMENT_PREFIX_ENV).is_some() {
+        anyhow::bail!(
+            "{EMBEDDING_DOCUMENT_PREFIX_ENV} is not supported by the current \
+             MultimodalEmbeddingRunner: it chunks a single text input internally, \
+             so a prepended prefix would corrupt persisted chunk offsets and would \
+             not be applied to every chunk"
+        );
+    }
+    Ok(())
+}
+
+/// Build `embed_text` arguments using the runner's `EmbedTextArgs` contract.
+/// Prefixes are part of `text`, not a separate runner argument.
+pub fn embed_text_arguments(text: &str, prefix: Option<&str>) -> serde_json::Value {
+    let text = match prefix.filter(|value| !value.is_empty()) {
+        Some(prefix) => format!("{prefix}{text}"),
+        None => text.to_owned(),
+    };
+    json!({ "text": text })
+}
+
+pub fn query_embed_text_arguments(text: &str) -> serde_json::Value {
+    let prefix = embedding_query_prefix();
+    embed_text_arguments(text, prefix.as_deref())
 }
 
 /// Which embedding pipelines a deployment runs. `none` keeps text-only
@@ -394,6 +456,7 @@ impl EmbeddingConfig {
     /// Read the shared `MEMORY_EMBEDDING_*` knobs plus a caller-supplied
     /// env var for the workers YAML path.
     pub fn from_env(workers_yaml_env: &str, workers_yaml_default: &str) -> Result<Self> {
+        validate_document_prefix_configuration()?;
         Ok(Self {
             timeout_sec: std::env::var("MEMORY_EMBEDDING_TIMEOUT_SEC")
                 .ok()
@@ -914,8 +977,12 @@ impl EmbeddingDispatcherCore {
         embed_worker_name: &str,
         text: &str,
     ) -> Result<QueryEmbedding> {
-        self.query_embed(embed_worker_name, "embed_text", &json!({ "text": text }))
-            .await
+        self.query_embed(
+            embed_worker_name,
+            "embed_text",
+            &query_embed_text_arguments(text),
+        )
+        .await
     }
 
     /// Convenience: embed a single image query by URL (one row expected).
@@ -1135,6 +1202,103 @@ mod tests {
         assert!(ImageSearchMode::Multimodal.is_image_enabled());
         assert!(ImageSearchMode::VlmCaption.is_image_enabled());
         assert!(ImageSearchMode::Both.is_image_enabled());
+    }
+
+    #[test]
+    fn embed_text_arguments_preserve_legacy_shape_without_prefix() {
+        assert_eq!(
+            embed_text_arguments("hello", None),
+            json!({ "text": "hello" })
+        );
+        assert_eq!(
+            embed_text_arguments("hello", Some("")),
+            json!({ "text": "hello" })
+        );
+    }
+
+    #[test]
+    fn embed_text_arguments_concatenates_prefix_into_text() {
+        assert_eq!(
+            embed_text_arguments("本文", Some("検索文書: ")),
+            json!({ "text": "検索文書: 本文" })
+        );
+    }
+
+    #[test]
+    fn every_text_embedding_workflow_preserves_source_offsets_and_uses_safe_query_prefixes() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../workflows");
+        for relative in [
+            "auto-embedding.yaml",
+            "auto-thread-embedding.yaml",
+            "auto-image-embedding.yaml",
+            "thread-reflection/auto-reflection-intent-embedding.yaml",
+            "thread-reflection/auto-reflection-summary-embedding.yaml",
+        ] {
+            let yaml = std::fs::read_to_string(root.join(relative)).unwrap();
+            let has_document_prefix = yaml.lines().any(|line| {
+                let line = line.trim_start();
+                !line.starts_with('#') && line.contains("MEMORY_EMBEDDING_DOCUMENT_PREFIX")
+            });
+            let has_prefix_argument = yaml.lines().any(|line| {
+                let line = line.trim_start();
+                !line.starts_with('#') && line.starts_with("prefix:")
+            });
+            assert!(
+                !has_document_prefix && !has_prefix_argument,
+                "{relative} must preserve runner chunk offsets and must not pass a document prefix"
+            );
+        }
+        for relative in ["rag/search-memories.yaml", "rag/search-threads.yaml"] {
+            let yaml = std::fs::read_to_string(root.join(relative)).unwrap();
+            assert!(
+                yaml.contains("%{MEMORY_EMBEDDING_QUERY_PREFIX_JAQ:-\"\"}")
+                    && !yaml.contains("env.MEMORY_EMBEDDING_QUERY_PREFIX")
+                    && !yaml.contains("prefix:"),
+                "{relative} must receive the query prefix as a registration-time Jaq literal"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn embedding_config_rejects_document_prefix_without_chunk_aware_runner_support() {
+        // A document prefix would be prepended before the runner splits the
+        // input, corrupting stored offsets and leaving later chunks unprefixed.
+        unsafe { std::env::set_var(EMBEDDING_DOCUMENT_PREFIX_ENV, "passage: ") };
+        let error = EmbeddingConfig::from_env("TEST_WORKERS_YAML", "workers.yaml")
+            .err()
+            .expect("document prefix must be rejected");
+        unsafe { std::env::remove_var(EMBEDDING_DOCUMENT_PREFIX_ENV) };
+
+        assert!(error.to_string().contains(EMBEDDING_DOCUMENT_PREFIX_ENV));
+    }
+
+    #[test]
+    fn jaq_literal_keeps_special_query_prefix_out_of_the_program_source() {
+        let prefix = "query: \"quoted\"\\path\n%{literal}";
+        let filter = format!("{} + .query", query_prefix_jaq_literal(Some(prefix)));
+        let output = command_utils::util::jq::execute_jq(
+            json!({ "query": "rust" }),
+            &filter,
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("prepared query prefix must be a jq value, not jq source");
+
+        assert_eq!(output, json!(format!("{prefix}rust")));
+    }
+
+    #[test]
+    fn query_prefix_jaq_literal_escapes_special_characters_for_registration() {
+        let prefix = "query: \"quoted\"'\\path\n%{literal}";
+        assert_eq!(
+            query_prefix_jaq_literal(Some(prefix)),
+            r#""query: \"quoted\"'\\path\n\u0025{literal}""#
+        );
+    }
+
+    #[test]
+    fn query_prefix_jaq_literal_defaults_to_an_empty_string() {
+        assert_eq!(query_prefix_jaq_literal(None), r#""""#);
     }
 
     #[tokio::test]

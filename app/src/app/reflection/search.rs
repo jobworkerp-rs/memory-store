@@ -1078,9 +1078,7 @@ async fn embed_intent_text_via_jobworkerp(
     // `jobworkerp_client` split in `app/src/module.rs`), so it uses the
     // always-available shared client directly.
     let worker_name = infra::infra::embedding_dispatch::mm_embedding_worker_name();
-    let args = serde_json::json!({
-        "text": intent_text,
-    });
+    let args = infra::infra::embedding_dispatch::query_embed_text_arguments(intent_text);
     let output = client
         .execute_worker_by_name(&worker_name, args, Some("embed_text"))
         .await

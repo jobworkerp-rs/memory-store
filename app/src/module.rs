@@ -47,6 +47,15 @@ where
     }
 }
 
+fn auto_embedding_config_startup_error(
+    error: anyhow::Error,
+) -> infra::infra::startup_error::StartupError {
+    infra::infra::startup_error::StartupError::ConfigLoadFailed {
+        component: "auto-embedding dispatcher".into(),
+        message: format!("{error:#}"),
+    }
+}
+
 pub struct AppModule {
     pub memory_app: MemoryAppImpl,
     pub memory_rating_app: MemoryRatingAppImpl,
@@ -135,9 +144,8 @@ impl AppModule {
                     // Config error (env / YAML path) is not transient —
                     // the dispatcher cannot even be constructed, so
                     // `from_env` returning Err means the operator must
-                    // fix configuration. Disable until restart.
-                    tracing::warn!("Auto-embedding disabled: config error: {e}");
-                    None
+                    // fix configuration before serving writes.
+                    auto_embedding_config_startup_error(e).fatal()
                 }
             }
         } else {
@@ -159,10 +167,7 @@ impl AppModule {
                     .await;
                     Some(Arc::new(d))
                 }
-                Err(e) => {
-                    tracing::warn!("Thread auto-embedding disabled: config error: {e}");
-                    None
-                }
+                Err(e) => auto_embedding_config_startup_error(e).fatal(),
             }
         } else {
             None
@@ -475,5 +480,14 @@ mod dispatcher_init_outcome_tests {
         // would force a conscious decision rather than silently changing
         // the on-Err behaviour.
         assert_eq!(outcome, DispatcherInitOutcome::InitDeferred);
+    }
+
+    #[test]
+    fn configuration_errors_are_promoted_to_fatal_startup_errors() {
+        let error = auto_embedding_config_startup_error(anyhow::anyhow!("invalid prefix"));
+        assert!(matches!(
+            error,
+            infra::infra::startup_error::StartupError::ConfigLoadFailed { .. }
+        ));
     }
 }
