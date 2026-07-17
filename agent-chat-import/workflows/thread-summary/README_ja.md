@@ -218,6 +218,19 @@ batch は `output_language` に応じて `memories-thread-summary-single-ja` /
 - `external_id`: `summary:<元スレッドID>`（逆引き・重複防止用）
 - `role`: `ROLE_ASSISTANT`
 
+### status
+
+構造化要約の `status` は次のいずれかです。
+
+| 値 | 意味 |
+|---|---|
+| `ongoing` | 主作業を継続中 |
+| `deferred` | 作業を意図的に保留した |
+| `resolved` | 主目的と残課題がすべて完了した |
+| `abandoned` | 作業を明示的に中止した |
+
+`in_review`, `blocked`, `deferred` は下位の日次・週次・月次要約で持ち越し対象として扱う。
+
 ### カテゴリ
 
 LLMが会話内容から自動判定:

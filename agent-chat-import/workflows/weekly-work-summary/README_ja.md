@@ -60,6 +60,10 @@ worker を登録しておく（後述）。
   - `kind="completed"` … 週前半まで ongoing で、週後半に resolved になったもの
 - **`carryover`** — 翌週以降への持ち越し
 
+`purpose_groups.status` は thread-summary の [status](../thread-summary/README_ja.md#status)
+と同じ値を使う。`in_review`, `blocked`, `deferred` は `continued` と `carryover` の対象であり、
+`completed` にはしない。
+
 system prompt は `agent-chat-import/workers/weekly-work-summary/prompts/system_prompt.<lang>.txt`、
 user prompt 末尾の言語依存指示は `agent-chat-import/workers/weekly-work-summary/prompts/user_tail.<lang>.txt`
 に置き、言語別 worker 登録時に `settings.workflow_context` へ焼き込む。

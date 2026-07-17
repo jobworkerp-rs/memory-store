@@ -8,9 +8,10 @@
 
 - `overall_purpose`: 月として何に取り組んでいたかを 1〜3 文で述べる。
 - `purpose_groups`: 週次の目的グループをマージし、月単位の粒度で主要な変更・決定・成果を整理する。`source_memory_ids` には入力の weekly summary memory_id を文字列でそのまま入れる。
+- `purpose_groups.status`: 確認待ちの `in_review`、進行不能の `blocked`、意図的保留の `deferred` を維持する。
 - `by_topic`: 週次のトピックを吸収し、月単位での主要な変更点を述べる。
 - `highlights`: 月内で最も重要だった事項を 5 件以内に絞る。
 - `milestones`: 月内で `resolved` に到達した目的やトピック単位の節目を列挙する。
-- `carryover`: 月末時点の未解決事項を列挙する。なければ空配列。
+- `carryover`: 月末時点の `ongoing`, `in_review`, `blocked`, `deferred` を列挙する。なければ空配列。
 
 入力 JSON の文言を尊重し、根拠のない詳細を作らないでください。必ず日本語で記述してください。

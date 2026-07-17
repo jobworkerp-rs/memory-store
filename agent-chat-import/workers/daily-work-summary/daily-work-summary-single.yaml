@@ -417,7 +417,7 @@ do:
                         "purpose": { "type": "string" },
                         "bullets": { "type": "array", "items": { "type": "string" } },
                         "source_memory_ids": { "type": "array", "items": { "type": "string" } },
-                        "status": { "type": "string", "enum": ["resolved", "ongoing", "abandoned"] }
+                        "status": { "type": "string", "enum": ["resolved", "ongoing", "in_review", "blocked", "deferred", "abandoned"] }
                       }
                     }
                   },

@@ -64,3 +64,16 @@ daily/weekly/monthly aggregation.
 
 `onError: continue` isolates per-thread failures, so inspect jobworkerp per-job
 logs for individual thread errors.
+
+## Status Values
+
+The structured summary `status` uses these values:
+
+| Value | Meaning |
+|---|---|
+| `ongoing` | The main work is still in progress. |
+| `deferred` | Work is intentionally postponed. |
+| `resolved` | The main goal and all follow-up work are complete. |
+| `abandoned` | The work was explicitly discontinued. |
+
+`in_review`, `blocked`, and `deferred` are carryover states for downstream summaries.

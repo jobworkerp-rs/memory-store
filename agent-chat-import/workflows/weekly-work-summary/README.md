@@ -35,6 +35,10 @@ The batch dispatches `memories-weekly-work-summary-single-ja/en` according to
 | External ID | `weekly:YYYY-Www:<scope_key>` |
 | Input query | Finds daily summary memories by `external_id_prefix="daily:"`, role, updated window, and labels |
 
+Weekly `purpose_groups.status` preserves the [thread-summary status
+vocabulary](../thread-summary/README.md#status-values). `in_review`, `blocked`,
+and `deferred` groups remain `continued` and appear in `carryover`; they are not `completed`.
+
 ## Example
 
 ```bash

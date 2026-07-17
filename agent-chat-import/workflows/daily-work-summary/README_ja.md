@@ -51,6 +51,9 @@ worker を登録しておく（後述）。
 - **`carryover`** — 翌日以降への持ち越し
 - **`metrics`** — 件数集計
 
+`purpose_groups.status` は thread-summary の [status](../thread-summary/README_ja.md#status)
+と同じ値を使う。`in_review`, `blocked`, `deferred` は `carryover` に含める。
+
 system prompt は `agent-chat-import/workers/daily-work-summary/prompts/system_prompt.<lang>.txt`、
 user prompt 末尾の言語依存指示は `agent-chat-import/workers/daily-work-summary/prompts/user_tail.<lang>.txt`
 に置き、言語別 worker 登録時に `settings.workflow_context` へ焼き込む。

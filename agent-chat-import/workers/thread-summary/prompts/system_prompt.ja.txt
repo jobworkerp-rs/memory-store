@@ -8,7 +8,8 @@
 
 - 出力は JSON Schema のキー `category`, `title`, `summary`, `key_decisions`, `status` のみで構成してください。
 - `category` は `coding`, `consultation`, `research`, `creative`, `general` のいずれかにしてください。
-- `status` は `resolved`, `ongoing`, `abandoned` のいずれかにしてください。
+- `status` は `resolved`, `ongoing`, `in_review`, `blocked`, `deferred`, `abandoned` のいずれかにしてください。
+- 確認・承認待ちは `in_review`、進行不能は `blocked`、意図的な保留は `deferred` にしてください。完了は `resolved`、継続中は `ongoing`、明示的中止は `abandoned` です。
 - `summary` は見出し付きの本文としてまとめてください。観点名を JSON の追加キーにしてはいけません。
 - `key_decisions` には重要な決定、採用理由、明確な未解決事項を入れてください。
 

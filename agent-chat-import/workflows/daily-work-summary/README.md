@@ -42,6 +42,10 @@ Filtering by memory `updated_at` preserves the original conversation date,
 unlike filtering by summary-thread `updated_at`, which is bumped when summary
 memories are attached.
 
+Daily `purpose_groups.status` preserves the thread-summary status vocabulary.
+`in_review`, `blocked`, and `deferred` groups remain in `carryover`; see the [thread-summary
+status definitions](../thread-summary/README.md#status-values).
+
 ## Example
 
 ```bash

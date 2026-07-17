@@ -460,6 +460,43 @@ mod tests {
         assert!(!batch.contains("workflow_context:"));
     }
 
+    #[test]
+    fn all_summary_layers_support_kanban_statuses() {
+        let workflows = [
+            include_str!("../workers/thread-summary/thread-summary-single.yaml"),
+            include_str!("../workers/daily-work-summary/daily-work-summary-single.yaml"),
+            include_str!("../workers/weekly-work-summary/weekly-work-summary-single.yaml"),
+            include_str!("../workers/monthly-work-summary/monthly-work-summary-single.yaml"),
+        ];
+        for workflow in workflows {
+            assert!(
+                workflow.contains(
+                    "\"enum\": [\"resolved\", \"ongoing\", \"in_review\", \"blocked\", \"deferred\", \"abandoned\"]"
+                ),
+                "summary status schema must expose the kanban-compatible values"
+            );
+        }
+
+        let prompts = [
+            include_str!("../workers/thread-summary/prompts/system_prompt.en.txt"),
+            include_str!("../workers/thread-summary/prompts/system_prompt.ja.txt"),
+            include_str!("../workers/daily-work-summary/prompts/system_prompt.en.txt"),
+            include_str!("../workers/daily-work-summary/prompts/system_prompt.ja.txt"),
+            include_str!("../workers/weekly-work-summary/prompts/system_prompt.en.txt"),
+            include_str!("../workers/weekly-work-summary/prompts/system_prompt.ja.txt"),
+            include_str!("../workers/monthly-work-summary/prompts/system_prompt.en.txt"),
+            include_str!("../workers/monthly-work-summary/prompts/system_prompt.ja.txt"),
+        ];
+        for prompt in prompts {
+            assert!(
+                ["in_review", "blocked", "deferred"]
+                    .iter()
+                    .all(|status| prompt.contains(status)),
+                "summary prompt must explain every kanban-compatible status"
+            );
+        }
+    }
+
     // ---- skip_reason ----
 
     #[test]

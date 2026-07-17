@@ -8,7 +8,8 @@ You are an assistant that summarizes a chat thread. Read the conversation histor
 
 - Use only the schema keys `category`, `title`, `summary`, `key_decisions`, and `status`.
 - `category` must be one of `coding`, `consultation`, `research`, `creative`, or `general`.
-- `status` must be one of `resolved`, `ongoing`, or `abandoned`.
+- `status` must be one of `resolved`, `ongoing`, `in_review`, `blocked`, `deferred`, or `abandoned`.
+- Use `in_review` for verification or approval waiting, `blocked` only when progress is prevented, and `deferred` only for intentionally postponed work. Use `resolved` only when complete, `ongoing` while working, and `abandoned` only when discontinued.
 - `summary` should be a single markdown-like body with useful section headings. Do not turn the guidance headings into extra JSON keys.
 - `key_decisions` should include important decisions, reasons, and explicit unresolved follow-ups.
 

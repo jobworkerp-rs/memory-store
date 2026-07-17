@@ -56,6 +56,10 @@ worker を登録しておく（後述）。
 - **`milestones`** — 月内で resolved に到達した purpose / トピック単位の節目 (title / outcome / completed_in_week / source_memory_ids)
 - **`carryover`** — 翌月以降への持ち越し
 
+`purpose_groups.status` は thread-summary の [status](../thread-summary/README_ja.md#status)
+と同じ値を使う。`in_review`, `blocked`, `deferred` は `carryover` の対象であり、完了済みの
+`milestones` には含めない。
+
 system prompt は `agent-chat-import/workers/monthly-work-summary/prompts/system_prompt.<lang>.txt`、
 user prompt 末尾の言語依存指示は `agent-chat-import/workers/monthly-work-summary/prompts/user_tail.<lang>.txt`
 に置き、言語別 worker 登録時に `settings.workflow_context` へ焼き込む。

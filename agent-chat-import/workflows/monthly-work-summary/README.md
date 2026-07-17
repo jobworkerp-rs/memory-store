@@ -31,6 +31,10 @@ The batch dispatches `memories-monthly-work-summary-single-ja/en` according to
 | External ID | `monthly:YYYY-MM:<scope_key>` |
 | Input query | Finds weekly summary memories by `external_id_prefix="weekly:"`, role, updated window, and labels |
 
+Monthly `purpose_groups.status` preserves the [thread-summary status
+vocabulary](../thread-summary/README.md#status-values). `in_review`, `blocked`,
+and `deferred` groups remain in `carryover` and do not qualify as completed milestones.
+
 ## Example
 
 ```bash
