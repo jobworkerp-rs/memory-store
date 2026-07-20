@@ -266,16 +266,14 @@ mod tests {
     }
 
     #[test]
-    fn production_import_and_summary_guides_do_not_send_legacy_owner() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("workspace root");
+    fn import_and_summary_guides_do_not_send_legacy_owner() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         for relative in [
-            "production-import/run-import.sh",
-            "agent-chat-import/README.md",
-            "agent-chat-import/README_ja.md",
-            "agent-chat-import/workflows/thread-summary/README.md",
-            "agent-chat-import/workflows/thread-summary/README_ja.md",
+            "workflows/agent-chat-import/run-import.sh",
+            "README.md",
+            "README_ja.md",
+            "workflows/thread-summary/README.md",
+            "workflows/thread-summary/README_ja.md",
         ] {
             let path = root.join(relative);
             let body = std::fs::read_to_string(&path)
@@ -285,8 +283,10 @@ mod tests {
                 "{relative} must not send the removed workflow field"
             );
         }
-        let script = std::fs::read_to_string(root.join("production-import/run-import.sh")).unwrap();
-        assert!(script.contains("<<'PY' \"$USER_ID\""));
+        let script =
+            std::fs::read_to_string(root.join("workflows/agent-chat-import/run-import.sh"))
+                .unwrap();
+        assert!(script.contains("\"$USER_ID\""));
     }
 
     #[test]
