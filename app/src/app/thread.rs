@@ -1034,7 +1034,8 @@ pub trait ThreadApp:
     /// pass through to the SQL layer, where they restrict the underlying
     /// `thread` rows before label aggregation. Bound semantics: `*_after`
     /// is strict (`>`), `*_before` is inclusive (`<=`); same convention as
-    /// `FindThreadListByLabels` (P8).
+    /// `FindThreadListByLabels` (P8). Memory kinds are ORed; an empty slice
+    /// leaves the aggregate unfiltered.
     #[allow(clippy::too_many_arguments)]
     async fn find_distinct_labels(
         &self,
@@ -1045,6 +1046,7 @@ pub trait ThreadApp:
         created_before: Option<i64>,
         updated_after: Option<i64>,
         updated_before: Option<i64>,
+        memory_kinds: &[i32],
     ) -> Result<Vec<LabelWithCountRow>> {
         self.thread_label_repository()
             .find_distinct_labels(
@@ -1055,6 +1057,7 @@ pub trait ThreadApp:
                 created_before,
                 updated_after,
                 updated_before,
+                memory_kinds,
             )
             .await
     }
@@ -1092,6 +1095,8 @@ pub trait ThreadApp:
     /// (P9) Time-range bounds restrict the inner candidate set (threads
     /// that match all `labels`) before co-occurrence aggregation, so the
     /// returned `thread_count` reflects the filtered population.
+    /// Memory kinds restrict the same inner candidate set; an empty slice
+    /// preserves the unfiltered behaviour.
     #[allow(clippy::too_many_arguments)]
     async fn find_co_occurring_labels(
         &self,
@@ -1103,6 +1108,7 @@ pub trait ThreadApp:
         created_before: Option<i64>,
         updated_after: Option<i64>,
         updated_before: Option<i64>,
+        memory_kinds: &[i32],
     ) -> Result<Vec<LabelWithCountRow>> {
         self.thread_label_repository()
             .find_co_occurring_labels(
@@ -1114,6 +1120,7 @@ pub trait ThreadApp:
                 created_before,
                 updated_after,
                 updated_before,
+                memory_kinds,
             )
             .await
     }

@@ -63,6 +63,43 @@ struct ThreadTimeFilter {
     next_offset: usize,
 }
 
+struct ThreadMemoryKindFilter {
+    sql: String,
+    binds: Vec<i32>,
+    next_offset: usize,
+}
+
+/// Builds a thread memory-kind predicate using the list-endpoint compatibility
+/// rule: legacy NULL and proto-default zero rows are RAW when RAW is requested.
+fn build_thread_memory_kind_filter(
+    qualifier: &str,
+    memory_kinds: &[i32],
+    param_offset: usize,
+) -> ThreadMemoryKindFilter {
+    if memory_kinds.is_empty() {
+        return ThreadMemoryKindFilter {
+            sql: String::new(),
+            binds: Vec::new(),
+            next_offset: param_offset,
+        };
+    }
+
+    let placeholders = build_in_placeholders(memory_kinds.len(), param_offset);
+    let kind_clause = format!("{qualifier}.memory_kind IN ({placeholders})");
+    let sql = if memory_kinds.contains(&(MemoryKind::Raw as i32)) {
+        format!(
+            " AND ({kind_clause} OR {qualifier}.memory_kind IS NULL OR {qualifier}.memory_kind = 0)"
+        )
+    } else {
+        format!(" AND {kind_clause}")
+    };
+    ThreadMemoryKindFilter {
+        sql,
+        binds: memory_kinds.to_vec(),
+        next_offset: param_offset + memory_kinds.len(),
+    }
+}
+
 fn build_thread_time_filter(
     qualifier: &str,
     created_after: Option<i64>,
@@ -267,18 +304,8 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
             String::new()
         };
 
-        let memory_kind_filter = if memory_kinds.is_empty() {
-            String::new()
-        } else {
-            let placeholders = build_in_placeholders(memory_kinds.len(), param_offset);
-            param_offset += memory_kinds.len();
-            let kind_clause = format!("t.memory_kind IN ({placeholders})");
-            if memory_kinds.contains(&(MemoryKind::Raw as i32)) {
-                format!(" AND ({kind_clause} OR t.memory_kind IS NULL OR t.memory_kind = 0)")
-            } else {
-                format!(" AND {kind_clause}")
-            }
-        };
+        let memory_kind = build_thread_memory_kind_filter("t", memory_kinds, param_offset);
+        param_offset = memory_kind.next_offset;
 
         // `tl.thread_id DESC` is a stable tiebreaker so pages stay
         // deterministic when several threads share the same MAX(updated_at).
@@ -291,11 +318,12 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
             format!(
                 "SELECT tl.thread_id FROM thread_label tl \
                  JOIN thread t ON tl.thread_id = t.id \
-                 WHERE tl.label IN ({label_placeholders}){user_filter}{memory_kind_filter} \
+                 WHERE tl.label IN ({label_placeholders}){user_filter}{} \
                  GROUP BY tl.thread_id \
                  HAVING COUNT(DISTINCT tl.label) = {label_count} \
                  ORDER BY MAX(t.updated_at) DESC, tl.thread_id DESC \
                  LIMIT {} OFFSET {}",
+                memory_kind.sql,
                 build_in_placeholders(1, param_offset),
                 build_in_placeholders(1, param_offset + 1),
             )
@@ -303,10 +331,11 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
             format!(
                 "SELECT tl.thread_id FROM thread_label tl \
                  JOIN thread t ON tl.thread_id = t.id \
-                 WHERE tl.label IN ({label_placeholders}){user_filter}{memory_kind_filter} \
+                 WHERE tl.label IN ({label_placeholders}){user_filter}{} \
                  GROUP BY tl.thread_id \
                  ORDER BY MAX(t.updated_at) DESC, tl.thread_id DESC \
                  LIMIT {} OFFSET {}",
+                memory_kind.sql,
                 build_in_placeholders(1, param_offset),
                 build_in_placeholders(1, param_offset + 1),
             )
@@ -319,7 +348,7 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
         if let Some(uid) = user_id {
             query = query.bind(uid);
         }
-        for kind in memory_kinds {
+        for kind in &memory_kind.binds {
             query = query.bind(*kind);
         }
         query = query.bind(limit.unwrap_or(100) as i64);
@@ -347,6 +376,7 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
         created_before: Option<i64>,
         updated_after: Option<i64>,
         updated_before: Option<i64>,
+        memory_kinds: &[i32],
     ) -> Result<Vec<LabelWithCountRow>> {
         let mut next_param: usize = 1;
         let user_filter = if user_id.is_some() {
@@ -365,10 +395,12 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
             next_param,
         );
         next_param = time.next_offset;
-        // Both `user_filter` and `time.sql` start with " AND " (or are
+        let memory_kind = build_thread_memory_kind_filter("t", memory_kinds, next_param);
+        next_param = memory_kind.next_offset;
+        // All optional fragments start with " AND " (or are
         // empty); collapse the leading " AND " into "WHERE " so the
         // grammar is right whether or not any optional predicate fired.
-        let combined = format!("{user_filter}{}", time.sql);
+        let combined = format!("{user_filter}{}{}", time.sql, memory_kind.sql);
         let where_clause = combined
             .strip_prefix(" AND ")
             .map(|rest| format!("WHERE {rest} "))
@@ -393,6 +425,9 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
         }
         for v in &time.binds {
             query = query.bind(v);
+        }
+        for kind in &memory_kind.binds {
+            query = query.bind(*kind);
         }
         query = query.bind(limit.unwrap_or(100) as i64);
         query = query.bind(offset.unwrap_or(0));
@@ -486,6 +521,7 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
         created_before: Option<i64>,
         updated_after: Option<i64>,
         updated_before: Option<i64>,
+        memory_kinds: &[i32],
     ) -> Result<Vec<LabelWithCountRow>> {
         if labels.is_empty() {
             return Ok(vec![]);
@@ -512,6 +548,8 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
         } else {
             String::new()
         };
+        let memory_kind = build_thread_memory_kind_filter("t_inner", memory_kinds, next_param);
+        next_param = memory_kind.next_offset;
         let time = build_thread_time_filter(
             "t_inner",
             created_after,
@@ -536,7 +574,7 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
              WHERE tl2.thread_id IN ( \
                  SELECT tl_inner.thread_id FROM thread_label tl_inner \
                  JOIN thread t_inner ON tl_inner.thread_id = t_inner.id \
-                 WHERE tl_inner.label IN ({inner_placeholders}){user_filter}{} \
+                 WHERE tl_inner.label IN ({inner_placeholders}){user_filter}{}{} \
                  GROUP BY tl_inner.thread_id \
                  HAVING COUNT(DISTINCT tl_inner.label) = {label_count} \
              ) \
@@ -544,7 +582,7 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
              GROUP BY tl2.label \
              ORDER BY thread_count DESC, tl2.label \
              LIMIT {limit_ph} OFFSET {offset_ph}",
-            time.sql
+            memory_kind.sql, time.sql
         );
 
         let mut query = sqlx::query_as::<_, LabelWithCountRow>(sqlx::AssertSqlSafe(sql));
@@ -553,6 +591,9 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
         }
         if let Some(uid) = user_id {
             query = query.bind(uid);
+        }
+        for kind in &memory_kind.binds {
+            query = query.bind(*kind);
         }
         for v in &time.binds {
             query = query.bind(v);
@@ -618,7 +659,7 @@ mod test {
     use anyhow::Context;
     use infra_utils::infra::rdb::RdbPool;
     use infra_utils::infra::test::{TEST_RUNTIME, setup_test_rdb_from};
-    use protobuf::llm_memory::data::{ThreadData, UserId};
+    use protobuf::llm_memory::data::{MemoryKind, ThreadData, UserId};
 
     fn create_test_thread_data(user_id: i64) -> ThreadData {
         ThreadData {
@@ -755,7 +796,7 @@ mod test {
 
         // Distinct labels
         let distinct = label_repo
-            .find_distinct_labels(None, None, None, None, None, None, None)
+            .find_distinct_labels(None, None, None, None, None, None, None, &[])
             .await?;
         assert!(distinct.len() >= 3);
 
@@ -776,6 +817,7 @@ mod test {
                 None,
                 None,
                 None,
+                &[],
             )
             .await?;
         assert!(co.iter().any(|r| r.label == "rust"));
@@ -1000,6 +1042,20 @@ mod test {
         Ok(id)
     }
 
+    async fn create_thread_with_kind(
+        thread_repo: &ThreadRepositoryImpl,
+        pool: &'static RdbPool,
+        user_id: i64,
+        memory_kind: MemoryKind,
+    ) -> Result<protobuf::llm_memory::data::ThreadId> {
+        let mut data = create_test_thread_data(user_id);
+        data.memory_kind = memory_kind as i32;
+        let mut tx = pool.begin().await.context("begin")?;
+        let id = thread_repo.create(&mut *tx, &data).await?;
+        tx.commit().await.context("commit thread")?;
+        Ok(id)
+    }
+
     async fn _test_find_distinct_labels_with_time_filter(pool: &'static RdbPool) -> Result<()> {
         let id_gen = crate::test_helper::shared_id_generator();
         let thread_repo = ThreadRepositoryImpl::new(id_gen, pool);
@@ -1041,7 +1097,7 @@ mod test {
 
         // No filter — all 4 distinct labels are present.
         let all = label_repo
-            .find_distinct_labels(Some(100), None, None, None, None, None, None)
+            .find_distinct_labels(Some(100), None, None, None, None, None, None, &[])
             .await?;
         let names: Vec<&str> = all.iter().map(|r| r.label.as_str()).collect();
         assert!(names.contains(&"old_only"));
@@ -1051,7 +1107,16 @@ mod test {
 
         // created_after = now - 25_000 (strict `>`): excludes t_old.
         let mid_and_newer = label_repo
-            .find_distinct_labels(Some(100), None, None, Some(now - 25_000), None, None, None)
+            .find_distinct_labels(
+                Some(100),
+                None,
+                None,
+                Some(now - 25_000),
+                None,
+                None,
+                None,
+                &[],
+            )
             .await?;
         let names: Vec<&str> = mid_and_newer.iter().map(|r| r.label.as_str()).collect();
         assert!(
@@ -1069,7 +1134,16 @@ mod test {
 
         // created_before = now - 20_000 (inclusive `<=`): includes t_old and t_mid.
         let mid_and_older = label_repo
-            .find_distinct_labels(Some(100), None, None, None, Some(now - 20_000), None, None)
+            .find_distinct_labels(
+                Some(100),
+                None,
+                None,
+                None,
+                Some(now - 20_000),
+                None,
+                None,
+                &[],
+            )
             .await?;
         let names: Vec<&str> = mid_and_older.iter().map(|r| r.label.as_str()).collect();
         assert!(names.contains(&"old_only"));
@@ -1089,6 +1163,7 @@ mod test {
                 Some(now - 20_000),
                 None,
                 None,
+                &[],
             )
             .await?;
         let names: Vec<&str> = only_mid.iter().map(|r| r.label.as_str()).collect();
@@ -1110,7 +1185,7 @@ mod test {
             .await?;
         tx.commit().await?;
         let recently_updated = label_repo
-            .find_distinct_labels(Some(100), None, None, None, None, Some(now), None)
+            .find_distinct_labels(Some(100), None, None, None, None, Some(now), None, &[])
             .await?;
         let names: Vec<&str> = recently_updated.iter().map(|r| r.label.as_str()).collect();
         assert!(
@@ -1228,6 +1303,7 @@ mod test {
                 None,
                 None,
                 None,
+                &[],
             )
             .await?;
         let names: Vec<&str> = all.iter().map(|r| r.label.as_str()).collect();
@@ -1250,6 +1326,7 @@ mod test {
                 None,
                 Some(now - 10_000),
                 None,
+                &[],
             )
             .await?;
         let names: Vec<&str> = recent.iter().map(|r| r.label.as_str()).collect();
@@ -1276,11 +1353,167 @@ mod test {
                 Some(now - 10_000),
                 None,
                 None,
+                &[],
             )
             .await?;
         let names: Vec<&str> = older.iter().map(|r| r.label.as_str()).collect();
         assert!(names.contains(&"co_old"));
         assert!(!names.contains(&"co_new"));
+
+        Ok(())
+    }
+
+    async fn _test_label_aggregations_with_memory_kind_filter(
+        pool: &'static RdbPool,
+    ) -> Result<()> {
+        let id_gen = crate::test_helper::shared_id_generator();
+        let thread_repo = ThreadRepositoryImpl::new(id_gen, pool);
+        let label_repo = ThreadLabelRepositoryImpl::new(pool);
+        let now = command_utils::util::datetime::now_millis();
+
+        let raw = create_thread_with_kind(&thread_repo, pool, 400, MemoryKind::Raw).await?;
+        let summary =
+            create_thread_with_kind(&thread_repo, pool, 400, MemoryKind::ThreadSummary).await?;
+        let reflection =
+            create_thread_with_kind(&thread_repo, pool, 400, MemoryKind::Reflection).await?;
+
+        label_repo
+            .add_labels(
+                raw.value,
+                &[
+                    "selected".to_string(),
+                    "raw_only".to_string(),
+                    "shared".to_string(),
+                ],
+                now,
+            )
+            .await?;
+        label_repo
+            .add_labels(
+                summary.value,
+                &[
+                    "selected".to_string(),
+                    "summary_only".to_string(),
+                    "shared".to_string(),
+                ],
+                now,
+            )
+            .await?;
+        label_repo
+            .add_labels(
+                reflection.value,
+                &["reflection_only".to_string(), "shared".to_string()],
+                now,
+            )
+            .await?;
+
+        let raw_labels = label_repo
+            .find_distinct_labels(
+                Some(400),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[MemoryKind::Raw as i32],
+            )
+            .await?;
+        let raw_names: Vec<&str> = raw_labels.iter().map(|row| row.label.as_str()).collect();
+        assert!(raw_names.contains(&"raw_only"));
+        assert!(!raw_names.contains(&"summary_only"));
+        assert!(!raw_names.contains(&"reflection_only"));
+        assert_eq!(
+            raw_labels
+                .iter()
+                .find(|row| row.label == "shared")
+                .unwrap()
+                .thread_count,
+            1
+        );
+
+        let raw_and_summary = label_repo
+            .find_distinct_labels(
+                Some(400),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[MemoryKind::Raw as i32, MemoryKind::ThreadSummary as i32],
+            )
+            .await?;
+        assert_eq!(
+            raw_and_summary
+                .iter()
+                .find(|row| row.label == "shared")
+                .unwrap()
+                .thread_count,
+            2
+        );
+
+        let all_labels = label_repo
+            .find_distinct_labels(Some(400), None, None, None, None, None, None, &[])
+            .await?;
+        assert_eq!(
+            all_labels
+                .iter()
+                .find(|row| row.label == "shared")
+                .unwrap()
+                .thread_count,
+            3
+        );
+
+        let raw_co_occurring = label_repo
+            .find_co_occurring_labels(
+                &["selected".to_string()],
+                Some(400),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[MemoryKind::Raw as i32],
+            )
+            .await?;
+        let raw_co_names: Vec<&str> = raw_co_occurring
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect();
+        assert!(raw_co_names.contains(&"raw_only"));
+        assert!(!raw_co_names.contains(&"summary_only"));
+        assert_eq!(
+            raw_co_occurring
+                .iter()
+                .find(|row| row.label == "shared")
+                .unwrap()
+                .thread_count,
+            1
+        );
+
+        let all_co_occurring = label_repo
+            .find_co_occurring_labels(
+                &["selected".to_string()],
+                Some(400),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
+            .await?;
+        assert_eq!(
+            all_co_occurring
+                .iter()
+                .find(|row| row.label == "shared")
+                .unwrap()
+                .thread_count,
+            2
+        );
 
         Ok(())
     }
@@ -1367,6 +1600,15 @@ mod test {
         TEST_RUNTIME.block_on(async {
             let pool = setup_pool().await;
             _test_find_co_occurring_labels_with_time_filter(pool).await
+        })
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn test_label_aggregations_with_memory_kind_filter_sqlite() -> Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_pool().await;
+            _test_label_aggregations_with_memory_kind_filter(pool).await
         })
     }
 }

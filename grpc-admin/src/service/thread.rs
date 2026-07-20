@@ -448,6 +448,7 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
         request: tonic::Request<FindDistinctLabelsRequest>,
     ) -> Result<Response<FindDistinctLabelsResponse>, tonic::Status> {
         let req = request.into_inner();
+        let memory_kinds = validated_memory_kinds(&req.memory_kinds)?;
         match self
             .app()
             .find_distinct_labels(
@@ -458,6 +459,7 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
                 req.created_before,
                 req.updated_after,
                 req.updated_before,
+                &memory_kinds,
             )
             .await
         {
@@ -648,6 +650,7 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
         if req.labels.is_empty() {
             return Err(tonic::Status::invalid_argument("labels must not be empty"));
         }
+        let memory_kinds = validated_memory_kinds(&req.memory_kinds)?;
         match self
             .app()
             .find_co_occurring_labels(
@@ -659,6 +662,7 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
                 req.created_before,
                 req.updated_after,
                 req.updated_before,
+                &memory_kinds,
             )
             .await
         {
