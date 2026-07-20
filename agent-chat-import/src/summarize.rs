@@ -1,3 +1,4 @@
+use crate::common::workflow_input::reject_removed_fields;
 use anyhow::{Context, Result, anyhow};
 use jobworkerp_client::client::wrapper::JobworkerpClientWrapper;
 use serde_json::{Value, json};
@@ -60,6 +61,7 @@ fn merge_template(
     let obj = template
         .as_object_mut()
         .ok_or_else(|| anyhow!("--summarize-after-* must be a JSON object"))?;
+    reject_removed_fields(obj, &["summary_user_id"])?;
     obj.insert("user_id".into(), json!(user_id));
     obj.insert("output_language".into(), json!(output_language));
     if let Some(ms) = updated_after_ms {
@@ -227,22 +229,149 @@ mod tests {
     }
 
     #[test]
-    fn merge_preserves_unrelated_keys() {
+    fn merge_rejects_legacy_summary_owner() {
         let tmpl = json!({
             "memories_grpc_host": "h",
             "memories_grpc_port": 9010,
-            "custom_field": "/x.yaml",
-            "labels_filter": ["a", "b"],
             "summary_user_id": 100000,
         });
-        let out = merge_template(tmpl, 1, Some(1_700_000_000_000), "ja").unwrap();
-        assert_eq!(out["memories_grpc_host"], json!("h"));
-        assert_eq!(out["memories_grpc_port"], json!(9010));
-        assert_eq!(out["custom_field"], json!("/x.yaml"));
-        assert_eq!(out["labels_filter"], json!(["a", "b"]));
-        assert_eq!(out["summary_user_id"], json!(100000));
-        assert_eq!(out["user_id"], json!(1));
-        assert_eq!(out["updated_after_ms"], json!(1_700_000_000_000_i64));
+        let error = merge_template(tmpl, 1, Some(1_700_000_000_000), "ja").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("summary_user_id is no longer supported")
+        );
+    }
+
+    #[test]
+    fn thread_summary_workflows_scope_by_kind_and_reject_legacy_owner() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for relative in [
+            "workers/thread-summary/thread-summary-single.yaml",
+            "workflows/thread-summary/thread-summary-batch.yaml",
+        ] {
+            let path = root.join(relative);
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            assert!(body.contains("summary_user_id is no longer supported"));
+            assert!(
+                body.contains("memory_kinds: [\"MEMORY_KIND_RAW\"]")
+                    || body.contains("memory_kinds: [\"MEMORY_KIND_THREAD_SUMMARY\"]")
+            );
+        }
+        let single =
+            std::fs::read_to_string(root.join("workers/thread-summary/thread-summary-single.yaml"))
+                .unwrap();
+        assert!(single.contains("memory_kind: \"MEMORY_KIND_THREAD_SUMMARY\""));
+    }
+
+    #[test]
+    fn production_import_and_summary_guides_do_not_send_legacy_owner() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root");
+        for relative in [
+            "production-import/run-import.sh",
+            "agent-chat-import/README.md",
+            "agent-chat-import/README_ja.md",
+            "agent-chat-import/workflows/thread-summary/README.md",
+            "agent-chat-import/workflows/thread-summary/README_ja.md",
+        ] {
+            let path = root.join(relative);
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            assert!(
+                !body.contains("summary_user_id"),
+                "{relative} must not send the removed workflow field"
+            );
+        }
+        let script = std::fs::read_to_string(root.join("production-import/run-import.sh")).unwrap();
+        assert!(script.contains("<<'PY' \"$USER_ID\""));
+    }
+
+    #[test]
+    fn summary_orchestration_uses_user_owned_kind_scoped_aggregates() {
+        let agent_summary = include_str!("../workflows/agent-chat-summary/agent-chat-summary.yaml");
+        let pipeline = include_str!("../workflows/agent-chat-pipeline/agent-chat-pipeline.yaml");
+        let summary_script = include_str!("../workflows/agent-chat-summary/run-summary.sh");
+        let pipeline_script = include_str!("../workflows/agent-chat-pipeline/run-pipeline.sh");
+
+        for workflow in [agent_summary, pipeline] {
+            assert!(
+                !workflow.contains("summary_user_id"),
+                "orchestration must not forward the removed summary owner"
+            );
+            assert!(
+                !workflow.contains("personality_user_id"),
+                "orchestration must not forward the removed personality owner"
+            );
+        }
+        for script in [summary_script, pipeline_script] {
+            assert!(!script.contains("SUMMARY_USER_ID"));
+            assert!(!script.contains("PERSONALITY_USER_ID"));
+        }
+
+        for (worker, input_kind, output_kind, external_id_prefix) in [
+            (
+                include_str!("../workers/daily-work-summary/daily-work-summary-single.yaml"),
+                "THREAD_SUMMARY",
+                "DAILY_SUMMARY",
+                "daily",
+            ),
+            (
+                include_str!("../workers/weekly-work-summary/weekly-work-summary-single.yaml"),
+                "DAILY_SUMMARY",
+                "WEEKLY_SUMMARY",
+                "weekly",
+            ),
+            (
+                include_str!("../workers/monthly-work-summary/monthly-work-summary-single.yaml"),
+                "WEEKLY_SUMMARY",
+                "MONTHLY_SUMMARY",
+                "monthly",
+            ),
+        ] {
+            assert!(!worker.contains("source_user_id"));
+            assert!(worker.contains(&format!("MEMORY_KIND_{input_kind}")));
+            assert!(worker.contains(&format!("memory_kind: \"MEMORY_KIND_{output_kind}\"")));
+            assert!(
+                worker.contains(&format!(
+                    "thread_filter: {{\n                  user_id: $effective_user_id,\n                  memory_kinds: [\"MEMORY_KIND_{input_kind}\"]"
+                )),
+                "{input_kind} must be a ThreadSearchFilter condition"
+            );
+            assert!(
+                worker.contains(&format!(
+                    "\"{external_id_prefix}:\" + ($effective_user_id | tostring)"
+                )),
+                "{external_id_prefix} aggregation external IDs must be scoped by user_id"
+            );
+            assert!(
+                !worker.contains(&format!("legacy_{external_id_prefix}_external_id")),
+                "{external_id_prefix} aggregation must require the migrated external ID format"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_workflows_require_user_id() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for relative in [
+            "workflows/daily-work-summary/daily-work-summary-batch.yaml",
+            "workflows/weekly-work-summary/weekly-work-summary-batch.yaml",
+            "workflows/monthly-work-summary/monthly-work-summary-batch.yaml",
+            "workers/daily-work-summary/daily-work-summary-single.yaml",
+            "workers/weekly-work-summary/weekly-work-summary-single.yaml",
+            "workers/monthly-work-summary/monthly-work-summary-single.yaml",
+        ] {
+            let path = root.join(relative);
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            assert!(
+                body.contains("required:\n        - user_id"),
+                "{relative} must require user_id"
+            );
+        }
     }
 
     #[test]
@@ -458,6 +587,10 @@ mod tests {
         assert!(!batch.contains("channel: llm_workflow"));
         assert!(!batch.contains("$context | tojson"));
         assert!(!batch.contains("workflow_context:"));
+        assert_eq!(
+            batch.matches("memory_kinds: [\"MEMORY_KIND_RAW\"]").count(),
+            2
+        );
     }
 
     #[test]

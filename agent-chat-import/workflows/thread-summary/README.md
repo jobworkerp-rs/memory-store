@@ -49,7 +49,6 @@ jobworkerp-client job enqueue-workflow \
     "memories_grpc_port": 9010,
     "ollama_base_url": "http://localhost:11434",
     "summary_model": "qwen3.6:27b",
-    "summary_user_id": 100000,
     "thread_ids": ["7453040111820003484"],
     "output_language": "en"
   }' \
@@ -59,8 +58,8 @@ jobworkerp-client job enqueue-workflow \
 ## Run a Batch
 
 Filter by user, labels, explicit thread IDs, or updated time. The workflow
-stores summary outputs under `summary_user_id` and labels them for downstream
-daily/weekly/monthly aggregation.
+stores summary outputs under the source `user_id` with `THREAD_SUMMARY` and
+labels them for downstream daily/weekly/monthly aggregation.
 
 `onError: continue` isolates per-thread failures, so inspect jobworkerp per-job
 logs for individual thread errors.

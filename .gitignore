@@ -26,4 +26,5 @@ target/
 *.bak
 .vscode
 refine/
-
+docker-compose-test.yml
+CLAUDE.md

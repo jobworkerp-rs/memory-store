@@ -27,6 +27,7 @@ dependencies = [
  "chrono",
  "clap",
  "command-utils 0.1.0 (git+https://github.com/sutr-app/command-utils.git?branch=main)",
+ "common",
  "dotenvy",
  "futures",
  "globset",
@@ -1762,6 +1763,13 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "common"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -3533,6 +3541,7 @@ dependencies = [
  "bytes",
  "clap",
  "command-utils 0.1.0",
+ "common",
  "debug_stub_derive",
  "dotenvy",
  "futures",
@@ -3542,9 +3551,11 @@ dependencies = [
  "prost",
  "prost-types",
  "protobuf",
+ "serde",
  "serde_json",
  "serde_yaml",
  "serial_test",
+ "sha2 0.11.0",
  "sqlx",
  "tokio",
  "tokio-stream",

@@ -9,7 +9,7 @@ use infra_utils::infra::rdb::Rdb;
 use infra_utils::infra::rdb::RdbPool;
 use infra_utils::infra::rdb::UseRdbPool;
 use itertools::Itertools;
-use protobuf::llm_memory::data::{Thread, ThreadData, ThreadId, UserId};
+use protobuf::llm_memory::data::{MemoryKind, Thread, ThreadData, ThreadId, UserId};
 use sqlx::Executor;
 
 // Phase 2 of system-prompt-as-memory migration:
@@ -23,7 +23,7 @@ use sqlx::Executor;
 // this constant would silently break under `--features postgres`.
 pub const INSERT_SQL: &str = concat!(
     "INSERT INTO thread (id, default_system_memory_id, user_id, description, channel, ",
-    "embedding, embedding_dim, created_at, updated_at, metadata) VALUES (",
+    "embedding, embedding_dim, created_at, updated_at, metadata, memory_kind) VALUES (",
     p!(1),
     ",",
     p!(2),
@@ -43,6 +43,8 @@ pub const INSERT_SQL: &str = concat!(
     p!(9),
     ",",
     p_jsonb!(10),
+    ",",
+    p!(11),
     ")"
 );
 
@@ -63,8 +65,10 @@ const UPDATE_SQL: &str = concat!(
     p!(7),
     ", metadata = ",
     p_jsonb!(8),
-    " WHERE id = ",
+    ", memory_kind = ",
     p!(9),
+    " WHERE id = ",
+    p!(10),
     ";"
 );
 
@@ -268,6 +272,7 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
             .bind(created_at)
             .bind(updated_at)
             .bind(&thread.metadata)
+            .bind(thread.memory_kind)
             .execute(tx)
             .await
             .map_err(LlmMemoryError::DBError)?;
@@ -298,6 +303,7 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
             .bind(thread.embedding_dim)
             .bind(updated_at)
             .bind(&thread.metadata)
+            .bind(thread.memory_kind)
             .bind(id.value)
             .execute(tx)
             .await
@@ -468,6 +474,49 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         .context(format!("error in find_list: ({:?}, {:?})", limit, offset))
     }
 
+    /// Filters threads by their own lifecycle-kind column (reusing the
+    /// `memory_kind` enum/column name for schema consistency with `memory`).
+    /// RAW also matches legacy rows with NULL/0 `memory_kind`, since those
+    /// rows predate the lifecycle-kind contract and are treated as RAW by
+    /// convention.
+    async fn find_list_by_memory_kinds(
+        &self,
+        limit: Option<&i32>,
+        offset: Option<&i64>,
+        memory_kinds: &[i32],
+    ) -> Result<Vec<Thread>> {
+        if memory_kinds.is_empty() {
+            return self.find_list(limit, offset).await;
+        }
+        let placeholders = crate::sql::build_in_placeholders(memory_kinds.len(), 1);
+        let kind_clause = format!("memory_kind IN ({placeholders})");
+        let where_clause = if memory_kinds.contains(&(MemoryKind::Raw as i32)) {
+            format!(" WHERE ({kind_clause} OR memory_kind IS NULL OR memory_kind = 0)")
+        } else {
+            format!(" WHERE {kind_clause}")
+        };
+        let mut sql = format!(
+            "SELECT {} FROM thread{where_clause} ORDER BY id DESC",
+            thread_columns!()
+        );
+        if limit.is_some() {
+            sql.push_str(&limit_offset_sql_fragment(memory_kinds.len() + 1));
+        }
+        let mut query = sqlx::query_as::<Rdb, ThreadRow>(sqlx::AssertSqlSafe(sql));
+        for kind in memory_kinds {
+            query = query.bind(*kind);
+        }
+        if let Some(limit) = limit {
+            query = query.bind(*limit as i64).bind(*offset.unwrap_or(&0i64));
+        }
+        query
+            .fetch_all(self.db_pool())
+            .await
+            .map(|rows| rows.into_iter().map(|row| row.to_proto()).collect_vec())
+            .map_err(LlmMemoryError::DBError)
+            .context("error in find_list_by_memory_kinds")
+    }
+
     /// (P8) Find threads owned by `user_id` with optional time-range
     /// filters and an explicit sort key. The static SQL constants used
     /// before P8 only supported the hard-coded `ORDER BY updated_at DESC`
@@ -484,6 +533,7 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         updated_after: Option<i64>,
         updated_before: Option<i64>,
         sort: ThreadSort,
+        memory_kinds: &[i32],
     ) -> Result<Vec<Thread>> {
         let mut clauses: Vec<String> = Vec::new();
         let mut placeholder_idx: usize = 1;
@@ -510,6 +560,24 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         if updated_before.is_some() {
             push_clause("updated_at", "<=");
         }
+        if !memory_kinds.is_empty() {
+            #[cfg(feature = "postgres")]
+            let placeholders = (0..memory_kinds.len())
+                .map(|offset| format!("${}", placeholder_idx + offset))
+                .collect::<Vec<_>>();
+            #[cfg(not(feature = "postgres"))]
+            let placeholders =
+                std::iter::repeat_n("?".to_string(), memory_kinds.len()).collect::<Vec<_>>();
+            placeholder_idx += memory_kinds.len();
+            let kind_clause = format!("memory_kind IN ({})", placeholders.join(", "));
+            if memory_kinds.contains(&(MemoryKind::Raw as i32)) {
+                clauses.push(format!(
+                    "({kind_clause} OR memory_kind IS NULL OR memory_kind = 0)"
+                ));
+            } else {
+                clauses.push(kind_clause);
+            }
+        }
         let where_sql = format!(" WHERE {}", clauses.join(" AND "));
         let order_sql = order_by_thread(sort);
         let limit_sql = limit
@@ -533,6 +601,9 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         }
         if let Some(v) = updated_before {
             query = query.bind(v);
+        }
+        for kind in memory_kinds {
+            query = query.bind(*kind);
         }
         if let Some(l) = limit {
             query = query.bind(*l as i64).bind(*offset.unwrap_or(&0i64));
@@ -584,9 +655,10 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
     }
 
     /// Generic thread-id resolver for the P5 thread_filter feature. Combines
-    /// the seven non-label conditions (`user_id`, `channel`, `created_*`,
-    /// `updated_*`) with AND in a single SQL statement and returns just the
-    /// matching thread ids — labels are resolved through
+    /// the six scalar conditions (`user_id`, `channel`, `created_*`,
+    /// `updated_*`) plus the `memory_kinds` IN-list with AND in a single SQL
+    /// statement and returns just the matching thread ids — labels are
+    /// resolved through
     /// `find_thread_ids_by_labels` and intersected by the app layer
     /// (see `MemoryVectorAppImpl::resolve_memory_ids_from_thread_filter`).
     ///
@@ -609,35 +681,59 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         created_before: Option<i64>,
         updated_after: Option<i64>,
         updated_before: Option<i64>,
+        memory_kinds: &[i32],
         max: i64,
     ) -> Result<Vec<i64>> {
         let mut clauses: Vec<String> = Vec::new();
         let mut placeholder_idx: usize = 1;
-        let mut push_clause = |column: &str, op: &str| {
+        // Generates `count` backend-appropriate placeholders (`$N..` for
+        // postgres, repeated `?` otherwise) and advances the shared
+        // counter, so every clause below — single-value or IN-list —
+        // draws from the same placeholder sequence.
+        let mut next_placeholders = |count: usize| -> Vec<String> {
             #[cfg(feature = "postgres")]
-            let placeholder = format!("${placeholder_idx}");
+            let placeholders = (0..count)
+                .map(|offset| format!("${}", placeholder_idx + offset))
+                .collect::<Vec<_>>();
             #[cfg(not(feature = "postgres"))]
-            let placeholder = "?".to_string();
-            clauses.push(format!("{column} {op} {placeholder}"));
-            placeholder_idx += 1;
+            let placeholders = std::iter::repeat_n("?".to_string(), count).collect::<Vec<_>>();
+            placeholder_idx += count;
+            placeholders
+        };
+        let mut push_clause = |clauses: &mut Vec<String>, column: &str, op: &str| {
+            clauses.push(format!("{column} {op} {}", next_placeholders(1)[0]));
         };
         if user_id.is_some() {
-            push_clause("user_id", "=");
+            push_clause(&mut clauses, "user_id", "=");
         }
         if channel.is_some() {
-            push_clause("channel", "=");
+            push_clause(&mut clauses, "channel", "=");
         }
         if created_after.is_some() {
-            push_clause("created_at", ">");
+            push_clause(&mut clauses, "created_at", ">");
         }
         if created_before.is_some() {
-            push_clause("created_at", "<");
+            push_clause(&mut clauses, "created_at", "<");
         }
         if updated_after.is_some() {
-            push_clause("updated_at", ">");
+            push_clause(&mut clauses, "updated_at", ">");
         }
         if updated_before.is_some() {
-            push_clause("updated_at", "<");
+            push_clause(&mut clauses, "updated_at", "<");
+        }
+        if !memory_kinds.is_empty() {
+            let placeholders = next_placeholders(memory_kinds.len());
+            let kind_clause = format!("memory_kind IN ({})", placeholders.join(", "));
+            if memory_kinds.contains(&(MemoryKind::Raw as i32)) {
+                // Manual migrations add a nullable column. Until backfill has
+                // completed, NULL and proto-default rows retain the legacy
+                // RAW semantics used by the read path.
+                clauses.push(format!(
+                    "({kind_clause} OR memory_kind IS NULL OR memory_kind = 0)"
+                ));
+            } else {
+                clauses.push(kind_clause);
+            }
         }
 
         let where_sql = if clauses.is_empty() {
@@ -647,10 +743,7 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         };
         // `+ 1` overfetch lets the caller reject "exceeds max" without a
         // separate count query.
-        #[cfg(feature = "postgres")]
-        let limit_clause = format!(" LIMIT ${placeholder_idx}");
-        #[cfg(not(feature = "postgres"))]
-        let limit_clause = " LIMIT ?".to_string();
+        let limit_clause = format!(" LIMIT {}", next_placeholders(1)[0]);
         let sql = format!("SELECT id FROM thread{where_sql}{limit_clause}");
 
         let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql));
@@ -671,6 +764,9 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         }
         if let Some(v) = updated_before {
             query = query.bind(v);
+        }
+        for kind in memory_kinds {
+            query = query.bind(*kind);
         }
         query = query.bind(max.saturating_add(1));
 
@@ -808,10 +904,10 @@ mod test {
     use anyhow::Result;
     use infra_utils::infra::rdb::RdbPool;
     use infra_utils::infra::rdb::UseRdbPool;
-    use protobuf::llm_memory::data::MemoryData;
     use protobuf::llm_memory::data::Thread;
     use protobuf::llm_memory::data::ThreadData;
     use protobuf::llm_memory::data::UserId;
+    use protobuf::llm_memory::data::{MemoryData, MemoryKind};
 
     async fn _test_repository(pool: &'static RdbPool) -> Result<()> {
         let repository = ThreadRepositoryImpl::new(crate::test_helper::shared_id_generator(), pool);
@@ -827,6 +923,7 @@ mod test {
             updated_at: 10,
             labels: vec![],
             metadata: None,
+            memory_kind: 0,
         });
 
         let mut tx = db.begin().await.context("error in test")?;
@@ -857,6 +954,7 @@ mod test {
             updated_at: 11,
             labels: vec![],
             metadata: None,
+            memory_kind: 0,
         };
         let updated = repository
             .update(&mut *tx, &expect.id.unwrap(), &update)
@@ -887,12 +985,31 @@ mod test {
         let found = repository.find(&expect.id.unwrap()).await?;
         assert_eq!(99, found.unwrap().data.unwrap().updated_at);
 
+        let personality = ThreadData {
+            default_system_memory_id: None,
+            user_id: Some(UserId { value: 4 }),
+            description: Some("personality thread".to_string()),
+            channel: None,
+            embedding: None,
+            embedding_dim: None,
+            created_at: 12,
+            updated_at: 13,
+            labels: vec![],
+            metadata: None,
+            memory_kind: MemoryKind::Personality as i32,
+        };
+        tx = db.begin().await.context("error in test")?;
+        let personality_id = repository.create(&mut *tx, &personality).await?;
+        tx.commit()
+            .await
+            .context("error in test personality create commit")?;
+
         let count = repository.count_list_tx(repository.db_pool()).await?;
-        assert_eq!(1, count);
+        assert_eq!(2, count);
 
         // find_list
         let list = repository.find_list(None, None).await?;
-        assert_eq!(1, list.len());
+        assert_eq!(2, list.len());
 
         // find_by_user_id
         let list = repository
@@ -905,15 +1022,38 @@ mod test {
                 None,
                 None,
                 ThreadSort::default(),
+                &[MemoryKind::Raw as i32],
             )
             .await?;
         assert_eq!(1, list.len());
+        assert_eq!(
+            list[0].data.as_ref().map(|data| data.memory_kind),
+            Some(MemoryKind::Unspecified as i32)
+        );
+
+        let personality_list = repository
+            .find_by_user_id(
+                UserId { value: 4 },
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ThreadSort::default(),
+                &[MemoryKind::Personality as i32],
+            )
+            .await?;
+        assert_eq!(personality_list.len(), 1);
+        assert_eq!(personality_list[0].id, Some(personality_id));
 
         // delete record
         tx = db.begin().await.context("error in test")?;
         let del = repository.delete_tx(&mut *tx, &expect.id.unwrap()).await?;
+        let personality_deleted = repository.delete_tx(&mut *tx, &personality_id).await?;
         tx.commit().await.context("error in test delete commit")?;
         assert!(del, "delete error");
+        assert!(personality_deleted, "personality delete error");
         Ok(())
     }
 
@@ -940,6 +1080,7 @@ mod test {
             updated_at: 100,
             labels: vec![],
             metadata: None,
+            memory_kind: 0,
         };
         let mut tx = db.begin().await.context("begin")?;
         let thread_id = thread_repo.create(&mut *tx, &thread_data).await?;
@@ -961,6 +1102,7 @@ mod test {
                 external_id: None,
                 media_object_id: None,
                 thread_ids: Vec::new(),
+                memory_kind: 0,
             };
             let mut tx = db.begin().await.context("begin mem")?;
             let mid = memory_repo.create(&mut *tx, &mem).await?;
@@ -1020,6 +1162,7 @@ mod test {
             updated_at: 100,
             labels: vec![],
             metadata: None,
+            memory_kind: 0,
         };
 
         let mut tx = db.begin().await.context("begin")?;
@@ -1074,6 +1217,7 @@ mod test {
             updated_at: 0,
             labels: vec![],
             metadata: None,
+            memory_kind: 0,
         };
 
         let before = command_utils::util::datetime::now_millis();
@@ -1206,6 +1350,7 @@ mod test {
             updated_at: 100,
             labels: vec![],
             metadata: initial_metadata.clone(),
+            memory_kind: 0,
         };
 
         let assert_json_eq =
@@ -1297,6 +1442,7 @@ mod test {
             .bind(created_at)
             .bind(updated_at)
             .bind(None::<String>) // metadata
+            .bind(0_i32) // memory_kind (legacy fixture)
             .execute(pool)
             .await?;
         Ok(())
@@ -1322,13 +1468,13 @@ mod test {
 
         // user_id only.
         let by_user = repo
-            .find_thread_ids_by_filter(Some(1), None, None, None, None, None, max)
+            .find_thread_ids_by_filter(Some(1), None, None, None, None, None, &[], max)
             .await?;
         assert_eq!(to_set(by_user), to_set(vec![9_100_001, 9_100_002]));
 
         // channel only.
         let by_channel = repo
-            .find_thread_ids_by_filter(None, Some("alpha"), None, None, None, None, max)
+            .find_thread_ids_by_filter(None, Some("alpha"), None, None, None, None, &[], max)
             .await?;
         assert_eq!(
             to_set(by_channel),
@@ -1337,32 +1483,48 @@ mod test {
 
         // user_id + channel (intersection).
         let by_uc = repo
-            .find_thread_ids_by_filter(Some(2), Some("alpha"), None, None, None, None, max)
+            .find_thread_ids_by_filter(Some(2), Some("alpha"), None, None, None, None, &[], max)
             .await?;
         assert_eq!(to_set(by_uc), to_set(vec![9_100_003, 9_100_004]));
 
+        // Legacy NULL/default rows remain visible while the migration
+        // backfill is in progress.
+        let conversations = repo
+            .find_thread_ids_by_filter(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[MemoryKind::Raw as i32],
+                max,
+            )
+            .await?;
+        assert_eq!(conversations.len(), 5);
+
         // created_after — strictly greater (not >=).
         let after_100 = repo
-            .find_thread_ids_by_filter(None, None, Some(100), None, None, None, max)
+            .find_thread_ids_by_filter(None, None, Some(100), None, None, None, &[], max)
             .await?;
         assert_eq!(to_set(after_100), to_set(vec![9_100_002, 9_100_004]));
 
         // created_before + updated_after combined.
         let combo = repo
-            .find_thread_ids_by_filter(None, None, None, Some(200), Some(100), None, max)
+            .find_thread_ids_by_filter(None, None, None, Some(200), Some(100), None, &[], max)
             .await?;
         assert_eq!(to_set(combo), to_set(vec![9_100_001, 9_100_002, 9_100_003]));
 
         // No conditions returns every thread (capped by max + 1).
         let none = repo
-            .find_thread_ids_by_filter(None, None, None, None, None, None, max)
+            .find_thread_ids_by_filter(None, None, None, None, None, None, &[], max)
             .await?;
         assert_eq!(none.len(), 5);
 
         // `max + 1` overfetch: ask for max=2 against 5 rows, get 3 (the
         // caller uses len > max to detect "exceeds max").
         let over = repo
-            .find_thread_ids_by_filter(None, None, None, None, None, None, 2)
+            .find_thread_ids_by_filter(None, None, None, None, None, None, &[], 2)
             .await?;
         assert_eq!(over.len(), 3);
 

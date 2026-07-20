@@ -33,7 +33,7 @@ fork:
 
 | Input | Description |
 |---|---|
-| `user_id` | Original conversation owner |
+| `user_id` | Original conversation thread creator |
 | `memories_grpc_host` / `memories_grpc_port` | memories callback endpoint |
 | `thread_summary_batch_yaml` | Thread summary batch YAML path/URL |
 | `daily_work_summary_batch_yaml` | Daily work summary batch YAML path/URL |

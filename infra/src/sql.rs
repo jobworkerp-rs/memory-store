@@ -53,14 +53,14 @@ macro_rules! p_jsonb {
 #[cfg(feature = "postgres")]
 macro_rules! memory_columns {
     () => {
-        "id, parent_ids, user_id, content, content_type, params::text AS params, metadata::text AS metadata, created_at, updated_at, role, external_id, media_object_id"
+        "id, parent_ids, user_id, content, content_type, params::text AS params, metadata::text AS metadata, created_at, updated_at, role, external_id, media_object_id, memory_kind"
     };
 }
 
 #[cfg(not(feature = "postgres"))]
 macro_rules! memory_columns {
     () => {
-        "id, parent_ids, user_id, content, content_type, params, metadata, created_at, updated_at, role, external_id, media_object_id"
+        "id, parent_ids, user_id, content, content_type, params, metadata, created_at, updated_at, role, external_id, media_object_id, memory_kind"
     };
 }
 
@@ -68,14 +68,14 @@ macro_rules! memory_columns {
 #[cfg(feature = "postgres")]
 macro_rules! memory_qualified_columns {
     () => {
-        "memory.id, memory.parent_ids, memory.user_id, memory.content, memory.content_type, memory.params::text AS params, memory.metadata::text AS metadata, memory.created_at, memory.updated_at, memory.role, memory.external_id, memory.media_object_id"
+        "memory.id, memory.parent_ids, memory.user_id, memory.content, memory.content_type, memory.params::text AS params, memory.metadata::text AS metadata, memory.created_at, memory.updated_at, memory.role, memory.external_id, memory.media_object_id, memory.memory_kind"
     };
 }
 
 #[cfg(not(feature = "postgres"))]
 macro_rules! memory_qualified_columns {
     () => {
-        "memory.id, memory.parent_ids, memory.user_id, memory.content, memory.content_type, memory.params, memory.metadata, memory.created_at, memory.updated_at, memory.role, memory.external_id, memory.media_object_id"
+        "memory.id, memory.parent_ids, memory.user_id, memory.content, memory.content_type, memory.params, memory.metadata, memory.created_at, memory.updated_at, memory.role, memory.external_id, memory.media_object_id, memory.memory_kind"
     };
 }
 
@@ -100,14 +100,14 @@ macro_rules! memory_rating_columns {
 #[cfg(feature = "postgres")]
 macro_rules! thread_columns {
     () => {
-        "id, default_system_memory_id, user_id, description, channel, embedding, embedding_dim, created_at, updated_at, metadata::text AS metadata"
+        "id, default_system_memory_id, user_id, description, channel, embedding, embedding_dim, created_at, updated_at, metadata::text AS metadata, memory_kind"
     };
 }
 
 #[cfg(not(feature = "postgres"))]
 macro_rules! thread_columns {
     () => {
-        "id, default_system_memory_id, user_id, description, channel, embedding, embedding_dim, created_at, updated_at, metadata"
+        "id, default_system_memory_id, user_id, description, channel, embedding, embedding_dim, created_at, updated_at, metadata, memory_kind"
     };
 }
 

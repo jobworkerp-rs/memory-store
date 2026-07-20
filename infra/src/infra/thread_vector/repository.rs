@@ -132,11 +132,15 @@ impl ThreadVectorRepositoryImpl {
         };
 
         if !is_new {
-            // Validate existing table schema matches expected schema
-            let actual = table
-                .schema()
-                .await
-                .map_err(|e| anyhow::anyhow!("LanceDB schema read failed: {e}"))?;
+            // Validate existing table schema matches expected schema.
+            // `memory_vector` and `thread_vector` gained `memory_kind` at
+            // the same schema revision, so legacy-column backfill is a
+            // shared helper.
+            let actual =
+                crate::infra::memory_vector::repository::add_legacy_memory_kind_column_if_missing(
+                    &table,
+                )
+                .await?;
             let actual_arrow = actual.as_ref().clone();
             let expected_fp =
                 crate::infra::memory_vector::repository::schema_fingerprint(schema.as_ref());
@@ -469,6 +473,7 @@ impl ThreadVectorRepositoryImpl {
             begin_position: i32_col("begin_position"),
             end_position: i32_col("end_position"),
             user_id: Self::extract_i64(batch, "user_id", row)?,
+            memory_kind: i32_col("memory_kind"),
             content: nullable_str("content").unwrap_or_default(),
             description: nullable_str("description"),
             labels,
@@ -1447,6 +1452,7 @@ impl ThreadVectorRepositoryImpl {
         let begin_positions: Vec<i32> = records.iter().map(|r| r.begin_position).collect();
         let end_positions: Vec<i32> = records.iter().map(|r| r.end_position).collect();
         let user_ids: Vec<i64> = records.iter().map(|r| r.user_id).collect();
+        let memory_kinds: Vec<i32> = records.iter().map(|r| r.memory_kind).collect();
         let contents: Vec<&str> = records.iter().map(|r| r.content.as_str()).collect();
         let descriptions: Vec<Option<&str>> =
             records.iter().map(|r| r.description.as_deref()).collect();
@@ -1497,6 +1503,7 @@ impl ThreadVectorRepositoryImpl {
                 Arc::new(Int64Array::from(created_ats)),
                 Arc::new(Int64Array::from(updated_ats)),
                 Arc::new(Int64Array::from(indexed_ats)),
+                Arc::new(Int32Array::from(memory_kinds)),
             ],
         )
         .map_err(|e| anyhow::anyhow!("Failed to build RecordBatch: {e}"))
@@ -1889,6 +1896,35 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn opens_legacy_table_by_adding_raw_kind_column() {
+        let dim = 8;
+        let (config, _db) = TestDb::config(dim);
+        let database = lancedb::connect(&config.uri).execute().await.unwrap();
+        let expected = thread_arrow_schema(dim);
+        let legacy = Arc::new(Schema::new(
+            expected
+                .fields()
+                .iter()
+                .filter(|field| field.name() != "memory_kind")
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+        let empty = RecordBatch::new_empty(legacy.clone());
+        let reader: Box<dyn arrow_array::RecordBatchReader + Send> =
+            Box::new(RecordBatchIterator::new(vec![Ok(empty)], legacy));
+        database
+            .create_table(&config.table_name, reader)
+            .execute()
+            .await
+            .unwrap();
+
+        let repo = ThreadVectorRepositoryImpl::new(config).await.unwrap();
+        let schema = repo.table.load_full().schema().await.unwrap();
+        let field = schema.field_with_name("memory_kind").unwrap();
+        assert_eq!(field.data_type(), &DataType::Int32);
+    }
+
     async fn embedding_vector_index_count(repo: &ThreadVectorRepositoryImpl) -> usize {
         use crate::infra::memory_vector::repository::is_embedding_vector_index;
         let table = repo.table.load_full();
@@ -2081,6 +2117,7 @@ mod tests {
             begin_position: chunk_index * 10,
             end_position: chunk_index * 10 + 10,
             user_id: 1,
+            memory_kind: 1,
             content: format!("chunk {chunk_index}"),
             description: Some("desc".to_string()),
             labels: vec![],

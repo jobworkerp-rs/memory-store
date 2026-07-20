@@ -21,4 +21,6 @@ message ThreadSearchFilter {
   // Update time range (milliseconds since epoch)
   optional int64 updated_after = 7;
   optional int64 updated_before = 8;
+  // Memory kinds to match. Empty means all kinds; multiple values use OR.
+  repeated MemoryKind memory_kinds = 9;
 }

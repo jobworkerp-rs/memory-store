@@ -57,38 +57,20 @@ input:
         output_language: { type: string, enum: ["ja", "en"], default: "ja" }
         memory_thread_label_prefix: { type: string, default: "summary" }
         force_resummarize: { type: boolean, default: false }
-        summary_user_id:
-          type: integer
-          default: 100000
-          description: Owner user ID for summary memory threads. Must differ from user_id to prevent recursive summarization.
 
 timeout:
   after:
     hours: 24
 
 do:
-  # Step 0a: Defensive fallback for summary_user_id when callers
-  # bypass the input schema (e.g. legacy clients). Schema default
-  # is 100000.
-  - normalizeSummaryUserId:
-      set:
-        effective_summary_user_id: "${ $workflow.input.summary_user_id // 100000 }"
-
-  # Step 0b: Reject summary_user_id == user_id outright. Sharing the
-  # owner would surface summary threads in the source user's listings
-  # and trigger recursive summarization on subsequent batch runs.
-  - failOnSelfOwnedSummary:
-      if: "${ $effective_summary_user_id == $workflow.input.user_id }"
+  - rejectLegacySummaryOwner:
+      if: "${ $workflow.input.summary_user_id != null }"
       raise:
         error:
           type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
           status: 400
-          title: "summary_user_id must differ from user_id"
-          detail: >-
-            ${ "summary_user_id (" + ($effective_summary_user_id | tostring)
-               + ") must differ from user_id ("
-               + ($workflow.input.user_id | tostring)
-               + ") to prevent recursive summarization." }
+          title: "summary_user_id is no longer supported"
+          detail: "Use user_id and memory_kind instead."
 
   # Step 0c: Resolve the effective `updated_after` lower bound (epoch ms).
   # `updated_after_ms` (absolute) wins when supplied; otherwise fall back
@@ -136,6 +118,7 @@ do:
                    labels: $workflow.input.labels_filter,
                    match_mode: "LABEL_ALL",
                    user_id: $workflow.input.user_id,
+                   memory_kinds: ["MEMORY_KIND_RAW"],
                    updated_after: $updated_after_ms,
                    updated_before: $updated_before_ms
                  }
@@ -164,6 +147,7 @@ do:
             json_body: >-
               ${ ({
                    user_id: { value: $workflow.input.user_id },
+                   memory_kinds: ["MEMORY_KIND_RAW"],
                    updated_after: $updated_after_ms,
                    updated_before: $updated_before_ms
                  }
@@ -232,8 +216,7 @@ do:
                             ollama_base_url: $workflow.input.ollama_base_url,
                             output_language: $workflow.input.output_language,
                             memory_thread_label_prefix: $workflow.input.memory_thread_label_prefix,
-                            force_resummarize: $workflow.input.force_resummarize,
-                            summary_user_id: $effective_summary_user_id
+                            force_resummarize: $workflow.input.force_resummarize
                           } | tojson }
               - recordSuccess:
                   set:

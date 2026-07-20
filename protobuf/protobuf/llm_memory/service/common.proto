@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package llm_memory.service;
 
+import "llm_memory/data/common.proto";
+
 // Generic response for update / delete style operations.
 message SuccessResponse {
     // Whether the operation succeeded.
@@ -15,6 +17,9 @@ message FindListRequest {
     optional int32 limit  = 1;
     // Number of records to skip from the start (0 when unset).
     optional int64 offset = 2;
+    // Memory/thread kinds to match. Empty means all kinds; multiple values
+    // use OR semantics. Each service applies this to its returned entity.
+    repeated llm_memory.data.MemoryKind memory_kinds = 3;
 }
 
 // Filter for search criteria, used as input to Count RPCs.

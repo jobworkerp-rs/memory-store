@@ -29,7 +29,7 @@ worker を登録しておく（後述）。
 
 ## 前提条件
 
-- `weekly-work-summary-single` が `weekly_summary` ラベル付き要約スレッドを `user_id = 100000` 配下に生成済みであること
+- `weekly-work-summary-single` が `weekly_summary` ラベル付き `WEEKLY_SUMMARY` を対象の `user_id` 配下に生成済みであること
 - 各週次要約スレッドの `ThreadData.description` に `<YYYY-Www> — <overall_purpose>` 形式のテキストが入っていること（weekly-work-summary Step 14 で書き込まれる）
 - jobworkerp / memories / Ollama の起動状態は daily/weekly と同じ
 
@@ -37,11 +37,12 @@ worker を登録しておく（後述）。
 
 | 項目 | 値 | 理由 |
 |---|---|---|
-| 集約スレッドの所有者 | `user_id = 100000` (= 上層と同じ) | 要約エージェントの出力。ラベルでフィルタ可能なので user 分離は不要 |
+| 集約スレッドの所有者 | 入力 `user_id` (= 上層と同じ) | `memory_kind` とラベルで要約階層を分離する |
 | 集約スレッドのラベル | `monthly_summary`, `month:YYYY-MM`, `scope:<scope_key>`, `extra_labels_filter` の各値 (sort 済み) | `monthly_summary` で一覧、`month:` で月絞り込み、`scope:` で同月内の異 scope を分離 |
-| 集約メモリの `external_id` | `monthly:YYYY-MM:<scope_key>` | `memory.external_id` は DB 全体で UNIQUE。同月に異なる `extra_labels_filter` で並列実行しても衝突しないよう scope を suffix に含める |
+| 集約メモリの `external_id` | `monthly:<user_id>:YYYY-MM:<scope_key>` | `memory.external_id` は DB 全体で UNIQUE。所有者と scope を含め、同月に異なるユーザーまたは `extra_labels_filter` で並列実行しても衝突しないようにする |
 | `scope_key` の算出 | `extra_labels_filter` を `sort \| join(",")`。空なら `_all` | 順序非依存 |
 | 入力の取得方法 | `MemoryService.FindListByCondition` で **週次要約メモリ自身**を絞り込む (`external_id_prefix="weekly:"` + `roles=[ROLE_ASSISTANT]` + `updated_after/before` + `thread_filter.labels=[weekly_summary]+extra` の AND マッチ) | 週次・日次と同じ「メモリ単位で時間絞り込み」パターン |
+
 | LLM 入力 | `memory.data.content` (週次要約 JSON: overall_purpose / purpose_groups / by_topic / trends / carryover) + `thread_description` の組み合わせ | trends フィールドを使って月内の節目を判定 |
 | 月境界 | 暦月 (1 日 00:00 〜 翌月 1 日 00:00 in tz) | 文字列演算で年跨ぎを処理することで、broken-down arithmetic のうるう/DST 問題を回避 |
 
@@ -165,7 +166,7 @@ agent-chat-import/workflows/monthly-work-summary/run-monthly-summary.sh \
 
 | パラメータ | 必須 | デフォルト | 説明 |
 |-----------|------|-----------|------|
-| `source_user_id` | - | `100000` | 集約対象 |
+| `user_id` | ○ | - | 集約対象。`WEEKLY_SUMMARY` と月次出力を同じ実ユーザー所有にする |
 | `memories_grpc_host` / `_port` | ○ | `localhost:9100` | memories gRPC エンドポイント |
 | `weekly_label` | - | `weekly_summary` | 入力スレッドのマーカーラベル |
 | `monthly_label` | - | `monthly_summary` | 出力スレッドのマーカーラベル |
@@ -203,21 +204,21 @@ batch は `output_language` に応じて `memories-monthly-work-summary-single-j
 
 `force_resummarize: false`（既定）のとき、以下を満たす場合にスキップする:
 
-1. 同 (month, scope) の `external_id = "monthly:YYYY-MM:<scope_key>"` 集約メモリが存在
+1. 同 (user_id, month, scope) の `external_id = "monthly:<user_id>:YYYY-MM:<scope_key>"` 集約メモリが存在
 2. その集約メモリの `updated_at` が、当月の入力週次要約群の最大 `updated_at` 以上
 
 ## 出力データの構造
 
 ### 集約スレッド (`Thread`)
 
-- `user_id`: `source_user_id` (= 100000)
+- `user_id`: 入力 `user_id` と同じ実ユーザー
 - `labels`: `["monthly_summary", "month:YYYY-MM", "scope:<scope_key>"]` + sorted `extra_labels_filter`
 - `description`: `"YYYY-MM — <overall_purpose>"`
 
 ### 集約メモリ (`Memory`, role=ASSISTANT)
 
 - `content`: 下記 JSON 構造を `tojson` した文字列
-- `external_id`: `monthly:YYYY-MM:<scope_key>`
+- `external_id`: `monthly:<user_id>:YYYY-MM:<scope_key>`
 - `metadata`: `{month, scope, extra_labels[], source_memory_count, source_memory_ids[], source_thread_ids[], summary_version}`
   - `source_memory_ids` は **週次要約メモリ** の id 列
 

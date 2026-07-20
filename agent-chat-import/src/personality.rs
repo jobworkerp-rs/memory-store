@@ -1,3 +1,4 @@
+use crate::common::workflow_input::reject_removed_fields;
 use anyhow::{Context, Result, anyhow};
 use jobworkerp_client::client::wrapper::JobworkerpClientWrapper;
 use serde_json::{Value, json};
@@ -56,6 +57,7 @@ fn merge_template(
     let obj = template
         .as_object_mut()
         .ok_or_else(|| anyhow!("--extract-personality-after-* must be a JSON object"))?;
+    reject_removed_fields(obj, &["personality_user_id", "summary_user_id"])?;
     obj.insert("user_id".into(), json!(user_id));
     obj.insert("output_language".into(), json!(output_language));
     if let Some(ms) = updated_after_ms {
@@ -203,24 +205,50 @@ mod tests {
     }
 
     #[test]
-    fn merge_preserves_unrelated_keys() {
+    fn merge_rejects_legacy_personality_owners() {
         let tmpl = json!({
             "memories_grpc_host": "h",
             "memories_grpc_port": 9100,
-            "custom_field": "/x.yaml",
-            "labels_filter": ["a", "b"],
             "personality_user_id": 200000,
             "summary_user_id": 100000,
         });
-        let out = merge_template(tmpl, 1, Some(1_700_000_000_000), "ja").unwrap();
-        assert_eq!(out["memories_grpc_host"], json!("h"));
-        assert_eq!(out["memories_grpc_port"], json!(9100));
-        assert_eq!(out["custom_field"], json!("/x.yaml"));
-        assert_eq!(out["labels_filter"], json!(["a", "b"]));
-        assert_eq!(out["personality_user_id"], json!(200000));
-        assert_eq!(out["summary_user_id"], json!(100000));
-        assert_eq!(out["user_id"], json!(1));
-        assert_eq!(out["updated_after_ms"], json!(1_700_000_000_000_i64));
+        let error = merge_template(tmpl, 1, Some(1_700_000_000_000), "ja").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("personality_user_id is no longer supported")
+        );
+    }
+
+    #[test]
+    fn personality_workflows_scope_by_kind_without_legacy_owners() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for relative in [
+            "workers/personality/thread-personality-single.yaml",
+            "workers/personality/user-personality-merge.yaml",
+        ] {
+            let path = root.join(relative);
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            assert!(!body.contains("personality_user_id: { type"));
+            assert!(!body.contains("personality_user_id:\n          type"));
+            assert!(body.contains("memory_kind: \"MEMORY_KIND_PERSONALITY\""));
+        }
+        let batch = std::fs::read_to_string(
+            root.join("workflows/personality/thread-personality-batch.yaml"),
+        )
+        .unwrap();
+        assert!(batch.contains("memory_kinds: [\"MEMORY_KIND_RAW\"]"));
+
+        let merge =
+            std::fs::read_to_string(root.join("workers/personality/user-personality-merge.yaml"))
+                .unwrap();
+        assert!(merge.contains(
+            "thread_filter: {\n                  user_id: $effective_personality_user_id,\n                  memory_kinds: [\"MEMORY_KIND_PERSONALITY\"]"
+        ));
+        assert!(!merge.contains(
+            "user_id: { value: $effective_personality_user_id },\n                memory_kinds: [\"MEMORY_KIND_PERSONALITY\"],\n                external_id_prefix"
+        ));
     }
 
     #[test]

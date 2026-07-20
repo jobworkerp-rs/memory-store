@@ -169,8 +169,7 @@ cat > /tmp/summarize.json <<'EOF'
   "memories_grpc_host": "localhost",
   "memories_grpc_port": 9010,
   "ollama_base_url": "http://192.168.1.2:11434",
-  "summary_model": "qwen3.6:27b",
-  "summary_user_id": 100000
+  "summary_model": "qwen3.6:27b"
 }
 EOF
 
@@ -206,8 +205,6 @@ cat > /tmp/personality.json <<'EOF'
   "memories_grpc_port": 9010,
   "ollama_base_url": "http://192.168.1.2:11434",
   "personality_model": "qwen3.6:27b",
-  "personality_user_id": 200000,
-  "summary_user_id": 100000,
   "min_user_messages": 2,
   "merge_enabled": true
 }
@@ -223,9 +220,9 @@ memories-import --user-id 1 \
   claude-code --all-projects
 ```
 
-`personality_user_id` must differ from both the imported conversation user and
-`summary_user_id` to avoid recursive contamination. When `merge_enabled: true`,
-the batch also runs the second-layer user profile merge workflow.
+Personality workflows use the imported `user_id` and `PERSONALITY` memory kind,
+so they do not need a separate owner value. When `merge_enabled: true`, the
+batch also runs the second-layer user profile merge workflow.
 
 ## `codex`
 
@@ -273,7 +270,9 @@ same root path for the same source name. Use distinct source names such as
 By default, import is add-only. Deleted, renamed, or moved files do not remove
 previously imported memories. Use `--prune-missing` to delete server-side
 memories whose `metadata.path` no longer exists on disk. Prune runs only after
-an import finishes without session errors.
+an import finishes without session errors. It considers only the current
+creator's scoped IDs. Migrate legacy plain IDs during the maintenance window
+before using prune with this release.
 
 ```bash
 memories-import --user-id 1 --server-url http://localhost:9010 plain \
@@ -310,7 +309,7 @@ Important `plain` options:
 
 | Option | Default | Description |
 |---|---|---|
-| `-u, --user-id` | required for import | Owner user ID |
+| `-u, --user-id` | required for import | Creator user ID for imported threads |
 | `-s, --since` | none | ISO 8601 lower bound; passed to generation workflows as epoch ms |
 | `--mtime-margin-seconds` | `60` | Conservative session-file mtime margin for `--since` |
 | `--no-mtime-filter` | `false` | Disable session-level mtime filtering |
@@ -334,6 +333,14 @@ The client naturally applies back-pressure by awaiting each chunk. Retryable
 gRPC errors and PostgreSQL serialization/deadlock SQLSTATEs are retried with
 exponential backoff. `AddMemoriesBatch` is idempotent by external ID, so retries
 do not create duplicates.
+
+## External IDs
+
+Sessions use `source:<thread-creator-id>:<source-specific-id>`. If that form
+would exceed the database's 512-byte limit, it deterministically becomes
+`source:<thread-creator-id>:~<sha256>`. Migrate existing data with
+`migrate-memory-kind apply` and `verify` during the maintenance window before
+deploying this importer; it does not query or reuse legacy external IDs.
 
 For long-running imports, glibc arena fragmentation can accumulate RSS. Consider
 setting:

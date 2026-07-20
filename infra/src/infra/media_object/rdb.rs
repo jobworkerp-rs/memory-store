@@ -1501,6 +1501,7 @@ mod tests {
                             external_id: None,
                             media_object_id: Some(MediaObjectId { value: ok_id }),
                             thread_ids: Vec::new(),
+                            memory_kind: 0,
                         },
                     )
                     .await?;

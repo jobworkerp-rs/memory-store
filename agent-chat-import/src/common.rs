@@ -19,6 +19,26 @@ pub mod importer;
 pub mod labels;
 pub mod path;
 
+pub mod workflow_input {
+    use anyhow::{Result, anyhow};
+    use serde_json::Map;
+
+    /// Reject removed owner-routing fields before dispatching a workflow.
+    pub(crate) fn reject_removed_fields(
+        input: &Map<String, serde_json::Value>,
+        removed_fields: &[&str],
+    ) -> Result<()> {
+        for field in removed_fields {
+            if input.contains_key(*field) {
+                return Err(anyhow!(
+                    "{field} is no longer supported; use user_id and memory_kind"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Output-language whitelist shared by the import CLI, the post-import
 /// dispatchers, and the lang-worker registrar. Single source of truth so
 /// adding a language touches one place.

@@ -2,7 +2,7 @@
 //!
 //! Spec: `docs/plain-prune-spec.md`. The prune step compares the set of
 //! `external_id`s the current import emitted against the set the server
-//! has under `<source-name>:` and `user_id`, then deletes the difference
+//! has under the creator-scoped `<source-name>:<creator>:` namespace, then deletes the difference
 //! after a per-candidate filesystem check. Renames / moves are out of
 //! scope for Phase A — they look like delete + create here.
 //!
@@ -387,6 +387,7 @@ mod tests {
                     external_id: Some(external_id.to_string()),
                     media_object_id: None,
                     thread_ids: Vec::new(),
+                    memory_kind: 0,
                 }),
                 media: None,
             }),
@@ -606,9 +607,15 @@ mod tests {
         async fn find_memories_by_external_id_prefix(
             &self,
             _prefix: String,
-            _user_id: i64,
         ) -> Result<Vec<MemoryListEntry>> {
             Ok(self.memories.lock().unwrap().clone())
+        }
+
+        async fn find_memory_by_external_id(
+            &self,
+            _external_id: String,
+        ) -> anyhow::Result<Option<MemoryListEntry>> {
+            unimplemented!("FakePruneClient does not use exact external ID lookup")
         }
         async fn delete_memory(&self, memory_id: PbMemoryId) -> Result<()> {
             if let Some(err_id) = *self.force_error_on_memory_id.lock().unwrap()

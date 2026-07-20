@@ -17,6 +17,7 @@ use lancedb::Table;
 use lancedb::index::vector::IvfPqIndexBuilder;
 use lancedb::index::{Index, IndexConfig, IndexType};
 use lancedb::query::{ExecutableQuery, QueryBase, VectorQuery};
+use lancedb::table::NewColumnTransform;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
@@ -945,6 +946,9 @@ impl MemoryVectorRepositoryImpl {
                 (t, true)
             }
         };
+        if !is_new {
+            add_legacy_memory_kind_column_if_missing(&table).await?;
+        }
         verify_table_schema_or_fail(&table, &schema, &config).await?;
 
         if is_new {
@@ -1004,6 +1008,7 @@ impl MemoryVectorRepositoryImpl {
             "user_id",
             "role",
             "content_type",
+            "memory_kind",
             "created_at",
         ];
         for col in columns {
@@ -2411,6 +2416,7 @@ impl MemoryVectorRepositoryImpl {
         let created_ats: Vec<i64> = records.iter().map(|r| r.created_at).collect();
         let updated_ats: Vec<i64> = records.iter().map(|r| r.updated_at).collect();
         let indexed_ats: Vec<i64> = records.iter().map(|r| r.indexed_at).collect();
+        let memory_kinds: Vec<i32> = records.iter().map(|r| r.memory_kind).collect();
 
         // Build FixedSizeList for embeddings
         let flat_values: Vec<f32> = records
@@ -2422,7 +2428,7 @@ impl MemoryVectorRepositoryImpl {
         let list_array =
             FixedSizeListArray::new(list_field, vector_size as i32, Arc::new(values_array), None);
 
-        // Column order MUST match `memory_arrow_schema` exactly (15 cols,
+        // Column order MUST match `memory_arrow_schema` exactly (16 cols,
         // image memory Phase 4 N-row). The N-row key columns
         // (vector_kind / chunk_index / begin_position / end_position)
         // sit right after memory_id; thread_id was removed in the thread
@@ -2446,6 +2452,7 @@ impl MemoryVectorRepositoryImpl {
                 Arc::new(Int64Array::from(created_ats)),
                 Arc::new(Int64Array::from(updated_ats)),
                 Arc::new(Int64Array::from(indexed_ats)),
+                Arc::new(Int32Array::from(memory_kinds)),
             ],
         )
         .map_err(|e| anyhow::anyhow!("Failed to build RecordBatch: {e}"))
@@ -2601,6 +2608,40 @@ impl MemoryVectorRepositoryImpl {
         merged.truncate(limit);
         Ok(merged)
     }
+}
+
+/// Evolve a legacy LanceDB table (`memory_vector` or `thread_vector`,
+/// both of which gained `memory_kind` at the same schema revision) in
+/// place by backfilling a constant `memory_kind = RAW` column
+/// if it is missing. Returns the table's current schema either way, so
+/// callers doing a subsequent fingerprint check never re-read it twice.
+pub(crate) async fn add_legacy_memory_kind_column_if_missing(
+    table: &Table,
+) -> anyhow::Result<Arc<Schema>> {
+    let schema = table
+        .schema()
+        .await
+        .map_err(|e| anyhow::anyhow!("LanceDB schema read failed: {e}"))?;
+    if schema.field_with_name("memory_kind").is_ok() {
+        return Ok(schema);
+    }
+
+    // Before MemoryKind existed every vector record was interpreted as a
+    // RAW memory. The offline migration later replaces generated rows.
+    table
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![(
+                "memory_kind".to_string(),
+                "CAST(1 AS INT)".to_string(),
+            )]),
+            None,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("LanceDB add memory_kind column failed: {e}"))?;
+    table
+        .schema()
+        .await
+        .map_err(|e| anyhow::anyhow!("LanceDB schema read after migration failed: {e}"))
 }
 
 async fn verify_table_schema_or_fail(
@@ -3236,6 +3277,7 @@ mod test {
             created_at: memory_id * 1000,
             updated_at: memory_id * 1000,
             indexed_at: command_utils::util::datetime::now_millis(),
+            memory_kind: 1,
         }
     }
 
@@ -3531,6 +3573,35 @@ mod test {
             Field::new("updated_at", DataType::Int64, false),
             Field::new("indexed_at", DataType::Int64, false),
         ]))
+    }
+
+    #[tokio::test]
+    async fn opens_legacy_table_by_adding_raw_kind_column() {
+        let dim = 8;
+        let (config, _db) = TestDb::config(dim);
+        let database = lancedb::connect(&config.uri).execute().await.unwrap();
+        let expected = memory_arrow_schema(dim);
+        let legacy = Arc::new(Schema::new(
+            expected
+                .fields()
+                .iter()
+                .filter(|field| field.name() != "memory_kind")
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+        let empty = RecordBatch::new_empty(legacy.clone());
+        let reader: Box<dyn arrow_array::RecordBatchReader + Send> =
+            Box::new(RecordBatchIterator::new(vec![Ok(empty)], legacy));
+        database
+            .create_table(&config.table_name, reader)
+            .execute()
+            .await
+            .unwrap();
+
+        let repo = MemoryVectorRepositoryImpl::new(config).await.unwrap();
+        let schema = repo.table.load_full().schema().await.unwrap();
+        let field = schema.field_with_name("memory_kind").unwrap();
+        assert_eq!(field.data_type(), &DataType::Int32);
     }
 
     // ===== Vector (ANN) index tests =====
@@ -4560,6 +4631,36 @@ mod test {
         let results = repo.search_by_vector(&emb, Some(&filter), 10).await?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].memory_id, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_kind_filter_limits_vector_and_text_searches() -> anyhow::Result<()> {
+        let dim = 8;
+        let (config, _db) = TestDb::config(dim);
+        let repo = MemoryVectorRepositoryImpl::new(config).await?;
+        let embedding = random_embedding(dim);
+
+        let mut conversation = test_record_with_content(1, 10, "kind filter phrase", dim);
+        conversation.embedding = embedding.clone();
+        let mut reflection = test_record_with_content(2, 10, "kind filter phrase", dim);
+        reflection.embedding = embedding.clone();
+        reflection.memory_kind = 7;
+        repo.batch_upsert(vec![conversation, reflection]).await?;
+
+        let filter = SafeFilter::memory_kinds_any(&[7])?;
+        let vector = repo.search_by_vector(&embedding, Some(&filter), 10).await?;
+        let text = repo
+            .search_by_text("kind filter phrase", Some(&filter), 10)
+            .await?;
+        assert_eq!(
+            vector.iter().map(|hit| hit.memory_id).collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(
+            text.iter().map(|hit| hit.memory_id).collect::<Vec<_>>(),
+            vec![2]
+        );
         Ok(())
     }
 

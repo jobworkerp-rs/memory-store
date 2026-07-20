@@ -56,6 +56,18 @@ impl ThreadSafeFilter {
         Self::from_expr(col("updated_at").lt(lit(ScalarValue::Int64(Some(ts)))))
     }
 
+    /// Filter threads whose kind matches any value in the request.
+    pub fn memory_kinds_any(kinds: &[i32]) -> anyhow::Result<Self> {
+        if kinds.is_empty() {
+            anyhow::bail!("memory_kinds_any: kinds must not be empty");
+        }
+        let literals = kinds
+            .iter()
+            .map(|&kind| lit(ScalarValue::Int32(Some(kind))))
+            .collect();
+        Ok(Self::from_expr(col("memory_kind").in_list(literals, false)))
+    }
+
     /// Filter threads that have ANY of the specified labels.
     /// Expanded to OR-chain of array_contains because lance-datafusion does not
     /// expose Spark's array_contains_any (only array_contains via array_has alias).
@@ -166,6 +178,9 @@ impl ThreadSafeFilter {
         }
         if let Some(before) = filter.updated_before {
             combine_and(Self::updated_before(before));
+        }
+        if !filter.memory_kinds.is_empty() {
+            combine_and(Self::memory_kinds_any(&filter.memory_kinds).expect("non-empty kinds"));
         }
 
         result
@@ -298,6 +313,7 @@ mod test {
             created_before: None,
             updated_after: None,
             updated_before: Some(2000),
+            memory_kinds: vec![],
         };
         let sf = ThreadSafeFilter::from_proto_filter(&pf).unwrap();
         let sql = sf.to_sql().unwrap();
@@ -306,6 +322,22 @@ mod test {
         assert!(sql.contains("channel = 'slack'"));
         assert!(sql.contains("created_at > 500"));
         assert!(sql.contains("updated_at < 2000"));
+    }
+
+    #[test]
+    fn test_from_proto_filter_with_memory_kinds() {
+        let pf = protobuf::llm_memory::data::ThreadSearchFilter {
+            memory_kinds: vec![
+                protobuf::llm_memory::data::MemoryKind::Raw as i32,
+                protobuf::llm_memory::data::MemoryKind::Reflection as i32,
+            ],
+            ..Default::default()
+        };
+        let sql = ThreadSafeFilter::from_proto_filter(&pf)
+            .expect("memory kinds should create a filter")
+            .to_sql()
+            .unwrap();
+        assert_eq!(sql, "(memory_kind IN (1, 7))");
     }
 
     #[test]

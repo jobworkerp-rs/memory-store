@@ -34,6 +34,18 @@ impl SafeFilter {
             expr: col("content_type").eq(lit(ScalarValue::Int32(Some(ct)))),
         }
     }
+    pub fn memory_kinds_any(kinds: &[i32]) -> anyhow::Result<Self> {
+        if kinds.is_empty() {
+            anyhow::bail!("memory_kinds_any: kinds must not be empty");
+        }
+        let literals = kinds
+            .iter()
+            .map(|&kind| lit(ScalarValue::Int32(Some(kind))))
+            .collect();
+        Ok(Self {
+            expr: col("memory_kind").in_list(literals, false),
+        })
+    }
     pub fn created_after(ts: i64) -> Self {
         Self {
             expr: col("created_at").gt(lit(ScalarValue::Int64(Some(ts)))),
@@ -143,6 +155,12 @@ impl SafeFilter {
                 .reduce(|a, b| a.or(b))
         {
             combine_and(ct_filter);
+        }
+
+        if !filter.memory_kinds.is_empty() {
+            combine_and(
+                Self::memory_kinds_any(&filter.memory_kinds).expect("non-empty memory_kinds"),
+            );
         }
 
         if let Some(after) = filter.created_after {
@@ -293,6 +311,19 @@ mod test {
         assert!(sql.contains("updated_at > 1000"));
         assert!(sql.contains("updated_at < 2000"));
         assert!(sql.contains("AND"));
+    }
+
+    #[test]
+    fn test_from_proto_filter_with_memory_kinds() {
+        let pf = protobuf::llm_memory::data::MemorySearchFilter {
+            memory_kinds: vec![1, 7],
+            ..Default::default()
+        };
+        let sql = SafeFilter::from_proto_filter(&pf)
+            .unwrap()
+            .to_sql()
+            .unwrap();
+        assert_eq!(sql, "(memory_kind IN (1, 7))");
     }
 
     #[test]

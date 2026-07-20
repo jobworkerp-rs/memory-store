@@ -144,9 +144,6 @@ input:
           description: >-
             Absolute path / URL of daily-work-summary-batch.yaml.
             Empty (default) skips the daily-summary stage entirely.
-        summary_user_id:
-          type: integer
-          default: 100000
         summary_model:
           type: string
           default: "qwen3.6:27b"
@@ -179,9 +176,6 @@ input:
         user_personality_merge_yaml:
           type: string
           default: ""
-        personality_user_id:
-          type: integer
-          default: 200000
         personality_model:
           type: string
           default: ""
@@ -316,7 +310,6 @@ do:
                 timezone_offset_hours: $workflow.input.timezone_offset_hours,
                 thread_summary_batch_yaml: $workflow.input.thread_summary_batch_yaml,
                 daily_work_summary_batch_yaml: $workflow.input.daily_work_summary_batch_yaml,
-                summary_user_id: $workflow.input.summary_user_id,
                 summary_model: $workflow.input.summary_model,
                 ollama_base_url: $workflow.input.ollama_base_url,
                 memory_thread_label_prefix: $workflow.input.memory_thread_label_prefix,
@@ -327,7 +320,6 @@ do:
                 max_context_chars: $workflow.input.max_context_chars,
                 thread_personality_batch_yaml: $workflow.input.thread_personality_batch_yaml,
                 user_personality_merge_yaml: $workflow.input.user_personality_merge_yaml,
-                personality_user_id: $workflow.input.personality_user_id,
                 personality_model: $workflow.input.personality_model,
                 min_user_messages: $workflow.input.min_user_messages,
                 force_reextract: $workflow.input.force_reextract,

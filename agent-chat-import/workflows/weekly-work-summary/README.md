@@ -22,7 +22,7 @@ The batch dispatches `memories-weekly-work-summary-single-ja/en` according to
 
 ## Prerequisites
 
-- Daily summaries exist under `summary_user_id = 100000`.
+- Daily summaries exist under the requested `user_id` with kind `DAILY_SUMMARY`.
 - Daily summary threads have `daily_summary` labels.
 - The workflow engine uses jaq 3.x or compatible ISO-week parsing.
 
@@ -30,9 +30,9 @@ The batch dispatches `memories-weekly-work-summary-single-ja/en` according to
 
 | Item | Behavior |
 |---|---|
-| Owner | `user_id = 100000` |
+| Thread creator | Requested `user_id`, same as daily summaries |
 | Labels | `weekly_summary`, `iso_week:YYYY-Www`, `scope:<scope_key>`, plus extra labels |
-| External ID | `weekly:YYYY-Www:<scope_key>` |
+| External ID | `weekly:<user_id>:YYYY-Www:<scope_key>` |
 | Input query | Finds daily summary memories by `external_id_prefix="daily:"`, role, updated window, and labels |
 
 Weekly `purpose_groups.status` preserves the [thread-summary status
@@ -45,7 +45,6 @@ and `deferred` groups remain `continued` and appear in `carryover`; they are not
 jobworkerp-client job enqueue-workflow \
   -i '{
     "user_id": 1,
-    "summary_user_id": 100000,
     "target_iso_week": "2026-W18",
     "memories_grpc_host": "localhost",
     "memories_grpc_port": 9010,

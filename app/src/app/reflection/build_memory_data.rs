@@ -1,8 +1,8 @@
 //! Build the immutable backing `MemoryData` and `ThreadReflectionIndexRow`
 //! for a finalized reflection.
 //!
-//! Spec §3.5 / §3.6 / §3.7: the reflection memory is owned by
-//! `REFLECTION_USER_ID`, content carries the search document, and
+//! Spec §3.5 / §3.6 / §3.7: the reflection memory is owned by its
+//! origin user, content carries the search document, and
 //! `external_id` follows
 //! `reflection:<thread>:<prompt_version>:<reflector_id>` so the
 //! existing `memory.external_id` UNIQUE index covers F-G3 idempotency
@@ -17,12 +17,10 @@ use anyhow::Result;
 use infra::error::LlmMemoryError;
 use infra::infra::reflection::failure_mode_convert;
 use protobuf::llm_memory::data::{
-    ContentType, FailureMode, MemoryData, MessageRole, ReflectionLlmOutput, UserId,
+    ContentType, FailureMode, MemoryData, MemoryKind, MessageRole, ReflectionLlmOutput, UserId,
 };
 use protobuf::llm_memory::service::FinalizeReflectionRequest;
 use serde_json::{Map, Value, json};
-
-use crate::app::REFLECTION_USER_ID;
 
 pub struct ReflectionMemoryParts {
     pub memory_data: MemoryData,
@@ -63,6 +61,7 @@ pub fn build_parts(
     req: &FinalizeReflectionRequest,
     parsed: &ReflectionLlmOutput,
     origin_thread_id: i64,
+    origin_user_id: i64,
     now_millis: i64,
 ) -> Result<ReflectionMemoryParts> {
     let external_id = external_id_for(origin_thread_id, &req.prompt_version, &req.reflector_id);
@@ -74,7 +73,7 @@ pub fn build_parts(
         // conversation-history edge consumed by other roles.
         parent_ids: Vec::new(),
         user_id: Some(UserId {
-            value: REFLECTION_USER_ID,
+            value: origin_user_id,
         }),
         content: build_reflection_search_document(parsed),
         content_type: ContentType::Text as i32,
@@ -87,6 +86,7 @@ pub fn build_parts(
         // Reflection memories are text-only; no media body.
         media_object_id: None,
         thread_ids: Vec::new(),
+        memory_kind: MemoryKind::Reflection as i32,
     };
 
     let score_self = parsed.score_self;

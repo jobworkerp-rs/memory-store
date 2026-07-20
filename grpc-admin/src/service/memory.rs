@@ -8,6 +8,7 @@ use crate::protobuf::llm_memory::service::{
     UpdateContentNoDispatchRequest, memory_service_server::MemoryService,
 };
 use crate::service::error_handle::handle_error;
+use crate::service::memory_kind::{normalize_memory_kinds, normalize_thread_search_filter};
 use app::app::media::MediaAppImpl;
 use app::app::memory::{MemoryApp, MemoryAppImpl, MemoryCondition, MemoryListCondition};
 use async_stream::stream;
@@ -199,7 +200,8 @@ impl<T: MemoryGrpc + Tracing + Send + Debug + Sync + 'static> MemoryService for 
         request: tonic::Request<FindListRequest>,
     ) -> Result<tonic::Response<Self::FindListStream>, tonic::Status> {
         let _s = Self::trace_request("memory", "find_list", &request);
-        let req = request.get_ref();
+        let mut req = request.into_inner();
+        normalize_memory_kinds(&mut req.memory_kinds)?;
         let ttl = if req.limit.is_some() {
             LIST_TTL
         } else {
@@ -208,7 +210,12 @@ impl<T: MemoryGrpc + Tracing + Send + Debug + Sync + 'static> MemoryService for 
         let media_app = self.media_app().cloned();
         match self
             .app()
-            .find_memory_list(req.limit.as_ref(), req.offset.as_ref(), Some(&ttl))
+            .find_memory_list(
+                req.limit.as_ref(),
+                req.offset.as_ref(),
+                &req.memory_kinds,
+                Some(&ttl),
+            )
             .await
         {
             Ok(list) => {
@@ -241,10 +248,11 @@ impl<T: MemoryGrpc + Tracing + Send + Debug + Sync + 'static> MemoryService for 
         request: tonic::Request<FindRecentListByUserIdRequest>,
     ) -> Result<tonic::Response<Self::FindRecentListByUserIdStream>, tonic::Status> {
         let _s = Self::trace_request("memory", "find_recent_list_by_user_id", &request);
-        let req = request.get_ref();
+        let mut req = request.into_inner();
         if req.user_id.is_none() {
             return Err(tonic::Status::invalid_argument("user_id is required"));
         }
+        normalize_memory_kinds(&mut req.memory_kinds)?;
         let media_app = self.media_app().cloned();
         match self
             .app()
@@ -253,6 +261,7 @@ impl<T: MemoryGrpc + Tracing + Send + Debug + Sync + 'static> MemoryService for 
                 req.limit.as_ref(),
                 req.updated_after.as_ref(),
                 req.updated_before.as_ref(),
+                &req.memory_kinds,
                 Some(&LIST_TTL),
             )
             .await
@@ -274,7 +283,11 @@ impl<T: MemoryGrpc + Tracing + Send + Debug + Sync + 'static> MemoryService for 
         request: tonic::Request<FindMemoryListRequest>,
     ) -> Result<tonic::Response<Self::FindListByConditionStream>, tonic::Status> {
         let _s = Self::trace_request("memory", "find_list_by_condition", &request);
-        let req = request.get_ref();
+        let mut req = request.into_inner();
+        normalize_memory_kinds(&mut req.memory_kinds)?;
+        if let Some(filter) = req.thread_filter.as_mut() {
+            normalize_thread_search_filter(filter)?;
+        }
         check_external_id_exclusivity(req.external_id.as_ref(), req.external_id_prefix.as_ref())?;
         let ttl = if req.limit.is_some() {
             LIST_TTL
@@ -288,6 +301,7 @@ impl<T: MemoryGrpc + Tracing + Send + Debug + Sync + 'static> MemoryService for 
             filter: MemoryCondition {
                 roles: req.roles.clone(),
                 content_types: req.content_types.clone(),
+                memory_kinds: req.memory_kinds.clone(),
                 user_id,
                 thread_id: req.thread_id,
                 updated_at_range: infra::infra::memory::rdb::UpdatedAtRange {
@@ -333,12 +347,17 @@ impl<T: MemoryGrpc + Tracing + Send + Debug + Sync + 'static> MemoryService for 
         request: tonic::Request<MemoryCountCondition>,
     ) -> Result<tonic::Response<CountResponse>, tonic::Status> {
         let _s = Self::trace_request("memory", "count_by_condition", &request);
-        let req = request.get_ref();
+        let mut req = request.into_inner();
+        normalize_memory_kinds(&mut req.memory_kinds)?;
+        if let Some(filter) = req.thread_filter.as_mut() {
+            normalize_thread_search_filter(filter)?;
+        }
         check_external_id_exclusivity(req.external_id.as_ref(), req.external_id_prefix.as_ref())?;
         let user_id = req.user_id.as_ref().map(|u| u.value);
         let condition = MemoryCondition {
             roles: req.roles.clone(),
             content_types: req.content_types.clone(),
+            memory_kinds: req.memory_kinds.clone(),
             user_id,
             thread_id: req.thread_id,
             updated_at_range: infra::infra::memory::rdb::UpdatedAtRange {

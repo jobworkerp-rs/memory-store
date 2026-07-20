@@ -355,10 +355,20 @@ async fn run_prune_for_plain(
     d_external_id: HashSet<String>,
     d_path: HashSet<PathBuf>,
 ) -> Result<PruneOutcome> {
-    let prefix = format!("{}:", cfg.source_name);
+    let creator_prefix = format!("{}:{}:", cfg.source_name, cfg.user_id);
     let server_memories = client
-        .find_memories_by_external_id_prefix(prefix, cfg.user_id)
+        .find_memories_by_external_id_prefix(creator_prefix)
         .await?;
+    let d_external_id = d_external_id
+        .into_iter()
+        .map(|external_id| {
+            crate::common::importer::namespace_external_id(
+                &cfg.source_name,
+                cfg.user_id,
+                &external_id,
+            )
+        })
+        .collect::<HashSet<_>>();
     let m_prime: Vec<prune::PruneCandidate> = server_memories
         .iter()
         .filter_map(prune::extract_candidate)

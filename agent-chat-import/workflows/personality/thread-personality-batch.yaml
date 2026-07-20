@@ -63,58 +63,28 @@ input:
         ollama_base_url: { type: string, default: "http://localhost:11434" }
         output_language: { type: string, enum: ["ja", "en"], default: "ja" }
         force_reextract: { type: boolean, default: false }
-        personality_user_id:
-          type: integer
-          default: 200000
-          description: Owner user ID for personality memory threads. Spec §2.2.
-        summary_user_id:
-          type: integer
-          default: 100000
-          description: >-
-            Reference value for collision detection only. Forwarded to
-            thread-personality-single so it can fail-fast if
-            `personality_user_id == summary_user_id`.
 
 timeout:
   after:
     hours: 24
 
 do:
-  - normalizePersonalityUserId:
+  - rejectLegacyPersonalityOwners:
+      if: "${ $workflow.input.personality_user_id != null or $workflow.input.summary_user_id != null }"
+      raise:
+        error:
+          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
+          status: 400
+          title: "legacy personality owner fields are no longer supported"
+          detail: "Use user_id and memory_kind instead."
+
+  - initializePersonalityScope:
       set:
-        effective_personality_user_id: "${ $workflow.input.personality_user_id // 200000 }"
-        effective_summary_user_id: "${ $workflow.input.summary_user_id // 100000 }"
+        effective_personality_user_id: "${ $workflow.input.user_id }"
         merge_enabled: "${ $workflow.input.merge_enabled // false }"
         # Default false; flipped to true only when invokeMerge exports it,
         # so a `try/catch` swallow of merge failure surfaces as merged=false.
         merge_invoked: "${ false }"
-
-  # See thread-personality-single for the rationale of these two guards.
-  - failOnSelfOwnedPersonality:
-      if: "${ $effective_personality_user_id == $workflow.input.user_id }"
-      raise:
-        error:
-          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
-          status: 400
-          title: "personality_user_id must differ from user_id"
-          detail: >-
-            ${ "personality_user_id (" + ($effective_personality_user_id | tostring)
-               + ") must differ from user_id ("
-               + ($workflow.input.user_id | tostring)
-               + ") to prevent recursive personality extraction." }
-
-  - failOnSummaryUserCollision:
-      if: "${ $effective_personality_user_id == $effective_summary_user_id }"
-      raise:
-        error:
-          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
-          status: 400
-          title: "personality_user_id must differ from summary_user_id"
-          detail: >-
-            ${ "personality_user_id (" + ($effective_personality_user_id | tostring)
-               + ") must differ from summary_user_id ("
-               + ($effective_summary_user_id | tostring)
-               + ") to keep the two extraction domains disjoint." }
 
   # Resolve effective `updated_after` lower bound (epoch ms): absolute
   # wins over relative, null clears the field so the server applies
@@ -148,6 +118,7 @@ do:
                    labels: $workflow.input.labels_filter,
                    match_mode: "LABEL_ALL",
                    user_id: $workflow.input.user_id,
+                   memory_kinds: ["MEMORY_KIND_RAW"],
                    updated_after: $updated_after_ms
                  }
                  | if $updated_after_ms == null then del(.updated_after) else . end
@@ -173,6 +144,7 @@ do:
             json_body: >-
               ${ ({
                    user_id: { value: $workflow.input.user_id },
+                   memory_kinds: ["MEMORY_KIND_RAW"],
                    updated_after: $updated_after_ms
                  }
                  | if $updated_after_ms == null then del(.updated_after) else . end
@@ -182,10 +154,8 @@ do:
         as:
           all_threads: ${ .jsonBody | fromjson }
 
-  # Defensive personality-thread filter (invariant I1 guard). Step 0b
-  # already catches `personality_user_id == user_id` under nominal
-  # config; this exists for the misconfigured run where that guard
-  # is bypassed (e.g. lowered `min_message_count`). Match on the
+  # Defense in depth: the RAW filter above is authoritative, while
+  # this label filter protects legacy rows that predate memory_kind. Match on the
   # full 3-label tuple `[personality, user:<src>, thread:<id>]` so
   # we don't accidentally exclude a regular source thread that
   # happens to carry a literal "personality" label among unrelated
@@ -245,9 +215,7 @@ do:
                             personality_model: $workflow.input.personality_model,
                             ollama_base_url: $workflow.input.ollama_base_url,
                             output_language: $workflow.input.output_language,
-                            force_reextract: $workflow.input.force_reextract,
-                            personality_user_id: $effective_personality_user_id,
-                            summary_user_id: $effective_summary_user_id
+                            force_reextract: $workflow.input.force_reextract
                           } | tojson }
             catch:
               as: error
@@ -284,8 +252,6 @@ do:
                       memories_grpc_port: $workflow.input.memories_grpc_port,
                       memories_grpc_tls: $workflow.input.memories_grpc_tls,
                       llm_worker_name: $workflow.input.llm_worker_name,
-                      personality_user_id: $effective_personality_user_id,
-                      summary_user_id: $effective_summary_user_id,
                       max_context_chars: $workflow.input.max_context_chars,
                       output_language: $workflow.input.output_language,
                       force_remerge: false,

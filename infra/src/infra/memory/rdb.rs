@@ -74,7 +74,7 @@ impl From<i32> for MemorySort {
 // parent_ids traversal at execution time.
 const INSERT_SQL: &str = concat!(
     "INSERT INTO memory (id, parent_ids, user_id, content, content_type, ",
-    "params, metadata, created_at, updated_at, role, external_id, media_object_id) VALUES (",
+    "params, metadata, created_at, updated_at, role, external_id, media_object_id, memory_kind) VALUES (",
     p!(1),
     ",",
     p_jsonb!(2),
@@ -98,6 +98,8 @@ const INSERT_SQL: &str = concat!(
     p!(11),
     ",",
     p!(12),
+    ",",
+    p!(13),
     ")"
 );
 
@@ -120,8 +122,10 @@ const UPDATE_SQL: &str = concat!(
     p!(8),
     ", media_object_id = ",
     p!(9),
-    " WHERE id = ",
+    ", memory_kind = ",
     p!(10),
+    " WHERE id = ",
+    p!(11),
     ";"
 );
 
@@ -252,6 +256,7 @@ pub trait MemoryRepository: UseRdbPool + UseIdGenerator + Sync + Send {
             .bind(memory.role)
             .bind(&memory.external_id)
             .bind(memory.media_object_id.map(|m| m.value))
+            .bind(memory.memory_kind)
             .execute(tx)
             .await
             .map_err(map_create_memory_error)?;
@@ -289,6 +294,7 @@ pub trait MemoryRepository: UseRdbPool + UseIdGenerator + Sync + Send {
             .bind(updated_at)
             .bind(memory.role)
             .bind(memory.media_object_id.map(|m| m.value))
+            .bind(memory.memory_kind)
             .bind(id.value)
             .execute(tx)
             .await
@@ -524,6 +530,60 @@ pub trait MemoryRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         Ok(memories)
     }
 
+    /// Generic ID-descending list with an optional lifecycle kind filter.
+    /// This preserves `MemoryService.FindList` ordering while allowing
+    /// callers to keep derived rows out of a normal history listing.
+    async fn find_list_by_memory_kinds(
+        &self,
+        limit: Option<&i32>,
+        offset: Option<&i64>,
+        memory_kinds: &[i32],
+        fill_thread_ids: bool,
+    ) -> Result<Vec<Memory>> {
+        let MemoryConditionSql {
+            from_clause,
+            where_clause,
+            binds,
+            ..
+        } = build_memory_condition_sql(
+            &[],
+            &[],
+            memory_kinds,
+            None,
+            None,
+            UpdatedAtRange::default(),
+            CreatedAtRange::default(),
+            None,
+            None,
+            None,
+        );
+        let mut sql = format!(
+            "SELECT {} FROM {from_clause}{where_clause} ORDER BY id DESC",
+            memory_columns!()
+        );
+        let limit_offset = limit.map(|l| (*l as i64, *offset.unwrap_or(&0i64)));
+        if limit_offset.is_some() {
+            append_limit_offset(&mut sql, binds.len());
+        }
+        let mut query = bind_condition_values(
+            sqlx::query_as::<Rdb, MemoryRow>(sqlx::AssertSqlSafe(sql)),
+            &binds,
+        );
+        if let Some((limit, offset)) = limit_offset {
+            query = query.bind(limit).bind(offset);
+        }
+        let mut memories = query
+            .fetch_all(self.db_pool())
+            .await
+            .map(|rows| rows.into_iter().map(|row| row.to_proto()).collect_vec())
+            .map_err(LlmMemoryError::DBError)
+            .context("error in find_list_by_memory_kinds")?;
+        if fill_thread_ids {
+            self.fill_thread_ids(&mut memories).await?;
+        }
+        Ok(memories)
+    }
+
     async fn find_row_list_tx<'c, E: Executor<'c, Database = Rdb>>(
         &self,
         tx: E,
@@ -550,8 +610,32 @@ pub trait MemoryRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         updated_at_range: UpdatedAtRange,
         fill_thread_ids: bool,
     ) -> Result<Vec<Memory>> {
+        self.find_recent_list_by_user_id_with_memory_kinds(
+            user_id,
+            limit,
+            updated_at_range,
+            &[],
+            fill_thread_ids,
+        )
+        .await
+    }
+
+    async fn find_recent_list_by_user_id_with_memory_kinds(
+        &self,
+        user_id: UserId,
+        limit: Option<&i32>,
+        updated_at_range: UpdatedAtRange,
+        memory_kinds: &[i32],
+        fill_thread_ids: bool,
+    ) -> Result<Vec<Memory>> {
         let mut memories: Vec<Memory> = self
-            .find_recent_row_list_by_user_id_tx(self.db_pool(), user_id, limit, updated_at_range)
+            .find_recent_row_list_by_user_id_tx(
+                self.db_pool(),
+                user_id,
+                limit,
+                updated_at_range,
+                memory_kinds,
+            )
             .await?
             .into_iter()
             .map(|r| r.to_proto())
@@ -568,6 +652,7 @@ pub trait MemoryRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         user_id: UserId,
         limit: Option<&i32>,
         updated_at_range: UpdatedAtRange,
+        memory_kinds: &[i32],
     ) -> Result<Vec<MemoryRow>> {
         let mut clauses = vec!["user_id = ".to_string() + &crate::sql::build_in_placeholders(1, 1)];
         let mut binds = vec![ConditionBind::I64(user_id.value)];
@@ -578,6 +663,7 @@ pub trait MemoryRepository: UseRdbPool + UseIdGenerator + Sync + Send {
             updated_at_range.updated_after,
             updated_at_range.updated_before,
         );
+        append_memory_kind_clause(&mut clauses, &mut binds, "memory_kind", memory_kinds);
         let mut sql = format!(
             "SELECT {} FROM memory WHERE {} ORDER BY updated_at DESC",
             memory_columns!(),
@@ -865,6 +951,7 @@ pub trait MemoryRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         } = build_memory_condition_sql(
             roles,
             content_types,
+            &[],
             None,
             Some(thread_id),
             UpdatedAtRange::default(),
@@ -931,6 +1018,43 @@ pub trait MemoryRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         created_at_range: CreatedAtRange,
         external_id: Option<&str>,
         external_id_prefix: Option<&str>,
+        memory_id_constraint: Option<&[i64]>,
+        sort: MemorySort,
+        fill_thread_ids: bool,
+    ) -> Result<Vec<Memory>> {
+        self.find_list_by_condition_with_memory_kinds(
+            limit,
+            offset,
+            roles,
+            content_types,
+            &[],
+            user_id,
+            thread_id,
+            updated_at_range,
+            created_at_range,
+            external_id,
+            external_id_prefix,
+            memory_id_constraint,
+            sort,
+            fill_thread_ids,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn find_list_by_condition_with_memory_kinds(
+        &self,
+        limit: Option<&i32>,
+        offset: Option<&i64>,
+        roles: &[i32],
+        content_types: &[i32],
+        memory_kinds: &[i32],
+        user_id: Option<i64>,
+        thread_id: Option<i64>,
+        updated_at_range: UpdatedAtRange,
+        created_at_range: CreatedAtRange,
+        external_id: Option<&str>,
+        external_id_prefix: Option<&str>,
         // App layer is expected to short-circuit on `Some(empty)` before
         // we get here; the `1=0` fallback in `build_memory_condition_sql`
         // is purely defensive for direct infra-level callers (tests).
@@ -949,6 +1073,7 @@ pub trait MemoryRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         } = build_memory_condition_sql(
             roles,
             content_types,
+            memory_kinds,
             user_id,
             thread_id,
             updated_at_range,
@@ -1008,6 +1133,26 @@ pub trait MemoryRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         user_id: Option<i64>,
         thread_id: Option<i64>,
     ) -> Result<Vec<Memory>> {
+        self.find_list_by_condition_after_id_with_memory_kinds(
+            limit,
+            after_id,
+            roles,
+            &[],
+            user_id,
+            thread_id,
+        )
+        .await
+    }
+
+    async fn find_list_by_condition_after_id_with_memory_kinds(
+        &self,
+        limit: i32,
+        after_id: i64,
+        roles: &[i32],
+        memory_kinds: &[i32],
+        user_id: Option<i64>,
+        thread_id: Option<i64>,
+    ) -> Result<Vec<Memory>> {
         let MemoryConditionSql {
             from_clause,
             mut where_clause,
@@ -1016,6 +1161,7 @@ pub trait MemoryRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         } = build_memory_condition_sql(
             roles,
             &[],
+            memory_kinds,
             user_id,
             thread_id,
             UpdatedAtRange::default(),
@@ -1075,6 +1221,35 @@ pub trait MemoryRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         external_id_prefix: Option<&str>,
         memory_id_constraint: Option<&[i64]>,
     ) -> Result<i64> {
+        self.count_by_condition_with_memory_kinds(
+            roles,
+            content_types,
+            &[],
+            user_id,
+            thread_id,
+            updated_at_range,
+            created_at_range,
+            external_id,
+            external_id_prefix,
+            memory_id_constraint,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn count_by_condition_with_memory_kinds(
+        &self,
+        roles: &[i32],
+        content_types: &[i32],
+        memory_kinds: &[i32],
+        user_id: Option<i64>,
+        thread_id: Option<i64>,
+        updated_at_range: UpdatedAtRange,
+        created_at_range: CreatedAtRange,
+        external_id: Option<&str>,
+        external_id_prefix: Option<&str>,
+        memory_id_constraint: Option<&[i64]>,
+    ) -> Result<i64> {
         let MemoryConditionSql {
             from_clause,
             where_clause,
@@ -1083,6 +1258,7 @@ pub trait MemoryRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         } = build_memory_condition_sql(
             roles,
             content_types,
+            memory_kinds,
             user_id,
             thread_id,
             updated_at_range,
@@ -1340,6 +1516,7 @@ fn format_i64_in_list(ids: &[i64]) -> String {
 fn build_memory_condition_sql(
     roles: &[i32],
     content_types: &[i32],
+    memory_kinds: &[i32],
     user_id: Option<i64>,
     thread_id: Option<i64>,
     updated_at_range: UpdatedAtRange,
@@ -1380,6 +1557,11 @@ fn build_memory_condition_sql(
     } else {
         "content_type"
     };
+    let memory_kind_col = if joined {
+        "memory.memory_kind"
+    } else {
+        "memory_kind"
+    };
 
     let mut clauses: Vec<String> = Vec::new();
     let mut binds: Vec<ConditionBind> = Vec::new();
@@ -1398,6 +1580,7 @@ fn build_memory_condition_sql(
             binds.push(ConditionBind::I32(*ct));
         }
     }
+    append_memory_kind_clause(&mut clauses, &mut binds, memory_kind_col, memory_kinds);
     if let Some(uid) = user_id {
         let ph = crate::sql::build_in_placeholders(1, binds.len() + 1);
         clauses.push(format!("{user_id_col} = {ph}"));
@@ -1468,6 +1651,30 @@ fn build_memory_condition_sql(
         binds,
         id_expr,
     }
+}
+
+/// Add the direct memory-row kind predicate. RAW also matches legacy rows
+/// with NULL/0 `memory_kind`, since those rows predate the lifecycle-kind
+/// contract and are treated as RAW by convention.
+fn append_memory_kind_clause(
+    clauses: &mut Vec<String>,
+    binds: &mut Vec<ConditionBind>,
+    column: &str,
+    memory_kinds: &[i32],
+) {
+    if memory_kinds.is_empty() {
+        return;
+    }
+    let placeholders = crate::sql::build_in_placeholders(memory_kinds.len(), binds.len() + 1);
+    let kind_clause = format!("{column} IN ({placeholders})");
+    if memory_kinds.contains(&(protobuf::llm_memory::data::MemoryKind::Raw as i32)) {
+        clauses.push(format!(
+            "({kind_clause} OR {column} IS NULL OR {column} = 0)"
+        ));
+    } else {
+        clauses.push(kind_clause);
+    }
+    binds.extend(memory_kinds.iter().copied().map(ConditionBind::I32));
 }
 
 /// Generic `>` / `<=` range append used by both updated_at and created_at.
@@ -1574,6 +1781,7 @@ mod test {
             external_id: None,
             media_object_id: None,
             thread_ids: Vec::new(),
+            memory_kind: 0,
         });
 
         let mut tx = db.begin().await.context("error in test")?;
@@ -1607,6 +1815,7 @@ mod test {
             external_id: None,
             media_object_id: None,
             thread_ids: Vec::new(),
+            memory_kind: 0,
         };
         let updated = repository
             .update(&mut *tx, &expect.id.unwrap(), &update)
@@ -1654,6 +1863,7 @@ mod test {
             external_id: None,
             media_object_id: None,
             thread_ids: Vec::new(),
+            memory_kind: 0,
         };
 
         let before = command_utils::util::datetime::now_millis();
@@ -1714,6 +1924,7 @@ mod test {
             external_id: None,
             media_object_id: None,
             thread_ids: Vec::new(),
+            memory_kind: 0,
         };
 
         let mut tx = db.begin().await.context("begin")?;
@@ -1785,6 +1996,7 @@ mod test {
                 external_id: None,
                 media_object_id: None,
                 thread_ids: Vec::new(),
+                memory_kind: 0,
             };
             let mut tx = db.begin().await.context("begin")?;
             let id = repository.create(&mut *tx, &data).await?;
@@ -1862,6 +2074,7 @@ mod test {
                 external_id: None,
                 media_object_id: None,
                 thread_ids: Vec::new(),
+                memory_kind: 0,
             };
             let mut tx = db.begin().await.context("begin")?;
             let id = repository.create(&mut *tx, &data).await?;
@@ -2037,6 +2250,7 @@ mod test {
                 external_id: None,
                 media_object_id: None,
                 thread_ids: Vec::new(),
+                memory_kind: 0,
             };
             let mut tx = db.begin().await.context("begin")?;
             let id = repository.create(&mut *tx, &data).await?;
@@ -2122,6 +2336,7 @@ mod test {
                 external_id: None,
                 media_object_id: None,
                 thread_ids: Vec::new(),
+                memory_kind: 0,
             };
             let mut tx = db.begin().await.context("begin")?;
             let id = repository.create(&mut *tx, &data).await?;
@@ -2373,6 +2588,7 @@ mod test {
                 external_id: None,
                 media_object_id: None,
                 thread_ids: Vec::new(),
+                memory_kind: 0,
             };
             let mut tx = db.begin().await.context("begin ct")?;
             let id = repository.create(&mut *tx, &data).await?;
@@ -2485,6 +2701,85 @@ mod test {
         })
     }
 
+    #[test]
+    fn memory_kind_condition_filters_or_and() -> Result<()> {
+        use infra_utils::infra::test::TEST_RUNTIME;
+        use protobuf::llm_memory::data::MemoryKind;
+
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_pool().await;
+            let repository =
+                MemoryRepositoryImpl::new(crate::test_helper::shared_id_generator(), pool);
+            let db = repository.db_pool();
+            let user_id = UserId { value: 70_001 };
+            let mut ids = Vec::new();
+            for (content, kind) in [
+                ("raw", MemoryKind::Raw as i32),
+                ("reflection", MemoryKind::Reflection as i32),
+                ("personality", MemoryKind::Personality as i32),
+            ] {
+                let data = MemoryData {
+                    user_id: Some(user_id),
+                    content: content.to_string(),
+                    content_type: 0,
+                    created_at: 1,
+                    updated_at: 1,
+                    role: 1,
+                    memory_kind: kind,
+                    ..Default::default()
+                };
+                let mut tx = db.begin().await?;
+                ids.push(repository.create(&mut *tx, &data).await?);
+                tx.commit().await?;
+            }
+
+            let raw = repository
+                .find_list_by_condition_with_memory_kinds(
+                    None,
+                    None,
+                    &[],
+                    &[],
+                    &[MemoryKind::Raw as i32],
+                    Some(user_id.value),
+                    None,
+                    UpdatedAtRange::default(),
+                    CreatedAtRange::default(),
+                    None,
+                    None,
+                    None,
+                    MemorySort::default(),
+                    false,
+                )
+                .await?;
+            assert_eq!(raw.len(), 1);
+            assert_eq!(raw[0].data.as_ref().unwrap().content, "raw");
+
+            let derived = repository
+                .count_by_condition_with_memory_kinds(
+                    &[],
+                    &[],
+                    &[
+                        MemoryKind::Reflection as i32,
+                        MemoryKind::Personality as i32,
+                    ],
+                    Some(user_id.value),
+                    None,
+                    UpdatedAtRange::default(),
+                    CreatedAtRange::default(),
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+            assert_eq!(derived, 2);
+
+            for id in ids {
+                repository.delete(&id).await?;
+            }
+            Ok(())
+        })
+    }
+
     /// Verifies that `find_list_by_condition` / `count_by_condition` resolve
     /// thread membership through the `thread_memory` junction table.
     ///
@@ -2521,6 +2816,7 @@ mod test {
             external_id: None,
             media_object_id: None,
             thread_ids: Vec::new(),
+            memory_kind: 0,
         };
         let mut tx = db.begin().await.context("begin joined")?;
         let joined_id = repository.create(&mut *tx, &joined_data).await?;
@@ -2547,6 +2843,7 @@ mod test {
             external_id: None,
             media_object_id: None,
             thread_ids: Vec::new(),
+            memory_kind: 0,
         };
         let mut tx = db.begin().await.context("begin orphan")?;
         let orphan_id = repository.create(&mut *tx, &orphan_data).await?;
@@ -2758,6 +3055,7 @@ mod test {
                 external_id: None,
                 media_object_id: None,
                 thread_ids: Vec::new(),
+                memory_kind: 0,
             };
             let id = repository.create(&mut *tx, &data).await?;
             id_values.push(id.value);
@@ -2878,6 +3176,7 @@ mod test {
                 external_id: Some((*eid).to_string()),
                 media_object_id: None,
                 thread_ids: Vec::new(),
+                memory_kind: 0,
             };
             repository.create(&mut *tx, &mem).await?;
         }
@@ -3046,6 +3345,7 @@ mod test {
                 external_id: None,
                 media_object_id: None,
                 thread_ids: Vec::new(),
+                memory_kind: 0,
             };
             let mut tx = db.begin().await.context("begin updated_at_range")?;
             let id = repository.create(&mut *tx, &data).await?;
@@ -3174,6 +3474,7 @@ mod test {
             external_id: None,
             media_object_id: None,
             thread_ids: Vec::new(),
+            memory_kind: 0,
         };
         let mut tx = db.begin().await.context("begin positioned")?;
         let id = repository.create(&mut *tx, &data).await?;
@@ -3358,6 +3659,7 @@ mod test {
             external_id: None,
             media_object_id: None,
             thread_ids: Vec::new(),
+            memory_kind: 0,
         };
         let mut tx = db.begin().await.context("begin free")?;
         let free_id = repository.create(&mut *tx, &free_data).await?;
@@ -3549,6 +3851,7 @@ mod test {
             external_id: None,
             media_object_id: None,
             thread_ids: Vec::new(),
+            memory_kind: 0,
         };
         let mut tx = db.begin().await?;
         let id = repo.create(&mut *tx, &data).await?;
@@ -3560,6 +3863,7 @@ mod test {
         let updated = MemoryData {
             media_object_id: Some(protobuf::llm_memory::data::MediaObjectId { value: 7 }),
             thread_ids: Vec::new(),
+            memory_kind: 0,
             ..data.clone()
         };
         let mut tx = db.begin().await?;
@@ -3575,6 +3879,7 @@ mod test {
         let with_media = MemoryData {
             media_object_id: Some(protobuf::llm_memory::data::MediaObjectId { value: 42 }),
             thread_ids: Vec::new(),
+            memory_kind: 0,
             content: "has media".to_string(),
             ..data.clone()
         };
@@ -3625,6 +3930,7 @@ mod test {
             external_id: Some("ext-1".to_string()),
             media_object_id: Some(protobuf::llm_memory::data::MediaObjectId { value: 9 }),
             thread_ids: Vec::new(),
+            memory_kind: 0,
         };
         let mut tx = db.begin().await?;
         let id = repo.create(&mut *tx, &data).await?;

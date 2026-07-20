@@ -27,13 +27,12 @@ use infra_utils::infra::rdb::{Rdb, RdbPool};
 use infra_utils::infra::test::{TEST_RUNTIME, setup_test_rdb_from};
 use protobuf::llm_memory::data::EmbeddingKind;
 use protobuf::llm_memory::data::{
-    ContentType, FailureMode, MemoryData, MemoryId, MessageRole, ReflectionAspect, ReflectionFact,
-    ReflectionLlmOutput, ReflectionOutcome, TaskCategory, ThreadData, ThreadId, ToolContribution,
-    ToolOutcomeEntry, UserId,
+    ContentType, FailureMode, MemoryData, MemoryId, MemoryKind, MessageRole, ReflectionAspect,
+    ReflectionFact, ReflectionLlmOutput, ReflectionOutcome, TaskCategory, ThreadData, ThreadId,
+    ToolContribution, ToolOutcomeEntry, UserId,
 };
 use protobuf::llm_memory::service::{FinalizeReflectionRequest, ReflectionListSort};
 
-use crate::app::REFLECTION_USER_ID;
 use crate::app::reflection::{ReflectionApp, ReflectionAppImpl};
 
 #[derive(Debug, Default)]
@@ -72,23 +71,19 @@ async fn setup_pool() -> &'static RdbPool {
     // Sqlite tests start from a fresh DB file (see infra-utils
     // `_setup_sqlite_internal`), but the postgres test DB is reused
     // across runs and across tests within a run. A previous test that
-    // panicked before its `cleanup_finalize_state` ran can leave
-    // `REFLECTION_USER_ID` rows behind, which then make later tests
-    // observe non-zero counts where they expect 0. Wipe all reflection
-    // rows owned by `REFLECTION_USER_ID` (and the aggregate threads
-    // that point at them) before every test so each test starts from
-    // an empty corpus regardless of prior failures.
+    // panicked before its `cleanup_finalize_state` ran can leave reflection
+    // rows behind. Wipe reflection-kind rows and their aggregate threads
+    // before every test so each test starts from an empty corpus.
     reset_reflection_state(pool).await;
     pool
 }
 
-/// Delete every reflection-scoped row tied to `REFLECTION_USER_ID`
-/// plus the aggregate threads that anchor them. Child rows first so
+/// Delete every reflection-kind row plus the aggregate threads that anchor
+/// them. Child rows first so
 /// FK-bearing schemas (postgres) don't reject the delete.
 async fn reset_reflection_state(pool: &'static RdbPool) {
-    let p1 = P1;
-    let memory_ids = format!("SELECT id FROM memory WHERE user_id = {p1}");
-    let thread_ids = format!("SELECT thread_id FROM thread_aggregate_key WHERE user_id = {p1}");
+    let memory_ids = "SELECT id FROM memory WHERE memory_kind = 7";
+    let thread_ids = "SELECT id FROM thread WHERE memory_kind = 7";
     let stmts = [
         format!("DELETE FROM reflection_failure_mode WHERE memory_id IN ({memory_ids})"),
         format!("DELETE FROM reflection_tool WHERE memory_id IN ({memory_ids})"),
@@ -100,13 +95,12 @@ async fn reset_reflection_state(pool: &'static RdbPool) {
         format!("DELETE FROM thread_memory WHERE memory_id IN ({memory_ids})"),
         format!("DELETE FROM thread_memory WHERE thread_id IN ({thread_ids})"),
         format!("DELETE FROM thread_label WHERE thread_id IN ({thread_ids})"),
+        format!("DELETE FROM thread_aggregate_key WHERE thread_id IN ({thread_ids})"),
         format!("DELETE FROM thread WHERE id IN ({thread_ids})"),
-        format!("DELETE FROM memory WHERE user_id = {p1}"),
-        format!("DELETE FROM thread_aggregate_key WHERE user_id = {p1}"),
+        "DELETE FROM memory WHERE memory_kind = 7".to_string(),
     ];
     for sql in stmts {
         let _ = sqlx::query::<Rdb>(sqlx::AssertSqlSafe(sql))
-            .bind(REFLECTION_USER_ID)
             .execute(pool)
             .await;
     }
@@ -114,7 +108,7 @@ async fn reset_reflection_state(pool: &'static RdbPool) {
     // test. There is no single bind that targets only "test
     // origin_user_ids", so leave those rows to the per-test
     // `cleanup_finalize_state`. They do not gate the assertions in
-    // tests that count by REFLECTION_USER_ID.
+    // tests that count per origin user.
 }
 
 /// Build a fully-wired `ReflectionAppImpl` against a real pool. No
@@ -186,6 +180,7 @@ async fn seed_origin(pool: &'static RdbPool, user_id: i64) -> Result<(i64, i64)>
                 updated_at: now,
                 metadata: None,
                 labels: vec![],
+                memory_kind: MemoryKind::Raw as i32,
             },
         )
         .await?;
@@ -205,6 +200,7 @@ async fn seed_origin(pool: &'static RdbPool, user_id: i64) -> Result<(i64, i64)>
                 external_id: None,
                 media_object_id: None,
                 thread_ids: Vec::new(),
+                memory_kind: MemoryKind::Raw as i32,
             },
         )
         .await?;
@@ -255,41 +251,41 @@ async fn cleanup_finalize_state(
             format!(
                 "DELETE FROM reflection_failure_mode WHERE memory_id IN ({by_aggregate_index})"
             ),
-            REFLECTION_USER_ID,
+            origin_user_id,
         ),
         (
             format!("DELETE FROM reflection_tool WHERE memory_id IN ({by_aggregate_index})"),
-            REFLECTION_USER_ID,
+            origin_user_id,
         ),
         (
             format!(
                 "DELETE FROM reflection_tool_outcome WHERE memory_id IN ({by_aggregate_index})"
             ),
-            REFLECTION_USER_ID,
+            origin_user_id,
         ),
         (
             format!("DELETE FROM reflection_fact WHERE memory_id IN ({by_aggregate_index})"),
-            REFLECTION_USER_ID,
+            origin_user_id,
         ),
         (
             format!("DELETE FROM thread_reflection_index WHERE thread_id IN ({by_aggregate})"),
-            REFLECTION_USER_ID,
+            origin_user_id,
         ),
         (
             format!("DELETE FROM thread_memory WHERE thread_id IN ({by_aggregate})"),
-            REFLECTION_USER_ID,
+            origin_user_id,
         ),
         (
-            format!("DELETE FROM memory WHERE user_id = {P1}"),
-            REFLECTION_USER_ID,
+            format!("DELETE FROM memory WHERE id IN ({by_aggregate_index})"),
+            origin_user_id,
         ),
         (
             format!("DELETE FROM thread WHERE id IN ({by_aggregate})"),
-            REFLECTION_USER_ID,
+            origin_user_id,
         ),
         (
             format!("DELETE FROM thread_aggregate_key WHERE user_id = {P1}"),
-            REFLECTION_USER_ID,
+            origin_user_id,
         ),
         (
             format!("DELETE FROM tool_outcome_stats WHERE origin_user_id = {P1}"),
@@ -484,9 +480,9 @@ fn run_finalize_anchor_memory_id_required() -> Result<()> {
         // No reflection memory was created.
         let p1 = P1;
         let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT COUNT(*) FROM memory WHERE user_id = {p1}"
+            "SELECT COUNT(*) FROM memory WHERE user_id = {p1} AND memory_kind = 7"
         )))
-        .bind(REFLECTION_USER_ID)
+        .bind(origin_user_id)
         .fetch_one(pool)
         .await?;
         assert_eq!(count, 0);
@@ -525,11 +521,11 @@ fn run_finalize_double_call_idempotent() -> Result<()> {
         );
 
         let p1 = P1;
-        // memory: exactly one row owned by REFLECTION_USER_ID for this run.
+        // memory: exactly one reflection row owned by the origin user for this run.
         let mem_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT COUNT(*) FROM memory WHERE user_id = {p1}"
+            "SELECT COUNT(*) FROM memory WHERE user_id = {p1} AND memory_kind = 7"
         )))
-        .bind(REFLECTION_USER_ID)
+        .bind(origin_user_id)
         .fetch_one(pool)
         .await?;
         assert_eq!(mem_count, 1);
@@ -1018,12 +1014,12 @@ fn run_finalize_phase3_rollback_keeps_aggregate_reusable() -> Result<()> {
         // what we are pinning down.
 
         // Inspect the aggregate-thread mapping. The Phase-2 row for
-        // (REFLECTION_USER_ID, sha256(["reflection"])) should exist.
+        // (origin_user_id, sha256(["reflection"])) should exist.
         let p1 = P1;
         let aggregate_thread_id: Option<i64> = sqlx::query_scalar::<Rdb, i64>(sqlx::AssertSqlSafe(
             format!("SELECT thread_id FROM thread_aggregate_key WHERE user_id = {p1}"),
         ))
-        .bind(REFLECTION_USER_ID)
+        .bind(origin_user_id)
         .fetch_optional(pool)
         .await?;
 
@@ -1042,7 +1038,7 @@ fn run_finalize_phase3_rollback_keeps_aggregate_reusable() -> Result<()> {
         let aggregate_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM thread_aggregate_key WHERE user_id = {p1}"
         )))
-        .bind(REFLECTION_USER_ID)
+        .bind(origin_user_id)
         .fetch_one(pool)
         .await?;
         assert_eq!(aggregate_count, 1, "must keep exactly one aggregate thread");
@@ -1051,7 +1047,7 @@ fn run_finalize_phase3_rollback_keeps_aggregate_reusable() -> Result<()> {
             let after: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT thread_id FROM thread_aggregate_key WHERE user_id = {p1}"
             )))
-            .bind(REFLECTION_USER_ID)
+            .bind(origin_user_id)
             .fetch_one(pool)
             .await?;
             assert_eq!(
@@ -1668,6 +1664,22 @@ fn run_finalize_origin_distinct_from_aggregate_thread() -> Result<()> {
             "origin_thread_id on the search result must match the trajectory thread"
         );
 
+        let p1 = P1;
+        let reflection_owner: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT user_id FROM memory WHERE id = {p1}"
+        )))
+        .bind(id.value)
+        .fetch_one(pool)
+        .await?;
+        let aggregate_owner: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT user_id FROM thread WHERE id = {p1}"
+        )))
+        .bind(aggregate_thread_id)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(reflection_owner, origin_user_id);
+        assert_eq!(aggregate_owner, origin_user_id);
+
         // F-S2 / spec §3.7.1: find_by_thread is keyed on origin thread.
         // The sidecar lookup must surface the reflection there, while
         // the aggregate thread (which only owns the memory through the
@@ -1743,12 +1755,12 @@ fn run_finalize_concurrent_aggregate_race() -> Result<()> {
         let _ = r1?;
         let _ = r2?;
 
-        // Exactly one aggregate thread for REFLECTION_USER_ID.
+        // Exactly one aggregate thread for the origin user.
         let p1 = P1;
         let aggregate_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM thread_aggregate_key WHERE user_id = {p1}"
         )))
-        .bind(REFLECTION_USER_ID)
+        .bind(origin_user_id)
         .fetch_one(pool)
         .await?;
         assert_eq!(aggregate_count, 1);
@@ -1756,9 +1768,9 @@ fn run_finalize_concurrent_aggregate_race() -> Result<()> {
         // Both reflections share the same aggregate thread_id.
         let distinct_thread_ids: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(DISTINCT thread_id) FROM thread_reflection_index \
-             WHERE memory_id IN (SELECT id FROM memory WHERE user_id = {p1})"
+             WHERE memory_id IN (SELECT id FROM memory WHERE user_id = {p1} AND memory_kind = 7)"
         )))
-        .bind(REFLECTION_USER_ID)
+        .bind(origin_user_id)
         .fetch_one(pool)
         .await?;
         assert_eq!(distinct_thread_ids, 1);
@@ -2510,16 +2522,15 @@ async fn seed_sidecar_with_metadata(
 
     let now = command_utils::util::datetime::now_millis();
     let mut tx = pool.begin().await?;
-    // The memory row must satisfy the sidecar FK on memory_id. Owner
-    // user is REFLECTION_USER_ID per Phase 4 schema; reflection
-    // content is irrelevant to the aggregate, so use a placeholder.
+    // The memory row must satisfy the sidecar FK on memory_id. Reflection
+    // rows are owned by the origin user; content is irrelevant here.
     let memory_id = memory_repo
         .create(
             &mut *tx,
             &MemoryData {
                 parent_ids: vec![],
                 user_id: Some(UserId {
-                    value: REFLECTION_USER_ID,
+                    value: origin_user_id,
                 }),
                 content: "test reflection".into(),
                 content_type: ContentType::Text as i32,
@@ -2531,6 +2542,7 @@ async fn seed_sidecar_with_metadata(
                 external_id: None,
                 media_object_id: None,
                 thread_ids: Vec::new(),
+                memory_kind: MemoryKind::Reflection as i32,
             },
         )
         .await?
@@ -2571,9 +2583,7 @@ async fn seed_sidecar_with_metadata(
 }
 
 /// Insert a bare container thread the test can attach reflections to.
-/// Returned `thread_id` lives under `REFLECTION_USER_ID` so the
-/// post-test cleanup catches it via the same `user_id` filter the
-/// other tests use.
+/// Insert a dedicated reflection container for aggregate-only tests.
 async fn seed_container_thread(pool: &'static RdbPool) -> Result<i64> {
     let id_gen = infra::test_helper::shared_id_generator();
     let thread_repo = ThreadRepositoryImpl::new(id_gen, pool);
@@ -2584,9 +2594,7 @@ async fn seed_container_thread(pool: &'static RdbPool) -> Result<i64> {
             &mut *tx,
             &ThreadData {
                 default_system_memory_id: None,
-                user_id: Some(UserId {
-                    value: REFLECTION_USER_ID,
-                }),
+                user_id: Some(UserId { value: 0 }),
                 description: Some("aggregate-scores test container".into()),
                 channel: None,
                 embedding: None,
@@ -2595,6 +2603,7 @@ async fn seed_container_thread(pool: &'static RdbPool) -> Result<i64> {
                 updated_at: now,
                 metadata: None,
                 labels: vec![],
+                memory_kind: MemoryKind::Reflection as i32,
             },
         )
         .await?;

@@ -40,12 +40,14 @@ CREATE TABLE IF NOT EXISTS thread (
     embedding_dim INT,
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL,
-    metadata JSONB
+    metadata JSONB,
+    memory_kind INT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS thread_default_system_memory_id ON thread (default_system_memory_id);
 CREATE INDEX IF NOT EXISTS thread_user_id ON thread (user_id);
 CREATE INDEX IF NOT EXISTS thread_updated_at ON thread (updated_at);
+CREATE INDEX IF NOT EXISTS thread_user_memory_kind_updated_at ON thread (user_id, memory_kind, updated_at);
 
 CREATE TABLE IF NOT EXISTS memory (
     id BIGINT NOT NULL PRIMARY KEY,
@@ -62,10 +64,12 @@ CREATE TABLE IF NOT EXISTS memory (
     -- Optional reference to a media_object (image memory feature). NULL = no
     -- attached media. content_type-independent. FK omitted per project
     -- convention; ref_count integrity is enforced in the app layer.
-    media_object_id BIGINT
+    media_object_id BIGINT,
+    memory_kind INT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS memory_user_id ON memory (user_id);
+CREATE INDEX IF NOT EXISTS memory_user_memory_kind_updated_at ON memory (user_id, memory_kind, updated_at);
 CREATE UNIQUE INDEX IF NOT EXISTS memory_external_id ON memory (external_id);
 CREATE INDEX IF NOT EXISTS memory_media_object_id ON memory (media_object_id);
 

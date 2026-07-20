@@ -7,18 +7,16 @@ document:
 # Aggregates per-day summaries (produced by daily-work-summary-single)
 # for one ISO 8601 week into a single "weekly work summary" memory.
 #
-# Input is the set of memories owned by `source_user_id` carrying the
+# Input is the set of DAILY_SUMMARY memories owned by `user_id` carrying the
 # `daily_label` marker AND whose memory.updated_at falls within
 # [week_start, week_end) (Monday 00:00 local — next Monday 00:00 local).
 # Output is one memory under a weekly_summary thread keyed by
-# `external_id = "weekly:<YYYY-Www>:<scope_key>"` so re-runs are
+# `external_id = "weekly:<user_id>:<YYYY-Www>:<scope_key>"` so re-runs are
 # idempotent and concurrent invocations with different
 # `extra_labels_filter` produce disjoint aggregates.
 #
-# Owner user is shared with daily summaries (default 100000) — both are
-# "summary agent" output. The two layers are distinguished only by the
-# `weekly_summary` label, which monthly callers MUST use to list
-# weekly source memories without leaking other layers.
+# Thread creator user is shared with daily summaries. The input and output layers are
+# separated by memory_kind as well as their labels.
 #
 # Requires jaq >= 3.x runtime: ISO week strptime "%G-W%V-%u" is not
 # supported by vanilla jq.
@@ -27,12 +25,12 @@ input:
   schema:
     document:
       type: object
-      required: []
+      required:
+        - user_id
       properties:
-        source_user_id:
+        user_id:
           type: integer
-          default: 100000
-          description: Owner of per-day summaries (the summary-agent user).
+          description: Creator of per-day summaries and weekly aggregates.
         target_week:
           type: string
           default: ""
@@ -163,10 +161,10 @@ do:
       set:
         week_end_ms: "${ $week_start_ms + 7 * 86400000 }"
 
-  # Step 3: Alias for readability. Schema-injected default is 100000.
-  - normalizeSourceUserId:
+  # Step 3: Alias for readability.
+  - normalizeUserId:
       set:
-        effective_source_user_id: "${ $workflow.input.source_user_id }"
+        effective_user_id: "${ $workflow.input.user_id }"
 
   # Step 3a: Derive scope_key from extra_labels_filter. memory.external_id
   # is UNIQUE DB-wide, so distinct filter sets must produce distinct
@@ -186,7 +184,7 @@ do:
   - composeWeeklyExternalId:
       set:
         weekly_external_id: >-
-          ${ "weekly:" + $target_week_resolved + ":" + $scope_key }
+          ${ "weekly:" + ($effective_user_id | tostring) + ":" + $target_week_resolved + ":" + $scope_key }
         weekly_thread_labels: >-
           ${ [$workflow.input.weekly_label,
               "iso_week:" + $target_week_resolved,
@@ -213,7 +211,7 @@ do:
             json_body: >-
               ${ {
                 roles: ["ROLE_ASSISTANT"],
-                user_id: { value: $effective_source_user_id },
+                user_id: { value: $effective_user_id },
                 external_id_prefix: "daily:",
                 # API: updated_after is strict (>), updated_before is
                 # inclusive (<=). To express the half-open interval
@@ -225,7 +223,8 @@ do:
                 updated_before: ($week_end_ms - 1),
                 content_types: ["TEXT"],
                 thread_filter: {
-                  user_id: $effective_source_user_id,
+                  user_id: $effective_user_id,
+                  memory_kinds: ["MEMORY_KIND_DAILY_SUMMARY"],
                   labels: ([$workflow.input.daily_label]
                            + $sorted_extra_labels),
                   label_match_mode: "LABEL_ALL"
@@ -298,7 +297,8 @@ do:
                          "iso_week:" + $target_week_resolved,
                          "scope:" + $scope_key],
                 match_mode: "LABEL_ALL",
-                user_id: $effective_source_user_id,
+                user_id: $effective_user_id,
+                memory_kinds: ["MEMORY_KIND_WEEKLY_SUMMARY"],
                 limit: 1
               } | tojson }
             as_json: true
@@ -316,8 +316,7 @@ do:
       set:
         existing_weekly_memory: "${ null }"
 
-  # Step 9: Look up the existing weekly memory inside that thread,
-  # keyed by external_id = "weekly:<YYYY-Www>:<scope_key>".
+  # Step 9: Look up the existing weekly memory inside that thread.
   - findExistingWeeklyMemory:
       if: "${ $existing_weekly_thread_id != null }"
       run:
@@ -343,7 +342,7 @@ do:
           existing_weekly_memory: >-
             ${ ((.jsonBody // "[]") | fromjson)
                | map(select(.data.externalId == $weekly_external_id))
-               | (if length > 0 then .[0] else null end) }
+               | if length > 0 then .[0] else null end }
 
   # Step 10: Eligibility — skip when an up-to-date weekly summary
   # already exists. "Up to date" = weekly memory's updated_at is at
@@ -494,7 +493,8 @@ do:
             method: "/llm_memory.service.ThreadService/Create"
             json_body: >-
               ${ {
-                user_id: { value: $effective_source_user_id },
+                user_id: { value: $effective_user_id },
+                memory_kind: "MEMORY_KIND_WEEKLY_SUMMARY",
                 description: ($target_week_resolved + " の作業要約 ("
                               + ($target_memories | length | tostring)
                               + " 日次)"),
@@ -567,7 +567,8 @@ do:
               ${ {
                 thread_id: { value: $weekly_thread_id },
                 memory: {
-                  user_id: { value: $effective_source_user_id },
+                  user_id: { value: $effective_user_id },
+                  memory_kind: "MEMORY_KIND_WEEKLY_SUMMARY",
                   content: ($summary_json | tojson),
                   content_type: "TEXT",
                   role: "ROLE_ASSISTANT",
@@ -590,7 +591,8 @@ do:
           ${ if $existing_weekly_thread_data != null
              then $existing_weekly_thread_data
              else {
-               user_id: { value: $effective_source_user_id },
+               user_id: { value: $effective_user_id },
+               memory_kind: "MEMORY_KIND_WEEKLY_SUMMARY",
                labels: $weekly_thread_labels,
                created_at: $week_start_ms,
                updated_at: $max_source_updated_at

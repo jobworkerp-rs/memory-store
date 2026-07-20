@@ -220,7 +220,6 @@ is combined with `MEMORY_IMAGE_SEARCH_MODE != none`.
 |---|---|---|
 | `REFLECTION_INTENT_VECTOR_ENABLED` | `false` | Enable the reflection intent vector store |
 | `REFLECTION_FS_MATCH_SCAN_CAP` | `1000` | RDB scan cap for `MatchFailureSignatures` |
-| `REFLECTION_USER_ID` | `300000` | Owner user ID for reflection memories |
 | `REFLECTION_LANCEDB_URI` | `${MEMORY_LANCEDB_URI}/reflection_intent` | Reflection intent vector store URI |
 | `REFLECTION_VECTOR_SIZE` | `MEMORY_VECTOR_SIZE` | Intent embedding dimension |
 | `MEMORY_REFLECTION_DISPATCH_ENABLED` | `false` | Enable reflection generation and intent embedding dispatch |

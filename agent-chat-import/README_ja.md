@@ -188,8 +188,7 @@ cat > /tmp/summarize.json <<'EOF'
   "memories_grpc_host": "localhost",
   "memories_grpc_port": 9010,
   "ollama_base_url": "http://192.168.1.2:11434",
-  "summary_model": "qwen3.6:27b",
-  "summary_user_id": 100000
+  "summary_model": "qwen3.6:27b"
 }
 EOF
 ```
@@ -226,7 +225,7 @@ memories-import --user-id 1 \
 JOBWORKERP_ADDR=http://localhost:9000 \
 memories-import --user-id 1 \
   --server-url http://localhost:9010 \
-  --summarize-after-json '{"memories_grpc_host":"localhost","memories_grpc_port":9010,"summary_user_id":100000,"min_message_count":2}' \
+  --summarize-after-json '{"memories_grpc_host":"localhost","memories_grpc_port":9010,"min_message_count":2}' \
   --summarize-workflow /abs/path/to/thread-summary-batch.yaml \
   --summarize-channel summarize \
   --summarize-timeout-sec 7200 \
@@ -292,15 +291,13 @@ cat > /tmp/personality.json <<'EOF'
   "memories_grpc_port": 9010,
   "ollama_base_url": "http://192.168.1.2:11434",
   "personality_model": "qwen3.6:27b",
-  "personality_user_id": 200000,
-  "summary_user_id": 100000,
   "min_user_messages": 2,
   "merge_enabled": true
 }
 EOF
 ```
 
-`personality_user_id` は **`user_id` および `summary_user_id` と異なる値** にすること (再帰汚染防止)。`personality_model` を省略するとワークフロー入力スキーマの既定 (`qwen3.6:27b`) が使われる。
+personality workflowは入力のthread作成者`user_id`と`PERSONALITY`種別で分離するため、別の作成者指定は不要である。`personality_model` を省略するとワークフロー入力スキーマの既定 (`qwen3.6:27b`) が使われる。
 
 ### import + 嗜好抽出 (基本)
 
@@ -427,7 +424,7 @@ vault が複数あるときは `obsidian-private`, `notes-archive` のように 
 
 ##### `--prune-missing`
 
-削除追跡モード。 `--source-name:` プレフィックス + `user_id` で server 側 memory 集合を取り、 fs に存在しない `metadata.path` を持つ memory を削除する:
+削除追跡モード。作成者スコープの `--source-name:<user_id>:` からserver側memory集合を取り、fsに存在しない `metadata.path` を持つmemoryを削除する。旧形式のデータは停止メンテナンス中に移行してからこの機能を使う:
 
 ```bash
 # 削除追跡あり (cron / CI 用には --no-interactive を必須)
@@ -544,6 +541,10 @@ memories サーバ側 (cnpg PostgreSQL) で `AddMemoriesBatch` の INSERT が遅
 
 1. **チャンクサイズ縮小**: 既定 200 件 / 4 MiB に絞ることで 1 transaction を数秒程度に抑え、 cnpg の lock contention が解消する余地を与えます。
 2. **指数バックオフ + リトライ**: 上記 SQLSTATE か gRPC `Unavailable` / `DeadlineExceeded` / `ResourceExhausted` が返った場合、 max 3 回まで指数バックオフで再送します。`AddMemoriesBatch` は server 側で `upsert_by_external_id=true` 固定により冪等で、`UpdateMemoryParents` も同じ memory_id への再送は `rewired: false` の no-op になるため、リトライ起因の二重作成は起きません。
+
+### external_id
+
+会話memoryは `source:<thread作成者ID>:<source固有ID>` を使います。作成後にDBの512バイト上限を超える場合は `source:<thread作成者ID>:~<sha256>` へ決定的に短縮します。既存データは新バックエンドの導入前に `migrate-memory-kind apply` と `verify` で一括移行してください。importerは旧形式のexternal IDを検索・再利用しません。
 
 ### 長時間プロセスでのメモリ管理 (推奨)
 

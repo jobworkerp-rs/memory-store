@@ -104,7 +104,6 @@ summary 系と personality 系は所有者 `user_id` が完全に分離されて
 | `claude_dir` / `codex_dir` | (未指定) | memories-import 既定 (`~/.claude` / `~/.codex`) を上書き |
 | `strip_path_prefix` | (未指定) | memories-import の `-P` (CSV) |
 | `extra_import_args` | `[]` | 追加引数。例: `["--prune-missing", "--source-name", "obsidian"]` |
-| `summary_user_id` | `100000` | thread/daily 要約スレッドの所有者 |
 | `summary_model` / `ollama_base_url` | `qwen3.6:27b` / `localhost:11434` | LLM 設定 |
 | `memory_thread_label_prefix` | `summary` | thread-summary が付与するマーカーラベル |
 | `daily_summary_label` | `daily_summary` | daily-work-summary が付与するマーカーラベル |
@@ -121,7 +120,6 @@ summary 系と personality 系は所有者 `user_id` が完全に分離されて
 |---|---|---|
 | `thread_personality_batch_yaml` | `""` | `thread-personality-batch.yaml` の絶対パスまたは URL。空で personality 段全体を skip |
 | `user_personality_merge_yaml` | `""` | **2層 merge の有効化フラグ**。非空のとき 2層 merge を実行する (batch は登録済み merge worker を呼ぶ。値は有効化判定にのみ使われる) |
-| `personality_user_id` | `200000` | 嗜好メモリの所有者。`user_id` および `summary_user_id` と異なる必要あり |
 | `personality_model` | `""` (= `summary_model` 流用) | personality 抽出/統合用 LLM モデル。空なら `summary_model` をそのまま使う |
 | `min_user_messages` | `2` | thread-personality-single の ROLE_USER 件数下限 |
 | `force_reextract` | `false` | thread-personality-batch に伝達 |

@@ -1,6 +1,7 @@
 [workspace]
 
 members = [
+    "common",
     "modules/command-utils",
     "modules/infra-utils",
     "modules/memory-utils",

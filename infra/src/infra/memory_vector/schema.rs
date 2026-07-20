@@ -59,6 +59,7 @@ pub fn memory_arrow_schema(vector_size: usize) -> Arc<Schema> {
         Field::new("created_at", DataType::Int64, false),
         Field::new("updated_at", DataType::Int64, false),
         Field::new("indexed_at", DataType::Int64, false),
+        Field::new("memory_kind", DataType::Int32, false),
     ];
     Arc::new(Schema::new(fields))
 }

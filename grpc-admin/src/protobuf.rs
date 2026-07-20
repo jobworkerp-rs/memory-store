@@ -27,6 +27,7 @@ pub mod llm_memory {
         pub type LabelMatchMode = data::LabelMatchMode;
         pub type ContentType = data::ContentType;
         pub type MessageRole = data::MessageRole;
+        pub type MemoryKind = data::MemoryKind;
         // media types (image memory feature). The locally generated
         // service/media.proto code references these via `super::data::*`,
         // so the shim must re-alias them even though handler code uses

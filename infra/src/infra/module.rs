@@ -271,3 +271,11 @@ impl RepositoryModule {
         self.pool
     }
 }
+
+/// Initializes only the relational database pool for RDB-only tools.
+///
+/// Migration CLIs must not open LanceDB because they can run before the
+/// replacement vector schema exists.
+pub async fn rdb_pool_by_env() -> anyhow::Result<RdbPool> {
+    super::resource::new_rdb_pool_by_env().await
+}

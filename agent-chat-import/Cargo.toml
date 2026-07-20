@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 protobuf = { path = "../protobuf" }
+common = { path = "../common" }
 command-utils = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

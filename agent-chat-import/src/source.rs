@@ -54,9 +54,9 @@ pub struct CanonicalSession {
 /// and converts them into `MemoryData`. Spec §4.2.
 #[derive(Debug, Clone)]
 pub struct CanonicalEntry {
-    /// Final `external_id` written to DB. The source has already
-    /// applied any prefix / hash / line_ordinal composition so the
-    /// shared importer never sees raw payload identifiers.
+    /// Source-local external ID. The source has already applied any prefix /
+    /// hash / line_ordinal composition; the shared importer adds the thread
+    /// creator namespace before writing it to the database.
     pub external_id: String,
     /// 0..N parent `external_id` pointers. Spec §4.2 / §4.2.2.6:
     /// each entry can carry **multiple** parents (e.g. tool_output

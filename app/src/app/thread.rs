@@ -18,24 +18,31 @@ use infra_utils::infra::rdb::UseRdbPool;
 use memory_utils::cache::stretto::UseMemoryCache;
 use memory_utils::lock::RwLockWithKey;
 use protobuf::llm_memory::data::{
-    MediaObjectId, Memory, MemoryData, MemoryId, MessageRole, Thread, ThreadData, ThreadId, UserId,
+    MediaObjectId, Memory, MemoryData, MemoryId, MemoryKind, MessageRole, Thread, ThreadData,
+    ThreadId, UserId,
 };
 use std::collections::HashSet;
 use std::{sync::Arc, time::Duration};
 use stretto::TokioCache;
 
-/// Common time-range and sort options for the thread list endpoints
+use crate::app::memory_kind::{
+    normalize_memory_for_create, normalize_thread_for_create, preserve_thread_kind_for_update,
+    validate_memory_kind_matches_thread,
+};
+
+/// Common time-range, sort, and memory-kind options for the thread list endpoints
 /// (`find_thread_list_by_user_id`, `find_threads_by_labels`).
 /// `Default` matches the pre-P8 hard-coded behaviour: no time filter and
 /// `updated_at DESC` ordering. Adding new optional knobs to this struct is
 /// preferred over growing the function signature again.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ThreadListOptions {
     pub created_after: Option<i64>,
     pub created_before: Option<i64>,
     pub updated_after: Option<i64>,
     pub updated_before: Option<i64>,
     pub sort: ThreadSort,
+    pub memory_kinds: Vec<i32>,
 }
 
 impl ThreadListOptions {
@@ -45,6 +52,27 @@ impl ThreadListOptions {
             || self.created_before.is_some()
             || self.updated_after.is_some()
             || self.updated_before.is_some()
+    }
+
+    fn has_memory_kind_filter(&self) -> bool {
+        !self.memory_kinds.is_empty()
+    }
+
+    fn matches_memory_kind(&self, thread: &Thread) -> bool {
+        if !self.has_memory_kind_filter() {
+            return true;
+        }
+        let kind = thread
+            .data
+            .as_ref()
+            .map(|data| data.memory_kind)
+            .unwrap_or(MemoryKind::Unspecified as i32);
+        let effective_kind = if kind == MemoryKind::Unspecified as i32 {
+            MemoryKind::Raw as i32
+        } else {
+            kind
+        };
+        self.memory_kinds.contains(&effective_kind)
     }
 
     /// True iff `thread`'s timestamps satisfy every populated bound. The
@@ -293,6 +321,10 @@ pub trait ThreadApp:
     }
 
     async fn create_thread(&self, thread: &ThreadData) -> Result<ThreadId> {
+        let thread = super::memory_kind::normalize_thread_for_create(
+            thread.clone(),
+            "ThreadService.Create",
+        )?;
         validate_metadata(thread.metadata.as_deref())?;
         let db = self.thread_repository().db_pool();
         let mut tx = db.begin().await.map_err(LlmMemoryError::DBError)?;
@@ -303,6 +335,7 @@ pub trait ThreadApp:
             self.memory_repository(),
             &mut tx,
             thread.default_system_memory_id,
+            thread.memory_kind,
         )
         .await?;
         let mut to_insert = thread.clone();
@@ -368,6 +401,11 @@ pub trait ThreadApp:
                 .ok_or_else(|| {
                     LlmMemoryError::NotFound(format!("thread not found: {}", id.value))
                 })?;
+            let mut to_update = preserve_thread_kind_for_update(
+                w.clone(),
+                existing.memory_kind.unwrap_or(0),
+                "ThreadService.UpdateThread",
+            )?;
             let new_user_id = w.user_id.map(|u| u.value).unwrap_or(0);
             let old_user_id = existing.user_id;
             if new_user_id != old_user_id {
@@ -383,9 +421,9 @@ pub trait ThreadApp:
                 self.memory_repository(),
                 &mut tx,
                 w.default_system_memory_id,
+                to_update.memory_kind,
             )
             .await?;
-            let mut to_update = w.clone();
             to_update.default_system_memory_id = normalized_default;
             let updated = self
                 .thread_repository()
@@ -646,12 +684,16 @@ pub trait ThreadApp:
         &self,
         limit: Option<&i32>,
         offset: Option<&i64>,
+        memory_kinds: &[i32],
         _ttl: Option<&Duration>,
     ) -> Result<Vec<Thread>>
     where
         Self: Send + 'static,
     {
-        let mut threads = self.thread_repository().find_list(limit, offset).await?;
+        let mut threads = self
+            .thread_repository()
+            .find_list_by_memory_kinds(limit, offset, memory_kinds)
+            .await?;
         self.hydrate_labels_batch(&mut threads).await?;
         Ok(threads)
     }
@@ -678,6 +720,7 @@ pub trait ThreadApp:
                 opts.updated_after,
                 opts.updated_before,
                 opts.sort,
+                &opts.memory_kinds,
             )
             .await?;
         self.hydrate_labels_batch(&mut threads).await?;
@@ -871,12 +914,13 @@ pub trait ThreadApp:
     /// SQL `LIMIT/OFFSET` is applied directly inside the labels query —
     /// that path matches the pre-P8 fast path one-for-one.
     ///
-    /// When time filtering or a non-default sort is requested, the
+    /// When time filtering, memory-kind filtering, or a non-default sort is requested, the
     /// pagination contract requires considering matches beyond the first
     /// SQL slice (otherwise pages would be under-filled or skip valid
     /// rows). We then over-fetch up to `MEMORY_THREAD_FILTER_INTERMEDIATE_HARD_LIMIT`
-    /// candidates without `LIMIT/OFFSET`, apply the time-range filter and
-    /// sort in-process, and slice the final `limit/offset` window. A
+    /// candidates without `LIMIT/OFFSET`, apply the remaining in-process
+    /// filters and sort, and slice the final `limit/offset` window. Memory
+    /// kinds are applied in the labels SQL before this cap. A
     /// candidate set that overflows the cap is rejected with
     /// `FailedPrecondition` so the caller is told to narrow the labels
     /// rather than silently receiving a truncated page.
@@ -890,7 +934,9 @@ pub trait ThreadApp:
         offset: Option<i64>,
         opts: ThreadListOptions,
     ) -> Result<Vec<Thread>> {
-        let needs_post_processing = opts.has_time_filter() || opts.sort != ThreadSort::default();
+        let needs_post_processing = opts.has_time_filter()
+            || opts.has_memory_kind_filter()
+            || opts.sort != ThreadSort::default();
 
         // Fetch IDs. Fast path lets the labels SQL paginate; the post-
         // processing path over-fetches so the in-process slice is correct.
@@ -899,7 +945,14 @@ pub trait ThreadApp:
             let fetch_limit = cap.saturating_add(1).min(i32::MAX as i64) as i32;
             let raw = self
                 .thread_label_repository()
-                .find_thread_ids_by_labels(labels, match_all, user_id, Some(fetch_limit), None)
+                .find_thread_ids_by_labels_and_memory_kinds(
+                    labels,
+                    match_all,
+                    user_id,
+                    &opts.memory_kinds,
+                    Some(fetch_limit),
+                    None,
+                )
                 .await?;
             if raw.len() as i64 > cap {
                 return Err(LlmMemoryError::FailedPrecondition(format!(
@@ -960,6 +1013,9 @@ pub trait ThreadApp:
         // two endpoints.
         if opts.has_time_filter() {
             result.retain(|t| opts.matches_time_range(t));
+        }
+        if opts.has_memory_kind_filter() {
+            result.retain(|t| opts.matches_memory_kind(t));
         }
         sort_threads_in_place(&mut result, opts.sort);
         let start = offset.unwrap_or(0).max(0) as usize;
@@ -1611,7 +1667,14 @@ impl ThreadAppImpl {
                 LlmMemoryError::NotFound(format!("thread not found: {}", thread_id.value))
             })?;
 
-        let mut memory = memory.clone();
+        let mut memory = super::memory_kind::normalize_memory_for_create(
+            memory.clone(),
+            "ThreadService.AddMemory",
+        )?;
+        super::memory_kind::validate_memory_kind_matches_thread(
+            thread.memory_kind.unwrap_or(0),
+            &memory,
+        )?;
 
         // ROLE_SYSTEM parent validation and default_system_memory_id injection.
         let supplied_parent_ids: Vec<i64> = memory.parent_ids.iter().map(|p| p.value).collect();
@@ -1632,6 +1695,12 @@ impl ThreadAppImpl {
                     .unwrap_or(false)
             })
             .count();
+        for parent in &parent_memories {
+            let data = parent.data.as_ref().ok_or_else(|| {
+                LlmMemoryError::InvalidArgument("parent memory has no data".to_string())
+            })?;
+            validate_memory_kind_matches_thread(thread.memory_kind.unwrap_or(0), data)?;
+        }
         if explicit_system_parent_count > 1 {
             return Err(LlmMemoryError::RuntimeError(format!(
                 "parent_ids contains {} ROLE_SYSTEM memories; at most 1 is allowed",
@@ -1646,6 +1715,7 @@ impl ThreadAppImpl {
                     self.memory_repository(),
                     tx,
                     thread.default_system_memory_id,
+                    thread.memory_kind.unwrap_or(0),
                 )
                 .await?;
                 if let Some(default_id) = default_id {
@@ -1919,7 +1989,7 @@ impl ThreadApp for ThreadAppImpl {
         let pool = self.thread_repository().db_pool();
         let mut tx = pool.begin().await.map_err(LlmMemoryError::DBError)?;
 
-        let (thread_id, thread_created, target_user_id) = match thread_target {
+        let (thread_id, thread_created, _target_user_id, target_memory_kind) = match thread_target {
             BatchThreadTarget::ExistingThreadId(tid) => {
                 let row = self
                     .thread_repository()
@@ -1928,9 +1998,11 @@ impl ThreadApp for ThreadAppImpl {
                     .ok_or_else(|| {
                         LlmMemoryError::NotFound(format!("thread not found: {}", tid.value))
                     })?;
-                (tid, false, row.user_id)
+                (tid, false, row.user_id, row.memory_kind.unwrap_or(0))
             }
             BatchThreadTarget::UpsertByChannel(thread_data) => {
+                let thread_data =
+                    normalize_thread_for_create(thread_data, "ThreadService.AddMemoriesBatch")?;
                 let user_id = thread_data.user_id.ok_or_else(|| {
                     LlmMemoryError::InvalidArgument("thread_data.user_id is required".to_string())
                 })?;
@@ -1987,7 +2059,7 @@ impl ThreadApp for ThreadAppImpl {
                             .thread_repository()
                             .create(&mut *tx, &to_insert)
                             .await?;
-                        (new_id, true, user_id.value)
+                        (new_id, true, user_id.value, to_insert.memory_kind)
                     }
                     1 => {
                         let existing_thread = existing.into_iter().next().unwrap();
@@ -2005,17 +2077,25 @@ impl ThreadApp for ThreadAppImpl {
                         // chunk 2 arrives with `metadata = None`, overwriting
                         // here would erase the state. Mutations go through
                         // ThreadService.Update only.
-                        let _ = self
+                        let locked = self
                             .thread_repository()
                             .find_row_for_update_tx(&mut *tx, &tid)
-                            .await?;
-                        let owner = existing_thread
+                            .await?
+                            .ok_or_else(|| {
+                                LlmMemoryError::NotFound(format!("thread not found: {}", tid.value))
+                            })?;
+                        let creator_user_id = existing_thread
                             .data
                             .as_ref()
                             .and_then(|d| d.user_id)
                             .map(|u| u.value)
                             .unwrap_or(user_id.value);
-                        (tid, false, owner)
+                        let effective_stored_kind = super::memory_kind::resolve_preserved_kind(
+                            thread_data.memory_kind,
+                            locked.memory_kind.unwrap_or(0),
+                            "ThreadService.AddMemoriesBatch",
+                        )?;
+                        (tid, false, creator_user_id, effective_stored_kind)
                     }
                     _ => {
                         return Err(LlmMemoryError::FailedPrecondition(format!(
@@ -2029,15 +2109,13 @@ impl ThreadApp for ThreadAppImpl {
         };
 
         // ----- Phase 1 (cont.): user_id alignment between target thread and each memory -----
-        for (idx, item) in memories.iter().enumerate() {
-            let uid = item.memory.user_id.map(|u| u.value).unwrap_or(0);
-            if uid != target_user_id {
-                return Err(LlmMemoryError::PermissionDenied(format!(
-                    "memories[{idx}].memory.user_id={uid} does not match \
-                     target thread owner user_id={target_user_id}"
-                ))
-                .into());
-            }
+        let mut memories = memories;
+        for item in &mut memories {
+            item.memory = normalize_memory_for_create(
+                std::mem::take(&mut item.memory),
+                "ThreadService.AddMemoriesBatch",
+            )?;
+            validate_memory_kind_matches_thread(target_memory_kind, &item.memory)?;
         }
 
         // ----- Phase 1 (cont.): seed eid_map from a single bulk JOIN
@@ -2045,10 +2123,9 @@ impl ThreadApp for ThreadAppImpl {
         //     batch (parent_external_ids ∪ each memory's own external_id).
         //     The JOIN against `thread_memory` returns the attach position
         //     in the same round trip, so the per-memory `find_position_tx`
-        //     is no longer necessary. `target_user_id` filtering defends
-        //     against past cross-user attaches; rows with a mismatched
-        //     owner are dropped from the eid_map but still indexed so the
-        //     cross-thread / cross-user guards can reject explicitly. -----
+        //     is no longer necessary. External IDs are scoped by the thread
+        //     creator at import time; memory.user_id remains the author and
+        //     is intentionally independent from thread.user_id. -----
         let mut wanted_eids: HashSet<String> = HashSet::with_capacity(memories.len());
         for item in &memories {
             for eid in &item.parent_external_ids {
@@ -2073,7 +2150,7 @@ impl ThreadApp for ThreadAppImpl {
         // exactly what the upsert / rewire decisions read.
         struct ExistingInfo {
             memory_id: MemoryId,
-            owner_user_id: i64,
+            author_user_id: i64,
             parent_ids_empty: bool,
             attached_position: Option<i32>,
             // Stored metadata that drives re-embedding dispatch on a
@@ -2098,7 +2175,7 @@ impl ThreadApp for ThreadAppImpl {
                 eid,
                 ExistingInfo {
                     memory_id: id,
-                    owner_user_id: data.user_id.map(|u| u.value).unwrap_or(0),
+                    author_user_id: data.user_id.map(|u| u.value).unwrap_or(0),
                     parent_ids_empty: data.parent_ids.is_empty(),
                     attached_position,
                     role: data.role,
@@ -2108,12 +2185,11 @@ impl ThreadApp for ThreadAppImpl {
             );
         }
 
-        // eid_map: only memories already attached to THIS thread under the
-        // target user can be parent-resolved against the batch.
+        // eid_map only includes memories already attached to THIS thread.
         let mut eid_map: std::collections::HashMap<String, (MemoryId, bool)> =
             std::collections::HashMap::with_capacity(existing_by_eid.len());
         for (eid, info) in &existing_by_eid {
-            if info.owner_user_id == target_user_id && info.attached_position.is_some() {
+            if info.attached_position.is_some() {
                 eid_map.insert(eid.clone(), (info.memory_id, info.parent_ids_empty));
             }
         }
@@ -2191,11 +2267,11 @@ impl ThreadApp for ThreadAppImpl {
                     .into());
                 }
                 (Some(info), true) => {
-                    if info.owner_user_id != target_user_id {
-                        return Err(LlmMemoryError::PermissionDenied(format!(
-                            "external_id existing memory belongs to user {} \
-                             but target thread is owned by {target_user_id}",
-                            info.owner_user_id
+                    let author_user_id = memory.user_id.map(|user_id| user_id.value).unwrap_or(0);
+                    if info.author_user_id != author_user_id {
+                        return Err(LlmMemoryError::FailedPrecondition(format!(
+                            "external_id memory id={} has author user_id {} but input has {}",
+                            info.memory_id.value, info.author_user_id, author_user_id
                         ))
                         .into());
                     }
@@ -2218,7 +2294,7 @@ impl ThreadApp for ThreadAppImpl {
                     // Contract (`upsert_by_external_id`): overwrite the
                     // existing memory's content with the incoming value.
                     // Scoped to `content` via `update_content_only` so the
-                    // branch's parent/ownership/position invariants stay
+                    // branch's parent/author/position invariants stay
                     // intact. We re-dispatch embedding for the new content
                     // so the vector index does not drift from the stored
                     // content on reimport.
@@ -2440,6 +2516,7 @@ async fn validate_default_system_memory_id_tx(
     memory_repo: &MemoryRepositoryImpl,
     tx: &mut infra_utils::infra::rdb::RdbTransaction<'_>,
     default_id: Option<i64>,
+    thread_memory_kind: i32,
 ) -> Result<Option<i64>> {
     let Some(id) = default_id else {
         return Ok(None);
@@ -2467,6 +2544,7 @@ async fn validate_default_system_memory_id_tx(
         ))
         .into());
     }
+    validate_memory_kind_matches_thread(thread_memory_kind, &data)?;
     Ok(Some(id))
 }
 
@@ -2557,13 +2635,40 @@ mod test {
             );
         }
     }
+
+    #[test]
+    fn thread_list_kind_filter_matches_requested_and_legacy_raw_kinds() {
+        let options = ThreadListOptions {
+            memory_kinds: vec![MemoryKind::Raw as i32],
+            ..Default::default()
+        };
+        let legacy_raw = Thread {
+            data: Some(ThreadData {
+                memory_kind: MemoryKind::Unspecified as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let personality = Thread {
+            data: Some(ThreadData {
+                memory_kind: MemoryKind::Personality as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(options.matches_memory_kind(&legacy_raw));
+        assert!(!options.matches_memory_kind(&personality));
+    }
     use infra::infra::memory::rdb::MemoryRepositoryImpl;
     use infra::infra::memory_rating::rdb::MemoryRatingRepositoryImpl;
     use infra::infra::thread::rdb::ThreadRepositoryImpl;
     use infra::infra::thread_memory::rdb::ThreadMemoryRepositoryImpl;
     use infra_utils::infra::rdb::RdbPool;
     use memory_utils::cache::stretto::{MemoryCacheConfig, new_memory_cache};
-    use protobuf::llm_memory::data::{ContentType, MediaObjectId, Memory, MessageRole, Thread};
+    use protobuf::llm_memory::data::{
+        ContentType, MediaObjectId, Memory, MemoryKind, MessageRole, Thread,
+    };
 
     fn build_app(pool: &'static RdbPool) -> ThreadAppImpl {
         let id_gen = infra::test_helper::shared_id_generator();
@@ -2668,6 +2773,15 @@ mod test {
     /// Used by tests that need a real system-prompt memory without constructing
     /// a full app-level create_memory path.
     async fn insert_system_memory(app: &ThreadAppImpl, user_id: i64, content: &str) -> Result<i64> {
+        insert_system_memory_with_kind(app, user_id, content, MemoryKind::Raw as i32).await
+    }
+
+    async fn insert_system_memory_with_kind(
+        app: &ThreadAppImpl,
+        user_id: i64,
+        content: &str,
+        memory_kind: i32,
+    ) -> Result<i64> {
         let data = MemoryData {
             parent_ids: vec![],
             user_id: Some(UserId { value: user_id }),
@@ -2681,6 +2795,7 @@ mod test {
             external_id: None,
             media_object_id: None,
             thread_ids: Vec::new(),
+            memory_kind,
         };
         let pool = app.memory_repository().db_pool();
         let mut tx = pool.begin().await.context("begin")?;
@@ -2704,6 +2819,7 @@ mod test {
             created_at: 0,
             updated_at: 0,
             labels: vec![],
+            memory_kind: MemoryKind::Raw as i32,
             metadata: None,
         };
         let pool = app.thread_repository().db_pool();
@@ -2727,6 +2843,7 @@ mod test {
             external_id: None,
             media_object_id: None,
             thread_ids: Vec::new(),
+            memory_kind: MemoryKind::Raw as i32,
         }
     }
 
@@ -3046,6 +3163,7 @@ mod test {
             created_at: 0,
             updated_at: 0,
             labels: vec![],
+            memory_kind: MemoryKind::Raw as i32,
             metadata: None,
         };
         app.create_thread(&data).await
@@ -3110,6 +3228,7 @@ mod test {
             created_at: 0,
             updated_at: 0,
             labels: vec![],
+            memory_kind: MemoryKind::Raw as i32,
             metadata: None,
         };
         app.update_thread(&thread_id, &Some(updated)).await?;
@@ -3169,6 +3288,7 @@ mod test {
             external_id: None,
             media_object_id: None,
             thread_ids: Vec::new(),
+            memory_kind: MemoryKind::Raw as i32,
         };
         let pool_ = app.memory_repository().db_pool();
         let mut tx = pool_.begin().await.context("begin")?;
@@ -3189,8 +3309,7 @@ mod test {
         Ok(())
     }
 
-    /// #2: a `default_system_memory_id` belonging to a different user is
-    /// accepted as long as it points at a ROLE_SYSTEM memory.
+    /// A default system memory may be authored by somebody other than the thread creator.
     async fn _test_create_thread_accepts_cross_user_default(pool: &'static RdbPool) -> Result<()> {
         let app = build_app(pool);
         let owner_id = 51i64;
@@ -3200,19 +3319,28 @@ mod test {
         let other_system_id =
             insert_system_memory(&app, other_user_id, "belongs to other user").await?;
 
-        let thread_id = create_thread_via_app(&app, owner_id, Some(other_system_id)).await?;
-        let stored = app
-            .thread_repository()
-            .find(&thread_id)
-            .await?
-            .expect("thread should exist");
-        assert_eq!(
-            stored
-                .data
-                .as_ref()
-                .and_then(|d| d.default_system_memory_id),
-            Some(other_system_id),
-            "cross-user ROLE_SYSTEM default must round-trip unchanged"
+        create_thread_via_app(&app, owner_id, Some(other_system_id)).await?;
+        Ok(())
+    }
+
+    async fn _test_create_thread_rejects_cross_kind_default(pool: &'static RdbPool) -> Result<()> {
+        let app = build_app(pool);
+        let user_id = 52i64;
+        let reflection_system = insert_system_memory_with_kind(
+            &app,
+            user_id,
+            "reflection system memory",
+            MemoryKind::Reflection as i32,
+        )
+        .await?;
+
+        let error = create_thread_via_app(&app, user_id, Some(reflection_system))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match thread memory_kind")
         );
         Ok(())
     }
@@ -3282,6 +3410,15 @@ mod test {
         TEST_RUNTIME.block_on(async {
             let pool = setup_pool().await;
             _test_create_thread_accepts_cross_user_default(pool).await
+        })
+    }
+
+    #[test]
+    fn run_test_create_thread_rejects_cross_kind_default() -> Result<()> {
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_pool().await;
+            _test_create_thread_rejects_cross_kind_default(pool).await
         })
     }
 
@@ -3703,6 +3840,7 @@ mod test {
             external_id: None,
             media_object_id: None,
             thread_ids: Vec::new(),
+            memory_kind: MemoryKind::Raw as i32,
         };
         let mut tx = app.memory_repository().db_pool().begin().await?;
         let orphan_id = app.memory_repository().create(&mut *tx, &orphan).await?;
@@ -3778,14 +3916,10 @@ mod test {
         })
     }
 
-    // ---- Phase 4 review: cross-user parent_ids are allowed ----
+    // ---- Parent author / kind invariants ----
 
-    /// `add_memory` accepts `parent_ids` whose memories carry a different
-    /// `user_id` than the thread metadata. The parent still needs to exist
-    /// so it can be attached to the junction and participate in traversal.
+    /// A parent authored by another user may be attached to a thread.
     async fn _test_add_memory_accepts_cross_user_parent_ids(pool: &'static RdbPool) -> Result<()> {
-        use infra::infra::thread_memory::rdb::ThreadMemoryRepository;
-
         let app = build_app(pool);
         let alice = 95i64;
         let bob = 96i64;
@@ -3807,6 +3941,7 @@ mod test {
             external_id: None,
             media_object_id: None,
             thread_ids: Vec::new(),
+            memory_kind: MemoryKind::Raw as i32,
         };
         let mut tx = app.memory_repository().db_pool().begin().await?;
         let alice_memory_id = app
@@ -3818,27 +3953,32 @@ mod test {
         // Bob owns his own thread with no default system prompt.
         let bob_thread_id = create_thread_with_default(&app, bob, None).await?;
 
-        // Bob pulls Alice's memory into his thread via parent_ids.
+        // Bob attaches a memory that references Alice's earlier message.
         let cross_user = user_message("cross-user attempt", bob, vec![alice_memory_id]);
-        let created_id = app.add_memory(&bob_thread_id, &cross_user).await?;
+        app.add_memory(&bob_thread_id, &cross_user).await?;
 
-        // The junction should now contain both the referenced parent and the
-        // newly created message.
-        let bob_members = app
-            .thread_memory_repository()
-            .find_memory_ids_by_thread_tx(app.thread_repository().db_pool(), bob_thread_id.value)
+        let mut reflection_parent = user_message("reflection parent", bob, vec![]);
+        reflection_parent.memory_kind = MemoryKind::Reflection as i32;
+        let mut tx = app.memory_repository().db_pool().begin().await?;
+        let reflection_parent_id = app
+            .memory_repository()
+            .create(&mut *tx, &reflection_parent)
             .await?;
+        tx.commit().await?;
+        let cross_kind = user_message("cross-kind attempt", bob, vec![reflection_parent_id]);
+        let error = app
+            .add_memory(&bob_thread_id, &cross_kind)
+            .await
+            .unwrap_err();
         assert!(
-            bob_members.iter().any(|m| m.value == alice_memory_id.value),
-            "cross-user parent must be attached to the target thread: {bob_members:?}"
-        );
-        assert!(
-            bob_members.iter().any(|m| m.value == created_id.value),
-            "newly created message must be attached to the target thread: {bob_members:?}"
+            error
+                .to_string()
+                .contains("does not match thread memory_kind")
         );
 
         // Cleanup
         let _ = app.memory_repository().delete(&alice_memory_id).await;
+        let _ = app.memory_repository().delete(&reflection_parent_id).await;
         let (_, _) = app.delete_thread(&bob_thread_id).await?;
         Ok(())
     }
@@ -4012,10 +4152,17 @@ mod test {
         let alice_msg = user_message("alice says hi", alice, vec![]);
         let alice_msg_id = app.add_memory(&alice_thread, &alice_msg).await?;
 
-        // Bob creates his own thread and references Alice's message as a parent.
+        // Simulate a pre-migration corrupt junction row. New API paths reject
+        // this association, but deletion must still preserve Alice's memory.
         let bob_thread = create_thread_with_default(&app, bob, None).await?;
-        let bob_msg = user_message("bob references alice", bob, vec![alice_msg_id]);
-        let _bob_msg_id = app.add_memory(&bob_thread, &bob_msg).await?;
+        app.thread_memory_repository()
+            .insert_or_ignore_auto_position_tx(
+                app.thread_repository().db_pool(),
+                bob_thread.value,
+                alice_msg_id.value,
+                command_utils::util::datetime::now_millis(),
+            )
+            .await?;
 
         // Delete Bob's thread.
         let (deleted, exclusive_ids) = app.delete_thread(&bob_thread).await?;
@@ -4062,8 +4209,24 @@ mod test {
 
         let alice_system = insert_system_memory(&thread_app, alice, "alice prompt").await?;
 
-        // Bob creates a thread that uses Alice's system memory as its default.
-        let bob_thread = create_thread_via_app(&thread_app, bob, Some(alice_system)).await?;
+        // Simulate a pre-migration cross-user default. New API paths reject
+        // this state, but delete_memory must clean it up safely.
+        let bob_thread = create_thread_with_default(&thread_app, bob, None).await?;
+        let mut legacy_thread = thread_app
+            .thread_repository()
+            .find(&bob_thread)
+            .await?
+            .and_then(|thread| thread.data)
+            .expect("Bob's thread should exist");
+        legacy_thread.default_system_memory_id = Some(alice_system);
+        let mut tx = thread_app.thread_repository().db_pool().begin().await?;
+        assert!(
+            thread_app
+                .thread_repository()
+                .update(&mut *tx, &bob_thread, &legacy_thread)
+                .await?
+        );
+        tx.commit().await?;
 
         // Warm the thread cache first so the delete path must actively
         // invalidate it instead of falling back to a cold repository read.
@@ -4294,6 +4457,7 @@ mod test {
             updated_at: 0,
             labels: vec!["alpha".to_string(), "beta".to_string()],
             metadata: None,
+            memory_kind: 0,
         };
         let thread_id = app.create_thread(&data).await?;
 
@@ -4329,6 +4493,7 @@ mod test {
             updated_at: 0,
             labels: vec!["a".to_string(), "b".to_string()],
             metadata: None,
+            memory_kind: 0,
         };
         let thread_id = app.create_thread(&data).await?;
 
@@ -4436,6 +4601,7 @@ mod test {
                 created_at,
                 updated_at,
                 labels: vec![],
+                memory_kind: MemoryKind::Raw as i32,
                 metadata: None,
             };
             let mut tx = pool.begin().await.context("begin")?;
@@ -4464,7 +4630,7 @@ mod test {
                 Some(user_id),
                 Some(2),
                 Some(0),
-                opts,
+                opts.clone(),
             )
             .await?;
         assert_eq!(page0.len(), 2, "page 0 must be filled to limit=2");
@@ -4482,7 +4648,7 @@ mod test {
                 Some(user_id),
                 Some(2),
                 Some(2),
-                opts,
+                opts.clone(),
             )
             .await?;
         assert_eq!(page1.len(), 1);
@@ -4536,6 +4702,91 @@ mod test {
         })
     }
 
+    async fn _test_find_threads_by_labels_applies_kind_before_candidate_cap(
+        pool: &'static RdbPool,
+    ) -> Result<()> {
+        // SAFETY: this workspace runs tests with --test-threads=1.
+        unsafe {
+            std::env::set_var("MEMORY_THREAD_FILTER_INTERMEDIATE_HARD_LIMIT", "2");
+        }
+        let app = build_app(pool);
+        let user_id = 9_122i64;
+        let label = "kind-cap".to_string();
+        let id_gen = infra::test_helper::shared_id_generator();
+        let thread_repo = ThreadRepositoryImpl::new(id_gen, pool);
+        let mut created_ids = Vec::new();
+
+        for (index, memory_kind) in [
+            MemoryKind::Raw as i32,
+            MemoryKind::Raw as i32,
+            MemoryKind::Raw as i32,
+            MemoryKind::ThreadSummary as i32,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let data = ThreadData {
+                default_system_memory_id: None,
+                user_id: Some(UserId { value: user_id }),
+                description: None,
+                channel: None,
+                embedding: None,
+                embedding_dim: None,
+                created_at: index as i64,
+                updated_at: index as i64,
+                labels: vec![],
+                memory_kind,
+                metadata: None,
+            };
+            let mut tx = pool.begin().await.context("begin")?;
+            let id = thread_repo.create(&mut *tx, &data).await?;
+            app.thread_label_repository()
+                .add_labels_tx(&mut *tx, id.value, label.as_str(), index as i64)
+                .await?;
+            tx.commit().await.context("commit")?;
+            created_ids.push(id);
+        }
+
+        let result = app
+            .find_threads_by_labels(
+                std::slice::from_ref(&label),
+                false,
+                Some(user_id),
+                Some(10),
+                Some(0),
+                ThreadListOptions {
+                    memory_kinds: vec![MemoryKind::ThreadSummary as i32],
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        for id in created_ids {
+            let _ = app.delete_thread(&id).await;
+        }
+        // SAFETY: this workspace runs tests with --test-threads=1.
+        unsafe {
+            std::env::remove_var("MEMORY_THREAD_FILTER_INTERMEDIATE_HARD_LIMIT");
+        }
+
+        let threads = result?;
+        assert_eq!(threads.len(), 1);
+        assert_eq!(
+            threads[0].data.as_ref().map(|data| data.memory_kind),
+            Some(MemoryKind::ThreadSummary as i32)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_test_find_threads_by_labels_applies_kind_before_candidate_cap() -> Result<()> {
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_pool().await;
+            _test_find_threads_by_labels_applies_kind_before_candidate_cap(pool).await
+        })
+    }
+
     /// When several threads share the same `updated_at`, label-based
     /// pagination must use the same tiebreaker as the user-scoped path
     /// (`updated_at DESC, id DESC`). Otherwise the two endpoints return
@@ -4565,6 +4816,7 @@ mod test {
                 created_at: shared_updated_at,
                 updated_at: shared_updated_at,
                 labels: vec![],
+                memory_kind: MemoryKind::Raw as i32,
                 metadata: None,
             };
             let mut tx = pool.begin().await.context("begin")?;
@@ -4628,7 +4880,7 @@ mod test {
                 Some(user_id),
                 Some(10),
                 Some(0),
-                opts_post,
+                opts_post.clone(),
             )
             .await?;
         let post_path_ids: Vec<i64> = post_path
@@ -4650,7 +4902,7 @@ mod test {
                     Some(user_id),
                     Some(2),
                     Some(offset as i64),
-                    opts_post,
+                    opts_post.clone(),
                 )
                 .await?;
             for t in &page {
@@ -4705,6 +4957,7 @@ mod test {
                 external_id: Some(external_id.to_string()),
                 media_object_id: None,
                 thread_ids: Vec::new(),
+                memory_kind: 0,
             },
             parent_external_ids,
         }
@@ -4727,6 +4980,7 @@ mod test {
                 created_at: 0,
                 updated_at: 0,
                 labels: vec![],
+                memory_kind: 0,
                 metadata: None,
             }),
             memories,
@@ -4784,6 +5038,12 @@ mod test {
             .unwrap_or_default();
         assert_eq!(stored_parents, vec![call_id]);
 
+        let thread = app.find_thread(&out.thread_id, None).await?.unwrap();
+        assert_eq!(
+            thread.data.as_ref().map(|data| data.memory_kind),
+            Some(MemoryKind::Raw as i32)
+        );
+
         // Cleanup
         let _ = app.delete_thread(&out.thread_id).await;
         Ok(())
@@ -4812,6 +5072,7 @@ mod test {
             created_at: 1_000,
             updated_at: 1_000,
             labels: vec![],
+            memory_kind: 0,
             metadata: Some(r#"{"git":{"last_commit":"abc"}}"#.to_string()),
         };
         let thread_id = app.create_thread(&seed).await?;
@@ -4850,6 +5111,45 @@ mod test {
             stored_json, expected_json,
             "AddMemoriesBatch must not overwrite existing thread metadata"
         );
+        Ok(())
+    }
+
+    async fn _test_batch_upsert_rejects_thread_kind_change(pool: &'static RdbPool) -> Result<()> {
+        let app = build_app(pool);
+        let user_id = 70_011i64;
+        let channel = "import:test:kind-immutable";
+        let first = channel_upsert_input(
+            user_id,
+            channel,
+            vec![batch_memory_input(
+                "kind-1",
+                user_id,
+                "first",
+                1_000,
+                vec![],
+            )],
+            true,
+        );
+        let created = app.add_memories_batch(first).await?;
+        let mut conflicting = channel_upsert_input(
+            user_id,
+            channel,
+            vec![batch_memory_input(
+                "kind-2",
+                user_id,
+                "second",
+                1_001,
+                vec![],
+            )],
+            true,
+        );
+        if let BatchThreadTarget::UpsertByChannel(thread) = &mut conflicting.thread_target {
+            thread.memory_kind = MemoryKind::Reflection as i32;
+        }
+
+        let error = app.add_memories_batch(conflicting).await.unwrap_err();
+        assert!(error.to_string().contains("memory_kind is immutable"));
+        let _ = app.delete_thread(&created.thread_id).await;
         Ok(())
     }
 
@@ -5363,9 +5663,8 @@ mod test {
         })
     }
 
-    /// Memory user_id mismatch with the target thread owner is rejected
-    /// with PermissionDenied.
-    async fn _test_batch_rejects_cross_user_memory(pool: &'static RdbPool) -> Result<()> {
+    /// A batch may contain memories authored by users other than the thread creator.
+    async fn _test_batch_accepts_cross_user_memory(pool: &'static RdbPool) -> Result<()> {
         let app = build_app(pool);
         let owner = 70_005i64;
         let attacker = 70_006i64;
@@ -5382,12 +5681,8 @@ mod test {
             )],
             true,
         );
-        let err = app.add_memories_batch(input).await.unwrap_err();
-        let downcast = err.downcast_ref::<LlmMemoryError>();
-        assert!(
-            matches!(downcast, Some(LlmMemoryError::PermissionDenied(_))),
-            "expected PermissionDenied, got: {err}"
-        );
+        let output = app.add_memories_batch(input).await?;
+        assert_eq!(output.outcomes.len(), 1);
         Ok(())
     }
 
@@ -5736,6 +6031,15 @@ mod test {
     }
 
     #[test]
+    fn run_test_batch_upsert_rejects_thread_kind_change() -> Result<()> {
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_pool().await;
+            _test_batch_upsert_rejects_thread_kind_change(pool).await
+        })
+    }
+
+    #[test]
     fn run_test_batch_rejects_non_empty_parent_ids() -> Result<()> {
         use infra_utils::infra::test::TEST_RUNTIME;
         TEST_RUNTIME.block_on(async {
@@ -5754,11 +6058,11 @@ mod test {
     }
 
     #[test]
-    fn run_test_batch_rejects_cross_user_memory() -> Result<()> {
+    fn run_test_batch_accepts_cross_user_memory() -> Result<()> {
         use infra_utils::infra::test::TEST_RUNTIME;
         TEST_RUNTIME.block_on(async {
             let pool = setup_pool().await;
-            _test_batch_rejects_cross_user_memory(pool).await
+            _test_batch_accepts_cross_user_memory(pool).await
         })
     }
 

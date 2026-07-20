@@ -10,6 +10,7 @@ use crate::protobuf::llm_memory::service::{
     ThreadSearchResult, ThreadTextSearchRequest, ThreadVectorSearchRequest,
 };
 use crate::service::error_handle::handle_error;
+use crate::service::memory_kind::normalize_thread_search_filter;
 use app::app::memory_vector::CountMode;
 use app::app::thread_vector::ThreadVectorAppImpl;
 use async_stream::stream;
@@ -40,7 +41,10 @@ impl<T: ThreadVectorGrpc + Tracing + Send + Debug + Sync + 'static> ThreadVector
                 "query_vectors must not be empty",
             ));
         }
-        let options = req.options.unwrap_or_default();
+        let mut options = req.options.unwrap_or_default();
+        if let Some(filter) = options.filter.as_mut() {
+            normalize_thread_search_filter(filter)?;
+        }
         if options.distance_type.is_some() {
             tracing::warn!(
                 "distance_type in ThreadSearchOptions is ignored; distance type is configured per-table"
@@ -120,7 +124,10 @@ impl<T: ThreadVectorGrpc + Tracing + Send + Debug + Sync + 'static> ThreadVector
                 "fts_options in ThreadTextSearchRequest is ignored; thread FTS uses fixed column 'description'"
             );
         }
-        let options = req.options.unwrap_or_default();
+        let mut options = req.options.unwrap_or_default();
+        if let Some(filter) = options.filter.as_mut() {
+            normalize_thread_search_filter(filter)?;
+        }
         if options.distance_type.is_some() {
             tracing::warn!(
                 "distance_type in ThreadSearchOptions is ignored; distance type is configured per-table"
@@ -184,7 +191,10 @@ impl<T: ThreadVectorGrpc + Tracing + Send + Debug + Sync + 'static> ThreadVector
             );
         }
         let query_vector = &req.query_vectors[0].values;
-        let options = req.options.unwrap_or_default();
+        let mut options = req.options.unwrap_or_default();
+        if let Some(filter) = options.filter.as_mut() {
+            normalize_thread_search_filter(filter)?;
+        }
         if options.distance_type.is_some() {
             tracing::warn!(
                 "distance_type in ThreadSearchOptions is ignored; distance type is configured per-table"
@@ -384,7 +394,7 @@ impl<T: ThreadVectorGrpc + Tracing + Send + Debug + Sync + 'static> ThreadVector
         request: tonic::Request<ThreadSearchCountRequest>,
     ) -> Result<Response<ThreadSearchCountResponse>, tonic::Status> {
         let _s = Self::trace_request("thread_vector", "count_search_matches", &request);
-        let req = request.get_ref();
+        let mut req = request.into_inner();
 
         let mode = CountMode::from_proto_i32(req.mode).ok_or_else(|| {
             tonic::Status::invalid_argument(
@@ -393,6 +403,9 @@ impl<T: ThreadVectorGrpc + Tracing + Send + Debug + Sync + 'static> ThreadVector
             )
         })?;
 
+        if let Some(filter) = req.filter.as_mut() {
+            normalize_thread_search_filter(filter)?;
+        }
         let filter = req
             .filter
             .as_ref()

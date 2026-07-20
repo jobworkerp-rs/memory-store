@@ -1,4 +1,4 @@
-use protobuf::llm_memory::data::MemoryData;
+use protobuf::llm_memory::data::{MemoryData, MemoryKind};
 
 /// Canonical `vector_kind` values. The LanceDB column and the proto
 /// `VectorRow.vector_kind` / `replace_kinds` are `Utf8`/`string` at the
@@ -44,6 +44,7 @@ pub struct MemoryVectorRecord {
     pub created_at: i64,
     pub updated_at: i64,
     pub indexed_at: i64,
+    pub memory_kind: i32,
 }
 
 impl MemoryVectorRecord {
@@ -137,6 +138,23 @@ impl MemoryVectorRecord {
             created_at: data.created_at,
             updated_at: data.updated_at,
             indexed_at: command_utils::util::datetime::now_millis(),
+            // Legacy RDB rows decode as UNSPECIFIED. Their historical
+            // semantics are RAW until the offline classifier
+            // assigns a generated kind.
+            memory_kind: normalized_memory_kind(data.memory_kind),
         }
+    }
+}
+
+/// Legacy rows (pre-MemoryKind, or NULL from a manual migration) decode
+/// as UNSPECIFIED. Their historical semantics are RAW until an
+/// offline classifier assigns a generated kind. Shared across the
+/// `infra` vector-store records and the `app` layer's own kind
+/// resolution, which all apply the same backfill policy.
+pub fn normalized_memory_kind(kind: i32) -> i32 {
+    if kind == MemoryKind::Unspecified as i32 {
+        MemoryKind::Raw as i32
+    } else {
+        kind
     }
 }

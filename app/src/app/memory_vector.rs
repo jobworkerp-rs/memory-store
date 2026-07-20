@@ -1589,14 +1589,22 @@ impl MemoryVectorAppImpl {
         thread_id: Option<i64>,
         batch_size: Option<u32>,
         kinds: &[DispatchKind],
+        memory_kinds: &[i32],
     ) -> Result<(u32, u32, u32, i64)> {
         let dispatcher = self.embedding_dispatcher.as_ref().ok_or_else(|| {
             LlmMemoryError::InvalidArgument(
                 "embedding dispatcher is not configured; cannot redispatch embeddings".to_string(),
             )
         })?;
-        self.redispatch_embeddings_with(dispatcher.as_ref(), user_id, thread_id, batch_size, kinds)
-            .await
+        self.redispatch_embeddings_with(
+            dispatcher.as_ref(),
+            user_id,
+            thread_id,
+            batch_size,
+            kinds,
+            memory_kinds,
+        )
+        .await
     }
 
     /// Inner loop extracted from [`Self::redispatch_embeddings`] so unit
@@ -1611,6 +1619,7 @@ impl MemoryVectorAppImpl {
         thread_id: Option<i64>,
         batch_size: Option<u32>,
         kinds: &[DispatchKind],
+        memory_kinds: &[i32],
     ) -> Result<(u32, u32, u32, i64)> {
         let page_size = batch_size.unwrap_or(500).clamp(1, 5000) as i32;
         // Keyset pagination: track the last seen id and fetch rows with
@@ -1627,7 +1636,14 @@ impl MemoryVectorAppImpl {
         'outer: loop {
             let memories = self
                 .memory_repo
-                .find_list_by_condition_after_id(page_size, cursor, &[], user_id, thread_id)
+                .find_list_by_condition_after_id_with_memory_kinds(
+                    page_size,
+                    cursor,
+                    &[],
+                    memory_kinds,
+                    user_id,
+                    thread_id,
+                )
                 .await?;
             if memories.is_empty() {
                 break;
@@ -2455,7 +2471,7 @@ mod test {
         AggregationStrategy, HybridOptions, HybridStrategy,
     };
     use infra_utils::infra::test::{TEST_RUNTIME, setup_test_rdb_from};
-    use protobuf::llm_memory::data::{MediaObjectId, MemoryData, UserId};
+    use protobuf::llm_memory::data::{MediaObjectId, MemoryData, MemoryKind, UserId};
     use rand::RngExt;
 
     fn random_embedding(dim: usize) -> Vec<f32> {
@@ -2528,6 +2544,7 @@ mod test {
             external_id: None,
             media_object_id: None,
             thread_ids: Vec::new(),
+            memory_kind: MemoryKind::Raw as i32,
         };
         let mut tx = pool.begin().await?;
         let id = repo.create(&mut *tx, &data).await?;
@@ -2576,6 +2593,7 @@ mod test {
             external_id: None,
             media_object_id: Some(MediaObjectId { value: media_id }),
             thread_ids: Vec::new(),
+            memory_kind: MemoryKind::Raw as i32,
         };
         let id = memory_repo.create(&mut *tx, &data).await?;
         tx.commit().await?;
@@ -2694,6 +2712,7 @@ mod test {
             external_id: None,
             media_object_id: Some(MediaObjectId { value: media_id }),
             thread_ids: Vec::new(),
+            memory_kind: MemoryKind::Raw as i32,
         };
         let id = memory_repo.create(&mut *tx, &data).await?;
         tx.commit().await?;
@@ -2955,6 +2974,7 @@ mod test {
                 created_at: 1000,
                 updated_at: 1000,
                 indexed_at: command_utils::util::datetime::now_millis(),
+                memory_kind: 1,
             };
             app.vector_repo.upsert(&stale_record).await?;
 
@@ -3165,6 +3185,7 @@ mod test {
                 created_at: 1000,
                 updated_at: 1000,
                 indexed_at: command_utils::util::datetime::now_millis(),
+                memory_kind: 1,
             };
             app.vector_repo.upsert(&stale_record).await?;
 
@@ -3535,7 +3556,9 @@ mod test {
         TEST_RUNTIME.block_on(async {
             let dim = 8;
             let (app, _pool, _db) = setup_app(dim).await?;
-            let result = app.redispatch_embeddings(None, None, Some(10), &[]).await;
+            let result = app
+                .redispatch_embeddings(None, None, Some(10), &[], &[])
+                .await;
             assert!(result.is_err(), "missing dispatcher must fail");
             let err = result.unwrap_err().to_string();
             assert!(
@@ -3625,12 +3648,49 @@ mod test {
             ]);
 
             let (dispatched, skipped, failed, _duration) = app
-                .redispatch_embeddings_with(&stub, Some(user_id), None, Some(10), &[])
+                .redispatch_embeddings_with(&stub, Some(user_id), None, Some(10), &[], &[])
                 .await?;
 
             assert_eq!(dispatched, 1, "exactly one successful enqueue");
             assert_eq!(skipped, 1, "Ok(None) must be counted as skipped");
             assert_eq!(failed, 1, "Enqueue error must be counted as failed");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_redispatch_memory_kind_filter_selects_only_matching_rows() -> anyhow::Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let dim = 8;
+            let (app, pool, _db) = setup_app(dim).await?;
+            let user_id = 15_201;
+            create_test_memory(&app.memory_repo, pool, "raw", user_id).await?;
+            let reflection_id =
+                create_test_memory(&app.memory_repo, pool, "reflection", user_id).await?;
+            let update_memory_kind_sql = if cfg!(feature = "postgres") {
+                "UPDATE memory SET memory_kind = $1 WHERE id = $2"
+            } else {
+                "UPDATE memory SET memory_kind = ? WHERE id = ?"
+            };
+            sqlx::query(update_memory_kind_sql)
+                .bind(MemoryKind::Reflection as i32)
+                .bind(reflection_id)
+                .execute(pool)
+                .await?;
+
+            let stub = StubDispatcher::new(vec![]);
+            let (dispatched, skipped, failed, _) = app
+                .redispatch_embeddings_with(
+                    &stub,
+                    Some(user_id),
+                    None,
+                    Some(10),
+                    &[],
+                    &[MemoryKind::Reflection as i32],
+                )
+                .await?;
+
+            assert_eq!((dispatched, skipped, failed), (1, 0, 0));
             Ok(())
         })
     }
@@ -3682,6 +3742,7 @@ mod test {
                     None,
                     Some(10),
                     &[DispatchKind::Media],
+                    &[],
                 )
                 .await?;
             assert_eq!(
@@ -3705,6 +3766,7 @@ mod test {
                     None,
                     Some(10),
                     &[DispatchKind::Media],
+                    &[],
                 )
                 .await?;
             assert_eq!(
@@ -3737,7 +3799,7 @@ mod test {
             ))]);
 
             let (dispatched, skipped, failed, _duration) = app
-                .redispatch_embeddings_with(&stub, Some(user_id), None, Some(10), &[])
+                .redispatch_embeddings_with(&stub, Some(user_id), None, Some(10), &[], &[])
                 .await?;
 
             assert_eq!(dispatched, 0, "no successful enqueue on init failure");
@@ -3783,7 +3845,7 @@ mod test {
             // Pass 1: same stub instance → Init error → loop aborts
             // after the first row (existing fast-fail behaviour).
             let (d1, _s1, f1, _) = app
-                .redispatch_embeddings_with(&stub, Some(user_id), None, Some(10), &[])
+                .redispatch_embeddings_with(&stub, Some(user_id), None, Some(10), &[], &[])
                 .await?;
             assert_eq!(d1, 0, "first pass: init error blocks all dispatch");
             assert_eq!(f1, 1, "init error counted exactly once before break");
@@ -3793,7 +3855,7 @@ mod test {
             // init error is so this second pass can succeed on the same
             // app + dispatcher pair, not on a fresh one.
             let (d2, _s2, f2, _) = app
-                .redispatch_embeddings_with(&stub, Some(user_id), None, Some(10), &[])
+                .redispatch_embeddings_with(&stub, Some(user_id), None, Some(10), &[], &[])
                 .await?;
             assert_eq!(
                 d2, 2,
@@ -4193,6 +4255,7 @@ mod test {
             .bind(created_at)
             .bind(updated_at)
             .bind(None::<String>) // metadata
+            .bind(MemoryKind::Raw as i32)
             .execute(pool)
             .await?;
         if !labels.is_empty() {
@@ -4437,6 +4500,7 @@ mod test {
             .bind(1_000_i64)
             .bind(1_000_i64)
             .bind(None::<String>) // metadata
+            .bind(MemoryKind::Raw as i32)
             .execute(pool)
             .await?;
         Ok(())
@@ -4543,6 +4607,7 @@ mod test {
                 external_id: None,
                 media_object_id: None,
                 thread_ids: Vec::new(),
+                memory_kind: MemoryKind::Raw as i32,
             };
             let mut tx = pool.begin().await?;
             let sys_id = memory_repo.create(&mut *tx, &sys_data).await?.value;
@@ -5565,6 +5630,7 @@ mod test {
                 external_id: None,
                 media_object_id: None,
                 thread_ids: Vec::new(),
+                memory_kind: MemoryKind::Raw as i32,
             }),
             media: None,
         }
@@ -5750,6 +5816,7 @@ mod test {
                 external_id: None,
                 media_object_id: None,
                 thread_ids: Vec::new(),
+                memory_kind: MemoryKind::Raw as i32,
             };
             let mut tx = pool.begin().await?;
             let sys_id = app.memory_repo.create(&mut *tx, &sys_data).await?.value;

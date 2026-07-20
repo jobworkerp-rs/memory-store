@@ -1,4 +1,4 @@
-use crate::infra::memory_vector::record::vector_kind;
+use crate::infra::memory_vector::record::{normalized_memory_kind, vector_kind};
 use protobuf::llm_memory::data::ThreadData;
 
 /// LanceDB record representing one embedding chunk row for a Thread.
@@ -19,6 +19,7 @@ pub struct ThreadVectorRecord {
     pub begin_position: i32,
     pub end_position: i32,
     pub user_id: i64,
+    pub memory_kind: i32,
     pub content: String,
     pub description: Option<String>,
     pub labels: Vec<String>,
@@ -82,6 +83,10 @@ impl ThreadVectorRecord {
             begin_position,
             end_position,
             user_id: data.user_id.map_or(0, |u| u.value),
+            // RDB manual migration leaves legacy rows as NULL, which maps to
+            // the proto default. Vector rows must retain RAW
+            // semantics so scalar re-sync cannot make them unsearchable.
+            memory_kind: normalized_memory_kind(data.memory_kind),
             content,
             description: data.description.clone(),
             labels,
@@ -92,5 +97,38 @@ impl ThreadVectorRecord {
             updated_at: data.updated_at,
             indexed_at: command_utils::util::datetime::now_millis(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protobuf::llm_memory::data::MemoryKind;
+
+    #[test]
+    fn legacy_unspecified_kind_is_written_as_raw() {
+        let record = ThreadVectorRecord::from_thread_data(
+            1,
+            &ThreadData::default(),
+            vec![],
+            &[0.1, 0.2],
+            None,
+        );
+        assert_eq!(record.memory_kind, MemoryKind::Raw as i32);
+    }
+
+    #[test]
+    fn explicit_kind_is_preserved() {
+        let record = ThreadVectorRecord::from_thread_data(
+            1,
+            &ThreadData {
+                memory_kind: MemoryKind::Reflection as i32,
+                ..Default::default()
+            },
+            vec![],
+            &[0.1, 0.2],
+            None,
+        );
+        assert_eq!(record.memory_kind, MemoryKind::Reflection as i32);
     }
 }

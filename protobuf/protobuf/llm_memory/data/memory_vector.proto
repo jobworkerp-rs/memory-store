@@ -36,8 +36,8 @@ message MemorySearchFilter {
   optional int64 updated_before = 9;
   // Filter Memory by attributes of attached Threads. The thread-side fields
   // (user_id / labels / channel / created_* / updated_*) are independent from
-  // the memory-side filters above, so a memory whose owner differs from the
-  // thread owner (e.g. a shared ROLE_SYSTEM prompt) still matches when both
+  // the memory-side filters above, so a memory whose author differs from the
+  // thread creator (e.g. a shared ROLE_SYSTEM prompt) still matches when both
   // filters are satisfied independently.
   //
   // Size limits (configurable via `MEMORY_THREAD_FILTER_*` env vars):
@@ -45,6 +45,11 @@ message MemorySearchFilter {
   //   - resolved memory_id set > FTS_MAX_INLINE_IDS → failed_precondition
   //     (search-side opt-in fallback via FTS_APPROXIMATE_MODE; count is always strict)
   optional ThreadSearchFilter thread_filter = 10;
+  // Memory kinds to match. Empty means all kinds; multiple values use OR.
+  // This is independent from thread_filter.memory_kinds: it filters the
+  // memory record itself, including memories that are not attached to a
+  // thread.
+  repeated MemoryKind memory_kinds = 11;
 }
 
 // Common search options

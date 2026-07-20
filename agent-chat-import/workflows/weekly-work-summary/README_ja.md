@@ -29,7 +29,7 @@ worker を登録しておく（後述）。
 
 ## 前提条件
 
-- `daily-work-summary-single` が `daily_summary` ラベル付き要約スレッドを `user_id = 100000` 配下に生成済みであること
+- `daily-work-summary-single` が `daily_summary` ラベル付き `DAILY_SUMMARY` を対象の `user_id` 配下に生成済みであること
 - 各日次要約スレッドの `ThreadData.description` に `<YYYY-MM-DD> — <overall_purpose>` 形式のテキストが入っていること（daily-work-summary Step 14 で書き込まれる）
 - jobworkerp / memories / Ollama の起動状態は daily-work-summary と同じ
 - **ワークフローエンジンが jaq (>= 3.x) を使用していること**。ISO 週の `strptime("%G-W%V-%u")` は vanilla jq では正しく動かない
@@ -38,11 +38,12 @@ worker を登録しておく（後述）。
 
 | 項目 | 値 | 理由 |
 |---|---|---|
-| 集約スレッドの所有者 | `user_id = 100000` (= 日次・スレッド要約と同じ) | どれも要約エージェントの出力という位置づけ。ラベルでフィルタ可能なので user 分離は不要 |
+| 集約スレッドの所有者 | 入力 `user_id` (= 日次・スレッド要約と同じ) | `memory_kind` とラベルで要約階層を分離する |
 | 集約スレッドのラベル | `weekly_summary`, `iso_week:YYYY-Www`, `scope:<scope_key>`, `extra_labels_filter` の各値 (sort 済み) | `weekly_summary` で一覧、`iso_week:` で週絞り込み、`scope:` で同週内の異 scope を分離 |
-| 集約メモリの `external_id` | `weekly:YYYY-Www:<scope_key>` | `memory.external_id` は DB 全体で UNIQUE。同週に異なる `extra_labels_filter` で並列実行しても衝突しないよう scope を suffix に含める |
+| 集約メモリの `external_id` | `weekly:<user_id>:YYYY-Www:<scope_key>` | `memory.external_id` は DB 全体で UNIQUE。所有者と scope を含め、同週に異なるユーザーまたは `extra_labels_filter` で並列実行しても衝突しないようにする |
 | `scope_key` の算出 | `extra_labels_filter` を `sort \| join(",")`。空なら `_all` | 呼び出し側のラベル順に依存しない (`["b","a"]` も `["a","b"]` も `scope_key="a,b"`) |
 | 入力の取得方法 | `MemoryService.FindListByCondition` で **日次要約メモリ自身**を絞り込む (`external_id_prefix="daily:"` + `roles=[ROLE_ASSISTANT]` + `updated_after/before` + `thread_filter.labels=[daily_summary]+extra` の AND マッチ) | スレッドの `updated_at` はサーバが `AddMemory` 時に `now` で bump されるため、要約 *スレッド* 単位で絞ると元の会話日付ではなく要約実行日でヒットしてしまう。要約 *メモリ* の `updated_at` は元の日次集計時刻を保持しているため、メモリ単位で絞ることで正しく「会話があった週」で絞れる |
+
 | LLM 入力 | `memory.data.content` (構造化要約 JSON: overall_purpose / purpose_groups / by_topic / carryover) + `thread_description` の組み合わせ | 日次要約の構造を引き継いで動向 (trends) を推論 |
 | コンテキスト圧縮 | `max_context_chars` を超えたら updated_at desc 順の prefix を保持して末尾を切り捨て | 通常 1 週間で 7 件しか入力がないため発火することはほぼない |
 | 週境界 | ISO 8601 (月曜始まり) | 国際標準。jaq の `strptime("%G-W%V-%u")` で堅牢にパース可能 |
@@ -189,7 +190,7 @@ jobworkerp-client job enqueue-workflow \
 
 | パラメータ | 必須 | デフォルト | 説明 |
 |-----------|------|-----------|------|
-| `source_user_id` | - | `100000` | 集約対象 (`daily-work-summary-single` の `source_user_id`) |
+| `user_id` | ○ | - | 集約対象。`DAILY_SUMMARY` と週次出力を同じ実ユーザー所有にする |
 | `memories_grpc_host` / `_port` | ○ | `localhost:9100` | memories gRPC エンドポイント |
 | `daily_label` | - | `daily_summary` | 入力スレッドのマーカーラベル |
 | `weekly_label` | - | `weekly_summary` | 出力スレッドのマーカーラベル |
@@ -227,21 +228,21 @@ batch は `output_language` に応じて `memories-weekly-work-summary-single-ja
 
 `force_resummarize: false`（既定）のとき、以下を満たす場合にスキップする:
 
-1. 同 (week, scope) の `external_id = "weekly:YYYY-Www:<scope_key>"` 集約メモリが存在
+1. 同 (user_id, week, scope) の `external_id = "weekly:<user_id>:YYYY-Www:<scope_key>"` 集約メモリが存在
 2. その集約メモリの `updated_at` が、当週の入力日次要約群の最大 `updated_at` 以上
 
 ## 出力データの構造
 
 ### 集約スレッド (`Thread`)
 
-- `user_id`: `source_user_id` (= 100000)
+- `user_id`: 入力 `user_id` と同じ実ユーザー
 - `labels`: `["weekly_summary", "iso_week:YYYY-Www", "scope:<scope_key>"]` + sorted `extra_labels_filter`
 - `description`: `"YYYY-Www — <overall_purpose>"`
 
 ### 集約メモリ (`Memory`, role=ASSISTANT)
 
 - `content`: 下記 JSON 構造を `tojson` した文字列
-- `external_id`: `weekly:YYYY-Www:<scope_key>`
+- `external_id`: `weekly:<user_id>:YYYY-Www:<scope_key>`
 - `metadata`: `{iso_week, scope, extra_labels[], source_memory_count, source_memory_ids[], source_thread_ids[], summary_version}`
   - `source_memory_ids` は **日次要約メモリ** の id 列。`source_thread_ids` は補助情報
 

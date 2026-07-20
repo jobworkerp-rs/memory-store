@@ -43,8 +43,8 @@ memories-import upsert-generation-workers \
   `personality_profile`, `user:<source_user_id>`.
 - Layer-2 profile memories use
   `external_id = "personality_profile:<source_user_id>"`.
-- `personality_user_id` must differ from the source `user_id` and
-  `summary_user_id`.
+- Personality threads and memories use the source `user_id` with
+  `PERSONALITY`; no separate owner fields are accepted.
 
 ## Batch Example
 
@@ -52,8 +52,6 @@ memories-import upsert-generation-workers \
 jobworkerp-client job enqueue-workflow \
   -i '{
     "user_id": 1,
-    "personality_user_id": 200000,
-    "summary_user_id": 100000,
     "memories_grpc_host": "localhost",
     "memories_grpc_port": 9010,
     "ollama_base_url": "http://localhost:11434",

@@ -25,6 +25,7 @@ use protobuf::llm_memory::data::{
 use std::{sync::Arc, time::Duration};
 use stretto::TokioCache;
 
+use crate::app::memory_kind::preserve_memory_kind_for_update;
 use crate::app::memory_vector::{RepresentativeThreadInfo, enrich_memories_with_thread_info};
 use crate::app::thread_filter_resolver::{self, ThreadFilterConfig};
 
@@ -40,6 +41,8 @@ pub trait UseThreadFilterResolver {
 pub struct MemoryCondition {
     pub roles: Vec<i32>,
     pub content_types: Vec<i32>,
+    /// Lifecycle kinds matched directly on the memory row. Empty means all.
+    pub memory_kinds: Vec<i32>,
     pub user_id: Option<i64>,
     pub thread_id: Option<i64>,
     pub updated_at_range: UpdatedAtRange,
@@ -241,6 +244,7 @@ pub trait MemoryApp:
         &self,
         limit: Option<&i32>,
         offset: Option<&i64>,
+        memory_kinds: &[i32],
         _ttl: Option<&Duration>,
     ) -> Result<Vec<Memory>>
     where
@@ -251,7 +255,7 @@ pub trait MemoryApp:
         // self.with_cache(&k, ttl, || async {
         let mut memories = self
             .memory_repository()
-            .find_list(limit, offset, true)
+            .find_list_by_memory_kinds(limit, offset, memory_kinds, true)
             .await?;
         hydrate_media_list(self.media_subsystem(), &mut memories).await?;
         Ok(memories)
@@ -265,6 +269,7 @@ pub trait MemoryApp:
         limit: Option<&i32>,
         updated_after: Option<&i64>,
         updated_before: Option<&i64>,
+        memory_kinds: &[i32],
         _ttl: Option<&Duration>,
     ) -> Result<Vec<Memory>>
     where
@@ -275,13 +280,14 @@ pub trait MemoryApp:
         // self.with_cache(&k, ttl, || async {
         let mut memories = self
             .memory_repository()
-            .find_recent_list_by_user_id(
+            .find_recent_list_by_user_id_with_memory_kinds(
                 user_id,
                 limit,
                 UpdatedAtRange {
                     updated_after: updated_after.copied(),
                     updated_before: updated_before.copied(),
                 },
+                memory_kinds,
                 true,
             )
             .await?;
@@ -344,11 +350,12 @@ pub trait MemoryApp:
         // `find_memory_list`. See the TODO in that method.
         let memories = self
             .memory_repository()
-            .find_list_by_condition(
+            .find_list_by_condition_with_memory_kinds(
                 condition.limit.as_ref(),
                 condition.offset.as_ref(),
                 &condition.filter.roles,
                 &condition.filter.content_types,
+                &condition.filter.memory_kinds,
                 condition.filter.user_id,
                 condition.filter.thread_id,
                 condition.filter.updated_at_range,
@@ -388,9 +395,10 @@ pub trait MemoryApp:
             return Ok(0);
         }
         self.memory_repository()
-            .count_by_condition(
+            .count_by_condition_with_memory_kinds(
                 &filter.roles,
                 &filter.content_types,
+                &filter.memory_kinds,
                 filter.user_id,
                 filter.thread_id,
                 filter.updated_at_range,
@@ -668,6 +676,10 @@ impl MemoryApp for MemoryAppImpl {
     /// (the §6.3.1 guarded SQL). A missing target or a {2,5} reject rolls
     /// the whole tx back with InvalidArgument (design 2/3 §7.5.1).
     async fn create_memory(&self, memory: &MemoryData) -> Result<MemoryId> {
+        let memory = super::memory_kind::normalize_memory_for_create(
+            memory.clone(),
+            "MemoryService.Create",
+        )?;
         let db = self.memory_repository().db_pool();
         let mut tx = db.begin().await.map_err(LlmMemoryError::DBError)?;
 
@@ -685,7 +697,7 @@ impl MemoryApp for MemoryAppImpl {
             media_backend = Some(bump.storage_backend);
         }
 
-        let id = self.memory_repository().create(&mut *tx, memory).await?;
+        let id = self.memory_repository().create(&mut *tx, &memory).await?;
         tx.commit().await.map_err(LlmMemoryError::DBError)?;
 
         self.spawn_embedding_dispatch(
@@ -710,11 +722,33 @@ impl MemoryApp for MemoryAppImpl {
         id: &MemoryId,
         memory: &Option<MemoryData>,
     ) -> Result<UpdateOutcome> {
-        let Some(w) = memory else {
+        let Some(requested) = memory else {
             return Ok(UpdateOutcome::default());
         };
         let pool = self.memory_repository().db_pool();
         let mut tx = pool.begin().await.map_err(LlmMemoryError::DBError)?;
+        let existing = self
+            .memory_repository()
+            .find_by_ids_for_update_tx(&mut tx, &[id.value])
+            .await?;
+        let Some(stored) = existing.first().and_then(|memory| memory.data.as_ref()) else {
+            return Ok(UpdateOutcome::default());
+        };
+        let requested_user_id = requested.user_id.map(|user_id| user_id.value).unwrap_or(0);
+        let stored_user_id = stored.user_id.map(|user_id| user_id.value).unwrap_or(0);
+        if requested_user_id != stored_user_id {
+            return Err(LlmMemoryError::InvalidArgument(format!(
+                "cannot change memory user_id from {stored_user_id} to {requested_user_id}: \
+                 memory user_id is immutable once created"
+            ))
+            .into());
+        }
+        let normalized = preserve_memory_kind_for_update(
+            requested.clone(),
+            stored.memory_kind,
+            "MemoryService.UpdateMemory",
+        )?;
+        let w = &normalized;
 
         // Post-commit storage delete jobs for media that hit ref_count=0.
         let mut post_delete: Vec<(i64, MediaObjectRow)> = Vec::new();
@@ -731,23 +765,7 @@ impl MemoryApp for MemoryAppImpl {
             let media_repo = &media.repository;
             // Old media_object_id from the row-locked pre-update row
             // (same pattern as delete_memory's find_by_ids_for_update_tx).
-            let prev = self
-                .memory_repository()
-                .find_by_ids_for_update_tx(&mut tx, &[id.value])
-                .await?;
-            if prev.is_empty() {
-                // The target memory does not exist. Bail out BEFORE any
-                // ref_count change: otherwise (None, Some(b)) below would
-                // incr_ref a media nothing references and the 0-row
-                // UPDATE would still commit, orphaning ref_count=1
-                // forever. tx drops -> ROLLBACK (no-op). Mirrors
-                // delete_memory's `locked.is_empty()` early return.
-                return Ok(UpdateOutcome::default());
-            }
-            let old_mid: Option<i64> = prev
-                .first()
-                .and_then(|m| m.data.as_ref())
-                .and_then(|d| d.media_object_id.map(|x| x.value));
+            let old_mid = stored.media_object_id.map(|x| x.value);
             let new_mid: Option<i64> = w.media_object_id.map(|x| x.value);
 
             match (old_mid, new_mid) {
@@ -1184,6 +1202,7 @@ mod tests {
             external_id: None,
             media_object_id: media.map(|value| MediaObjectId { value }),
             thread_ids: Vec::new(),
+            memory_kind: 0,
         }
     }
 
@@ -1263,6 +1282,27 @@ mod tests {
     }
 
     // ---- Update 5-transition (§7.5.2 / spec §4.2.1.1) ----
+
+    #[test]
+    fn update_rejects_user_id_change() -> Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let p = pool().await;
+            let (a, _) = app(p);
+            let id = a.create_memory(&mem("body", None)).await?;
+            let mut update = mem("changed", None);
+            update.user_id = Some(UserId { value: 2 });
+
+            let error = a.update_memory(&id, &Some(update)).await.unwrap_err();
+            assert!(error.to_string().contains("memory user_id is immutable"));
+
+            let stored = a.find_memory(&id, None).await?.unwrap();
+            assert_eq!(
+                stored.data.and_then(|data| data.user_id).map(|id| id.value),
+                Some(1)
+            );
+            Ok(())
+        })
+    }
 
     #[test]
     fn update_none_to_some_increments() -> Result<()> {

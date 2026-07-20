@@ -13,8 +13,10 @@ input:
   schema:
     document:
       type: object
+      required:
+        - user_id
       properties:
-        source_user_id: { type: integer, default: 100000 }
+        user_id: { type: integer }
         memories_grpc_host: { type: string, default: "localhost" }
         memories_grpc_port: { type: integer, default: 9100 }
         memories_grpc_tls: { type: boolean, default: false }
@@ -140,7 +142,7 @@ do:
                       arguments:
                         input: >-
                           ${ {
-                            source_user_id: $workflow.input.source_user_id,
+                            user_id: $workflow.input.user_id,
                             target_date: $target_date,
                             timezone_offset_hours: $workflow.input.timezone_offset_hours,
                             memories_grpc_host: $workflow.input.memories_grpc_host,

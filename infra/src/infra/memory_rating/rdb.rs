@@ -559,6 +559,7 @@ mod test {
             external_id: None,
             media_object_id: None,
             thread_ids: Vec::new(),
+            memory_kind: 0,
         };
         let mut tx = db.begin().await.context("begin")?;
         let memory_id = memory_repo.create(&mut *tx, &memory_data).await?;
@@ -791,6 +792,7 @@ mod test {
             updated_at: 100,
             labels: vec![],
             metadata: None,
+            memory_kind: 0,
         };
         let mut tx = db.begin().await.context("begin")?;
         let thread_id = thread_repo.create(&mut *tx, &thread_data).await?;
@@ -810,6 +812,7 @@ mod test {
             external_id: None,
             media_object_id: None,
             thread_ids: Vec::new(),
+            memory_kind: 0,
         };
         let mut tx = db.begin().await.context("begin")?;
         let memory_id = memory_repo.create(&mut *tx, &memory_data).await?;

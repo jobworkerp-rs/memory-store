@@ -23,7 +23,7 @@ upsert-generation-workers` before running.
 
 ## Prerequisites
 
-- Thread summaries exist under `summary_user_id = 100000`.
+- Thread summaries exist under the requested `user_id` with kind `THREAD_SUMMARY`.
 - Summary threads have `summary` labels.
 - `ThreadData.description` contains the thread title/summary text written by
   `thread-summary-single`.
@@ -32,11 +32,11 @@ upsert-generation-workers` before running.
 
 | Item | Behavior |
 |---|---|
-| Owner | `user_id = 100000`, same as thread summaries |
+| Thread creator | Requested `user_id`, same as thread summaries |
 | Labels | `daily_summary`, `date:YYYY-MM-DD`, `scope:<scope_key>`, plus extra labels |
-| External ID | `daily:YYYY-MM-DD:<scope_key>` |
+| External ID | `daily:<user_id>:YYYY-MM-DD:<scope_key>` |
 | Scope key | Sorted `extra_labels_filter` joined by comma, or `_all` |
-| Input query | Finds summary memories by `external_id_prefix="summary:"`, role, updated window, and labels |
+| Input query | Finds `THREAD_SUMMARY` memories by `external_id_prefix="summary:"`, role, updated window, and labels |
 
 Filtering by memory `updated_at` preserves the original conversation date,
 unlike filtering by summary-thread `updated_at`, which is bumped when summary
@@ -52,7 +52,6 @@ status definitions](../thread-summary/README.md#status-values).
 jobworkerp-client job enqueue-workflow \
   -i '{
     "user_id": 1,
-    "summary_user_id": 100000,
     "target_date": "2026-05-01",
     "memories_grpc_host": "localhost",
     "memories_grpc_port": 9010,

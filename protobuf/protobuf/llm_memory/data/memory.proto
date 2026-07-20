@@ -14,8 +14,8 @@ message MemoryData {
   // MemoryIds of every message passed to the LLM as input. Only stores
   // MemoryIds that exist in memoriesDB.
   repeated MemoryId parent_ids = 2;
-  // Owning user of this memory. Used by filters such as
-  // FindRecentListByUserId.
+  // Author (speaker) of this memory. Used by filters such as
+  // FindRecentListByUserId; it is independent from the thread creator.
   llm_memory.data.UserId user_id = 3;
   // Actual text content of the memory (prompt to the LLM, the
   // response, etc.).
@@ -52,6 +52,9 @@ message MemoryData {
   // Create / Update ignore this field; use ThreadService.AddMemory or
   // ThreadService.AddMemoriesBatch to attach memories to threads.
   repeated ThreadId thread_ids = 15;
+  // Data kind owned by this memory. Zero is accepted only during the
+  // expand/compatibility migration and is rejected at the persistence boundary.
+  MemoryKind memory_kind = 16;
 }
 
 // Unique identifier for a memory record.

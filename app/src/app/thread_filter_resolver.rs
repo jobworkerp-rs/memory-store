@@ -139,6 +139,7 @@ pub fn has_non_label_filters(f: &ThreadSearchFilter) -> bool {
         || f.created_before.is_some()
         || f.updated_after.is_some()
         || f.updated_before.is_some()
+        || !f.memory_kinds.is_empty()
 }
 
 /// True iff the non-label route is *actually needed* on top of the
@@ -152,7 +153,8 @@ pub fn needs_other_route(f: &ThreadSearchFilter) -> bool {
         || f.created_after.is_some()
         || f.created_before.is_some()
         || f.updated_after.is_some()
-        || f.updated_before.is_some();
+        || f.updated_before.is_some()
+        || !f.memory_kinds.is_empty();
     if !f.labels.is_empty() {
         // labels route already AND-applies user_id; only run the other
         // route when there is genuinely a non-user_id condition.
@@ -235,6 +237,7 @@ pub async fn resolve_memory_ids_from_thread_filter(
                 filter.created_before,
                 filter.updated_after,
                 filter.updated_before,
+                &filter.memory_kinds,
                 cfg.intermediate_hard_limit,
             )
             .await?;
@@ -350,6 +353,10 @@ mod tests {
                 updated_before: Some(1),
                 ..Default::default()
             },
+            ThreadSearchFilter {
+                memory_kinds: vec![1],
+                ..Default::default()
+            },
         ] {
             assert!(
                 has_non_label_filters(&f),
@@ -395,6 +402,11 @@ mod tests {
             ThreadSearchFilter {
                 labels: vec!["rust".into()],
                 updated_before: Some(2),
+                ..Default::default()
+            },
+            ThreadSearchFilter {
+                labels: vec!["rust".into()],
+                memory_kinds: vec![1],
                 ..Default::default()
             },
         ] {

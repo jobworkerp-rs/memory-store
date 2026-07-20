@@ -19,6 +19,7 @@ pub struct ThreadRow {
     pub created_at: i64,
     pub updated_at: i64,
     pub metadata: Option<String>,
+    pub memory_kind: Option<i32>,
 }
 
 impl ThreadRow {
@@ -49,6 +50,7 @@ impl ThreadRow {
                 // Labels are hydrated separately by the app layer
                 labels: vec![],
                 metadata: self.metadata.clone(),
+                memory_kind: self.memory_kind.unwrap_or(0),
             }),
         }
     }

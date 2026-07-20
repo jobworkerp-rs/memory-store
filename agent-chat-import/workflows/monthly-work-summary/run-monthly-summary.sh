@@ -21,7 +21,7 @@
 #   --start-month <YYYY-MM>             range start (inclusive)
 #   --end-month <YYYY-MM>               range end (inclusive)
 #   --target-month <YYYY-MM>            shortcut: same as --start --end <month>
-#   --source-user-id <i64>              default: 100000 (the summary-agent user)
+#   --user-id <i64>                     required owner of the summaries
 #   --extra-labels <csv>                extra AND-matched labels (default: none)
 #   --weekly-label <str>                default: weekly_summary
 #   --monthly-label <str>               default: monthly_summary
@@ -80,7 +80,7 @@ LAST_N_MONTHS=""
 START_MONTH=""
 END_MONTH=""
 
-SOURCE_USER_ID="100000"
+USER_ID="${MEMORY_USER_ID:-}"
 EXTRA_LABELS_CSV=""
 WEEKLY_LABEL="weekly_summary"
 MONTHLY_LABEL="monthly_summary"
@@ -127,7 +127,7 @@ while [[ $# -gt 0 ]]; do
         --start-month)              START_MONTH="$2"; shift 2 ;;
         --end-month)                END_MONTH="$2"; shift 2 ;;
         --target-month)             START_MONTH="$2"; END_MONTH="$2"; shift 2 ;;
-        --source-user-id)           SOURCE_USER_ID="$2"; shift 2 ;;
+        --user-id)                  USER_ID="$2"; shift 2 ;;
         --extra-labels)             EXTRA_LABELS_CSV="$2"; shift 2 ;;
         --weekly-label)             WEEKLY_LABEL="$2"; shift 2 ;;
         --monthly-label)            MONTHLY_LABEL="$2"; shift 2 ;;
@@ -175,6 +175,10 @@ need_cmd() {
 }
 need_cmd jobworkerp-client
 need_cmd python3   # used to assemble the JSON input safely
+if [[ -z "$USER_ID" ]]; then
+    echo "error: --user-id is required (or set MEMORY_USER_ID)" >&2
+    exit 2
+fi
 
 # Validate month selection: at most one of (last_n_months, range).
 if [[ -n "$LAST_N_MONTHS" && ( -n "$START_MONTH" || -n "$END_MONTH" ) ]]; then
@@ -267,14 +271,14 @@ fi
 # ----------------------------------------------------------------
 # Build workflow input JSON
 # ----------------------------------------------------------------
-INPUT_JSON=$(python3 - <<'PY' "$SOURCE_USER_ID" "$MEMORIES_GRPC_HOST" "$MEMORIES_GRPC_PORT" "$START_MONTH" "$END_MONTH" "$LAST_N_MONTHS" "$TIMEZONE_OFFSET_HOURS" "$WEEKLY_LABEL" "$MONTHLY_LABEL" "$EXTRA_LABELS_CSV" "$MIN_THREAD_COUNT" "$MAX_CONTEXT_CHARS" "$SUMMARY_MODEL" "$OLLAMA_BASE_URL" "$OUTPUT_LANGUAGE" "$FORCE_RESUMMARIZE"
+INPUT_JSON=$(python3 - <<'PY' "$USER_ID" "$MEMORIES_GRPC_HOST" "$MEMORIES_GRPC_PORT" "$START_MONTH" "$END_MONTH" "$LAST_N_MONTHS" "$TIMEZONE_OFFSET_HOURS" "$WEEKLY_LABEL" "$MONTHLY_LABEL" "$EXTRA_LABELS_CSV" "$MIN_THREAD_COUNT" "$MAX_CONTEXT_CHARS" "$SUMMARY_MODEL" "$OLLAMA_BASE_URL" "$OUTPUT_LANGUAGE" "$FORCE_RESUMMARIZE"
 import json, sys
-(_, source_user_id, host, port, start_month, end_month, last_n,
+(_, user_id, host, port, start_month, end_month, last_n,
  tz, weekly_label, monthly_label, extra_csv, min_thread, max_chars,
  model, ollama, output_language, force) = sys.argv
 
 payload = {
-    "source_user_id": int(source_user_id),
+    "user_id": int(user_id),
     "memories_grpc_host": host,
     "memories_grpc_port": int(port),
     "weekly_label": weekly_label,

@@ -25,7 +25,7 @@ worker を登録しておく（後述）。
 
 ## 前提条件
 
-- `thread-summary-single` が `summary` ラベル付き要約スレッドを `user_id = 100000` 配下に生成済みであること
+- `thread-summary-single` が `summary` ラベル付き `THREAD_SUMMARY` を対象の `user_id` 配下に生成済みであること
 - 各要約スレッドの `ThreadData.description` に `【タイトル】 要約本文` 形式のテキストが入っていること（thread-summary-single の Step 9 で書き込まれる）
 - jobworkerp / memories / Ollama の起動状態は thread-summary と同じ
 
@@ -33,11 +33,12 @@ worker を登録しておく（後述）。
 
 | 項目 | 値 | 理由 |
 |---|---|---|
-| 集約スレッドの所有者 | `user_id = 100000` (= thread 要約と同じ) | どちらも要約エージェントの出力という位置づけ。ラベルでフィルタ可能なので user 分離は不要 |
+| 集約スレッドの所有者 | 入力 `user_id` (= thread 要約と同じ) | `memory_kind` とラベルで要約階層を分離する |
 | 集約スレッドのラベル | `daily_summary`, `date:YYYY-MM-DD`, `scope:<scope_key>`, `extra_labels_filter` の各値 (sort 済み) | `daily_summary` で一覧、`date:` で日付絞り込み、`scope:` で同日内の異 scope を分離 |
-| 集約メモリの `external_id` | `daily:YYYY-MM-DD:<scope_key>` | `memory.external_id` は DB 全体で UNIQUE。同日に異なる `extra_labels_filter` で並列実行しても衝突しないよう scope を suffix に含める |
+| 集約メモリの `external_id` | `daily:<user_id>:YYYY-MM-DD:<scope_key>` | `memory.external_id` は DB 全体で UNIQUE。所有者と scope を含め、同日に異なるユーザーまたは `extra_labels_filter` で並列実行しても衝突しないようにする |
 | `scope_key` の算出 | `extra_labels_filter` を `sort | join(",")`。空なら `_all` | 呼び出し側のラベル順に依存しない (`["b","a"]` も `["a","b"]` も `scope_key="a,b"`)。external_id・スレッドラベル・filter request すべてが順序非依存 |
 | 入力の取得方法 | `MemoryService.FindListByCondition` で **要約メモリ自身**を絞り込む (`external_id_prefix="summary:"` + `roles=[ROLE_ASSISTANT]` + `updated_after/before` + `thread_filter.labels=[summary]+extra` の AND マッチ) | スレッドの `updated_at` はサーバが `AddMemory` 時に `now` で bump されるため、要約 *スレッド* 単位で絞ると元の会話日付ではなく要約実行日でヒットしてしまう。要約 *メモリ* の `updated_at` は `thread-summary-single` が元スレッドの updated_at をそのまま転記しているため、メモリ単位で絞ることで正しく「会話があった日」で絞れる |
+
 | LLM 入力 | `memory.data.content` (構造化要約 JSON: category / title / summary / key_decisions / status) + `thread_description` の組み合わせ | スレッドの一行サマリだけでなく key_decisions など詳細データを LLM に渡すことでグルーピング精度を上げる |
 | コンテキスト圧縮 | `max_context_chars` を超えたら updated_at desc 順の prefix を保持して末尾を切り捨て | 時系列の新しい順に詰めるので、日のうち古い議論が落ちる |
 
@@ -180,7 +181,7 @@ jobworkerp-client job enqueue-workflow \
 
 | パラメータ | 必須 | デフォルト | 説明 |
 |-----------|------|-----------|------|
-| `source_user_id` | - | `100000` | 集約対象 (`thread-summary-single` の `summary_user_id`) |
+| `user_id` | ○ | - | 集約対象。`THREAD_SUMMARY` と日次出力を同じ実ユーザー所有にする |
 | `memories_grpc_host` / `_port` | ○ | `localhost:9100` | memories gRPC エンドポイント |
 | `summary_label` | - | `summary` | 入力スレッドのマーカーラベル |
 | `daily_label` | - | `daily_summary` | 出力スレッドのマーカーラベル |
@@ -218,21 +219,21 @@ batch は `output_language` に応じて `memories-daily-work-summary-single-ja`
 
 `force_resummarize: false`（既定）のとき、以下を満たす場合にスキップする:
 
-1. 同 (date, scope) の `external_id = "daily:YYYY-MM-DD:<scope_key>"` 集約メモリが存在
+1. 同 (user_id, date, scope) の `external_id = "daily:<user_id>:YYYY-MM-DD:<scope_key>"` 集約メモリが存在
 2. その集約メモリの `updated_at` が、当日の入力スレッド群の最大 `updated_at` 以上
 
 ## 出力データの構造
 
 ### 集約スレッド (`Thread`)
 
-- `user_id`: `source_user_id` (= 100000)
+- `user_id`: 入力 `user_id` と同じ実ユーザー
 - `labels`: `["daily_summary", "date:YYYY-MM-DD", "scope:<scope_key>"]` + sorted `extra_labels_filter`
 - `description`: `"YYYY-MM-DD — <overall_purpose>"`
 
 ### 集約メモリ (`Memory`, role=ASSISTANT)
 
 - `content`: 下記 JSON 構造を `tojson` した文字列
-- `external_id`: `daily:YYYY-MM-DD:<scope_key>`
+- `external_id`: `daily:<user_id>:YYYY-MM-DD:<scope_key>`
 - `metadata`: `{daily_date, scope, extra_labels[], source_memory_count, source_memory_ids[], source_thread_ids[], summary_version}`
   - `scope` / `extra_labels` で「どのフィルタ条件で生成された要約か」をトレース可能
   - 主軸は `source_memory_ids`（要約メモリ単位の正確なトレース）。`source_thread_ids` は集計の便宜のため要約メモリの所属スレッドを `unique` した補助情報として残す

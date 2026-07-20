@@ -40,7 +40,7 @@ importChats (COMMAND: memories-import)
 | Input | Description |
 |---|---|
 | `source` | `claude-code`, `codex`, or `plain` |
-| `user_id` | Import owner user ID |
+| `user_id` | Creator user ID for imported threads |
 | `memories_grpc_url` | Passed to `memories-import --server-url` |
 
 Common optional inputs include `since_date`, `end_date`,

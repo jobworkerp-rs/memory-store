@@ -51,7 +51,7 @@ input:
         # ---- subject / endpoint -------------------------------------------
         user_id:
           type: integer
-          description: Owner user_id of the threads to be summarized/reflected.
+          description: Creator user_id of the threads to be summarized/reflected.
         memories_grpc_url:
           type: string
           description: >-
@@ -121,10 +121,6 @@ input:
             Absolute path / URL of daily-work-summary-batch.yaml.
             Empty (default) skips the daily-summary stage entirely.
         # ---- summary tuning -----------------------------------------------
-        summary_user_id:
-          type: integer
-          default: 100000
-          description: Summary memory owner. Must differ from user_id.
         summary_model:
           type: string
           default: "qwen3.6:27b"
@@ -169,12 +165,6 @@ input:
             runs the per-thread layer only. The path itself is no longer
             dispatched — the merge runs via the registered
             user-personality-merge language worker.
-        personality_user_id:
-          type: integer
-          default: 200000
-          description: >-
-            Owner user_id for personality memories. MUST differ from
-            both `user_id` and `summary_user_id`.
         personality_model:
           type: string
           default: ""
@@ -362,9 +352,8 @@ do:
              and ($workflow.input.user_personality_merge_yaml // "") != "" }
 
   # Step 3: Run the summary and personality pipelines concurrently.
-  # The two systems own disjoint user_id spaces (summary_user_id vs
-  # personality_user_id) and never read each other's data, so a fork
-  # is safe.
+  # The branches are kind-scoped and never read each other's data, so a fork
+  # is safe even though both use the source thread creator's ID.
   #
   # summaryBranch runs threadSummaryBatch → dailyWorkSummary →
   # reflectionStage serially. reflection is at the end (not before
@@ -418,7 +407,6 @@ do:
                               output_language: $workflow.input.output_language,
                               memory_thread_label_prefix: $workflow.input.memory_thread_label_prefix,
                               force_resummarize: $workflow.input.force_resummarize,
-                              summary_user_id: $workflow.input.summary_user_id,
                               min_message_count: 4,
                               max_context_chars: $workflow.input.max_context_chars
                             } | tojson }
@@ -441,7 +429,7 @@ do:
                         arguments:
                           input: >-
                             ${ {
-                              source_user_id: $workflow.input.summary_user_id,
+                              user_id: $workflow.input.user_id,
                               start_date: $workflow.input.since_date,
                               end_date: $workflow.input.end_date,
                               timezone_offset_hours: $workflow.input.timezone_offset_hours,
@@ -542,8 +530,6 @@ do:
                               ollama_base_url: $workflow.input.ollama_base_url,
                               output_language: $workflow.input.output_language,
                               force_reextract: $workflow.input.force_reextract,
-                              personality_user_id: $workflow.input.personality_user_id,
-                              summary_user_id: $workflow.input.summary_user_id,
                               min_message_count: 4,
                               min_user_messages: $workflow.input.min_user_messages,
                               max_context_chars: $workflow.input.max_context_chars

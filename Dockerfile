@@ -23,6 +23,7 @@ COPY Cargo.toml Cargo.lock ./
 
 # Workspace members (must match memories/Cargo.toml `members`).
 COPY modules modules/
+COPY common common/
 COPY protobuf protobuf/
 COPY infra infra/
 COPY app app/
@@ -47,6 +48,7 @@ RUN cargo build --release \
         --features postgres,lindera \
         -p grpc-admin \
         --bin front \
+        --bin migrate-memory-kind \
         --bin migrate-attachment-to-media \
         --bin cleanup-orphan-media
 
@@ -87,6 +89,7 @@ WORKDIR /home/memories
 COPY --from=builder --chown=memories:memories /build/target/release/memories-import ./memories-import
 COPY --from=builder --chown=memories:memories /build/target/release/front ./front
 # Operational batch jobs, run as one-off k8s Pods from this image.
+COPY --from=builder --chown=memories:memories /build/target/release/migrate-memory-kind ./migrate-memory-kind
 COPY --from=builder --chown=memories:memories /build/target/release/migrate-attachment-to-media ./migrate-attachment-to-media
 COPY --from=builder --chown=memories:memories /build/target/release/cleanup-orphan-media ./cleanup-orphan-media
 COPY --chown=memories:memories workflows ./workflows

@@ -162,6 +162,7 @@ async fn redis_test() -> Result<()> {
         external_id: None,
         media_object_id: None,
         thread_ids: Vec::new(),
+        memory_kind: 0,
     };
     // clear first
     repo.delete(&id).await?;

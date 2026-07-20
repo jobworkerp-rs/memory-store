@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, bail};
-use app::app::REFLECTION_USER_ID;
 use app::app::reflection::build_memory_data::build_reflection_search_document_from_metadata;
 use clap::{Parser, Subcommand};
 use infra::infra::memory::rdb::{MemoryRepository, MemoryRepositoryImpl};
@@ -7,7 +6,7 @@ use infra::infra::memory_vector::dispatcher::{EmbeddingDispatch, EmbeddingJobDis
 use infra::infra::module::RepositoryModule;
 use infra_utils::infra::rdb::UseRdbPool;
 use infra_utils::infra::rdb::{Rdb, RdbPool};
-use protobuf::llm_memory::data::{MemoryId, MessageRole};
+use protobuf::llm_memory::data::{MemoryId, MemoryKind, MessageRole};
 
 #[cfg(feature = "postgres")]
 const METADATA_TEXT_EXPR: &str = "m.metadata::TEXT";
@@ -205,23 +204,27 @@ async fn fetch_page(
     batch_size: i64,
     after_id: i64,
 ) -> Result<Vec<ReflectionBackfillRow>> {
-    let sql = format!(
-        "SELECT m.id AS id, m.content AS content, {METADATA_TEXT_EXPR} AS metadata, \
-         m.created_at AS created_at, tri.origin_user_id AS origin_user_id, \
-         tri.origin_thread_id AS origin_thread_id \
-         FROM memory m \
-         JOIN thread_reflection_index tri ON tri.memory_id = m.id \
-         WHERE m.id > {P1} AND m.user_id = {P2} AND m.role = {P3} \
-         ORDER BY m.id ASC LIMIT {P4}"
-    );
+    let sql = reflection_page_sql();
     sqlx::query_as::<Rdb, ReflectionBackfillRow>(sqlx::AssertSqlSafe(sql))
         .bind(after_id)
-        .bind(REFLECTION_USER_ID)
+        .bind(MemoryKind::Reflection as i32)
         .bind(MessageRole::RoleReflection as i32)
         .bind(batch_size)
         .fetch_all(pool)
         .await
         .context("fetching reflection memory page")
+}
+
+fn reflection_page_sql() -> String {
+    format!(
+        "SELECT m.id AS id, m.content AS content, {METADATA_TEXT_EXPR} AS metadata, \
+         m.created_at AS created_at, tri.origin_user_id AS origin_user_id, \
+         tri.origin_thread_id AS origin_thread_id \
+         FROM memory m \
+         JOIN thread_reflection_index tri ON tri.memory_id = m.id \
+         WHERE m.id > {P1} AND m.memory_kind = {P2} AND m.role = {P3} \
+         ORDER BY m.id ASC LIMIT {P4}"
+    )
 }
 
 fn matches_filter(row: &ReflectionBackfillRow, args: &BackfillArgs) -> bool {
@@ -249,4 +252,16 @@ async fn update_content(repo: &MemoryRepositoryImpl, memory_id: i64, content: &s
         .await?;
     tx.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reflection_backfill_is_selected_by_kind_not_reserved_owner() {
+        let sql = reflection_page_sql();
+        assert!(sql.contains("m.memory_kind"));
+        assert!(!sql.contains("m.user_id"));
+    }
 }

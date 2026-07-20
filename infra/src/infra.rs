@@ -2,6 +2,7 @@ pub mod embedding_dispatch;
 pub mod media_object;
 pub mod media_storage;
 pub mod memory;
+pub mod memory_kind_migration;
 pub mod memory_rating;
 pub mod memory_vector;
 pub mod module;

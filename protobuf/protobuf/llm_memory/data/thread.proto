@@ -14,7 +14,7 @@ message ThreadData {
     // If the caller already supplies a ROLE_SYSTEM memory in `parent_ids`,
     // this default is ignored.
     optional int64 default_system_memory_id = 1;
-    // Owning user of the thread.
+    // User that created this thread.
     llm_memory.data.UserId user_id = 2;
     // Free-form description of the thread (conversation topic or
     // purpose). May be auto-generated or updated by the LLM later.
@@ -58,6 +58,9 @@ message ThreadData {
     // metadata: when an upsert hits an already-present thread, this field on the
     // incoming ThreadData is ignored. Use ThreadService.Update to mutate it.
     optional string metadata = 11;
+    // Data kind owned by this thread. Zero is accepted only during the
+    // expand/compatibility migration and is rejected at the persistence boundary.
+    MemoryKind memory_kind = 12;
 }
 
 // Unique identifier for a thread.

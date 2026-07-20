@@ -38,7 +38,7 @@ reflected in those flags.
 | `agent_chat_import_yaml` | Import sub-workflow path/URL |
 | `agent_chat_summary_yaml` | Summary sub-workflow path/URL |
 | `source` | `claude-code`, `codex`, or `plain` |
-| `user_id` | Conversation owner |
+| `user_id` | Conversation thread creator |
 | `memories_grpc_url` | Importer server URL |
 | `memories_grpc_host` / `memories_grpc_port` | Callback endpoint for summary workflows |
 | `thread_summary_batch_yaml` | Thread summary batch YAML |

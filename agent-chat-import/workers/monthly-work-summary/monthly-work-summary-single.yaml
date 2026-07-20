@@ -7,11 +7,11 @@ document:
 # Aggregates per-week summaries (produced by weekly-work-summary-single)
 # for one calendar month into a single "monthly work summary" memory.
 #
-# Input is the set of memories owned by `source_user_id` carrying the
+# Input is the set of WEEKLY_SUMMARY memories owned by `user_id` carrying the
 # `weekly_label` marker AND whose memory.updated_at falls within
 # [month_start, month_end) (1st 00:00 local — next-month-1st 00:00
 # local). Output is one memory under a monthly_summary thread keyed by
-# `external_id = "monthly:<YYYY-MM>:<scope_key>"` so re-runs are
+# `external_id = "monthly:<user_id>:<YYYY-MM>:<scope_key>"` so re-runs are
 # idempotent.
 #
 # Note on month-straddling ISO weeks: a weekly memory's updated_at is
@@ -24,12 +24,12 @@ input:
   schema:
     document:
       type: object
-      required: []
+      required:
+        - user_id
       properties:
-        source_user_id:
+        user_id:
           type: integer
-          default: 100000
-          description: Owner of per-week summaries (the summary-agent user).
+          description: Creator of per-week summaries and monthly aggregates.
         target_month:
           type: string
           default: ""
@@ -181,10 +181,10 @@ do:
                      | mktime) - $tz_offset_seconds)
               end) * 1000 }
 
-  # Step 3: Alias for readability. Schema-injected default is 100000.
-  - normalizeSourceUserId:
+  # Step 3: Alias for readability.
+  - normalizeUserId:
       set:
-        effective_source_user_id: "${ $workflow.input.source_user_id }"
+        effective_user_id: "${ $workflow.input.user_id }"
 
   # Step 3a: Derive scope_key from extra_labels_filter. memory.external_id
   # is UNIQUE DB-wide, so distinct filter sets must produce distinct
@@ -204,7 +204,7 @@ do:
   - composeMonthlyExternalId:
       set:
         monthly_external_id: >-
-          ${ "monthly:" + $target_month_resolved + ":" + $scope_key }
+          ${ "monthly:" + ($effective_user_id | tostring) + ":" + $target_month_resolved + ":" + $scope_key }
         monthly_thread_labels: >-
           ${ [$workflow.input.monthly_label,
               "month:" + $target_month_resolved,
@@ -231,7 +231,7 @@ do:
             json_body: >-
               ${ {
                 roles: ["ROLE_ASSISTANT"],
-                user_id: { value: $effective_source_user_id },
+                user_id: { value: $effective_user_id },
                 external_id_prefix: "weekly:",
                 # API: updated_after is strict (>), updated_before is
                 # inclusive (<=). To express the half-open interval
@@ -241,7 +241,8 @@ do:
                 updated_before: ($month_end_ms - 1),
                 content_types: ["TEXT"],
                 thread_filter: {
-                  user_id: $effective_source_user_id,
+                  user_id: $effective_user_id,
+                  memory_kinds: ["MEMORY_KIND_WEEKLY_SUMMARY"],
                   labels: ([$workflow.input.weekly_label]
                            + $sorted_extra_labels),
                   label_match_mode: "LABEL_ALL"
@@ -307,7 +308,8 @@ do:
                          "month:" + $target_month_resolved,
                          "scope:" + $scope_key],
                 match_mode: "LABEL_ALL",
-                user_id: $effective_source_user_id,
+                user_id: $effective_user_id,
+                memory_kinds: ["MEMORY_KIND_MONTHLY_SUMMARY"],
                 limit: 1
               } | tojson }
             as_json: true
@@ -325,8 +327,7 @@ do:
       set:
         existing_monthly_memory: "${ null }"
 
-  # Step 9: Look up the existing monthly memory inside that thread,
-  # keyed by external_id = "monthly:<YYYY-MM>:<scope_key>".
+  # Step 9: Look up the existing monthly memory inside that thread.
   - findExistingMonthlyMemory:
       if: "${ $existing_monthly_thread_id != null }"
       run:
@@ -352,7 +353,7 @@ do:
           existing_monthly_memory: >-
             ${ ((.jsonBody // "[]") | fromjson)
                | map(select(.data.externalId == $monthly_external_id))
-               | (if length > 0 then .[0] else null end) }
+               | if length > 0 then .[0] else null end }
 
   # Step 10: Eligibility — skip when an up-to-date monthly summary
   # already exists. Split into two setTasks because jaq's `set`
@@ -513,7 +514,8 @@ do:
             method: "/llm_memory.service.ThreadService/Create"
             json_body: >-
               ${ {
-                user_id: { value: $effective_source_user_id },
+                user_id: { value: $effective_user_id },
+                memory_kind: "MEMORY_KIND_MONTHLY_SUMMARY",
                 description: ($target_month_resolved + " の作業要約 ("
                               + ($target_memories | length | tostring)
                               + " 週次)"),
@@ -586,7 +588,8 @@ do:
               ${ {
                 thread_id: { value: $monthly_thread_id },
                 memory: {
-                  user_id: { value: $effective_source_user_id },
+                  user_id: { value: $effective_user_id },
+                  memory_kind: "MEMORY_KIND_MONTHLY_SUMMARY",
                   content: ($summary_json | tojson),
                   content_type: "TEXT",
                   role: "ROLE_ASSISTANT",
@@ -609,7 +612,8 @@ do:
           ${ if $existing_monthly_thread_data != null
              then $existing_monthly_thread_data
              else {
-               user_id: { value: $effective_source_user_id },
+               user_id: { value: $effective_user_id },
+               memory_kind: "MEMORY_KIND_MONTHLY_SUMMARY",
                labels: $monthly_thread_labels,
                created_at: $month_start_ms,
                updated_at: $max_source_updated_at

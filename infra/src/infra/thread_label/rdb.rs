@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use infra_utils::infra::rdb::Rdb;
 use infra_utils::infra::rdb::RdbPool;
 use infra_utils::infra::rdb::UseRdbPool;
+use protobuf::llm_memory::data::MemoryKind;
 use sqlx::Executor;
 
 use super::rows::{LabelWithCountRow, ThreadLabelRow};
@@ -217,6 +218,29 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
         limit: Option<i32>,
         offset: Option<i64>,
     ) -> Result<Vec<i64>> {
+        self.find_thread_ids_by_labels_and_memory_kinds(
+            labels,
+            match_all,
+            user_id,
+            &[],
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    /// Find thread IDs that have the specified labels and memory kinds.
+    /// Memory kinds are applied in SQL before pagination, so an unrelated
+    /// kind cannot consume the intermediate candidate budget.
+    async fn find_thread_ids_by_labels_and_memory_kinds(
+        &self,
+        labels: &[String],
+        match_all: bool,
+        user_id: Option<i64>,
+        memory_kinds: &[i32],
+        limit: Option<i32>,
+        offset: Option<i64>,
+    ) -> Result<Vec<i64>> {
         if labels.is_empty() {
             return Ok(vec![]);
         }
@@ -243,6 +267,19 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
             String::new()
         };
 
+        let memory_kind_filter = if memory_kinds.is_empty() {
+            String::new()
+        } else {
+            let placeholders = build_in_placeholders(memory_kinds.len(), param_offset);
+            param_offset += memory_kinds.len();
+            let kind_clause = format!("t.memory_kind IN ({placeholders})");
+            if memory_kinds.contains(&(MemoryKind::Raw as i32)) {
+                format!(" AND ({kind_clause} OR t.memory_kind IS NULL OR t.memory_kind = 0)")
+            } else {
+                format!(" AND {kind_clause}")
+            }
+        };
+
         // `tl.thread_id DESC` is a stable tiebreaker so pages stay
         // deterministic when several threads share the same MAX(updated_at).
         // Without it, the app-level fast path (which trusts this SQL's
@@ -254,7 +291,7 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
             format!(
                 "SELECT tl.thread_id FROM thread_label tl \
                  JOIN thread t ON tl.thread_id = t.id \
-                 WHERE tl.label IN ({label_placeholders}){user_filter} \
+                 WHERE tl.label IN ({label_placeholders}){user_filter}{memory_kind_filter} \
                  GROUP BY tl.thread_id \
                  HAVING COUNT(DISTINCT tl.label) = {label_count} \
                  ORDER BY MAX(t.updated_at) DESC, tl.thread_id DESC \
@@ -266,7 +303,7 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
             format!(
                 "SELECT tl.thread_id FROM thread_label tl \
                  JOIN thread t ON tl.thread_id = t.id \
-                 WHERE tl.label IN ({label_placeholders}){user_filter} \
+                 WHERE tl.label IN ({label_placeholders}){user_filter}{memory_kind_filter} \
                  GROUP BY tl.thread_id \
                  ORDER BY MAX(t.updated_at) DESC, tl.thread_id DESC \
                  LIMIT {} OFFSET {}",
@@ -281,6 +318,9 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
         }
         if let Some(uid) = user_id {
             query = query.bind(uid);
+        }
+        for kind in memory_kinds {
+            query = query.bind(*kind);
         }
         query = query.bind(limit.unwrap_or(100) as i64);
         query = query.bind(offset.unwrap_or(0));
@@ -592,6 +632,7 @@ mod test {
             updated_at: 0,
             labels: vec![],
             metadata: None,
+            memory_kind: 0,
         }
     }
 

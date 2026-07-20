@@ -15,6 +15,7 @@ pub struct MemoryRow {
     pub role: i32,
     pub external_id: Option<String>,
     pub media_object_id: Option<i64>,
+    pub memory_kind: Option<i32>,
 }
 
 impl MemoryRow {
@@ -46,6 +47,7 @@ impl MemoryRow {
                 external_id: self.external_id.clone(),
                 media_object_id: self.media_object_id.map(|value| MediaObjectId { value }),
                 thread_ids: Vec::new(),
+                memory_kind: self.memory_kind.unwrap_or(0),
             }),
             // Output-only enrichment. The infra layer never resolves
             // media; the app/grpc layer hydrates `media` before responding
@@ -73,6 +75,7 @@ pub struct MemoryWithPositionRow {
     pub role: i32,
     pub external_id: Option<String>,
     pub media_object_id: Option<i64>,
+    pub memory_kind: Option<i32>,
     pub position: i32,
 }
 
@@ -95,6 +98,7 @@ impl MemoryWithPositionRow {
             role: self.role,
             external_id: self.external_id.clone(),
             media_object_id: self.media_object_id,
+            memory_kind: self.memory_kind,
         };
         (row.to_proto(), self.position)
     }
@@ -118,6 +122,7 @@ pub struct MemoryWithOptionalPositionRow {
     pub role: i32,
     pub external_id: Option<String>,
     pub media_object_id: Option<i64>,
+    pub memory_kind: Option<i32>,
     pub attached_position: Option<i32>,
 }
 
@@ -137,6 +142,7 @@ impl MemoryWithOptionalPositionRow {
             role: self.role,
             external_id: self.external_id,
             media_object_id: self.media_object_id,
+            memory_kind: self.memory_kind,
         };
         (row.to_proto(), pos)
     }

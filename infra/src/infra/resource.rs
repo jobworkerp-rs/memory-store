@@ -25,6 +25,22 @@ pub async fn setup_rdb_by_env() -> &'static Pool<Rdb> {
     setup_rdb(&conf).await
 }
 
+/// Opens an RDB pool for a one-shot RDB-only tool without initializing
+/// the process-wide application pool or any vector repository.
+pub async fn new_rdb_pool_by_env() -> Result<Pool<Rdb>> {
+    let conf = load_db_config_from_env().unwrap_or(
+        load_db_url_config_from_env().unwrap_or(RdbConfig::Separate(RdbConfigImpl::default())),
+    );
+    sqlx::any::install_default_drivers();
+    #[cfg(not(feature = "postgres"))]
+    let combined_schema = format!("{SQLITE_SCHEMA_001}\n{SQLITE_SCHEMA_003_REFLECTION}");
+    #[cfg(not(feature = "postgres"))]
+    let schema: Option<&String> = Some(&combined_schema);
+    #[cfg(feature = "postgres")]
+    let schema: Option<&String> = None;
+    infra_utils::infra::rdb::new_rdb_pool(&conf, schema).await
+}
+
 // new rdb pool and store as static
 // (if failed initializing, panic!)
 // (if need multiple database, add RDB_POOL and setup multiple)

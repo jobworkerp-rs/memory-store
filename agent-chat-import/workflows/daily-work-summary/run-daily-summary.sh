@@ -21,7 +21,7 @@
 #   --start-date <YYYY-MM-DD>          range start (inclusive)
 #   --end-date <YYYY-MM-DD>            range end (inclusive)
 #   --target-date <YYYY-MM-DD>         shortcut: same as --start --end <date>
-#   --source-user-id <i64>             default: 100000 (the summary-agent user)
+#   --user-id <i64>                    required owner of the summaries
 #   --extra-labels <csv>               extra AND-matched labels (default: none)
 #   --summary-label <str>              default: summary
 #   --daily-label <str>                default: daily_summary
@@ -80,7 +80,7 @@ LAST_N_DAYS=""
 START_DATE=""
 END_DATE=""
 
-SOURCE_USER_ID="100000"
+USER_ID="${MEMORY_USER_ID:-}"
 EXTRA_LABELS_CSV=""
 SUMMARY_LABEL="summary"
 DAILY_LABEL="daily_summary"
@@ -127,7 +127,7 @@ while [[ $# -gt 0 ]]; do
         --start-date)               START_DATE="$2"; shift 2 ;;
         --end-date)                 END_DATE="$2"; shift 2 ;;
         --target-date)              START_DATE="$2"; END_DATE="$2"; shift 2 ;;
-        --source-user-id)           SOURCE_USER_ID="$2"; shift 2 ;;
+        --user-id)                  USER_ID="$2"; shift 2 ;;
         --extra-labels)             EXTRA_LABELS_CSV="$2"; shift 2 ;;
         --summary-label)            SUMMARY_LABEL="$2"; shift 2 ;;
         --daily-label)              DAILY_LABEL="$2"; shift 2 ;;
@@ -175,6 +175,10 @@ need_cmd() {
 }
 need_cmd jobworkerp-client
 need_cmd python3   # used to assemble the JSON input safely
+if [[ -z "$USER_ID" ]]; then
+    echo "error: --user-id is required (or set MEMORY_USER_ID)" >&2
+    exit 2
+fi
 
 # Validate date selection: at most one of (last_n_days, range) — both
 # are accepted by the workflow but the batch picks the range when both
@@ -272,14 +276,14 @@ fi
 # Built via python3 to avoid hand-rolled escaping. Optional fields
 # (start_date / end_date / last_n_days / extra_labels) are omitted when
 # empty so the workflow's defaults / mode-selection logic kicks in.
-INPUT_JSON=$(python3 - <<'PY' "$SOURCE_USER_ID" "$MEMORIES_GRPC_HOST" "$MEMORIES_GRPC_PORT" "$START_DATE" "$END_DATE" "$LAST_N_DAYS" "$TIMEZONE_OFFSET_HOURS" "$SUMMARY_LABEL" "$DAILY_LABEL" "$EXTRA_LABELS_CSV" "$MIN_THREAD_COUNT" "$MAX_CONTEXT_CHARS" "$SUMMARY_MODEL" "$OLLAMA_BASE_URL" "$OUTPUT_LANGUAGE" "$FORCE_RESUMMARIZE"
+INPUT_JSON=$(python3 - <<'PY' "$USER_ID" "$MEMORIES_GRPC_HOST" "$MEMORIES_GRPC_PORT" "$START_DATE" "$END_DATE" "$LAST_N_DAYS" "$TIMEZONE_OFFSET_HOURS" "$SUMMARY_LABEL" "$DAILY_LABEL" "$EXTRA_LABELS_CSV" "$MIN_THREAD_COUNT" "$MAX_CONTEXT_CHARS" "$SUMMARY_MODEL" "$OLLAMA_BASE_URL" "$OUTPUT_LANGUAGE" "$FORCE_RESUMMARIZE"
 import json, sys
-(_, source_user_id, host, port, start_date, end_date, last_n,
+(_, user_id, host, port, start_date, end_date, last_n,
  tz, summary_label, daily_label, extra_csv, min_thread, max_chars,
  model, ollama, output_language, force) = sys.argv
 
 payload = {
-    "source_user_id": int(source_user_id),
+    "user_id": int(user_id),
     "memories_grpc_host": host,
     "memories_grpc_port": int(port),
     "summary_label": summary_label,

@@ -7,8 +7,7 @@ document:
 # Per-thread user personality / preference signal extraction.
 #
 # Mirrors thread-summary-single but writes a separate "personality"
-# memory under `personality_user_id` (default 200000) so that summary,
-# daily-work and personality systems remain physically disjoint.
+# memory under the source user with PERSONALITY kind.
 
 input:
   schema:
@@ -36,23 +35,6 @@ input:
         ollama_base_url: { type: string, default: "http://localhost:11434" }
         output_language: { type: string, enum: ["ja", "en"], default: "ja" }
         force_reextract: { type: boolean, default: false }
-        personality_user_id:
-          type: integer
-          default: 200000
-          description: >-
-            Owner user ID for personality memory threads. MUST differ from
-            both `user_id` (avoids recursive pollution: personality threads
-            would otherwise be picked up as input by subsequent runs) and
-            `summary_user_id` (avoids cross-contamination with the summary
-            system).
-        summary_user_id:
-          type: integer
-          default: 100000
-          description: >-
-            Reference value for collision detection only. The personality
-            workflow never reads or writes summary memories — it just
-            ensures `personality_user_id != summary_user_id` so the two
-            collection-points cannot fuse into one.
 
 do:
   # Initialize variables referenced from `output.as` so an early
@@ -64,44 +46,18 @@ do:
         result: "${ null }"
         truncation_level: "${ \"none\" }"
 
-  # Defensive fallback for callers that bypass the input schema
-  # (e.g. legacy clients without our schema-side defaults).
-  - normalizePersonalityUserId:
+  - rejectLegacyPersonalityOwners:
+      if: "${ $workflow.input.personality_user_id != null or $workflow.input.summary_user_id != null }"
+      raise:
+        error:
+          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
+          status: 400
+          title: "legacy personality owner fields are no longer supported"
+          detail: "Use user_id and memory_kind instead."
+
+  - initializePersonalityScope:
       set:
-        effective_personality_user_id: "${ $workflow.input.personality_user_id // 200000 }"
-        effective_summary_user_id: "${ $workflow.input.summary_user_id // 100000 }"
-
-  # Sharing the owner with the source user would surface personality
-  # threads in that user's listings and feed them back into subsequent
-  # extractions (recursive pollution).
-  - failOnSelfOwnedPersonality:
-      if: "${ $effective_personality_user_id == $workflow.input.user_id }"
-      raise:
-        error:
-          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
-          status: 400
-          title: "personality_user_id must differ from user_id"
-          detail: >-
-            ${ "personality_user_id (" + ($effective_personality_user_id | tostring)
-               + ") must differ from user_id ("
-               + ($workflow.input.user_id | tostring)
-               + ") to prevent recursive personality extraction." }
-
-  # Sharing owner with the summary system would let thread-summary-batch
-  # pick up personality memory threads as summarisation targets when
-  # `min_message_count` is lowered.
-  - failOnSummaryUserCollision:
-      if: "${ $effective_personality_user_id == $effective_summary_user_id }"
-      raise:
-        error:
-          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
-          status: 400
-          title: "personality_user_id must differ from summary_user_id"
-          detail: >-
-            ${ "personality_user_id (" + ($effective_personality_user_id | tostring)
-               + ") must differ from summary_user_id ("
-               + ($effective_summary_user_id | tostring)
-               + ") to keep the two extraction domains disjoint." }
+        effective_personality_user_id: "${ $workflow.input.user_id }"
 
   - fetchThread:
       run:
@@ -268,6 +224,7 @@ do:
                 ],
                 match_mode: "LABEL_ALL",
                 user_id: $effective_personality_user_id,
+                memory_kinds: ["MEMORY_KIND_PERSONALITY"],
                 limit: 1
               } | tojson }
             as_json: true
@@ -579,6 +536,7 @@ do:
             json_body: >-
               ${ {
                 user_id: { value: $effective_personality_user_id },
+                memory_kind: "MEMORY_KIND_PERSONALITY",
                 description: ("personality signals for thread "
                               + ($workflow.input.thread_id | tostring)
                               + " (user " + ($workflow.input.user_id | tostring) + ")"),
@@ -651,6 +609,7 @@ do:
                 thread_id: { value: $memory_thread_id },
                 memory: {
                   user_id: { value: $effective_personality_user_id },
+                  memory_kind: "MEMORY_KIND_PERSONALITY",
                   content: ($personality_json | tojson),
                   content_type: "TEXT",
                   role: "ROLE_ASSISTANT",

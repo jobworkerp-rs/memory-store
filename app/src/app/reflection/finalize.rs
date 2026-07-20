@@ -5,7 +5,7 @@
 //!                                reflection.
 //! Phase 2 (idempotent, short tx) — retrieve-or-create the aggregate
 //!                                reflection thread keyed on
-//!                                (REFLECTION_USER_ID, sha256(labels)).
+//!                                (origin_user_id, sha256(labels)).
 //! Phase 3 (main tx)              — insert memory + thread_memory junction
 //!                                + sidecar + child rows + derived stats.
 //!                                F-G3 idempotency rides on the
@@ -20,7 +20,7 @@
 //!                                anything still in PENDING.
 
 use anyhow::Result;
-use protobuf::llm_memory::data::{ReflectionId, ThreadData, UserId};
+use protobuf::llm_memory::data::{MemoryKind, ReflectionId, ThreadData, UserId};
 use protobuf::llm_memory::service::FinalizeReflectionRequest;
 use sha2::{Digest, Sha256};
 
@@ -39,7 +39,6 @@ use infra::infra::thread::rdb::ThreadRepository;
 use infra::infra::thread_label::rdb::ThreadLabelRepository;
 use infra::infra::thread_memory::rdb::ThreadMemoryRepository;
 
-use crate::app::REFLECTION_USER_ID;
 use crate::app::reflection::ReflectionAppImpl;
 use crate::app::reflection::build_memory_data::{ReflectionMemoryParts, build_parts};
 use crate::app::reflection::validate;
@@ -111,14 +110,9 @@ pub async fn finalize(
     // ===== Phase 2: aggregate-thread retrieve-or-create =====
     let target_labels = compose_aggregate_labels(&origin_labels);
     let labels_hash = sha256_join_pipe(&target_labels);
-    let aggregate_thread_id = resolve_or_create_aggregate_thread(
-        app,
-        REFLECTION_USER_ID,
-        &target_labels,
-        &labels_hash,
-        now,
-    )
-    .await?;
+    let aggregate_thread_id =
+        resolve_or_create_aggregate_thread(app, origin_user_id, &target_labels, &labels_hash, now)
+            .await?;
 
     // ===== Phase 3: main tx =====
     // Concurrent finalize calls into the same aggregate thread can
@@ -129,7 +123,7 @@ pub async fn finalize(
     // serialises writers so the race is invisible there. We retry the
     // whole Phase 3 on UNIQUE violation — the second pass observes the
     // committed row from the winner and picks the next position.
-    let parts = build_parts(req, parsed, origin_thread_id, now)?;
+    let parts = build_parts(req, parsed, origin_thread_id, origin_user_id, now)?;
 
     const MAX_PHASE3_RETRIES: u32 = 3;
     let mut attempt = 0u32;
@@ -396,7 +390,12 @@ fn recurrence_window_millis() -> i64 {
     days.saturating_mul(DAY_MILLIS)
 }
 
-fn compose_aggregate_labels(origin_labels: &[String]) -> Vec<String> {
+/// Canonical labels used as the aggregate-thread identity.
+///
+/// This is public because offline migrations must produce the identical key
+/// as the online finalize path; a second normalizer would silently split an
+/// aggregate stream.
+pub fn compose_aggregate_labels(origin_labels: &[String]) -> Vec<String> {
     let mut out: Vec<String> = origin_labels.to_vec();
     if !out.iter().any(|l| l == REFLECTION_LABEL) {
         out.push(REFLECTION_LABEL.to_string());
@@ -406,7 +405,8 @@ fn compose_aggregate_labels(origin_labels: &[String]) -> Vec<String> {
     out
 }
 
-fn sha256_join_pipe(labels: &[String]) -> String {
+/// Stable aggregate-thread key for canonical labels.
+pub fn sha256_join_pipe(labels: &[String]) -> String {
     use std::fmt::Write;
     let digest = Sha256::digest(labels.join("|").as_bytes());
     digest.iter().fold(String::with_capacity(64), |mut s, b| {
@@ -446,6 +446,7 @@ async fn resolve_or_create_aggregate_thread(
         updated_at: now,
         metadata: None,
         labels: target_labels.to_vec(),
+        memory_kind: MemoryKind::Reflection as i32,
     };
 
     let mut tx = app.pool.begin().await?;

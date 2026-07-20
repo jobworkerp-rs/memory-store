@@ -11,6 +11,7 @@ use crate::protobuf::llm_memory::service::{
 };
 use crate::service::error_handle::handle_error;
 use crate::service::memory::enrich_memory_media;
+use crate::service::memory_kind::{normalize_memory_kinds, normalize_memory_search_filter};
 use app::app::memory_vector::{CountMode, CountSearchInput, MemoryVectorAppImpl};
 use async_stream::stream;
 use command_utils::trace::Tracing;
@@ -281,7 +282,12 @@ impl<T: MemoryVectorGrpc + Tracing + Send + Debug + Sync + 'static> MemoryVector
         request: tonic::Request<VectorSearchRequest>,
     ) -> Result<tonic::Response<Self::SearchByVectorStream>, tonic::Status> {
         let _s = Self::trace_request("memory_vector", "search_by_vector", &request);
-        let req = request.get_ref();
+        let mut req = request.into_inner();
+        if let Some(options) = req.options.as_mut()
+            && let Some(filter) = options.filter.as_mut()
+        {
+            normalize_memory_search_filter(filter)?;
+        }
         let vectors: Vec<Vec<f32>> = req.query_vectors.iter().map(|v| v.values.clone()).collect();
         if vectors.is_empty() {
             return Err(tonic::Status::invalid_argument("query_vectors is required"));
@@ -344,7 +350,12 @@ impl<T: MemoryVectorGrpc + Tracing + Send + Debug + Sync + 'static> MemoryVector
         request: tonic::Request<TextSearchRequest>,
     ) -> Result<tonic::Response<Self::SearchByTextStream>, tonic::Status> {
         let _s = Self::trace_request("memory_vector", "search_by_text", &request);
-        let req = request.get_ref();
+        let mut req = request.into_inner();
+        if let Some(options) = req.options.as_mut()
+            && let Some(filter) = options.filter.as_mut()
+        {
+            normalize_memory_search_filter(filter)?;
+        }
         if req.query_text.is_empty() {
             return Err(tonic::Status::invalid_argument("query_text is required"));
         }
@@ -389,7 +400,12 @@ impl<T: MemoryVectorGrpc + Tracing + Send + Debug + Sync + 'static> MemoryVector
         request: tonic::Request<HybridSearchRequest>,
     ) -> Result<tonic::Response<Self::HybridSearchStream>, tonic::Status> {
         let _s = Self::trace_request("memory_vector", "hybrid_search", &request);
-        let req = request.get_ref();
+        let mut req = request.into_inner();
+        if let Some(options) = req.options.as_mut()
+            && let Some(filter) = options.filter.as_mut()
+        {
+            normalize_memory_search_filter(filter)?;
+        }
         let vectors: Vec<Vec<f32>> = req.query_vectors.iter().map(|v| v.values.clone()).collect();
         if vectors.is_empty() {
             return Err(tonic::Status::invalid_argument("query_vectors is required"));
@@ -475,7 +491,12 @@ impl<T: MemoryVectorGrpc + Tracing + Send + Debug + Sync + 'static> MemoryVector
         request: tonic::Request<SemanticTextSearchRequest>,
     ) -> Result<tonic::Response<Self::SearchSemanticStream>, tonic::Status> {
         let _s = Self::trace_request("memory_vector", "search_semantic", &request);
-        let req = request.get_ref();
+        let mut req = request.into_inner();
+        if let Some(options) = req.options.as_mut()
+            && let Some(filter) = options.filter.as_mut()
+        {
+            normalize_memory_search_filter(filter)?;
+        }
         if req.query_text.trim().is_empty() {
             return Err(tonic::Status::invalid_argument("query_text is required"));
         }
@@ -519,7 +540,12 @@ impl<T: MemoryVectorGrpc + Tracing + Send + Debug + Sync + 'static> MemoryVector
         request: tonic::Request<MediaSearchRequest>,
     ) -> Result<tonic::Response<Self::SearchByMediaStream>, tonic::Status> {
         let _s = Self::trace_request("memory_vector", "search_by_media", &request);
-        let req = request.get_ref();
+        let mut req = request.into_inner();
+        if let Some(options) = req.options.as_mut()
+            && let Some(filter) = options.filter.as_mut()
+        {
+            normalize_memory_search_filter(filter)?;
+        }
         let media_object_id = req
             .media_object_id
             .as_ref()
@@ -697,7 +723,10 @@ impl<T: MemoryVectorGrpc + Tracing + Send + Debug + Sync + 'static> MemoryVector
         request: tonic::Request<MemorySearchCountRequest>,
     ) -> Result<tonic::Response<MemorySearchCountResponse>, tonic::Status> {
         let _s = Self::trace_request("memory_vector", "count_search_matches", &request);
-        let req = request.get_ref();
+        let mut req = request.into_inner();
+        if let Some(filter) = req.filter.as_mut() {
+            normalize_memory_search_filter(filter)?;
+        }
 
         // UNSPECIFIED (and any unknown enum tag) is rejected explicitly
         // so a hybrid request with a missing `mode` is not silently
@@ -749,11 +778,18 @@ impl<T: MemoryVectorGrpc + Tracing + Send + Debug + Sync + 'static> MemoryVector
         request: tonic::Request<RedispatchEmbeddingsRequest>,
     ) -> Result<tonic::Response<RedispatchEmbeddingsResponse>, tonic::Status> {
         let _s = Self::trace_request("memory_vector", "redispatch_embeddings", &request);
-        let req = request.get_ref();
+        let mut req = request.into_inner();
         let kinds = validate_redispatch_kinds(&req.kinds)?;
+        normalize_memory_kinds(&mut req.memory_kinds)?;
         match self
             .app()
-            .redispatch_embeddings(req.user_id, req.thread_id, req.batch_size, &kinds)
+            .redispatch_embeddings(
+                req.user_id,
+                req.thread_id,
+                req.batch_size,
+                &kinds,
+                &req.memory_kinds,
+            )
             .await
         {
             Ok((dispatched, skipped, failed, duration_ms)) => {

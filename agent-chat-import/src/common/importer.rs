@@ -6,9 +6,10 @@
 use crate::client::ImportClient;
 use crate::source::{CanonicalEntry, CanonicalSession, ChatSource, ReadSessionOutcome, StreamItem};
 use anyhow::Result;
-use futures::stream::StreamExt;
+use common::external_id::{EXTERNAL_ID_MAX_BYTES, namespace_for_external_id, owner_scoped};
+use futures::stream::{StreamExt, TryStreamExt};
 use prost::Message;
-use protobuf::llm_memory::data::{MemoryData, MemoryId, ThreadData, ThreadId, UserId};
+use protobuf::llm_memory::data::{MemoryData, MemoryId, MemoryKind, ThreadData, ThreadId, UserId};
 use protobuf::llm_memory::service::add_memories_batch_request::ThreadTarget as PbThreadTarget;
 use protobuf::llm_memory::service::{
     AddMemoriesBatchRequest, BatchMemoryInput as PbBatchMemoryInput, ThreadUpsertByChannel,
@@ -24,6 +25,91 @@ const CHUNK_MAX_ENTRIES: usize = 500;
 /// metadata (tonic headers, grpc length prefix) plus a per-import
 /// overhead margin still fit. Spec §3.2.9 / open-issue A5.
 const CHUNK_MAX_BYTES: usize = 12 * 1024 * 1024;
+
+/// Independent per-entry `UpdateMemoryParents` RPCs, run concurrently to
+/// amortise RTT for chunks with many duplicates.
+const REWIRE_CONCURRENCY: usize = 8;
+
+struct RewireJob {
+    external_id: String,
+    memory_id: MemoryId,
+    request: UpdateMemoryParentsRequest,
+}
+
+/// Shared by `run_import` and `flush_chunk`: for every non-created outcome
+/// whose parent_ids were empty and got resolved server-side, issue a
+/// rewire RPC so the memory picks up its resolved parents. Each rewire
+/// targets a different memory_id, so they're independent on the server
+/// side and safe to run with bounded concurrency. Updates
+/// `result.memories_imported` / `memories_skipped_duplicate` /
+/// `memories_rewired` in place; returns `Err` on the first RPC failure.
+async fn run_rewire_pass(
+    client: &dyn ImportClient,
+    entries: &[CanonicalEntry],
+    outcomes: &[protobuf::llm_memory::service::AddMemoryOutcome],
+    batch_thread_id: ThreadId,
+    result: &mut CanonicalSessionResult,
+) -> Result<(), String> {
+    let mut rewire_jobs: Vec<RewireJob> = Vec::new();
+    for (entry, outcome) in entries.iter().zip(outcomes.iter()) {
+        if outcome.created {
+            result.memories_imported += 1;
+            continue;
+        }
+        result.memories_skipped_duplicate += 1;
+        if !outcome.existing_parent_ids_empty || outcome.resolved_parent_ids.is_empty() {
+            continue;
+        }
+        let Some(memory_id) = outcome.memory_id else {
+            continue;
+        };
+        rewire_jobs.push(RewireJob {
+            external_id: entry.external_id.clone(),
+            memory_id,
+            request: UpdateMemoryParentsRequest {
+                thread_id: Some(batch_thread_id),
+                memory_id: Some(memory_id),
+                parent_ids: outcome.resolved_parent_ids.clone(),
+                force_overwrite_when_shared: false,
+                force_overwrite_when_non_empty: false,
+            },
+        });
+    }
+
+    let rewire_outcomes: Vec<(
+        String,
+        MemoryId,
+        anyhow::Result<UpdateMemoryParentsResponse>,
+    )> = futures::stream::iter(rewire_jobs.into_iter().map(|job| async move {
+        let r = client.update_memory_parents(job.request).await;
+        (job.external_id, job.memory_id, r)
+    }))
+    .buffer_unordered(REWIRE_CONCURRENCY)
+    .collect()
+    .await;
+
+    for (external_id, memory_id, r) in rewire_outcomes {
+        match r {
+            Ok(resp) if resp.rewired => {
+                result.memories_rewired += 1;
+            }
+            Ok(resp) => {
+                let reason = SkipReason::try_from(resp.skip_reason)
+                    .unwrap_or(SkipReason::UpdateMemoryParentsSkipUnspecified);
+                tracing::warn!(
+                    external_id = external_id.as_str(),
+                    memory_id = memory_id.value,
+                    skip_reason = ?reason,
+                    "UpdateMemoryParents skipped by server-side guard"
+                );
+            }
+            Err(e) => {
+                return Err(format!("UpdateMemoryParents for {external_id} failed: {e}"));
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Per-RPC sizing limits forwarded into the streaming importer. Carried
 /// as a value so CLI flags / env config can shrink the defaults — a
@@ -98,7 +184,7 @@ pub async fn run_import(
 
     // Drop entries the runner-side `--since` filter rejects.
     let total = entries.len();
-    let importable: Vec<CanonicalEntry> = entries
+    let mut importable: Vec<CanonicalEntry> = entries
         .into_iter()
         .filter(|e| is_entry_importable(e, since_millis))
         .collect();
@@ -106,6 +192,10 @@ pub async fn run_import(
     result.memories_skipped_filtered += since_filtered;
     if importable.is_empty() {
         return result;
+    }
+
+    for entry in &mut importable {
+        namespace_entry_external_ids(entry, &session.source_id, user_id);
     }
 
     let labels = build_labels(session, extra_labels);
@@ -122,27 +212,23 @@ pub async fn run_import(
         entry_max_ms
     };
     // The existing-external_id pre-fetch only matters when there is an
-    // attachment to (potentially) skip. A text-only transcript — the
-    // common case — has nothing to dedup, so skip the round-trip (it
-    // would otherwise stream every memory under the session prefix only
-    // to discard the set). Every entry's external_id is
-    // `{source_id}:{session_id}:<...>` for all sources, so the prefix
-    // scopes exactly to this session. Pre-fetched external_ids belong to
+    // attachment to (potentially) skip. Pre-fetched external_ids belong to
     // memories that `upsert_by_external_id` will reuse; resolving their
     // attachments would re-upload bytes and leak orphan url-backed
-    // media_object rows on every re-import. Fail-safe: on query error,
-    // resolve everything (original behaviour) rather than abort.
+    // media_object rows on every re-import. A failure here only affects
+    // media optimisation; namespace resolution has already succeeded.
     let has_attachment = importable.iter().any(|e| e.canonical.attachment.is_some());
     let already_imported: std::collections::HashSet<String> = if has_attachment {
-        let prefix = format!("{}:{}:", session.source_id, session.session_id);
-        match client
-            .find_memories_by_external_id_prefix(prefix, user_id)
-            .await
+        match fetch_existing_external_ids(
+            client,
+            importable
+                .iter()
+                .filter(|entry| entry.canonical.attachment.is_some())
+                .map(|entry| entry.external_id.as_str()),
+        )
+        .await
         {
-            Ok(entries) => entries
-                .into_iter()
-                .filter_map(|e| e.memory.and_then(|m| m.data).and_then(|d| d.external_id))
-                .collect(),
+            Ok(external_ids) => external_ids,
             Err(e) => {
                 tracing::warn!(
                     "existing-external_id pre-fetch failed, resolving all \
@@ -233,76 +319,17 @@ pub async fn run_import(
             return result;
         }
 
-        // Rewire pass. Each rewire targets a different (memory_id) so
-        // they're independent on the server side; run them concurrently
-        // with a small bound to amortise RPC RTT for chunks with many
-        // duplicates.
-        struct RewireJob {
-            external_id: String,
-            memory_id: MemoryId,
-            request: UpdateMemoryParentsRequest,
-        }
-
-        let mut rewire_jobs: Vec<RewireJob> = Vec::new();
-        for (entry, outcome) in chunk.iter().zip(response.outcomes.iter()) {
-            if outcome.created {
-                result.memories_imported += 1;
-                continue;
-            }
-            result.memories_skipped_duplicate += 1;
-            if !outcome.existing_parent_ids_empty || outcome.resolved_parent_ids.is_empty() {
-                continue;
-            }
-            let Some(memory_id) = outcome.memory_id else {
-                continue;
-            };
-            rewire_jobs.push(RewireJob {
-                external_id: entry.external_id.clone(),
-                memory_id,
-                request: UpdateMemoryParentsRequest {
-                    thread_id: Some(batch_thread_id),
-                    memory_id: Some(memory_id),
-                    parent_ids: outcome.resolved_parent_ids.clone(),
-                    force_overwrite_when_shared: false,
-                    force_overwrite_when_non_empty: false,
-                },
-            });
-        }
-
-        const REWIRE_CONCURRENCY: usize = 8;
-        let rewire_outcomes: Vec<(
-            String,
-            MemoryId,
-            anyhow::Result<UpdateMemoryParentsResponse>,
-        )> = futures::stream::iter(rewire_jobs.into_iter().map(|job| async move {
-            let r = client.update_memory_parents(job.request).await;
-            (job.external_id, job.memory_id, r)
-        }))
-        .buffer_unordered(REWIRE_CONCURRENCY)
-        .collect()
-        .await;
-
-        for (external_id, memory_id, r) in rewire_outcomes {
-            match r {
-                Ok(resp) if resp.rewired => {
-                    result.memories_rewired += 1;
-                }
-                Ok(resp) => {
-                    let reason = SkipReason::try_from(resp.skip_reason)
-                        .unwrap_or(SkipReason::UpdateMemoryParentsSkipUnspecified);
-                    tracing::warn!(
-                        external_id = external_id.as_str(),
-                        memory_id = memory_id.value,
-                        skip_reason = ?reason,
-                        "UpdateMemoryParents skipped by server-side guard"
-                    );
-                }
-                Err(e) => {
-                    result.error =
-                        Some(format!("UpdateMemoryParents for {external_id} failed: {e}"));
-                    return result;
-                }
-            }
+        if let Err(e) = run_rewire_pass(
+            client,
+            chunk,
+            &response.outcomes,
+            batch_thread_id,
+            &mut result,
+        )
+        .await
+        {
+            result.error = Some(e);
+            return result;
         }
     }
 
@@ -362,6 +389,7 @@ fn build_thread_data(session: &CanonicalSession, user_id: i64) -> ThreadData {
         updated_at: session.created_at_ms,
         labels: Vec::new(),
         metadata: None,
+        memory_kind: MemoryKind::Raw as i32,
     }
 }
 
@@ -601,7 +629,61 @@ fn build_memory_data(
         media_object_id: resolved_media_object_id
             .map(|value| protobuf::llm_memory::data::MediaObjectId { value }),
         thread_ids: Vec::new(),
+        memory_kind: MemoryKind::Raw as i32,
     }
+}
+
+pub(crate) fn namespace_external_id(
+    source_id: &str,
+    creator_user_id: i64,
+    external_id: &str,
+) -> String {
+    let namespace =
+        namespace_for_external_id(source_id, external_id).unwrap_or_else(|| source_id.to_string());
+    owner_scoped(
+        &namespace,
+        creator_user_id,
+        external_id,
+        EXTERNAL_ID_MAX_BYTES,
+    )
+    .expect("the configured external ID limit must fit a SHA-256 identifier")
+}
+
+async fn fetch_existing_external_ids(
+    client: &dyn ImportClient,
+    external_ids: impl IntoIterator<Item = &str>,
+) -> Result<std::collections::HashSet<String>> {
+    const EXTERNAL_ID_LOOKUP_CONCURRENCY: usize = 16;
+    let requested_ids = external_ids
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<std::collections::HashSet<_>>();
+    let found =
+        futures::stream::iter(requested_ids.into_iter().map(|external_id| async move {
+            client.find_memory_by_external_id(external_id).await
+        }))
+        .buffer_unordered(EXTERNAL_ID_LOOKUP_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok(found
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .memory
+                .and_then(|memory| memory.data)
+                .and_then(|data| data.external_id)
+        })
+        .collect())
+}
+
+fn namespace_entry_external_ids(entry: &mut CanonicalEntry, source_id: &str, creator_user_id: i64) {
+    entry.external_id = namespace_external_id(source_id, creator_user_id, &entry.external_id);
+    entry.parent_external_ids = entry
+        .parent_external_ids
+        .iter()
+        .map(|external_id| namespace_external_id(source_id, creator_user_id, external_id))
+        .collect();
 }
 
 /// Iterate every input the source yields and feed each session through
@@ -1099,10 +1181,9 @@ pub async fn run_import_streaming(
 
     let labels = build_labels(session, extra_labels);
 
-    // Lazy attachment context: only fetch the existing-external_id set
-    // when the first attachment-bearing entry arrives, so
-    // attachment-free transcripts (the common case) never round-trip
-    // `find_memories_by_external_id_prefix`.
+    // Lazy attachment context: attachment-free transcripts never issue an
+    // external-ID lookup. Attachment-bearing entries use exact lookups so a
+    // re-import never scans another session's hashed overflow IDs.
     let mut attachment_ctx: Option<AttachmentContext> = None;
 
     // Streaming state.
@@ -1130,6 +1211,9 @@ pub async fn run_import_streaming(
             }
         };
 
+        let mut entry = entry;
+        namespace_entry_external_ids(&mut entry, &session.source_id, user_id);
+
         if !is_entry_importable(&entry, since_millis) {
             result.memories_skipped_filtered += 1;
             continue;
@@ -1140,14 +1224,8 @@ pub async fn run_import_streaming(
         // `metadata.attachment` blob attached only when resolution
         // failed.
         let media_id_for_entry: Option<i64> = if entry.canonical.attachment.is_some() {
-            let ctx = match attachment_ctx.as_mut() {
-                Some(c) => c,
-                None => {
-                    attachment_ctx = Some(AttachmentContext::fetch(client, session, user_id).await);
-                    attachment_ctx.as_mut().unwrap()
-                }
-            };
-            if ctx.already_imported.contains(&entry.external_id) {
+            let ctx = attachment_ctx.get_or_insert_default();
+            if ctx.is_already_imported(client, &entry.external_id).await {
                 None
             } else {
                 match resolve_one_media(client, &entry).await {
@@ -1239,30 +1317,26 @@ pub async fn run_import_streaming(
 /// Lazy-loaded "this session already has these external_ids on the
 /// server" set. Built once per session, on the first attachment-bearing
 /// entry.
+#[derive(Default)]
 struct AttachmentContext {
     already_imported: std::collections::HashSet<String>,
+    queried_external_ids: std::collections::HashSet<String>,
 }
 
 impl AttachmentContext {
-    async fn fetch(client: &dyn ImportClient, session: &CanonicalSession, user_id: i64) -> Self {
-        let prefix = format!("{}:{}:", session.source_id, session.session_id);
-        let already_imported = match client
-            .find_memories_by_external_id_prefix(prefix, user_id)
-            .await
-        {
-            Ok(entries) => entries
-                .into_iter()
-                .filter_map(|e| e.memory.and_then(|m| m.data).and_then(|d| d.external_id))
-                .collect(),
-            Err(e) => {
-                tracing::warn!(
-                    "existing-external_id pre-fetch failed, resolving all \
-                     attachments (may re-upload on re-import): {e}"
-                );
-                std::collections::HashSet::new()
+    async fn is_already_imported(&mut self, client: &dyn ImportClient, external_id: &str) -> bool {
+        if self.queried_external_ids.insert(external_id.to_string()) {
+            match fetch_existing_external_ids(client, [external_id]).await {
+                Ok(external_ids) => self.already_imported.extend(external_ids),
+                Err(e) => {
+                    tracing::warn!(
+                        "existing-external_id pre-fetch failed, resolving all \
+                         attachments (may re-upload on re-import): {e}"
+                    );
+                }
             }
-        };
-        Self { already_imported }
+        }
+        self.already_imported.contains(external_id)
     }
 }
 
@@ -1395,72 +1469,14 @@ async fn flush_chunk(
         ));
     }
 
-    // Rewire pass (same as `run_import`). `REWIRE_CONCURRENCY = 8`
-    // independent updates so the response RTT amortises across
-    // duplicates in one chunk.
-    struct RewireJob {
-        external_id: String,
-        memory_id: MemoryId,
-        request: UpdateMemoryParentsRequest,
-    }
-    let mut rewire_jobs: Vec<RewireJob> = Vec::new();
-    for (entry, outcome) in entries_sorted.iter().zip(response.outcomes.iter()) {
-        if outcome.created {
-            result.memories_imported += 1;
-            continue;
-        }
-        result.memories_skipped_duplicate += 1;
-        if !outcome.existing_parent_ids_empty || outcome.resolved_parent_ids.is_empty() {
-            continue;
-        }
-        let Some(memory_id) = outcome.memory_id else {
-            continue;
-        };
-        rewire_jobs.push(RewireJob {
-            external_id: entry.external_id.clone(),
-            memory_id,
-            request: UpdateMemoryParentsRequest {
-                thread_id: Some(batch_thread_id),
-                memory_id: Some(memory_id),
-                parent_ids: outcome.resolved_parent_ids.clone(),
-                force_overwrite_when_shared: false,
-                force_overwrite_when_non_empty: false,
-            },
-        });
-    }
-    const REWIRE_CONCURRENCY: usize = 8;
-    let rewire_outcomes: Vec<(
-        String,
-        MemoryId,
-        anyhow::Result<UpdateMemoryParentsResponse>,
-    )> = futures::stream::iter(rewire_jobs.into_iter().map(|job| async move {
-        let r = client.update_memory_parents(job.request).await;
-        (job.external_id, job.memory_id, r)
-    }))
-    .buffer_unordered(REWIRE_CONCURRENCY)
-    .collect()
-    .await;
-    for (external_id, memory_id, r) in rewire_outcomes {
-        match r {
-            Ok(resp) if resp.rewired => {
-                result.memories_rewired += 1;
-            }
-            Ok(resp) => {
-                let reason = SkipReason::try_from(resp.skip_reason)
-                    .unwrap_or(SkipReason::UpdateMemoryParentsSkipUnspecified);
-                tracing::warn!(
-                    external_id = external_id.as_str(),
-                    memory_id = memory_id.value,
-                    skip_reason = ?reason,
-                    "UpdateMemoryParents skipped by server-side guard"
-                );
-            }
-            Err(e) => {
-                return Err(format!("UpdateMemoryParents for {external_id} failed: {e}"));
-            }
-        }
-    }
-    Ok(())
+    run_rewire_pass(
+        client,
+        &entries_sorted,
+        &response.outcomes,
+        batch_thread_id,
+        result,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1611,6 +1627,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn namespaces_entry_and_parent_external_ids_by_thread_creator() {
+        let mut entry = entry_with(
+            "codex:session-1:message-1",
+            1,
+            vec!["codex:session-1:parent-1"],
+        );
+
+        namespace_entry_external_ids(&mut entry, "codex", 42);
+
+        assert_eq!(entry.external_id, "codex:42:session-1:message-1");
+        assert_eq!(
+            entry.parent_external_ids,
+            vec!["codex:42:session-1:parent-1"]
+        );
+    }
+
+    #[test]
+    fn creator_scoped_external_id_at_the_database_limit_is_preserved() {
+        let source_id = "src";
+        let creator_user_id = 42;
+        let prefix = format!("{source_id}:{creator_user_id}:");
+        let raw_external_id = format!("{source_id}:{}", "x".repeat(512 - prefix.len()));
+
+        let external_id = namespace_external_id(source_id, creator_user_id, &raw_external_id);
+
+        assert_eq!(external_id.len(), 512);
+        assert_eq!(
+            external_id,
+            format!("{prefix}{}", "x".repeat(512 - prefix.len()))
+        );
+    }
+
+    #[test]
+    fn creator_scoped_external_id_uses_the_legacy_normalized_source_namespace() {
+        assert_eq!(
+            namespace_external_id(
+                "news-aggregator",
+                42,
+                "news_aggregator:https://example.test/article",
+            ),
+            "news_aggregator:42:https://example.test/article"
+        );
+    }
+
+    #[test]
+    fn creator_scoped_external_id_over_the_database_limit_is_hashed_deterministically() {
+        let raw_external_id = format!("codex:{}", "あ".repeat(200));
+
+        let first = namespace_external_id("codex", 42, &raw_external_id);
+        let second = namespace_external_id("codex", 42, &raw_external_id);
+        let different = namespace_external_id("codex", 42, &(raw_external_id + "x"));
+
+        assert!(first.len() <= 512);
+        assert!(first.starts_with("codex:42:~"));
+        assert_eq!(first, second);
+        assert_ne!(first, different);
+    }
+
     // build_memory_data must strip NULs before they reach the DB;
     // see `strip_nul_bytes_in_value` for why.
     #[test]
@@ -1757,6 +1832,8 @@ mod tests {
         // the fail-safe (resolve everything) path is exercised.
         existing_external_ids: Mutex<Vec<String>>,
         fail_prefix_query: Mutex<bool>,
+        exact_external_id_queries: Mutex<Vec<String>>,
+        prefix_queries: Mutex<Vec<String>>,
     }
 
     impl FakeImportClient {
@@ -1797,6 +1874,12 @@ mod tests {
         }
         fn fail_prefix_query(&self) {
             *self.fail_prefix_query.lock().unwrap() = true;
+        }
+        fn exact_external_id_queries(&self) -> Vec<String> {
+            self.exact_external_id_queries.lock().unwrap().clone()
+        }
+        fn prefix_queries(&self) -> Vec<String> {
+            self.prefix_queries.lock().unwrap().clone()
         }
     }
 
@@ -1879,8 +1962,8 @@ mod tests {
         async fn find_memories_by_external_id_prefix(
             &self,
             prefix: String,
-            _user_id: i64,
         ) -> anyhow::Result<Vec<protobuf::llm_memory::service::MemoryListEntry>> {
+            self.prefix_queries.lock().unwrap().push(prefix.clone());
             if *self.fail_prefix_query.lock().unwrap() {
                 anyhow::bail!("simulated prefix query failure");
             }
@@ -1891,11 +1974,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|eid| eid.starts_with(&prefix))
-                .map(|eid| MemoryListEntry {
+                .filter(|external_id| external_id.starts_with(&prefix))
+                .map(|external_id| MemoryListEntry {
                     memory: Some(Memory {
                         data: Some(MemoryData {
-                            external_id: Some(eid.clone()),
+                            external_id: Some(external_id.clone()),
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -1904,6 +1987,32 @@ mod tests {
                 })
                 .collect();
             Ok(out)
+        }
+        async fn find_memory_by_external_id(
+            &self,
+            external_id: String,
+        ) -> anyhow::Result<Option<protobuf::llm_memory::service::MemoryListEntry>> {
+            self.exact_external_id_queries
+                .lock()
+                .unwrap()
+                .push(external_id.clone());
+            use protobuf::llm_memory::data::{Memory, MemoryData};
+            use protobuf::llm_memory::service::MemoryListEntry;
+            Ok(self
+                .existing_external_ids
+                .lock()
+                .unwrap()
+                .contains(&external_id)
+                .then(|| MemoryListEntry {
+                    memory: Some(Memory {
+                        data: Some(MemoryData {
+                            external_id: Some(external_id),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }))
         }
         async fn delete_memory(&self, _memory_id: PbMemoryId) -> anyhow::Result<()> {
             unimplemented!("FakeImportClient (importer tests) does not stub prune RPCs")
@@ -2313,17 +2422,20 @@ mod tests {
         e
     }
 
-    /// Decode the metadata JSON the importer sent for `eid` from the
-    /// single recorded batch.
+    /// Decode the metadata JSON the importer sent for the raw (pre-namespacing)
+    /// `eid` from the single recorded batch. All callers use `fake_session()`
+    /// (source_id "codex") with creator_user_id 1, so the expected id is
+    /// derived the same way production code namespaces it.
     fn sent_memory<'a>(
         batch: &'a AddMemoriesBatchRequest,
         eid: &str,
     ) -> &'a protobuf::llm_memory::data::MemoryData {
+        let expected = namespace_external_id("codex", 1, eid);
         batch
             .memories
             .iter()
             .map(|m| m.memory.as_ref().unwrap())
-            .find(|m| m.external_id.as_deref() == Some(eid))
+            .find(|m| m.external_id.as_deref() == Some(expected.as_str()))
             .expect("memory for eid not in batch")
     }
 
@@ -2506,7 +2618,7 @@ mod tests {
 
     #[tokio::test]
     async fn reimport_skips_media_for_already_existing_external_id() {
-        let session = fake_session(); // prefix = "codex:sfake:"
+        let session = fake_session(); // prefix = "codex:1:sfake:"
         let att = serde_json::json!({
             "storage": "url",
             "media_type": "image/png",
@@ -2515,7 +2627,7 @@ mod tests {
         let entries = vec![entry_with_attachment("codex:sfake:old", 100, att)];
         let fake = FakeImportClient::default();
         // The pre-fetch reports this external_id as already imported.
-        fake.mark_existing("codex:sfake:old");
+        fake.mark_existing("codex:1:sfake:old");
 
         let res = run_import(&fake, &session, entries, 0, None, 1, &[]).await;
         assert!(res.error.is_none(), "{:?}", res.error);
@@ -2549,28 +2661,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reimport_prefix_query_failure_falls_back_to_resolving_all() {
+    async fn reimport_looks_up_only_current_attachment_ids_including_hashed_ids() {
         let session = fake_session();
-        let att = serde_json::json!({
+        let attachment = serde_json::json!({
             "storage": "url",
             "media_type": "image/png",
-            "url": "https://example.test/fb.png",
+            "url": "https://example.test/large.png",
         });
-        let entries = vec![entry_with_attachment("codex:sfake:fb", 100, att)];
-        let fake = FakeImportClient::default();
-        // Even though it *is* marked existing, a failed pre-fetch must
-        // fall back to resolving everything (a missed dedup is cheaper
-        // than aborting / silently dropping media).
-        fake.mark_existing("codex:sfake:fb");
-        fake.fail_prefix_query();
-
-        let res = run_import(&fake, &session, entries, 0, None, 1, &[]).await;
-        assert!(res.error.is_none(), "{:?}", res.error);
-        assert_eq!(
-            res.media_objects_linked, 1,
-            "prefix-query failure must fall back to resolving all"
+        let long_id = format!("codex:sfake:{}", "x".repeat(EXTERNAL_ID_MAX_BYTES));
+        let expected = namespace_external_id("codex", 1, &long_id);
+        let unrelated = namespace_external_id(
+            "codex",
+            1,
+            &format!("codex:other:{}", "y".repeat(EXTERNAL_ID_MAX_BYTES)),
         );
-        assert_eq!(fake.registers().len(), 1);
+        let fake = FakeImportClient::default();
+        fake.mark_existing(&unrelated);
+
+        let result = run_import(
+            &fake,
+            &session,
+            vec![entry_with_attachment(&long_id, 100, attachment)],
+            0,
+            None,
+            1,
+            &[],
+        )
+        .await;
+
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(fake.exact_external_id_queries(), vec![expected]);
+        assert!(fake.prefix_queries().is_empty());
+        assert_eq!(result.media_objects_linked, 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_reimport_checks_each_attachment_id_without_namespace_scan() {
+        let session = fake_session();
+        let first = "codex:sfake:first";
+        let second = "codex:sfake:second";
+        let attachment = serde_json::json!({
+            "storage": "url",
+            "media_type": "image/png",
+            "url": "https://example.test/reimport.png",
+        });
+        let fake = FakeImportClient::default();
+        let first_scoped = namespace_external_id("codex", 1, first);
+        let second_scoped = namespace_external_id("codex", 1, second);
+        fake.mark_existing(&first_scoped);
+        fake.mark_existing(&second_scoped);
+
+        let result = run_import_streaming(
+            &fake,
+            &session,
+            stream_of(vec![
+                entry_with_attachment(first, 100, attachment.clone()),
+                entry_with_attachment(second, 101, attachment),
+            ]),
+            0,
+            None,
+            1,
+            &[],
+            ChunkLimits::default(),
+        )
+        .await;
+
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(result.media_objects_linked, 0);
+        assert!(fake.uploads().is_empty() && fake.registers().is_empty());
+        assert_eq!(
+            fake.exact_external_id_queries(),
+            vec![first_scoped, second_scoped]
+        );
     }
 
     // ---------- streaming importer tests ----------

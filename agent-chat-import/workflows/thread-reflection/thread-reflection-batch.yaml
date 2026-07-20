@@ -112,6 +112,7 @@ do:
                    labels: $workflow.input.labels_filter,
                    match_mode: "LABEL_ALL",
                    user_id: $workflow.input.user_id,
+                   memory_kinds: ["MEMORY_KIND_RAW"],
                    updated_after: $updated_after_ms
                  }
                  | if $updated_after_ms == null then del(.updated_after) else . end
@@ -138,6 +139,7 @@ do:
             json_body: >-
               ${ ({
                    user_id: { value: $workflow.input.user_id },
+                   memory_kinds: ["MEMORY_KIND_RAW"],
                    updated_after: $updated_after_ms
                  }
                  | if $updated_after_ms == null then del(.updated_after) else . end

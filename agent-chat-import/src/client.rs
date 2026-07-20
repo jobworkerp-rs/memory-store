@@ -80,15 +80,22 @@ pub trait ImportClient: Send + Sync {
         request: UpdateMemoryParentsRequest,
     ) -> Result<UpdateMemoryParentsResponse>;
 
-    /// Enumerate memories whose external_id begins with `prefix`, scoped to
-    /// `user_id`. The server stream is fully consumed and collected — for
+    /// Enumerate memories whose external_id begins with the creator-scoped
+    /// `prefix`. The server stream is fully consumed and collected — for
     /// vault-sized prefixes (10k–100k entries) this fits comfortably in
     /// memory; very-large vaults are out of Phase A scope.
     async fn find_memories_by_external_id_prefix(
         &self,
         prefix: String,
-        user_id: i64,
     ) -> Result<Vec<MemoryListEntry>>;
+
+    /// Look up exactly one external ID. The unique external-id index makes
+    /// this suitable for a small, caller-provided set without scanning an
+    /// entire source or creator namespace.
+    async fn find_memory_by_external_id(
+        &self,
+        external_id: String,
+    ) -> Result<Option<MemoryListEntry>>;
 
     async fn delete_memory(&self, memory_id: MemoryId) -> Result<()>;
 
@@ -319,7 +326,6 @@ impl ImportClient for LiveGrpcImportClient {
     async fn find_memories_by_external_id_prefix(
         &self,
         prefix: String,
-        user_id: i64,
     ) -> Result<Vec<MemoryListEntry>> {
         // Only the initial RPC dispatch is retried — a mid-stream
         // failure after we've started consuming items would mean
@@ -330,7 +336,6 @@ impl ImportClient for LiveGrpcImportClient {
             let mut client = self.build_memory_client();
             let req = FindMemoryListRequest {
                 external_id_prefix: Some(prefix.clone()),
-                user_id: Some(protobuf::llm_memory::data::UserId { value: user_id }),
                 ..Default::default()
             };
             let auth_req = self.attach_auth(tonic::Request::new(req));
@@ -344,6 +349,29 @@ impl ImportClient for LiveGrpcImportClient {
             out.push(item.map_err(map_status)?);
         }
         Ok(out)
+    }
+
+    async fn find_memory_by_external_id(
+        &self,
+        external_id: String,
+    ) -> Result<Option<MemoryListEntry>> {
+        let stream = retry_status(&self.retry, "find_memory_by_external_id", || {
+            let mut client = self.build_memory_client();
+            let req = FindMemoryListRequest {
+                external_id: Some(external_id.clone()),
+                limit: Some(1),
+                ..Default::default()
+            };
+            let auth_req = self.attach_auth(tonic::Request::new(req));
+            async move { client.find_list_by_condition(auth_req).await }
+        })
+        .await
+        .map_err(map_status)?;
+        let mut stream = stream.into_inner();
+        match stream.next().await {
+            Some(entry) => Ok(Some(entry.map_err(map_status)?)),
+            None => Ok(None),
+        }
     }
 
     async fn delete_memory(&self, memory_id: MemoryId) -> Result<()> {

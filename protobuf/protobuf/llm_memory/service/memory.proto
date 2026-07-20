@@ -32,6 +32,8 @@ message FindRecentListByUserIdRequest {
     // Return only rows whose updated_at is less than or equal to this
     // epoch-milliseconds timestamp.
     optional int64 updated_before = 4;
+    // Memory kinds to match. Empty means all kinds; multiple values use OR.
+    repeated llm_memory.data.MemoryKind memory_kinds = 5;
 }
 
 // MemoryService-specific conditional list request.
@@ -79,6 +81,9 @@ message FindMemoryListRequest {
     // Mutually exclusive with `external_id` (exact match): the server returns
     // `InvalidArgument` if both are set.
     optional string external_id_prefix = 14;
+    // Memory kinds to match on the memory row itself. Empty means all kinds;
+    // multiple values use OR semantics independently of thread_filter.
+    repeated llm_memory.data.MemoryKind memory_kinds = 15;
 }
 
 // MemoryService-specific count condition. Accepts the same filter
@@ -112,6 +117,9 @@ message MemoryCountCondition {
     // Same semantics and exclusivity rules as
     // `FindMemoryListRequest.external_id_prefix`.
     optional string external_id_prefix = 11;
+    // Memory kinds to match on the memory row itself. Empty means all kinds;
+    // multiple values use OR semantics independently of thread_filter.
+    repeated llm_memory.data.MemoryKind memory_kinds = 12;
     // sort intentionally absent — Count returns a scalar.
 }
 
@@ -127,7 +135,7 @@ message MemoryListEntry {
   optional int32 position = 5;
   optional int32 thread_total = 6;
   optional llm_memory.data.ThreadId thread_id = 7;
-  // Owner of the representative thread (= Thread.data.user_id). Required
+  // Creator of the representative thread (= Thread.data.user_id). Required
   // so cross-user list results can be opened by passing both ids.
   optional llm_memory.data.UserId thread_owner_user_id = 8;
   optional string thread_description = 9;

@@ -64,7 +64,6 @@
 #                                      (split on commas, no quoting)
 #
 # Summary settings:
-#   --summary-user-id <i64>            default: 100000
 #   --summary-model <name>             default: qwen3.6:27b
 #   --ollama-base-url <url>            default: http://localhost:11434
 #   --label-prefix <str>               default: summary
@@ -142,7 +141,6 @@
 #                                      per-thread layer). Ignored when
 #                                      --user-personality-merge-yaml is
 #                                      explicitly set.
-#   --personality-user-id <i64>        default: 200000
 #   --personality-model <name>         default: "" (= reuse summary_model)
 #   --min-user-messages <n>            default: 2
 #   --force-reextract                  flag (default off)
@@ -193,7 +191,6 @@ CODEX_DIR=""
 STRIP_PATH_PREFIX=""
 EXTRA_IMPORT_ARGS_CSV=""
 
-SUMMARY_USER_ID="100000"
 SUMMARY_MODEL="qwen3.6:27b"
 OLLAMA_BASE_URL="http://localhost:11434"
 LABEL_PREFIX="summary"
@@ -232,7 +229,6 @@ ENABLE_USER_MERGE_EXPLICIT_OFF="false"
 THREAD_PERSONALITY_BATCH_YAML="${WORKFLOWS_DIR}/personality/thread-personality-batch.yaml"
 USER_PERSONALITY_MERGE_YAML="${WORKERS_DIR}/personality/user-personality-merge.yaml"
 USER_PERSONALITY_MERGE_YAML_EXPLICIT="false"
-PERSONALITY_USER_ID="200000"
 PERSONALITY_MODEL=""
 MIN_USER_MESSAGES="2"
 FORCE_REEXTRACT="false"
@@ -298,7 +294,6 @@ while [[ $# -gt 0 ]]; do
         --codex-dir)                       CODEX_DIR="$2"; shift 2 ;;
         --strip-path-prefix)               STRIP_PATH_PREFIX="$2"; shift 2 ;;
         --extra-import-args)               EXTRA_IMPORT_ARGS_CSV="$2"; shift 2 ;;
-        --summary-user-id)                 SUMMARY_USER_ID="$2"; shift 2 ;;
         --summary-model)                   SUMMARY_MODEL="$2"; shift 2 ;;
         --ollama-base-url)                 OLLAMA_BASE_URL="$2"; shift 2 ;;
         --label-prefix)                    LABEL_PREFIX="$2"; shift 2 ;;
@@ -325,7 +320,6 @@ while [[ $# -gt 0 ]]; do
             USER_PERSONALITY_MERGE_YAML_EXPLICIT="true"
             ENABLE_PERSONALITY="true"
             shift 2 ;;
-        --personality-user-id)             PERSONALITY_USER_ID="$2"; shift 2 ;;
         --personality-model)               PERSONALITY_MODEL="$2"; shift 2 ;;
         --min-user-messages)               MIN_USER_MESSAGES="$2"; shift 2 ;;
         --force-reextract)                 FORCE_REEXTRACT="true"; shift 1 ;;
@@ -502,7 +496,7 @@ INPUT_JSON=$(python3 - <<'PY' \
     "$MEMORIES_GRPC_URL" "$MEMORIES_GRPC_HOST" "$MEMORIES_GRPC_PORT" \
     "$IMPORT_COMMAND" "$ALL_FLAG" "$CLAUDE_DIR" "$CODEX_DIR" \
     "$STRIP_PATH_PREFIX" "$EXTRA_IMPORT_ARGS_CSV" \
-    "$SUMMARY_USER_ID" "$SUMMARY_MODEL" "$OLLAMA_BASE_URL" \
+    "$SUMMARY_MODEL" "$OLLAMA_BASE_URL" \
     "$LABEL_PREFIX" "$DAILY_LABEL" "$EXTRA_LABELS_FILTER_CSV" \
     "$FORCE_RESUMMARIZE" "$MIN_THREAD_COUNT" "$MAX_CONTEXT_CHARS" \
     "$PIPELINE_YAML" "$THREAD_SUMMARY_BATCH_YAML" \
@@ -511,7 +505,7 @@ INPUT_JSON=$(python3 - <<'PY' \
     "$ENABLE_PERSONALITY" "$ENABLE_USER_MERGE" \
     "$THREAD_PERSONALITY_BATCH_YAML" \
     "$USER_PERSONALITY_MERGE_YAML" \
-    "$PERSONALITY_USER_ID" "$PERSONALITY_MODEL" "$MIN_USER_MESSAGES" \
+    "$PERSONALITY_MODEL" "$MIN_USER_MESSAGES" \
     "$FORCE_REEXTRACT" "$FORCE_REMERGE" "$MAX_SIGNALS" \
     "$ENABLE_REFLECTION" \
     "$THREAD_REFLECTION_BATCH_YAML" \
@@ -523,7 +517,7 @@ import json, sys
  grpc_url, grpc_host, grpc_port,
  import_cmd, all_flag, claude_dir, codex_dir,
  strip_path, extra_args_csv,
- summary_uid, model, ollama,
+ model, ollama,
  label_prefix, daily_label, extra_filter_csv,
  force, min_thread, max_chars,
  _pipeline_yaml, ts_batch,
@@ -531,7 +525,7 @@ import json, sys
  dws_batch,
  enable_personality, enable_user_merge,
  tp_batch, upm,
- personality_uid, personality_model, min_user_msgs,
+ personality_model, min_user_msgs,
  force_reextract, force_remerge, max_signals,
  enable_reflection,
  tr_batch,
@@ -546,7 +540,6 @@ payload = {
     "timezone_offset_hours": int(tz_hours),
     "import_command": import_cmd,
     "all_projects_or_sessions": all_flag == "true",
-    "summary_user_id": int(summary_uid),
     "summary_model": model,
     "ollama_base_url": ollama,
     "memory_thread_label_prefix": label_prefix,
@@ -599,7 +592,6 @@ if enable_personality == "true":
     payload["thread_personality_batch_yaml"] = tp_batch
     if enable_user_merge == "true":
         payload["user_personality_merge_yaml"] = upm
-    payload["personality_user_id"] = int(personality_uid)
     if personality_model:
         payload["personality_model"] = personality_model
     payload["min_user_messages"] = int(min_user_msgs)

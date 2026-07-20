@@ -102,7 +102,7 @@ message MemorySearchResult {
   optional int32 thread_total = 6;
   // Representative thread ID (always unset for ROLE_SYSTEM).
   optional llm_memory.data.ThreadId thread_id = 7;
-  // Owner user_id of the representative thread (= Thread.data.user_id).
+  // Creator user_id of the representative thread (= Thread.data.user_id).
   // Required so cross-user search results can be opened in the chat view
   // by passing both `thread_id` and `user_id`.
   optional llm_memory.data.UserId thread_owner_user_id = 8;
@@ -347,6 +347,10 @@ message RedispatchEmbeddingsRequest {
   // DISPATCH_KIND_UNSPECIFIED => invalid_argument. Added field
   // (back-compat: old clients omit it and get all kinds).
   repeated DispatchKind kinds = 4;
+  // Memory lifecycle kinds to scan. Empty = all memory kinds; multiple values
+  // use OR semantics. This is independent from `kinds`, which filters the
+  // TEXT/MEDIA embedding pipelines after a memory row has been selected.
+  repeated llm_memory.data.MemoryKind memory_kinds = 5;
 }
 
 message RedispatchEmbeddingsResponse {

@@ -7,7 +7,7 @@ document:
 # Layer 2: aggregate per-thread personality signals into a single
 # user-level profile memory.
 #
-# Reads layer-1 signals owned by `personality_user_id` (default 200000),
+# Reads layer-1 signals owned by the source user with PERSONALITY kind,
 # filters by `metadata.source_user_id == input.user_id` (invariant I6),
 # asks an LLM to merge them, then post-processes per-entry first/last
 # seen timestamps in jq so the LLM cannot fabricate dates. The result
@@ -28,14 +28,6 @@ input:
         memories_grpc_port: { type: integer, default: 9100 }
         memories_grpc_tls: { type: boolean, default: false }
         llm_worker_name: { type: string, default: "memories-llm" }
-        personality_user_id: { type: integer, default: 200000 }
-        summary_user_id:
-          type: integer
-          default: 100000
-          description: >-
-            Reference value for collision detection only. Same purpose
-            as in thread-personality-single — keep the two extraction
-            domains disjoint.
         max_context_chars: { type: integer, default: 200000 }
         merge_model: { type: string, default: "qwen3.6:27b" }
         ollama_base_url: { type: string, default: "http://localhost:11434" }
@@ -54,37 +46,18 @@ timeout:
     hours: 6
 
 do:
-  - normalizePersonalityUserId:
+  - rejectLegacyPersonalityOwners:
+      if: "${ $workflow.input.personality_user_id != null or $workflow.input.summary_user_id != null }"
+      raise:
+        error:
+          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
+          status: 400
+          title: "legacy personality owner fields are no longer supported"
+          detail: "Use user_id and memory_kind instead."
+
+  - initializePersonalityScope:
       set:
-        effective_personality_user_id: "${ $workflow.input.personality_user_id // 200000 }"
-        effective_summary_user_id: "${ $workflow.input.summary_user_id // 100000 }"
-
-  # See thread-personality-single for the rationale of these two guards.
-  - failOnSelfOwnedPersonality:
-      if: "${ $effective_personality_user_id == $workflow.input.user_id }"
-      raise:
-        error:
-          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
-          status: 400
-          title: "personality_user_id must differ from user_id"
-          detail: >-
-            ${ "personality_user_id (" + ($effective_personality_user_id | tostring)
-               + ") must differ from user_id ("
-               + ($workflow.input.user_id | tostring)
-               + ") to prevent recursive personality extraction." }
-
-  - failOnSummaryUserCollision:
-      if: "${ $effective_personality_user_id == $effective_summary_user_id }"
-      raise:
-        error:
-          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
-          status: 400
-          title: "personality_user_id must differ from summary_user_id"
-          detail: >-
-            ${ "personality_user_id (" + ($effective_personality_user_id | tostring)
-               + ") must differ from summary_user_id ("
-               + ($effective_summary_user_id | tostring)
-               + ") to keep the two extraction domains disjoint." }
+        effective_personality_user_id: "${ $workflow.input.user_id }"
 
   # Initialised early so an early `then: exit` does not leave
   # `output.as` referencing undefined variables. `truncated_signals`
@@ -121,6 +94,7 @@ do:
                          "user:" + ($workflow.input.user_id | tostring)],
                 match_mode: "LABEL_ALL",
                 user_id: $effective_personality_user_id,
+                memory_kinds: ["MEMORY_KIND_PERSONALITY"],
                 limit: 1
               } | tojson }
             as_json: true
@@ -192,7 +166,8 @@ do:
                          "user:" + ($workflow.input.user_id | tostring),
                          "personality_signal"],
                 match_mode: "LABEL_ALL",
-                user_id: $effective_personality_user_id
+                user_id: $effective_personality_user_id,
+                memory_kinds: ["MEMORY_KIND_PERSONALITY"]
               } | tojson }
             as_json: true
       export:
@@ -224,6 +199,7 @@ do:
                 content_types: ["TEXT"],
                 thread_filter: {
                   user_id: $effective_personality_user_id,
+                  memory_kinds: ["MEMORY_KIND_PERSONALITY"],
                   labels: ["personality",
                            "user:" + ($workflow.input.user_id | tostring)],
                   label_match_mode: "LABEL_ALL"
@@ -664,6 +640,7 @@ do:
             json_body: >-
               ${ {
                 user_id: { value: $effective_personality_user_id },
+                memory_kind: "MEMORY_KIND_PERSONALITY",
                 description: ("personality profile for user "
                               + ($workflow.input.user_id | tostring)),
                 labels: ["personality_profile",
@@ -762,6 +739,7 @@ do:
                 thread_id: { value: $profile_thread_id },
                 memory: {
                   user_id: { value: $effective_personality_user_id },
+                  memory_kind: "MEMORY_KIND_PERSONALITY",
                   content: ($profile_json | tojson),
                   content_type: "TEXT",
                   role: "ROLE_ASSISTANT",

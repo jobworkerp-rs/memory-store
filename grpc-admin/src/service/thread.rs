@@ -16,6 +16,7 @@ use crate::protobuf::llm_memory::service::{
 };
 use crate::service::error_handle::handle_error;
 use crate::service::memory::enrich_memory_media;
+use crate::service::memory_kind::normalize_memory_kinds;
 use app::app::thread::{
     AddMemoriesBatchInput, AddMemoryOutcome as AppAddMemoryOutcome, BatchMemoryInput,
     BatchThreadTarget, MemoryWithPosition, ThreadApp, ThreadAppImpl, ThreadListOptions,
@@ -27,14 +28,23 @@ use futures::stream::BoxStream;
 use infra::infra::thread::rdb::ThreadSort;
 use tonic::Response;
 
-fn thread_list_options_from_user_req(req: &FindThreadListByUserIdRequest) -> ThreadListOptions {
-    ThreadListOptions {
+fn validated_memory_kinds(memory_kinds: &[i32]) -> Result<Vec<i32>, tonic::Status> {
+    let mut memory_kinds = memory_kinds.to_vec();
+    normalize_memory_kinds(&mut memory_kinds)?;
+    Ok(memory_kinds)
+}
+
+fn thread_list_options_from_user_req(
+    req: &FindThreadListByUserIdRequest,
+) -> Result<ThreadListOptions, tonic::Status> {
+    Ok(ThreadListOptions {
         created_after: req.created_after,
         created_before: req.created_before,
         updated_after: req.updated_after,
         updated_before: req.updated_before,
         sort: req.sort.map(ThreadSort::from).unwrap_or_default(),
-    }
+        memory_kinds: validated_memory_kinds(&req.memory_kinds)?,
+    })
 }
 
 pub trait ThreadGrpc {
@@ -52,6 +62,41 @@ pub trait ThreadGrpc {
 
 const DEFAULT_TTL: Duration = Duration::from_secs(30);
 const LIST_TTL: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protobuf::llm_memory::data::MemoryKind;
+
+    #[test]
+    fn thread_list_options_accepts_explicit_memory_kinds() {
+        let req = FindThreadListByUserIdRequest {
+            memory_kinds: vec![MemoryKind::Raw as i32, MemoryKind::ThreadSummary as i32],
+            ..Default::default()
+        };
+
+        let options = thread_list_options_from_user_req(&req).unwrap();
+
+        assert_eq!(
+            options.memory_kinds,
+            vec![MemoryKind::Raw as i32, MemoryKind::ThreadSummary as i32,]
+        );
+    }
+
+    #[test]
+    fn thread_list_options_rejects_unspecified_or_unknown_memory_kinds() {
+        for memory_kinds in [vec![0], vec![99]] {
+            let req = FindThreadListByUserIdRequest {
+                memory_kinds,
+                ..Default::default()
+            };
+
+            let error = thread_list_options_from_user_req(&req).unwrap_err();
+
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
+    }
+}
 
 #[tonic::async_trait]
 impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for T {
@@ -144,7 +189,8 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
         request: tonic::Request<FindListRequest>,
     ) -> Result<tonic::Response<Self::FindListStream>, tonic::Status> {
         let _s = Self::trace_request("thread", "find_list", &request);
-        let req = request.get_ref();
+        let mut req = request.into_inner();
+        normalize_memory_kinds(&mut req.memory_kinds)?;
         let ttl = if req.limit.is_some() {
             LIST_TTL
         } else {
@@ -152,7 +198,12 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
         };
         match self
             .app()
-            .find_thread_list(req.limit.as_ref(), req.offset.as_ref(), Some(&ttl))
+            .find_thread_list(
+                req.limit.as_ref(),
+                req.offset.as_ref(),
+                &req.memory_kinds,
+                Some(&ttl),
+            )
             .await
         {
             Ok(list) => Ok(Response::new(Box::pin(stream! {
@@ -175,7 +226,7 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
         let user_id = req
             .user_id
             .ok_or_else(|| tonic::Status::invalid_argument("user_id is required"))?;
-        let opts = thread_list_options_from_user_req(req);
+        let opts = thread_list_options_from_user_req(req)?;
         match self
             .app()
             .find_thread_list_by_user_id(
@@ -363,6 +414,7 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
             updated_after: req.updated_after,
             updated_before: req.updated_before,
             sort: req.sort.map(ThreadSort::from).unwrap_or_default(),
+            memory_kinds: validated_memory_kinds(&req.memory_kinds)?,
         };
         match self
             .app()

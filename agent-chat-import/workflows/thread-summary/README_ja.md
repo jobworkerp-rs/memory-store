@@ -50,7 +50,6 @@ jobworkerp-client job enqueue-workflow \
     "memories_grpc_port": 9010,
     "ollama_base_url": "http://192.168.1.2:11434",
     "summary_model": "qwen3.6:27b",
-    "summary_user_id": 100000,
     "output_language": "ja"
   }' \
   -w /absolute/path/to/thread-summary-batch.yaml \
@@ -69,8 +68,7 @@ jobworkerp-client job enqueue-workflow \
     "memories_grpc_host": "localhost",
     "memories_grpc_port": 9010,
     "ollama_base_url": "http://192.168.1.2:11434",
-    "summary_model": "qwen3.6:27b",
-    "summary_user_id": 100000
+    "summary_model": "qwen3.6:27b"
   }' \
   -w /absolute/path/to/thread-summary-batch.yaml \
   --format json \
@@ -88,8 +86,7 @@ jobworkerp-client job enqueue-workflow \
     "memories_grpc_host": "localhost",
     "memories_grpc_port": 9010,
     "labels_filter": ["coding_agent", "agent:claude_code"],
-    "ollama_base_url": "http://192.168.1.2:11434",
-    "summary_user_id": 100000
+    "ollama_base_url": "http://192.168.1.2:11434"
   }' \
   -w /absolute/path/to/thread-summary-batch.yaml \
   --format json \
@@ -108,8 +105,7 @@ jobworkerp-client job enqueue-workflow \
     "memories_grpc_host": "localhost",
     "memories_grpc_port": 9010,
     "ollama_base_url": "http://192.168.1.2:11434",
-    "force_resummarize": true,
-    "summary_user_id": 100000
+    "force_resummarize": true
   }' \
   -w /absolute/path/to/thread-summary-batch.yaml \
   --format json \
@@ -127,8 +123,7 @@ cat > /tmp/summarize.json <<'EOF'
   "memories_grpc_host": "localhost",
   "memories_grpc_port": 9010,
   "ollama_base_url": "http://192.168.1.2:11434",
-  "summary_model": "qwen3.6:27b",
-  "summary_user_id": 100000
+  "summary_model": "qwen3.6:27b"
 }
 EOF
 
@@ -146,7 +141,7 @@ JOBWORKERP_ADDR=http://localhost:9000 \
 - `user_id` — `memories-import --user-id` の値で常に上書き (テンプレ側の値は無視)
 - `updated_within_hours` — `--since` を指定したときのみ、`(now - since)` を 1 時間単位に切り上げて上書き。`--since` 未指定なら touch しない
 
-その他のフィールド (`memories_grpc_host`/`_port`、`summary_user_id`、`labels_filter` 等) は JSON の値がそのまま透過される。
+その他のフィールド (`memories_grpc_host`/`_port`、`labels_filter` 等) は JSON の値がそのまま透過される。`user_id` はimportの`--user-id`から上書きされる。
 
 `--summarize-after-json '<JSON>'` で同等のインライン指定も可。
 
@@ -167,7 +162,6 @@ JOBWORKERP_ADDR=http://localhost:9000 \
 | `ollama_base_url` | - | `http://localhost:11434` | OllamaサーバのベースURL |
 | `memory_thread_label_prefix` | - | `summary` | 要約メモリスレッドのマーカーラベル |
 | `force_resummarize` | - | `false` | `true` で既存要約も再生成 |
-| `summary_user_id` | - | `100000` | 要約メモリスレッドの所有者ユーザID（`user_id` と異なる値を指定すること） |
 | `output_language` | - | `ja` | 生成言語 `ja` / `en`。batch が呼ぶ言語別 worker の選択に使う |
 
 ### single worker 固有
@@ -211,7 +205,7 @@ batch は `output_language` に応じて `memories-thread-summary-single-ja` /
 
 ### 要約メモリ
 
-要約は `summary_user_id` が所有するメモリスレッドに保存される。同一ラベルのスレッドは同一メモリスレッドに集約される。
+要約は元会話と同じ`user_id`を持つ`THREAD_SUMMARY`メモリスレッドに保存される。同一ラベルのスレッドは同一メモリスレッドに集約される。
 
 - `content`: JSON構造化要約（category, title, summary, key_decisions, status）
 - `metadata`: `{"source_thread_id": "<元スレッドID(文字列)>", "category": "...", "summary_version": "1.0"}` （`source_thread_id` はint64の精度欠落を避けるため文字列で格納）
@@ -245,8 +239,7 @@ LLMが会話内容から自動判定:
 
 ## 注意事項
 
-- **`summary_user_id` は `user_id` と異なる値にすること**。同一値の場合、ワークフロー先頭のバリデーションで `summary_user_id must differ from user_id` エラーで失敗する(再帰汚染を防ぐため拒否される)
-- **`summary_user_id` を省略した場合は 100000 として扱われる**。`user_id` に 100000 を使用している環境では明示的に別の値を指定すること
+- 要約の分離は`THREAD_SUMMARY`種別で行う。別のthread作成者を指定するフィールドはない。
 - **ワークフローファイルのパスは絶対パスで指定すること**。jobworkerpサーバの作業ディレクトリとワークフローファイルの場所が異なるため
 - **バッチ実行は逐次処理**。全スレッド処理には `スレッド数 × 約1分` 程度かかる。タイムアウトは十分な値を設定すること
 - **`max_context_chars`** はモデルのコンテキスト長に対してマージンを取った値を指定する。Qwen3.6:27b（256kトークン）ではデフォルト `200000` を推奨
