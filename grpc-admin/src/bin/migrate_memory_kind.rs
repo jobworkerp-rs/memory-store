@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use common::external_id::{EXTERNAL_ID_MAX_BYTES, namespace_for_external_id, owner_scoped};
 use infra::infra::IdGeneratorWrapper;
 use infra::infra::memory_kind_migration::{
-    Classification, ThreadEvidence, classify_thread, parse_mapping_json,
+    Classification, ClassificationMapping, ThreadEvidence, classify_thread, parse_mapping_json,
 };
 use infra::infra::module::rdb_pool_by_env;
 use infra_utils::infra::rdb::{Rdb, RdbPool, RdbTransaction};
@@ -284,17 +284,113 @@ fn thread_owner_sql() -> String {
     format!("SELECT CAST(user_id AS BIGINT) FROM thread WHERE id = {P1}")
 }
 
-/// Owner of a source thread referenced by summary provenance metadata.
-/// Shared by the direct (non-aggregate) summary path and the aggregate
-/// hierarchy walk, which both resolve `source_thread_id` -> owner the
-/// same way.
-async fn thread_owner(tx: &mut RdbTransaction<'_>, thread_id: i64) -> Result<Option<i64>> {
+#[derive(Default)]
+struct SourceThreadOwnerEvidence {
+    owners: BTreeSet<i64>,
+    has_invalid_hierarchy: bool,
+    is_missing: bool,
+}
+
+/// Resolves a provenance thread to its human owner without mistaking a
+/// generated summary's stored worker owner for an end-user owner.
+async fn resolve_source_thread_owner(
+    tx: &mut RdbTransaction<'_>,
+    mapping: &ClassificationMapping,
+    thread_id: i64,
+    visiting: &mut BTreeSet<i64>,
+) -> Result<SourceThreadOwnerEvidence> {
     let owner_sql = thread_owner_sql();
-    sqlx::query_scalar::<Rdb, i64>(sqlx::AssertSqlSafe(owner_sql))
+    let Some(stored_owner) = sqlx::query_scalar::<Rdb, i64>(sqlx::AssertSqlSafe(owner_sql))
         .bind(thread_id)
         .fetch_optional(&mut **tx)
         .await
-        .context("read source thread owner for memory kind migration plan")
+        .context("read source thread owner for memory kind migration plan")?
+    else {
+        return Ok(SourceThreadOwnerEvidence {
+            is_missing: true,
+            ..Default::default()
+        });
+    };
+    if stored_owner < GENERATED_USER_ID_MIN {
+        return Ok(SourceThreadOwnerEvidence {
+            owners: BTreeSet::from([stored_owner]),
+            ..Default::default()
+        });
+    }
+
+    let labels_sql = format!("SELECT label FROM thread_label WHERE thread_id = {P1}");
+    let labels = sqlx::query_scalar::<Rdb, String>(sqlx::AssertSqlSafe(labels_sql))
+        .bind(thread_id)
+        .fetch_all(&mut **tx)
+        .await
+        .context("read source thread labels for memory kind migration plan")?;
+    let metadata_sql = format!(
+        "SELECT {MEMORY_METADATA_EXPR} AS metadata FROM memory m \
+         JOIN thread_memory tm ON tm.memory_id = m.id WHERE tm.thread_id = {P1}"
+    );
+    let metadata_rows = sqlx::query_as::<Rdb, MetadataRow>(sqlx::AssertSqlSafe(metadata_sql))
+        .bind(thread_id)
+        .fetch_all(&mut **tx)
+        .await
+        .context("read source thread metadata for memory kind migration plan")?;
+    let (
+        _,
+        has_summary_metadata,
+        aggregate_metadata_kind,
+        has_aggregate_metadata_conflict,
+        has_invalid_metadata,
+    ) = metadata_evidence(&metadata_rows);
+    let summary_kinds = labels
+        .iter()
+        .filter_map(|label| mapping.summary_labels.get(label).copied())
+        .collect::<BTreeSet<_>>();
+    let is_mapped_summary = summary_kinds.len() == 1
+        && !has_aggregate_metadata_conflict
+        && !has_invalid_metadata
+        && summary_kinds.first().is_some_and(|kind| {
+            (*kind == MemoryKind::ThreadSummary as i32
+                && has_summary_metadata
+                && aggregate_metadata_kind.is_none())
+                || aggregate_metadata_kind == Some(*kind)
+        });
+    if !has_summary_metadata && aggregate_metadata_kind.is_none() {
+        // A high-valued user id on an ordinary thread is a real owner, not
+        // enough evidence to rewrite the thread as a generated artifact.
+        return Ok(SourceThreadOwnerEvidence {
+            owners: BTreeSet::from([stored_owner]),
+            ..Default::default()
+        });
+    }
+    if !is_mapped_summary || !visiting.insert(thread_id) {
+        return Ok(SourceThreadOwnerEvidence {
+            has_invalid_hierarchy: true,
+            ..Default::default()
+        });
+    }
+    let source_thread_ids = source_thread_ids(&metadata_rows);
+    if source_thread_ids.is_empty() {
+        visiting.remove(&thread_id);
+        return Ok(SourceThreadOwnerEvidence {
+            has_invalid_hierarchy: true,
+            ..Default::default()
+        });
+    }
+    let mut evidence = SourceThreadOwnerEvidence::default();
+    for source_thread_id in source_thread_ids {
+        let source = Box::pin(resolve_source_thread_owner(
+            tx,
+            mapping,
+            source_thread_id,
+            visiting,
+        ))
+        .await?;
+        evidence.owners.extend(source.owners);
+        evidence.has_invalid_hierarchy |= source.has_invalid_hierarchy;
+        evidence.is_missing |= source.is_missing;
+    }
+    visiting.remove(&thread_id);
+    evidence.has_invalid_hierarchy |= evidence.owners.len() != 1;
+    Ok(evidence)
 }
 
 /// The single owner candidate, or `None` when the set is empty or
@@ -549,6 +645,7 @@ fn expected_aggregate_input_kind(aggregate_kind: i32) -> Option<i32> {
 /// usable as an ownership signal.
 async fn aggregate_source_evidence(
     tx: &mut RdbTransaction<'_>,
+    mapping: &ClassificationMapping,
     aggregate_kind: i32,
     initial_memory_ids: &BTreeSet<i64>,
 ) -> Result<AggregateSourceEvidence> {
@@ -626,12 +723,15 @@ async fn aggregate_source_evidence(
             let source_thread_ids = source_thread_ids(&rows);
             evidence.has_invalid_hierarchy |= source_thread_ids.is_empty();
             for source_thread_id in source_thread_ids {
-                match thread_owner(tx, source_thread_id).await? {
-                    Some(owner) => {
-                        evidence.owners.insert(owner);
-                    }
-                    None => evidence.has_invalid_hierarchy = true,
-                }
+                let source = resolve_source_thread_owner(
+                    tx,
+                    mapping,
+                    source_thread_id,
+                    &mut BTreeSet::new(),
+                )
+                .await?;
+                evidence.owners.extend(source.owners);
+                evidence.has_invalid_hierarchy |= source.has_invalid_hierarchy || source.is_missing;
             }
             // Daily summaries can outlive their raw inputs. If provenance is
             // retained, however, every referenced input must still exist.
@@ -810,28 +910,36 @@ async fn build_preflight_audit_in_tx(
         let mut has_missing_summary_source_thread = false;
         if let Some(aggregate_kind) = aggregate_metadata_kind {
             let aggregate_evidence =
-                aggregate_source_evidence(tx, aggregate_kind, &source_memory_ids).await?;
+                aggregate_source_evidence(tx, &mapping, aggregate_kind, &source_memory_ids).await?;
             owner_candidates.extend(aggregate_evidence.owners);
             has_invalid_aggregate_source_hierarchy = aggregate_evidence.has_invalid_hierarchy;
             has_invalid_metadata |= aggregate_evidence.has_invalid_metadata;
             if aggregate_kind == MemoryKind::DailySummary as i32 {
                 for source_thread_id in &source_thread_ids {
-                    match thread_owner(tx, *source_thread_id).await? {
-                        Some(owner) => {
-                            owner_candidates.insert(owner);
-                        }
-                        None => has_missing_summary_source_thread = true,
-                    }
+                    let source = resolve_source_thread_owner(
+                        tx,
+                        &mapping,
+                        *source_thread_id,
+                        &mut BTreeSet::new(),
+                    )
+                    .await?;
+                    owner_candidates.extend(source.owners);
+                    has_invalid_aggregate_source_hierarchy |= source.has_invalid_hierarchy;
+                    has_missing_summary_source_thread |= source.is_missing;
                 }
             }
         } else {
             for source_thread_id in &source_thread_ids {
-                match thread_owner(tx, *source_thread_id).await? {
-                    Some(owner) => {
-                        owner_candidates.insert(owner);
-                    }
-                    None => has_missing_summary_source_thread = true,
-                }
+                let source = resolve_source_thread_owner(
+                    tx,
+                    &mapping,
+                    *source_thread_id,
+                    &mut BTreeSet::new(),
+                )
+                .await?;
+                owner_candidates.extend(source.owners);
+                has_invalid_aggregate_source_hierarchy |= source.has_invalid_hierarchy;
+                has_missing_summary_source_thread |= source.is_missing;
             }
         }
         let metadata_source_user_id = single_owner(&owner_candidates);
@@ -3003,6 +3111,139 @@ mod tests {
 
     #[cfg(not(feature = "postgres"))]
     #[tokio::test]
+    async fn client_apply_resolves_period_summaries_through_legacy_summary_owner() {
+        let pool = client_fixture_pool().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(
+            "INSERT INTO thread (id, user_id, memory_kind) VALUES \
+               (1, 1, NULL), (2, 100000, NULL), (3, 100000, NULL), \
+               (4, 100000, NULL), (5, 100000, NULL); \
+             INSERT INTO memory (id, user_id, memory_kind, external_id, metadata) VALUES \
+               (10, 1, NULL, 'raw:conversation', NULL), \
+               (20, 100000, NULL, 'summary:legacy', '{\"summary_version\":1,\"source_thread_id\":1}'), \
+               (30, 100000, NULL, 'daily:2026-07-20:_all', '{\"daily_date\":\"2026-07-20\",\"source_thread_ids\":[2]}'), \
+               (40, 100000, NULL, 'weekly:2026-W30:_all', '{\"iso_week\":\"2026-W30\",\"source_memory_ids\":[30]}'), \
+               (50, 100000, NULL, 'monthly:2026-07:_all', '{\"month\":\"2026-07\",\"source_memory_ids\":[40]}'); \
+             INSERT INTO thread_memory (thread_id, memory_id) VALUES \
+               (1, 10), (2, 20), (3, 30), (4, 40), (5, 50); \
+             INSERT INTO thread_label (thread_id, label) VALUES \
+               (2, 'summary'), (3, 'daily_summary'), (4, 'weekly_summary'), (5, 'monthly_summary');",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let audit = apply_client_mapping_with_pool(&pool, b"{}", None)
+            .await
+            .unwrap();
+        assert!(audit.failures.is_empty());
+        for (thread_id, memory_id, kind) in [
+            (2, 20, MemoryKind::ThreadSummary),
+            (3, 30, MemoryKind::DailySummary),
+            (4, 40, MemoryKind::WeeklySummary),
+            (5, 50, MemoryKind::MonthlySummary),
+        ] {
+            assert_eq!(
+                sqlx::query_as::<_, (i64, i32)>(
+                    "SELECT user_id, memory_kind FROM thread WHERE id = ?",
+                )
+                .bind(thread_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                (1, kind as i32)
+            );
+            assert_eq!(
+                sqlx::query_as::<_, (i64, i32)>(
+                    "SELECT user_id, memory_kind FROM memory WHERE id = ?",
+                )
+                .bind(memory_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                (1, kind as i32)
+            );
+        }
+        for (memory_id, external_id) in [
+            (30, "daily:1:2026-07-20:_all"),
+            (40, "weekly:1:2026-W30:_all"),
+            (50, "monthly:1:2026-07:_all"),
+        ] {
+            assert_eq!(
+                sqlx::query_scalar::<_, String>("SELECT external_id FROM memory WHERE id = ?")
+                    .bind(memory_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                external_id
+            );
+        }
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
+    async fn client_apply_keeps_a_high_id_normal_source_thread_owner() {
+        let pool = client_fixture_pool().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(
+            "INSERT INTO thread (id, user_id, memory_kind) VALUES (1, 100000, NULL), (2, 100000, NULL); \
+             INSERT INTO memory (id, user_id, memory_kind, metadata) VALUES \
+               (10, 100000, NULL, NULL), \
+               (20, 100000, NULL, '{\"summary_version\":1,\"source_thread_id\":1}'); \
+             INSERT INTO thread_memory (thread_id, memory_id) VALUES (1, 10), (2, 20); \
+             INSERT INTO thread_label (thread_id, label) VALUES (2, 'summary');",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let audit = apply_client_mapping_with_pool(&pool, b"{}", None)
+            .await
+            .unwrap();
+        assert!(audit.warnings.is_empty());
+        assert_eq!(
+            sqlx::query_as::<_, (i64, i32)>(
+                "SELECT user_id, memory_kind FROM thread WHERE id = 2",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            (100_000, MemoryKind::ThreadSummary as i32)
+        );
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
+    async fn client_apply_leaves_cyclic_legacy_summary_provenance_unresolved() {
+        let pool = client_fixture_pool().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(
+            "INSERT INTO thread (id, user_id, memory_kind) VALUES (1, 100000, NULL); \
+             INSERT INTO memory (id, user_id, memory_kind, metadata) VALUES \
+               (10, 100000, NULL, '{\"summary_version\":1,\"source_thread_id\":1}'); \
+             INSERT INTO thread_memory (thread_id, memory_id) VALUES (1, 10); \
+             INSERT INTO thread_label (thread_id, label) VALUES (1, 'summary');",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let audit = apply_client_mapping_with_pool(&pool, b"{}", None)
+            .await
+            .unwrap();
+        assert!(audit.warnings.iter().any(|warning| {
+            warning.entity == "thread"
+                && warning.id == Some(1)
+                && warning.check == "unresolved_preflight"
+        }));
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<i32>>("SELECT memory_kind FROM thread WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
     async fn client_apply_records_dangling_memberships_without_failing() {
         let pool = client_fixture_pool().await;
         sqlx::raw_sql(sqlx::AssertSqlSafe(
@@ -3960,6 +4201,7 @@ mod tests {
 
         let evidence = aggregate_source_evidence(
             &mut tx,
+            &ClassificationMapping::default(),
             MemoryKind::MonthlySummary as i32,
             &BTreeSet::from([1]),
         )
@@ -3998,6 +4240,7 @@ mod tests {
 
         let evidence = aggregate_source_evidence(
             &mut tx,
+            &ClassificationMapping::default(),
             MemoryKind::WeeklySummary as i32,
             &BTreeSet::from([1]),
         )
@@ -4020,6 +4263,7 @@ mod tests {
 
         let evidence = aggregate_source_evidence(
             &mut tx,
+            &ClassificationMapping::default(),
             MemoryKind::DailySummary as i32,
             &BTreeSet::from([2]),
         )
@@ -4045,6 +4289,7 @@ mod tests {
 
         let evidence = aggregate_source_evidence(
             &mut tx,
+            &ClassificationMapping::default(),
             MemoryKind::WeeklySummary as i32,
             &BTreeSet::from([1]),
         )
