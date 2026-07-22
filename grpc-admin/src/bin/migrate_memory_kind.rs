@@ -109,6 +109,17 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Dump and remove unresolved client-only records before retrying the migration.
+    ClientPruneUnresolved {
+        #[arg(long)]
+        audit: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        /// Permit client recovery to remove unresolved rows even when they
+        /// are referenced by otherwise retained client records.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1236,7 +1247,7 @@ struct VerifyFailure {
     detail: String,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct ClientApplyAudit {
     format_version: u32,
     status: String,
@@ -1263,7 +1274,7 @@ fn write_client_audit(file: &mut std::fs::File, audit: &ClientApplyAudit) -> Res
     Ok(())
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ClientApplyWarning {
     entity: String,
     id: Option<i64>,
@@ -1272,6 +1283,26 @@ struct ClientApplyWarning {
 }
 
 #[derive(Debug, serde::Serialize)]
+struct ClientPruneDump {
+    format_version: u32,
+    status: String,
+    memory_ids: Vec<i64>,
+    thread_ids: Vec<i64>,
+    records: serde_json::Value,
+    deleted_memory_rows: u64,
+    deleted_thread_rows: u64,
+    deleted_membership_rows: u64,
+}
+
+fn write_client_prune_dump(file: &mut std::fs::File, dump: &ClientPruneDump) -> Result<()> {
+    file.set_len(0)?;
+    file.rewind()?;
+    file.write_all(&serde_json::to_vec_pretty(dump)?)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct ClientApplyFailure {
     entity: String,
     id: i64,
@@ -2865,6 +2896,516 @@ async fn apply_client_mapping(
     apply_client_mapping_with_pool(&pool, mapping_bytes, journal).await
 }
 
+async fn prune_client_unresolved_with_pool(
+    pool: &RdbPool,
+    audit: &ClientApplyAudit,
+    output: &std::path::Path,
+) -> Result<ClientPruneDump> {
+    prune_client_unresolved_with_pool_force(pool, audit, output, false).await
+}
+
+async fn prune_client_unresolved_with_pool_force(
+    pool: &RdbPool,
+    audit: &ClientApplyAudit,
+    output: &std::path::Path,
+    force: bool,
+) -> Result<ClientPruneDump> {
+    if audit.status != "completed" || !audit.failures.is_empty() {
+        bail!("only a completed client audit without failures can be pruned");
+    }
+    if audit
+        .warnings
+        .iter()
+        .any(|warning| warning.check != "unresolved_preflight")
+    {
+        bail!("client audit contains warnings that are not safe to prune");
+    }
+    let mut memory_ids = BTreeSet::new();
+    let mut thread_ids = BTreeSet::new();
+    for warning in &audit.warnings {
+        let Some(id) = warning.id else {
+            bail!("unresolved warning has no id");
+        };
+        match warning.entity.as_str() {
+            "memory" => {
+                memory_ids.insert(id);
+            }
+            "thread" => {
+                thread_ids.insert(id);
+            }
+            entity => bail!("unresolved warning has unsupported entity {entity}"),
+        }
+    }
+    let mut schema_tx = pool
+        .begin()
+        .await
+        .context("begin client unresolved prune schema check")?;
+    let unknown_references = unsupported_thread_reference_columns(&mut schema_tx).await?;
+    schema_tx.commit().await?;
+    if !unknown_references.is_empty() {
+        bail!(
+            "refusing unresolved prune with unknown thread reference columns: {}",
+            unknown_references.join(", ")
+        );
+    }
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin client unresolved prune")?;
+    let memory_ids = memory_ids.into_iter().collect::<Vec<_>>();
+    let thread_ids = thread_ids.into_iter().collect::<Vec<_>>();
+    for thread_id in &thread_ids {
+        let sql = format!("SELECT memory_id FROM thread_reflection_index WHERE thread_id = {P1}");
+        let reflection_memory_ids = sqlx::query_scalar::<Rdb, i64>(sqlx::AssertSqlSafe(sql))
+            .bind(thread_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        if !force
+            && let Some(memory_id) = reflection_memory_ids
+                .into_iter()
+                .find(|memory_id| !memory_ids.contains(memory_id))
+        {
+            bail!(
+                "refusing unresolved prune: thread {thread_id} contains retained reflection memory {memory_id} via thread_id"
+            );
+        }
+        let sql =
+            format!("SELECT memory_id FROM thread_reflection_index WHERE origin_thread_id = {P1}");
+        let reflection_memory_ids = sqlx::query_scalar::<Rdb, i64>(sqlx::AssertSqlSafe(sql))
+            .bind(thread_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        if !force
+            && let Some(memory_id) = reflection_memory_ids
+                .into_iter()
+                .find(|memory_id| !memory_ids.contains(memory_id))
+        {
+            bail!(
+                "refusing unresolved prune: thread {thread_id} is referenced by retained reflection memory {memory_id} via origin_thread_id"
+            );
+        }
+    }
+    for memory_id in &memory_ids {
+        let sql = format!(
+            "SELECT tm.thread_id FROM thread_memory tm JOIN thread t ON t.id = tm.thread_id WHERE tm.memory_id = {P1}"
+        );
+        let referencing_thread_ids = sqlx::query_scalar::<Rdb, i64>(sqlx::AssertSqlSafe(sql))
+            .bind(memory_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        if !force
+            && let Some(thread_id) = referencing_thread_ids
+                .into_iter()
+                .find(|thread_id| !thread_ids.contains(thread_id))
+        {
+            bail!(
+                "refusing unresolved prune: memory {memory_id} is shared with retained thread {thread_id} via thread_memory"
+            );
+        }
+        let sql = format!(
+            "SELECT DISTINCT m.id FROM memory m JOIN json_each(m.parent_ids) AS parent WHERE CAST(parent.value AS INTEGER) = {P1}"
+        );
+        let referencing_memory_ids = sqlx::query_scalar::<Rdb, i64>(sqlx::AssertSqlSafe(sql))
+            .bind(memory_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        if !force
+            && let Some(referencing_memory_id) = referencing_memory_ids
+                .into_iter()
+                .find(|referencing_memory_id| !memory_ids.contains(referencing_memory_id))
+        {
+            bail!(
+                "refusing unresolved prune: memory {memory_id} is referenced by retained memory {referencing_memory_id} via parent_ids"
+            );
+        }
+        let sql = format!("SELECT id FROM thread WHERE default_system_memory_id = {P1}");
+        let referencing_thread_ids = sqlx::query_scalar::<Rdb, i64>(sqlx::AssertSqlSafe(sql))
+            .bind(memory_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        if !force
+            && let Some(thread_id) = referencing_thread_ids
+                .into_iter()
+                .find(|thread_id| !thread_ids.contains(thread_id))
+        {
+            bail!(
+                "refusing unresolved prune: memory {memory_id} is referenced by retained thread {thread_id} via default_system_memory_id"
+            );
+        }
+        let sql = format!("SELECT memory_id FROM reflection_fact WHERE fact_memory_id = {P1}");
+        let referencing_memory_ids = sqlx::query_scalar::<Rdb, i64>(sqlx::AssertSqlSafe(sql))
+            .bind(memory_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        if !force
+            && let Some(reflection_memory_id) = referencing_memory_ids
+                .into_iter()
+                .find(|reflection_memory_id| !memory_ids.contains(reflection_memory_id))
+        {
+            bail!(
+                "refusing unresolved prune: memory {memory_id} is referenced by retained reflection memory {reflection_memory_id} via reflection_fact"
+            );
+        }
+        let sql = format!(
+            "SELECT memory_id FROM thread_reflection_index WHERE previous_reflection_id = {P1}"
+        );
+        let referencing_memory_ids = sqlx::query_scalar::<Rdb, i64>(sqlx::AssertSqlSafe(sql))
+            .bind(memory_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        if !force
+            && let Some(reflection_memory_id) = referencing_memory_ids
+                .into_iter()
+                .find(|reflection_memory_id| !memory_ids.contains(reflection_memory_id))
+        {
+            bail!(
+                "refusing unresolved prune: memory {memory_id} is referenced by retained reflection memory {reflection_memory_id} via previous_reflection_id"
+            );
+        }
+    }
+    let records = client_prune_dump_records(&mut tx, &memory_ids, &thread_ids).await?;
+    let dump = ClientPruneDump {
+        format_version: 3,
+        status: "prepared".into(),
+        memory_ids: memory_ids.clone(),
+        thread_ids: thread_ids.clone(),
+        records,
+        deleted_memory_rows: 0,
+        deleted_thread_rows: 0,
+        deleted_membership_rows: 0,
+    };
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+        .with_context(|| format!("create client prune dump {}", output.display()))?;
+    write_client_prune_dump(&mut file, &dump)?;
+    let mut deleted_membership_rows = 0;
+    let mut deleted_memory_rows = 0;
+    let mut deleted_thread_rows = 0;
+    for memory_id in &memory_ids {
+        if force {
+            // Client recovery deliberately preserves unrelated records, so
+            // detach their optional references before removing the target.
+            let sql = format!(
+                "UPDATE thread SET default_system_memory_id = NULL WHERE default_system_memory_id = {P1}"
+            );
+            sqlx::query::<Rdb>(sqlx::AssertSqlSafe(sql))
+                .bind(memory_id)
+                .execute(&mut *tx)
+                .await?;
+            let sql = format!("DELETE FROM reflection_fact WHERE fact_memory_id = {P1}");
+            sqlx::query::<Rdb>(sqlx::AssertSqlSafe(sql))
+                .bind(memory_id)
+                .execute(&mut *tx)
+                .await?;
+            let sql =
+                format!("DELETE FROM thread_reflection_index WHERE previous_reflection_id = {P1}");
+            sqlx::query::<Rdb>(sqlx::AssertSqlSafe(sql))
+                .bind(memory_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let sql = format!("DELETE FROM thread_memory WHERE memory_id = {P1}");
+        deleted_membership_rows += sqlx::query::<Rdb>(sqlx::AssertSqlSafe(sql))
+            .bind(memory_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        let sql = format!("DELETE FROM memory_rating WHERE memory_id = {P1}");
+        sqlx::query::<Rdb>(sqlx::AssertSqlSafe(sql))
+            .bind(memory_id)
+            .execute(&mut *tx)
+            .await?;
+        for table in [
+            "reflection_failure_mode",
+            "reflection_tool",
+            "reflection_tool_outcome",
+            "reflection_fact",
+            "reflection_applied_target",
+            "reflection_few_shot_usage",
+        ] {
+            let sql = format!("DELETE FROM {table} WHERE memory_id = {P1}");
+            sqlx::query::<Rdb>(sqlx::AssertSqlSafe(sql))
+                .bind(memory_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let sql = format!("DELETE FROM thread_reflection_index WHERE memory_id = {P1}");
+        sqlx::query::<Rdb>(sqlx::AssertSqlSafe(sql))
+            .bind(memory_id)
+            .execute(&mut *tx)
+            .await?;
+        // Migration-target client databases do not use media_object, so this
+        // destructive compatibility path intentionally does not adjust ref_count.
+        let sql = format!("DELETE FROM memory WHERE id = {P1}");
+        deleted_memory_rows += sqlx::query::<Rdb>(sqlx::AssertSqlSafe(sql))
+            .bind(memory_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+    }
+    for thread_id in &thread_ids {
+        let sql = format!("DELETE FROM thread_memory WHERE thread_id = {P1}");
+        deleted_membership_rows += sqlx::query::<Rdb>(sqlx::AssertSqlSafe(sql))
+            .bind(thread_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        for table in ["thread_label", "thread_aggregate_key"] {
+            let sql = format!("DELETE FROM {table} WHERE thread_id = {P1}");
+            sqlx::query::<Rdb>(sqlx::AssertSqlSafe(sql))
+                .bind(thread_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let sql = format!(
+            "DELETE FROM thread_reflection_index WHERE thread_id = {P1} OR origin_thread_id = {P1}"
+        );
+        sqlx::query::<Rdb>(sqlx::AssertSqlSafe(sql))
+            .bind(thread_id)
+            .execute(&mut *tx)
+            .await?;
+        let sql = format!("DELETE FROM reflection_few_shot_usage WHERE used_in_thread_id = {P1}");
+        sqlx::query::<Rdb>(sqlx::AssertSqlSafe(sql))
+            .bind(thread_id)
+            .execute(&mut *tx)
+            .await?;
+        let sql = format!("DELETE FROM thread WHERE id = {P1}");
+        deleted_thread_rows += sqlx::query::<Rdb>(sqlx::AssertSqlSafe(sql))
+            .bind(thread_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+    }
+    let commit_pending_dump = ClientPruneDump {
+        status: "commit_pending".into(),
+        deleted_memory_rows,
+        deleted_thread_rows,
+        deleted_membership_rows,
+        ..dump
+    };
+    write_client_prune_dump(&mut file, &commit_pending_dump)
+        .context("persist client unresolved prune dump before commit")?;
+    tx.commit().await.map_err(|error| {
+        anyhow::Error::new(CommitOutcomeUnknown).context(format!(
+            "client unresolved prune commit failed after the dump recorded commit_pending; inspect {} before retrying: {error}",
+            output.display()
+        ))
+    })?;
+    let dump = ClientPruneDump {
+        status: "completed".into(),
+        ..commit_pending_dump
+    };
+    write_client_prune_dump(&mut file, &dump).with_context(|| {
+        format!(
+            "client unresolved prune committed, but its dump remains commit_pending at {}",
+            output.display()
+        )
+    })?;
+    Ok(dump)
+}
+
+async fn client_prune_dump_records(
+    tx: &mut RdbTransaction<'_>,
+    memory_ids: &[i64],
+    thread_ids: &[i64],
+) -> Result<serde_json::Value> {
+    // Client pruning is only supported for the SQLite schema. JSON objects
+    // preserve the stored payload before any destructive statement executes.
+    #[cfg(feature = "postgres")]
+    {
+        let _ = (tx, memory_ids, thread_ids);
+        bail!("client unresolved prune is SQLite-only");
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        use sqlx::Row;
+        let mut result = serde_json::Map::new();
+        for (name, sql, ids) in [
+            (
+                "memory",
+                "SELECT json_object('id',id,'parent_ids',parent_ids,'user_id',user_id,'content',content,'content_type',content_type,'params',params,'metadata',metadata,'created_at',created_at,'updated_at',updated_at,'role',role,'external_id',external_id,'media_object_id',media_object_id,'memory_kind',memory_kind) value FROM memory WHERE id = ?",
+                memory_ids,
+            ),
+            (
+                "thread",
+                "SELECT json_object('id',id,'default_system_memory_id',default_system_memory_id,'user_id',user_id,'description',description,'channel',channel,'embedding_hex',CASE WHEN embedding IS NULL THEN NULL ELSE hex(embedding) END,'embedding_dim',embedding_dim,'created_at',created_at,'updated_at',updated_at,'metadata',metadata,'memory_kind',memory_kind) value FROM thread WHERE id = ?",
+                thread_ids,
+            ),
+        ] {
+            let mut values = Vec::new();
+            for id in ids {
+                for row in sqlx::query(sql).bind(id).fetch_all(&mut **tx).await? {
+                    values.push(serde_json::from_str::<serde_json::Value>(
+                        row.try_get::<String, _>("value")?.as_str(),
+                    )?);
+                }
+            }
+            result.insert(name.into(), serde_json::Value::Array(values));
+        }
+        let mut thread_memories = Vec::new();
+        for id in memory_ids {
+            for row in sqlx::query("SELECT json_object('thread_id',thread_id,'memory_id',memory_id,'position',position,'created_at',created_at) value FROM thread_memory WHERE memory_id = ?")
+                .bind(id).fetch_all(&mut **tx).await?
+            {
+                thread_memories.push(serde_json::from_str::<serde_json::Value>(
+                    row.try_get::<String, _>("value")?.as_str(),
+                )?);
+            }
+        }
+        for id in thread_ids {
+            for row in sqlx::query("SELECT json_object('thread_id',thread_id,'memory_id',memory_id,'position',position,'created_at',created_at) value FROM thread_memory WHERE thread_id = ?")
+                .bind(id).fetch_all(&mut **tx).await?
+            {
+                let value = serde_json::from_str::<serde_json::Value>(
+                    row.try_get::<String, _>("value")?.as_str(),
+                )?;
+                if !thread_memories.contains(&value) {
+                    thread_memories.push(value);
+                }
+            }
+        }
+        result.insert(
+            "thread_memory".into(),
+            serde_json::Value::Array(thread_memories),
+        );
+        for (name, sql, ids) in [
+            (
+                "thread_label",
+                "SELECT json_object('thread_id',thread_id,'label',label,'created_at',created_at) value FROM thread_label WHERE thread_id = ?",
+                thread_ids,
+            ),
+            (
+                "thread_aggregate_key",
+                "SELECT json_object('user_id',user_id,'labels_hash',labels_hash,'thread_id',thread_id,'created_at',created_at) value FROM thread_aggregate_key WHERE thread_id = ?",
+                thread_ids,
+            ),
+        ] {
+            let mut values = Vec::new();
+            for id in ids {
+                for row in sqlx::query(sql).bind(id).fetch_all(&mut **tx).await? {
+                    values.push(serde_json::from_str::<serde_json::Value>(
+                        row.try_get::<String, _>("value")?.as_str(),
+                    )?);
+                }
+            }
+            result.insert(name.into(), serde_json::Value::Array(values));
+        }
+        let mut memory_ratings = Vec::new();
+        for id in memory_ids {
+            for row in sqlx::query("SELECT json_object('id',id,'memory_id',memory_id,'user_id',user_id,'rating',rating,'metadata',metadata,'created_at',created_at,'updated_at',updated_at) value FROM memory_rating WHERE memory_id = ?")
+                .bind(id).fetch_all(&mut **tx).await?
+            {
+                memory_ratings.push(serde_json::from_str::<serde_json::Value>(
+                    row.try_get::<String, _>("value")?.as_str(),
+                )?);
+            }
+        }
+        result.insert(
+            "memory_rating".into(),
+            serde_json::Value::Array(memory_ratings),
+        );
+        for (name, sql) in [
+            (
+                "reflection_failure_mode",
+                "SELECT json_object('memory_id',memory_id,'mode',mode) value FROM reflection_failure_mode WHERE memory_id = ?",
+            ),
+            (
+                "reflection_tool",
+                "SELECT json_object('memory_id',memory_id,'tool',tool) value FROM reflection_tool WHERE memory_id = ?",
+            ),
+            (
+                "reflection_tool_outcome",
+                "SELECT json_object('memory_id',memory_id,'tool',tool,'contribution',contribution,'error_kind',error_kind) value FROM reflection_tool_outcome WHERE memory_id = ?",
+            ),
+            (
+                "reflection_fact",
+                "SELECT json_object('memory_id',memory_id,'fact_memory_id',fact_memory_id,'fact_kind',fact_kind,'turn_index',turn_index,'weight',weight,'note',note,'links_json',links_json) value FROM reflection_fact WHERE memory_id = ?",
+            ),
+            (
+                "reflection_applied_target",
+                "SELECT json_object('memory_id',memory_id,'target',target,'mitigation_fingerprint',mitigation_fingerprint,'applied_at',applied_at) value FROM reflection_applied_target WHERE memory_id = ?",
+            ),
+        ] {
+            let mut values = Vec::new();
+            for id in memory_ids {
+                for row in sqlx::query(sql).bind(id).fetch_all(&mut **tx).await? {
+                    values.push(serde_json::from_str::<serde_json::Value>(
+                        row.try_get::<String, _>("value")?.as_str(),
+                    )?);
+                }
+            }
+            result.insert(name.into(), serde_json::Value::Array(values));
+        }
+        let reflection_index_value_sql = "SELECT json_object('memory_id',memory_id,'thread_id',thread_id,'origin_thread_id',origin_thread_id,'origin_user_id',origin_user_id,'origin_channel',origin_channel,'outcome',outcome,'score',score,'score_self',score_self,'score_heuristic',score_heuristic,'task_category',task_category,'reflection_aspect',reflection_aspect,'dataset_quality',dataset_quality,'summary_embedding_status',summary_embedding_status,'summary_embedding_error',summary_embedding_error,'intent_embedding_status',intent_embedding_status,'intent_embedding_error',intent_embedding_error,'prompt_version',prompt_version,'target_model_version',target_model_version,'experiment_id',experiment_id,'experiment_variant',experiment_variant,'previous_reflection_id',previous_reflection_id,'pinned',pinned,'is_recurrence',is_recurrence,'mitigation_fingerprint',mitigation_fingerprint,'created_at',created_at,'updated_at',updated_at) value FROM thread_reflection_index";
+        let mut reflection_index = Vec::new();
+        for id in thread_ids {
+            let sql =
+                format!("{reflection_index_value_sql} WHERE thread_id = ? OR origin_thread_id = ?");
+            for row in sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(id)
+                .bind(id)
+                .fetch_all(&mut **tx)
+                .await?
+            {
+                let value = serde_json::from_str::<serde_json::Value>(
+                    row.try_get::<String, _>("value")?.as_str(),
+                )?;
+                if !reflection_index.contains(&value) {
+                    reflection_index.push(value);
+                }
+            }
+        }
+        for id in memory_ids {
+            let sql = format!("{reflection_index_value_sql} WHERE memory_id = ?");
+            for row in sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(id)
+                .fetch_all(&mut **tx)
+                .await?
+            {
+                let value = serde_json::from_str::<serde_json::Value>(
+                    row.try_get::<String, _>("value")?.as_str(),
+                )?;
+                if !reflection_index.contains(&value) {
+                    reflection_index.push(value);
+                }
+            }
+        }
+        result.insert(
+            "thread_reflection_index".into(),
+            serde_json::Value::Array(reflection_index),
+        );
+        let mut few_shot_usage = Vec::new();
+        for id in memory_ids {
+            for row in sqlx::query("SELECT json_object('memory_id',memory_id,'used_in_thread_id',used_in_thread_id,'used_at',used_at) value FROM reflection_few_shot_usage WHERE memory_id = ?")
+                .bind(id).fetch_all(&mut **tx).await?
+            {
+                few_shot_usage.push(serde_json::from_str::<serde_json::Value>(
+                    row.try_get::<String, _>("value")?.as_str(),
+                )?);
+            }
+        }
+        for id in thread_ids {
+            for row in sqlx::query("SELECT json_object('memory_id',memory_id,'used_in_thread_id',used_in_thread_id,'used_at',used_at) value FROM reflection_few_shot_usage WHERE used_in_thread_id = ?")
+                .bind(id).fetch_all(&mut **tx).await?
+            {
+                let value = serde_json::from_str::<serde_json::Value>(
+                    row.try_get::<String, _>("value")?.as_str(),
+                )?;
+                if !few_shot_usage.contains(&value) {
+                    few_shot_usage.push(value);
+                }
+            }
+        }
+        result.insert(
+            "reflection_few_shot_usage".into(),
+            serde_json::Value::Array(few_shot_usage),
+        );
+        Ok(serde_json::Value::Object(result))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -3010,6 +3551,31 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::ClientPruneUnresolved {
+            audit,
+            output,
+            force,
+        } => {
+            let bytes = std::fs::read(&audit)
+                .with_context(|| format!("read client audit {}", audit.display()))?;
+            let audit: ClientApplyAudit =
+                serde_json::from_slice(&bytes).context("invalid client audit JSON")?;
+            let dump = prune_client_unresolved_with_pool_force(
+                &rdb_pool_by_env().await?,
+                &audit,
+                &output,
+                force,
+            )
+            .await?;
+            println!(
+                "client unresolved records pruned; dump written to {} ({} memories, {} threads, {} memberships removed)",
+                output.display(),
+                dump.deleted_memory_rows,
+                dump.deleted_thread_rows,
+                dump.deleted_membership_rows,
+            );
+            Ok(())
+        }
     }
 }
 
@@ -3028,17 +3594,70 @@ mod tests {
             .unwrap();
         sqlx::raw_sql(sqlx::AssertSqlSafe(
             "CREATE TABLE thread (id INTEGER PRIMARY KEY, default_system_memory_id INTEGER, user_id INTEGER NOT NULL, description TEXT, channel TEXT, embedding BLOB, embedding_dim INTEGER, created_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0, metadata TEXT, memory_kind INTEGER); \
-             CREATE TABLE memory (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL DEFAULT 0, content TEXT NOT NULL DEFAULT '', content_type INTEGER NOT NULL DEFAULT 0, params TEXT, metadata TEXT, created_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0, role INTEGER NOT NULL DEFAULT 0, external_id TEXT, memory_kind INTEGER); \
+             CREATE TABLE memory (id INTEGER PRIMARY KEY, parent_ids TEXT, user_id INTEGER NOT NULL DEFAULT 0, content TEXT NOT NULL DEFAULT '', content_type INTEGER NOT NULL DEFAULT 0, params TEXT, metadata TEXT, created_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0, role INTEGER NOT NULL DEFAULT 0, external_id TEXT, media_object_id INTEGER, memory_kind INTEGER); \
              CREATE TABLE thread_memory (thread_id INTEGER NOT NULL, memory_id INTEGER NOT NULL, position INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT 0); \
              CREATE TABLE thread_label (thread_id INTEGER NOT NULL, label TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT 0); \
-             CREATE TABLE thread_reflection_index (memory_id INTEGER NOT NULL, thread_id INTEGER NOT NULL, origin_thread_id INTEGER NOT NULL, origin_user_id INTEGER NOT NULL); \
+             CREATE TABLE thread_reflection_index (memory_id INTEGER NOT NULL PRIMARY KEY, thread_id INTEGER NOT NULL, origin_thread_id INTEGER NOT NULL, origin_user_id INTEGER NOT NULL, origin_channel TEXT, outcome INTEGER NOT NULL DEFAULT 0, score REAL NOT NULL DEFAULT 0, score_self REAL NOT NULL DEFAULT 0, score_heuristic REAL NOT NULL DEFAULT 0, task_category INTEGER NOT NULL DEFAULT 0, reflection_aspect INTEGER NOT NULL DEFAULT 0, dataset_quality INTEGER NOT NULL DEFAULT 1, summary_embedding_status INTEGER NOT NULL DEFAULT 1, summary_embedding_error TEXT, intent_embedding_status INTEGER NOT NULL DEFAULT 1, intent_embedding_error TEXT, prompt_version TEXT NOT NULL DEFAULT '', target_model_version TEXT, experiment_id TEXT, experiment_variant TEXT, previous_reflection_id INTEGER, pinned INTEGER NOT NULL DEFAULT 0, is_recurrence INTEGER NOT NULL DEFAULT 0, mitigation_fingerprint TEXT, created_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0); \
              CREATE TABLE thread_aggregate_key (user_id INTEGER NOT NULL, labels_hash TEXT NOT NULL, thread_id INTEGER NOT NULL, created_at INTEGER NOT NULL DEFAULT 0); \
-             CREATE TABLE reflection_few_shot_usage (used_in_thread_id INTEGER NOT NULL);",
+             CREATE TABLE reflection_failure_mode (memory_id INTEGER NOT NULL, mode TEXT NOT NULL); \
+             CREATE TABLE reflection_tool (memory_id INTEGER NOT NULL, tool TEXT NOT NULL); \
+             CREATE TABLE reflection_tool_outcome (memory_id INTEGER NOT NULL, tool TEXT NOT NULL, contribution INTEGER NOT NULL, error_kind TEXT NOT NULL); \
+             CREATE TABLE reflection_fact (memory_id INTEGER NOT NULL, fact_memory_id INTEGER NOT NULL, fact_kind INTEGER NOT NULL, turn_index INTEGER NOT NULL, weight REAL, note TEXT, links_json TEXT); \
+             CREATE TABLE reflection_applied_target (memory_id INTEGER NOT NULL, target TEXT NOT NULL, mitigation_fingerprint TEXT, applied_at INTEGER NOT NULL); \
+             CREATE TABLE reflection_few_shot_usage (memory_id INTEGER NOT NULL, used_in_thread_id INTEGER NOT NULL, used_at INTEGER NOT NULL); \
+             CREATE TABLE memory_rating (id INTEGER PRIMARY KEY, memory_id INTEGER NOT NULL, user_id INTEGER NOT NULL, rating REAL NOT NULL, metadata TEXT, created_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0);",
         ))
         .execute(&pool)
         .await
         .unwrap();
         pool
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    fn completed_unresolved_memory_audit(memory_id: i64) -> ClientApplyAudit {
+        ClientApplyAudit {
+            format_version: 2,
+            status: "completed".into(),
+            mapping_sha256: String::new(),
+            updated_threads: 0,
+            updated_thread_owners: 0,
+            updated_memories: 0,
+            updated_external_ids: 0,
+            retained_threads: 0,
+            retained_memories: 0,
+            raw_threads: 0,
+            raw_memories: 0,
+            external_id_moves: Vec::new(),
+            reflection_moves: Vec::new(),
+            warnings: vec![client_warning(
+                "memory",
+                Some(memory_id),
+                "unresolved_preflight",
+                "test unresolved memory",
+            )],
+            failures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn client_prune_dump_serializes_commit_pending_with_counts() {
+        let dump = ClientPruneDump {
+            format_version: 3,
+            status: "commit_pending".into(),
+            memory_ids: vec![10],
+            thread_ids: vec![1],
+            records: serde_json::Value::Object(serde_json::Map::new()),
+            deleted_memory_rows: 1,
+            deleted_thread_rows: 1,
+            deleted_membership_rows: 2,
+        };
+
+        let value = serde_json::to_value(dump).unwrap();
+
+        assert_eq!(value["status"], "commit_pending");
+        assert_eq!(value["deleted_memory_rows"], 1);
+        assert_eq!(value["deleted_thread_rows"], 1);
+        assert_eq!(value["deleted_membership_rows"], 2);
     }
 
     #[cfg(not(feature = "postgres"))]
@@ -3269,6 +3888,592 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
+    async fn client_prune_unresolved_dumps_and_removes_a_memory_and_its_memberships() {
+        let pool = client_fixture_pool().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(
+            "INSERT INTO memory (id, parent_ids, user_id, media_object_id, memory_kind) VALUES (10, '[1,2]', 100000, 42, NULL);
+             INSERT INTO thread_memory (thread_id, memory_id) VALUES (99, 10);
+             INSERT INTO memory_rating (id, memory_id, user_id, rating) VALUES (20, 10, 1, 0.5);",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut audit = apply_client_mapping_with_pool(&pool, b"{}", None)
+            .await
+            .unwrap();
+        audit.status = "completed".into();
+        let dump_path = std::env::temp_dir().join(format!(
+            "memory-kind-prune-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dump = prune_client_unresolved_with_pool(&pool, &audit, &dump_path)
+            .await
+            .unwrap();
+
+        assert_eq!(dump.memory_ids, vec![10]);
+        assert_eq!(dump.deleted_memory_rows, 1);
+        assert_eq!(dump.deleted_membership_rows, 1);
+        assert_eq!(dump.deleted_thread_rows, 0);
+        assert_eq!(dump.status, "completed");
+        assert!(dump_path.exists());
+        let dump_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&dump_path).unwrap()).unwrap();
+        assert_eq!(dump_json["deleted_memory_rows"], 1);
+        assert_eq!(dump_json["deleted_membership_rows"], 1);
+        assert_eq!(dump_json["deleted_thread_rows"], 0);
+        assert_eq!(dump_json["status"], "completed");
+        assert_eq!(dump_json["records"]["memory"][0]["parent_ids"], "[1,2]");
+        assert_eq!(dump_json["records"]["memory"][0]["media_object_id"], 42);
+        assert_eq!(dump_json["records"]["memory_rating"][0]["id"], 20);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory WHERE id = 10")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_rating WHERE memory_id = 10")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT default_system_memory_id FROM thread WHERE id = 1"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            None
+        );
+        std::fs::remove_file(dump_path).unwrap();
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
+    async fn client_prune_unresolved_rejects_memory_referenced_by_a_retained_thread() {
+        let pool = client_fixture_pool().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(
+            "INSERT INTO thread (id, default_system_memory_id, user_id, memory_kind) VALUES (1, 10, 1, 0);
+             INSERT INTO memory (id, user_id, memory_kind) VALUES (10, 1, NULL);",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let dump_path = std::env::temp_dir().join(format!(
+            "memory-kind-prune-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let error = prune_client_unresolved_with_pool(
+            &pool,
+            &completed_unresolved_memory_audit(10),
+            &dump_path,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("default_system_memory_id"));
+        assert!(!dump_path.exists());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory WHERE id = 10")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM thread_memory WHERE memory_id = 10")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
+    async fn forced_client_prune_removes_a_memory_referenced_by_a_retained_thread() {
+        let pool = client_fixture_pool().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(
+            "INSERT INTO thread (id, default_system_memory_id, user_id, memory_kind) VALUES (1, 10, 1, 0);
+             INSERT INTO memory (id, user_id, memory_kind) VALUES (10, 1, NULL);",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let dump_path = std::env::temp_dir().join(format!(
+            "memory-kind-prune-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let dump = prune_client_unresolved_with_pool_force(
+            &pool,
+            &completed_unresolved_memory_audit(10),
+            &dump_path,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dump.deleted_memory_rows, 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory WHERE id = 10")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        std::fs::remove_file(dump_path).unwrap();
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
+    async fn client_prune_unresolved_rejects_memory_referenced_by_retained_parent_ids() {
+        let pool = client_fixture_pool().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(
+            "INSERT INTO memory (id, parent_ids, user_id, memory_kind) VALUES (10, NULL, 1, NULL), (20, '[10]', 1, 0);",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let dump_path = std::env::temp_dir().join(format!(
+            "memory-kind-prune-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let error = prune_client_unresolved_with_pool(
+            &pool,
+            &completed_unresolved_memory_audit(10),
+            &dump_path,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("parent_ids"));
+        assert!(!dump_path.exists());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory WHERE id = 10")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
+    async fn client_prune_unresolved_rejects_memory_shared_with_a_retained_thread() {
+        let pool = client_fixture_pool().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(
+            "INSERT INTO thread (id, user_id, memory_kind) VALUES (1, 1, NULL), (2, 2, 0);
+             INSERT INTO memory (id, user_id, memory_kind) VALUES (10, 1, NULL);
+             INSERT INTO thread_memory (thread_id, memory_id) VALUES (1, 10), (2, 10);",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let dump_path = std::env::temp_dir().join(format!(
+            "memory-kind-prune-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut audit = completed_unresolved_memory_audit(1);
+        audit.warnings[0].entity = "thread".into();
+        audit.warnings.push(client_warning(
+            "memory",
+            Some(10),
+            "unresolved_preflight",
+            "test unresolved memory",
+        ));
+
+        let error = prune_client_unresolved_with_pool(&pool, &audit, &dump_path)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("retained thread"));
+        assert!(!dump_path.exists());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory WHERE id = 10")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM thread_memory WHERE memory_id = 10")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
+    async fn client_prune_unresolved_rejects_memory_used_by_a_retained_reflection_fact() {
+        let pool = client_fixture_pool().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(
+            "INSERT INTO memory (id, user_id, memory_kind) VALUES (10, 1, NULL), (20, 1, 7);
+             INSERT INTO reflection_fact (memory_id, fact_memory_id, fact_kind, turn_index) VALUES (20, 10, 1, 0);",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let dump_path = std::env::temp_dir().join(format!(
+            "memory-kind-prune-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let error = prune_client_unresolved_with_pool(
+            &pool,
+            &completed_unresolved_memory_audit(10),
+            &dump_path,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("reflection_fact"));
+        assert!(!dump_path.exists());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory WHERE id = 10")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
+    async fn client_prune_unresolved_rejects_thread_referenced_by_retained_reflection() {
+        let pool = client_fixture_pool().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(
+            "INSERT INTO thread (id, user_id, memory_kind) VALUES (1, 1, NULL), (2, 300000, 7);
+             INSERT INTO memory (id, user_id, memory_kind) VALUES (20, 300000, 7);
+             INSERT INTO thread_reflection_index (memory_id, thread_id, origin_thread_id, origin_user_id) VALUES (20, 2, 1, 1);",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let dump_path = std::env::temp_dir().join(format!(
+            "memory-kind-prune-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut audit = completed_unresolved_memory_audit(1);
+        audit.warnings[0].entity = "thread".into();
+
+        let error = prune_client_unresolved_with_pool(&pool, &audit, &dump_path)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("origin_thread_id"));
+        assert!(!dump_path.exists());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM thread_reflection_index WHERE memory_id = 20"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
+    async fn client_prune_unresolved_rejects_thread_that_aggregates_retained_reflection() {
+        let pool = client_fixture_pool().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(
+            "INSERT INTO thread (id, user_id, memory_kind) VALUES (1, 300000, NULL);
+             INSERT INTO memory (id, user_id, memory_kind) VALUES (20, 300000, 7);
+             INSERT INTO thread_reflection_index (memory_id, thread_id, origin_thread_id, origin_user_id) VALUES (20, 1, 2, 1);",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let dump_path = std::env::temp_dir().join(format!(
+            "memory-kind-prune-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut audit = completed_unresolved_memory_audit(1);
+        audit.warnings[0].entity = "thread".into();
+
+        let error = prune_client_unresolved_with_pool(&pool, &audit, &dump_path)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("thread_id"));
+        assert!(!dump_path.exists());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM thread_reflection_index WHERE memory_id = 20"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
+    async fn client_prune_unresolved_rejects_memory_referenced_by_retained_reflection_previous_id()
+    {
+        let pool = client_fixture_pool().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(
+            "INSERT INTO memory (id, user_id, memory_kind) VALUES (10, 300000, NULL), (20, 300000, 7);
+             INSERT INTO thread_reflection_index (memory_id, thread_id, origin_thread_id, origin_user_id, previous_reflection_id) VALUES (20, 2, 2, 1, 10);",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let dump_path = std::env::temp_dir().join(format!(
+            "memory-kind-prune-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let error = prune_client_unresolved_with_pool(
+            &pool,
+            &completed_unresolved_memory_audit(10),
+            &dump_path,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("previous_reflection_id"));
+        assert!(!dump_path.exists());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory WHERE id = 10")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
+    async fn client_prune_unresolved_dumps_all_reflection_index_columns() {
+        let pool = client_fixture_pool().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(
+            "INSERT INTO thread (id, user_id, memory_kind) VALUES (1, 1, NULL);
+             INSERT INTO memory (id, user_id, memory_kind) VALUES (10, 1, NULL);
+             INSERT INTO thread_memory (thread_id, memory_id) VALUES (1, 10);
+             INSERT INTO thread_reflection_index (memory_id, thread_id, origin_thread_id, origin_user_id, origin_channel, outcome, score, score_self, score_heuristic, task_category, reflection_aspect, dataset_quality, summary_embedding_status, summary_embedding_error, intent_embedding_status, intent_embedding_error, prompt_version, target_model_version, experiment_id, experiment_variant, previous_reflection_id, pinned, is_recurrence, mitigation_fingerprint, created_at, updated_at) VALUES (10, 1, 1, 1, 'channel', 2, 0.1, 0.2, 0.3, 4, 5, 6, 7, 'summary error', 8, 'intent error', 'prompt', 'model', 'experiment', 'variant', 9, 1, 1, 'fingerprint', 10, 11);",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let dump_path = std::env::temp_dir().join(format!(
+            "memory-kind-prune-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut audit = completed_unresolved_memory_audit(1);
+        audit.warnings[0].entity = "thread".into();
+        audit.warnings.push(client_warning(
+            "memory",
+            Some(10),
+            "unresolved_preflight",
+            "test unresolved memory",
+        ));
+
+        prune_client_unresolved_with_pool(&pool, &audit, &dump_path)
+            .await
+            .unwrap();
+
+        let row = &serde_json::from_slice::<serde_json::Value>(&std::fs::read(&dump_path).unwrap())
+            .unwrap()["records"]["thread_reflection_index"][0];
+        for field in [
+            "origin_channel",
+            "outcome",
+            "score",
+            "score_self",
+            "score_heuristic",
+            "task_category",
+            "reflection_aspect",
+            "dataset_quality",
+            "summary_embedding_status",
+            "summary_embedding_error",
+            "intent_embedding_status",
+            "intent_embedding_error",
+            "prompt_version",
+            "target_model_version",
+            "experiment_id",
+            "experiment_variant",
+            "previous_reflection_id",
+            "pinned",
+            "is_recurrence",
+            "mitigation_fingerprint",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(row.get(field).is_some(), "missing {field} from prune dump");
+        }
+        std::fs::remove_file(dump_path).unwrap();
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
+    async fn client_prune_unresolved_dumps_thread_embedding() {
+        let pool = client_fixture_pool().await;
+        sqlx::query("INSERT INTO thread (id, user_id, embedding, memory_kind) VALUES (?, ?, ?, ?)")
+            .bind(1_i64)
+            .bind(1_i64)
+            .bind(vec![0x01_u8, 0x02, 0xff])
+            .bind(0_i32)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let dump_path = std::env::temp_dir().join(format!(
+            "memory-kind-prune-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut audit = completed_unresolved_memory_audit(1);
+        audit.warnings[0].entity = "thread".into();
+        audit.warnings.push(client_warning(
+            "memory",
+            Some(10),
+            "unresolved_preflight",
+            "test unresolved memory",
+        ));
+
+        prune_client_unresolved_with_pool(&pool, &audit, &dump_path)
+            .await
+            .unwrap();
+
+        let dump_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&dump_path).unwrap()).unwrap();
+        assert_eq!(dump_json["records"]["thread"][0]["embedding_hex"], "0102FF");
+        std::fs::remove_file(dump_path).unwrap();
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
+    async fn client_prune_unresolved_dumps_and_deletes_reflection_children() {
+        let pool = client_fixture_pool().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(
+            "INSERT INTO thread (id, user_id, memory_kind) VALUES (1, 1, NULL);
+             INSERT INTO memory (id, user_id, memory_kind) VALUES (10, 1, NULL), (99, 1, 0);
+             INSERT INTO thread_memory (thread_id, memory_id) VALUES (1, 10);
+             INSERT INTO reflection_failure_mode (memory_id, mode) VALUES (10, 'timeout');
+             INSERT INTO reflection_tool (memory_id, tool) VALUES (10, 'search');
+             INSERT INTO reflection_tool_outcome (memory_id, tool, contribution, error_kind) VALUES (10, 'search', 1, '');
+             INSERT INTO reflection_fact (memory_id, fact_memory_id, fact_kind, turn_index, weight, note, links_json) VALUES (10, 99, 1, 2, 0.5, 'note', '[]');
+             INSERT INTO reflection_applied_target (memory_id, target, mitigation_fingerprint, applied_at) VALUES (10, 'target', 'fingerprint', 3);
+             INSERT INTO reflection_few_shot_usage (memory_id, used_in_thread_id, used_at) VALUES (10, 99, 4), (99, 1, 5);",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let dump_path = std::env::temp_dir().join(format!(
+            "memory-kind-prune-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut audit = completed_unresolved_memory_audit(1);
+        audit.warnings[0].entity = "thread".into();
+        audit.warnings.push(client_warning(
+            "memory",
+            Some(10),
+            "unresolved_preflight",
+            "test unresolved memory",
+        ));
+
+        prune_client_unresolved_with_pool(&pool, &audit, &dump_path)
+            .await
+            .unwrap();
+
+        for table in [
+            "reflection_failure_mode",
+            "reflection_tool",
+            "reflection_tool_outcome",
+            "reflection_fact",
+            "reflection_applied_target",
+            "reflection_few_shot_usage",
+        ] {
+            let sql = format!("SELECT COUNT(*) FROM {table}");
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                0,
+                "{table} was not deleted"
+            );
+        }
+        let dump_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&dump_path).unwrap()).unwrap();
+        for table in [
+            "reflection_failure_mode",
+            "reflection_tool",
+            "reflection_tool_outcome",
+            "reflection_fact",
+            "reflection_applied_target",
+        ] {
+            assert_eq!(dump_json["records"][table].as_array().unwrap().len(), 1);
+        }
+        assert_eq!(
+            dump_json["records"]["reflection_few_shot_usage"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        std::fs::remove_file(dump_path).unwrap();
     }
 
     #[cfg(not(feature = "postgres"))]
@@ -3555,6 +4760,61 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
+    async fn client_prune_unresolved_records_actual_thread_and_membership_deletions() {
+        let pool = client_fixture_pool().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(
+            "INSERT INTO thread (id, user_id, memory_kind) VALUES (1, 1, NULL);
+             INSERT INTO memory (id, user_id, memory_kind) VALUES (10, 1, NULL);
+             INSERT INTO thread_memory (thread_id, memory_id) VALUES (1, 10);
+             INSERT INTO thread_label (thread_id, label) VALUES (1, 'label');",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let dump_path = std::env::temp_dir().join(format!(
+            "memory-kind-prune-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut audit = completed_unresolved_memory_audit(1);
+        audit.warnings[0].entity = "thread".into();
+
+        let dump = prune_client_unresolved_with_pool(&pool, &audit, &dump_path)
+            .await
+            .unwrap();
+
+        assert_eq!(dump.deleted_memory_rows, 0);
+        assert_eq!(dump.deleted_thread_rows, 1);
+        assert_eq!(dump.deleted_membership_rows, 1);
+        let dump_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&dump_path).unwrap()).unwrap();
+        assert_eq!(dump_json["deleted_memory_rows"], 0);
+        assert_eq!(dump_json["deleted_thread_rows"], 1);
+        assert_eq!(dump_json["deleted_membership_rows"], 1);
+        assert_eq!(
+            dump_json["records"]["thread_memory"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(dump_json["records"]["thread_memory"][0]["thread_id"], 1);
+        assert_eq!(dump_json["records"]["thread_memory"][0]["memory_id"], 10);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory WHERE id = 10")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        std::fs::remove_file(dump_path).unwrap();
     }
 
     #[test]
