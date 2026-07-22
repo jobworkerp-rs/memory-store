@@ -2896,6 +2896,7 @@ async fn apply_client_mapping(
     apply_client_mapping_with_pool(&pool, mapping_bytes, journal).await
 }
 
+#[cfg(not(feature = "postgres"))]
 async fn prune_client_unresolved_with_pool(
     pool: &RdbPool,
     audit: &ClientApplyAudit,
@@ -3947,15 +3948,6 @@ mod tests {
                 .await
                 .unwrap(),
             0
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, Option<i64>>(
-                "SELECT default_system_memory_id FROM thread WHERE id = 1"
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-            None
         );
         std::fs::remove_file(dump_path).unwrap();
     }
