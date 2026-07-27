@@ -206,6 +206,9 @@ batch は `output_language` に応じて `memories-monthly-work-summary-single-j
 
 1. 同 (user_id, month, scope) の `external_id = "monthly:<user_id>:YYYY-MM:<scope_key>"` 集約メモリが存在
 2. その集約メモリの `updated_at` が、当月の入力週次要約群の最大 `updated_at` 以上
+3. 入力週次要約の ID・`updated_at`・各 metadata の `source_fingerprint` から作る source fingerprint が、保存済み metadata の fingerprint と一致する
+
+週次要約が元の時刻を保持したまま再生成された場合も、上流 fingerprint の変化により月次要約を再生成する。
 
 ## 出力データの構造
 
@@ -219,8 +222,8 @@ batch は `output_language` に応じて `memories-monthly-work-summary-single-j
 
 - `content`: 下記 JSON 構造を `tojson` した文字列
 - `external_id`: `monthly:<user_id>:YYYY-MM:<scope_key>`
-- `metadata`: `{month, scope, extra_labels[], source_memory_count, source_memory_ids[], source_thread_ids[], summary_version}`
-  - `source_memory_ids` は **週次要約メモリ** の id 列
+- `metadata`: `{month, scope, extra_labels[], source_memory_count, source_snapshot_version, source_max_updated_at, source_fingerprint_algorithm, source_fingerprint, summary_version}`
+  - `source_snapshot_version=2` の fingerprint は **週次要約メモリ** の ID・`updated_at`・上流 fingerprint を含むため、時刻を変えない週次再生成も検知する
 
 ```json
 {
@@ -263,3 +266,9 @@ batch は `output_language` に応じて `memories-monthly-work-summary-single-j
 - **タイムゾーンの取り扱い**。月境界は jq を評価する jobworkerp worker の `TZ` 環境変数（例 `TZ=Asia/Tokyo`）で決まり、夏時間 (DST) と負オフセットに対応する。`TZ` 未設定時のフォールバック `timezone_offset_hours` は時単位（0..23）
 - **LLM のコンテキスト長**。月 4-5 週分の週次 JSON が入る。`max_context_chars=200000` は十分
 - **cron 順序**: weekly が完了してから monthly を回すこと。例: weekly を月曜 03:30 JST、monthly を毎月 1 日 04:00 JST
+
+## バッチ結果
+
+`generated_count` / `skipped_count` / `failed_count` と対応する月配列を返す。
+既存・最新または入力不足による `skipped` は正常結果として `succeeded_count` に含まれる。
+`completed=false, skipped=false` のみ失敗として記録する。

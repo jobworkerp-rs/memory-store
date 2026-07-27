@@ -182,8 +182,8 @@ fn build_image_job_args(
     mode: ImageSearchMode,
 ) -> serde_json::Value {
     let inner = serde_json::json!({
-        "memory_id": memory_id,
-        "media_object_id": media_object_id,
+        "memory_id": memory_id.to_string(),
+        "media_object_id": media_object_id.to_string(),
         "image_search_mode": mode.as_str(),
     });
     serde_json::json!({ "input": inner.to_string() })
@@ -429,10 +429,14 @@ mod tests {
 
     #[test]
     fn build_image_job_args_shape() {
-        let v = build_image_job_args(11, 22, ImageSearchMode::VlmCaption);
+        let v = build_image_job_args(
+            7_465_246_090_942_480_532,
+            7_465_246_090_942_480_757,
+            ImageSearchMode::VlmCaption,
+        );
         let inner: serde_json::Value = serde_json::from_str(v["input"].as_str().unwrap()).unwrap();
-        assert_eq!(inner["memory_id"], 11);
-        assert_eq!(inner["media_object_id"], 22);
+        assert_eq!(inner["memory_id"], "7465246090942480532");
+        assert_eq!(inner["media_object_id"], "7465246090942480757");
         assert_eq!(inner["image_search_mode"], "vlm_caption");
         // embedding_model is read from runner output in the workflow.
         assert!(inner.get("embedding_model").is_none());

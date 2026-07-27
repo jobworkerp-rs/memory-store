@@ -29,10 +29,6 @@ path = "src/bin/cleanup_orphan_media.rs"
 name = "memories-admin"
 path = "src/bin/memories_admin.rs"
 
-[[bin]]
-name = "migrate-memory-kind"
-path = "src/bin/migrate_memory_kind.rs"
-
 # Phase 3's one-shot data migration binary (`migrate_sp_to_memory`) was
 # removed in Phase 4. Phase 4 assumes that every production environment has
 # already run Phase 3 end-to-end; the Phase 4 SQL drop scripts physically

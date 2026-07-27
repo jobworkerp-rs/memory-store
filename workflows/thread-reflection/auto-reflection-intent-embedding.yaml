@@ -34,7 +34,7 @@ input:
       required: [reflection_id, content]
       properties:
         reflection_id:
-          type: integer
+          type: string
         content:
           type: string
           description: task_intent text (named `content` to match the dispatcher).

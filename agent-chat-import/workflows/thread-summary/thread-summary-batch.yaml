@@ -17,7 +17,7 @@ input:
         llm_worker_name: { type: string, default: "memories-llm" }
         thread_ids:
           type: array
-          items: { type: integer }
+          items: { type: string }
           description: When specified, only these threads are summarized (all threads when omitted).
         labels_filter:
           type: array
@@ -159,10 +159,10 @@ do:
         as:
           all_threads: ${ .jsonBody | fromjson }
 
-  # Step 2: Filter by thread_ids if specified
+  # Step 2: Filter by thread_ids if specified.
   - filterThreads:
       set:
-        target_threads: >-
+        candidate_threads: >-
           ${ if ($workflow.input.thread_ids // []) | length > 0
              then $all_threads | map(select(
                .id.value as $tid | $workflow.input.thread_ids | any(. == $tid)
@@ -170,14 +170,126 @@ do:
              else $all_threads
              end }
 
+  # Step 2a: Resolve already-current summaries in one gRPC call so a
+  # historical range does not dispatch one child workflow per skipped thread.
+  - initExistingSummaries:
+      set:
+        existing_summary_entries: "${ [] }"
+        existing_summary_threads: "${ [] }"
+
+  - fetchExistingSummaries:
+      if: "${ $workflow.input.force_resummarize | not }"
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryService/FindListByCondition"
+            json_body: >-
+              ${ {
+                user_id: { value: $workflow.input.user_id },
+                roles: ["ROLE_ASSISTANT"],
+                content_types: ["TEXT"],
+                memory_kinds: ["MEMORY_KIND_THREAD_SUMMARY"],
+                external_id_prefix: "summary:"
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          existing_summary_entries: ${ .jsonBody | fromjson }
+
+  - fetchExistingSummaryThreads:
+      if: "${ $workflow.input.force_resummarize | not }"
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindThreadListByUserId"
+            json_body: >-
+              ${ {
+                user_id: { value: $workflow.input.user_id },
+                memory_kinds: ["MEMORY_KIND_THREAD_SUMMARY"]
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          existing_summary_threads: ${ .jsonBody | fromjson }
+
+  - indexExistingSummaries:
+      set:
+        existing_summary_by_external_id: >-
+          ${ reduce $existing_summary_entries[] as $entry
+             ({};
+              .[$entry.memory.data.externalId] = {
+                memory: $entry.memory,
+                thread_id: ($entry.threadId.value | tostring)
+              }) }
+        existing_summary_thread_by_id: >-
+          ${ reduce $existing_summary_threads[] as $thread
+             ({}; .[$thread.id.value | tostring] = $thread) }
+
+  - selectThreadsNeedingSummary:
+      set:
+        target_threads: >-
+          ${ if $workflow.input.force_resummarize
+             then $candidate_threads
+             else
+               $candidate_threads
+               | map(
+                   . as $thread
+                   | ($existing_summary_by_external_id[
+                        "summary:" + ($thread.id.value | tostring)
+                     ] // null) as $existing_summary
+                   | (($thread.data.labels
+                       // ["thread_" + ($thread.id.value | tostring)])
+                      + [$workflow.input.memory_thread_label_prefix]
+                      | unique) as $required_labels
+                   | (if $existing_summary == null
+                      then null
+                      else ($existing_summary_thread_by_id[
+                              $existing_summary.thread_id
+                            ] // null)
+                      end) as $existing_summary_thread
+                   | select(
+                       ($thread.data.description // "") == ""
+                       or $existing_summary == null
+                       or $existing_summary_thread == null
+                       or (($required_labels
+                            - ($existing_summary_thread.data.labels // []))
+                           | length) > 0
+                       or $thread.data.updatedAt
+                          > $existing_summary.memory.data.updatedAt
+                     )
+                 )
+             end }
+
+  - collectPreSkippedThreads:
+      set:
+        pre_skipped_threads: >-
+          ${ ($candidate_threads | map(.id.value | tostring))
+             - ($target_threads | map(.id.value | tostring)) }
+
   # Step 2.5: Initialize per-thread outcome accumulators so callers can
   # distinguish "every thread failed" from "some succeeded" / "nothing to
   # do" by reading succeeded_count / failed_count, mirroring the period
   # batches' output contract.
   - initOutcomeAccumulators:
       set:
-        succeeded_count: "${ 0 }"
-        failed_count: "${ 0 }"
+        generated_threads: "${ [] }"
+        skipped_threads: "${ $pre_skipped_threads // [] }"
+        failed_threads: "${ [] }"
+        last_error: "${ null }"
 
   # Step 3: Invoke the language-specific single-thread summary worker.
   # Prompt context is baked into the registered worker.
@@ -203,7 +315,7 @@ do:
                         input: >-
                           ${ {
                             user_id: $workflow.input.user_id,
-                            thread_id: ($thread.id.value | tonumber),
+                            thread_id: ($thread.id.value | tostring),
                             memories_grpc_host: $workflow.input.memories_grpc_host,
                             memories_grpc_port: $workflow.input.memories_grpc_port,
                             memories_grpc_tls: $workflow.input.memories_grpc_tls,
@@ -218,15 +330,37 @@ do:
                             memory_thread_label_prefix: $workflow.input.memory_thread_label_prefix,
                             force_resummarize: $workflow.input.force_resummarize
                           } | tojson }
-              - recordSuccess:
+                  export:
+                    as:
+                      single_result: "${ .output | fromjson }"
+              - rejectLogicalFailure:
+                  if: >-
+                    ${ (($single_result.completed // false)
+                        or ($single_result.skipped // false)) | not }
+                  raise:
+                    error:
+                      type: "https://memories.local/errors/thread-summary/incomplete"
+                      status: 500
+                      title: "thread summary returned neither completed nor skipped"
+              - recordGenerated:
+                  if: >-
+                    ${ ($single_result.completed // false)
+                       and (($single_result.skipped // false) | not) }
                   set:
-                    succeeded_count: "${ $succeeded_count + 1 }"
+                    generated_threads: >-
+                      ${ $generated_threads + [($thread.id.value | tostring)] }
+              - recordSkipped:
+                  if: "${ $single_result.skipped // false }"
+                  set:
+                    skipped_threads: >-
+                      ${ $skipped_threads + [($thread.id.value | tostring)] }
             catch:
               as: error
               do:
                 - logError:
                     set:
-                      failed_count: "${ $failed_count + 1 }"
+                      failed_threads: >-
+                        ${ $failed_threads + [($thread.id.value | tostring)] }
                       last_error: "${ $error }"
 
 output:
@@ -234,7 +368,17 @@ output:
     # `completed` reflects "no thread failed". Callers read
     # processed_threads / succeeded_count / failed_count to decide whether
     # to treat the run as fully failed vs partial vs nothing-to-do.
-    completed: ${ ($failed_count // 0) == 0 }
-    processed_threads: ${ $target_threads | length }
-    succeeded_count: ${ $succeeded_count // 0 }
-    failed_count: ${ $failed_count // 0 }
+    completed: ${ ($failed_threads | length) == 0 }
+    processed_threads: >-
+      ${ ($generated_threads | length)
+         + ($skipped_threads | length)
+         + ($failed_threads | length) }
+    generated_count: ${ $generated_threads | length }
+    skipped_count: ${ $skipped_threads | length }
+    succeeded_count: >-
+      ${ ($generated_threads | length) + ($skipped_threads | length) }
+    failed_count: ${ $failed_threads | length }
+    generated_threads: ${ $generated_threads }
+    skipped_threads: ${ $skipped_threads }
+    failed_threads: ${ $failed_threads }
+    last_error: ${ $last_error }

@@ -56,7 +56,7 @@ input:
 
 timeout:
   after:
-    hours: 24
+    days: 7
 
 do:
   # Step 1: Resolve the week list. Modes (in priority order):
@@ -117,7 +117,8 @@ do:
   # iterations ran.
   - initOutcomeAccumulators:
       set:
-        succeeded_weeks: "${ [] }"
+        generated_weeks: "${ [] }"
+        skipped_weeks: "${ [] }"
         failed_weeks: "${ [] }"
         last_error: "${ null }"
 
@@ -128,7 +129,7 @@ do:
   - summarizeEachWeek:
       timeout:
         after:
-          hours: 24
+          days: 7
       for:
         each: target_week
         in: "${ $week_list }"
@@ -165,9 +166,28 @@ do:
                             output_language: $workflow.input.output_language,
                             force_resummarize: $workflow.input.force_resummarize
                           } | tojson }
-              - recordSuccess:
+                  export:
+                    as:
+                      single_result: "${ .output | fromjson }"
+              - rejectLogicalFailure:
+                  if: >-
+                    ${ (($single_result.completed // false)
+                        or ($single_result.skipped // false)) | not }
+                  raise:
+                    error:
+                      type: "https://memories.local/errors/weekly-work-summary/incomplete"
+                      status: 500
+                      title: "weekly summary returned neither completed nor skipped"
+              - recordGenerated:
+                  if: >-
+                    ${ ($single_result.completed // false)
+                       and (($single_result.skipped // false) | not) }
                   set:
-                    succeeded_weeks: "${ $succeeded_weeks + [$target_week] }"
+                    generated_weeks: "${ $generated_weeks + [$target_week] }"
+              - recordSkipped:
+                  if: "${ $single_result.skipped // false }"
+                  set:
+                    skipped_weeks: "${ $skipped_weeks + [$target_week] }"
             catch:
               as: error
               do:
@@ -182,9 +202,13 @@ output:
     # When false, inspect `failed_weeks` to know what to re-run.
     completed: ${ ($failed_weeks | length) == 0 }
     processed_weeks: ${ $week_list | length }
-    succeeded_count: ${ $succeeded_weeks | length }
+    generated_count: ${ $generated_weeks | length }
+    skipped_count: ${ $skipped_weeks | length }
+    succeeded_count: ${ ($generated_weeks | length) + ($skipped_weeks | length) }
     failed_count: ${ $failed_weeks | length }
     weeks: ${ $week_list }
-    succeeded_weeks: ${ $succeeded_weeks }
+    generated_weeks: ${ $generated_weeks }
+    skipped_weeks: ${ $skipped_weeks }
+    succeeded_weeks: ${ $generated_weeks + $skipped_weeks }
     failed_weeks: ${ $failed_weeks }
     last_error: ${ $last_error }

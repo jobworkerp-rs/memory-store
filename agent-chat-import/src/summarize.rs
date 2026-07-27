@@ -530,6 +530,191 @@ mod tests {
     }
 
     #[test]
+    fn summary_batches_preserve_generated_skipped_and_failed_outcomes() {
+        for (feature, item) in [
+            ("thread-summary", "threads"),
+            ("daily-work-summary", "dates"),
+            ("weekly-work-summary", "weeks"),
+            ("monthly-work-summary", "months"),
+        ] {
+            let yaml = match feature {
+                "thread-summary" => {
+                    include_str!("../workflows/thread-summary/thread-summary-batch.yaml")
+                }
+                "daily-work-summary" => {
+                    include_str!("../workflows/daily-work-summary/daily-work-summary-batch.yaml")
+                }
+                "weekly-work-summary" => {
+                    include_str!("../workflows/weekly-work-summary/weekly-work-summary-batch.yaml")
+                }
+                "monthly-work-summary" => {
+                    include_str!(
+                        "../workflows/monthly-work-summary/monthly-work-summary-batch.yaml"
+                    )
+                }
+                _ => unreachable!(),
+            };
+            assert!(
+                yaml.contains("single_result: \"${ .output | fromjson }\""),
+                "{feature} must inspect the single-workflow outcome"
+            );
+            assert!(
+                yaml.contains("single_result.skipped // false"),
+                "{feature} must classify skipped as a non-failure"
+            );
+            assert!(
+                yaml.contains("single_result.completed // false"),
+                "{feature} must distinguish generated from logical failure"
+            );
+            assert!(
+                yaml.contains("generated_count:")
+                    && yaml.contains("skipped_count:")
+                    && yaml.contains(&format!("skipped_{item}:")),
+                "{feature} must expose generated/skipped outcome counts"
+            );
+            assert!(
+                yaml.contains("succeeded_count:")
+                    && yaml.contains(&format!("($generated_{item} | length)"))
+                    && yaml.contains(&format!("($skipped_{item} | length)")),
+                "{feature} must keep skipped items successful for downstream stages"
+            );
+        }
+    }
+
+    #[test]
+    fn thread_summary_batch_filters_up_to_date_summaries_before_single_dispatch() {
+        let yaml = include_str!("../workflows/thread-summary/thread-summary-batch.yaml");
+        assert!(yaml.contains("method: \"/llm_memory.service.MemoryService/FindListByCondition\""));
+        assert!(yaml.contains("memory_kinds: [\"MEMORY_KIND_THREAD_SUMMARY\"]"));
+        assert!(yaml.contains("external_id_prefix: \"summary:\""));
+        assert!(yaml.contains("$workflow.input.force_resummarize"));
+        assert!(yaml.contains("> $existing_summary.memory.data.updatedAt"));
+        assert!(yaml.contains("$required_labels"));
+        assert!(yaml.contains("$existing_summary_thread.data.labels"));
+        assert!(yaml.contains("pre_skipped_threads:"));
+    }
+
+    #[test]
+    fn thread_workflows_preserve_large_ids_as_strings() {
+        for (batch, single) in [
+            (
+                include_str!("../workflows/thread-summary/thread-summary-batch.yaml"),
+                include_str!("../workers/thread-summary/thread-summary-single.yaml"),
+            ),
+            (
+                include_str!("../workflows/thread-reflection/thread-reflection-batch.yaml"),
+                include_str!("../workers/thread-reflection/thread-reflection-single.yaml"),
+            ),
+            (
+                include_str!("../workflows/personality/thread-personality-batch.yaml"),
+                include_str!("../workers/personality/thread-personality-single.yaml"),
+            ),
+        ] {
+            assert!(batch.contains("items: { type: string }"));
+            assert!(batch.contains("thread_id: ($thread.id.value | tostring)"));
+            assert!(!batch.contains("thread_id: ($thread.id.value | tonumber)"));
+            assert!(single.contains("thread_id: { type: string }"));
+        }
+    }
+
+    #[test]
+    fn agent_chat_summary_runs_daily_after_a_successful_skipped_thread_batch() {
+        let yaml = include_str!("../workflows/agent-chat-summary/agent-chat-summary.yaml");
+        let thread = yaml.find("                - threadSummaryBatch:").unwrap();
+        let daily = yaml.find("                - dailyWorkSummary:").unwrap();
+        let reflection = yaml.find("                - reflectionStage:").unwrap();
+        assert!(thread < daily);
+        let thread_stage = &yaml[thread..daily];
+        assert!(
+            !thread_stage.contains("skipped"),
+            "a skipped child result must not gate the daily stage"
+        );
+        assert!(thread_stage.contains("thread_summary_result: \"${ .output | fromjson }\""));
+        assert!(
+            !thread_stage.contains("thread summary stage failed entirely"),
+            "thread-summary failures must not prevent the daily stage from using existing sources"
+        );
+        assert!(thread_stage.contains("thread_summary_succeeded: true"));
+        assert!(
+            thread_stage.contains("- recordThreadSummaryPartialFailure:")
+                && thread_stage.contains("thread_summary_failed: \"${ true }\"")
+                && thread_stage.contains("($thread_summary_result.failed_count // 0) > 0"),
+            "thread batch item failures must be reported without preventing daily generation"
+        );
+        let daily_stage = &yaml[daily..reflection];
+        assert!(daily_stage.contains("daily_summary_result: \"${ .output | fromjson }\""));
+        assert!(daily_stage.contains("($daily_summary_result.failed_count // 0) > 0"));
+        assert!(
+            daily_stage.contains("- recordDailySummaryPartialFailure:")
+                && daily_stage.contains("daily_summary_failed: \"${ true }\""),
+            "daily batch item failures must be reported as a partial summary result"
+        );
+        assert!(
+            !daily_stage.contains("skipped_count"),
+            "a skipped daily result must not gate the reflection stage"
+        );
+        assert!(yaml.contains("timeout:\n  after:\n    days: 32"));
+        assert!(
+            daily_stage.contains(
+                "timeout:\n                      after:\n                        days: 31"
+            )
+        );
+        assert!(
+            yaml.contains("and ($thread_summary_failed | not)")
+                && yaml.contains("and (($daily_summary_failed | not)"),
+            "partial thread or daily failures must make the summary output incomplete"
+        );
+    }
+
+    #[test]
+    fn period_rollups_use_fixed_size_source_snapshots() {
+        let daily = include_str!("../workers/daily-work-summary/daily-work-summary-single.yaml");
+        let weekly = include_str!("../workers/weekly-work-summary/weekly-work-summary-single.yaml");
+        let monthly =
+            include_str!("../workers/monthly-work-summary/monthly-work-summary-single.yaml");
+
+        for workflow in [daily, weekly, monthly] {
+            assert!(workflow.contains("runnerName: COMMAND"));
+            assert!(workflow.contains("stdin: \"${ $source_snapshot_json }\""));
+            assert!(workflow.contains("shasum -a 256"));
+            assert!(workflow.contains("source_fingerprint: $source_fingerprint"));
+            assert!(!workflow.contains("source_memory_ids: ($target_memories"));
+            assert!(!workflow.contains("source_thread_ids: ($target_memories"));
+        }
+
+        assert!(daily.contains("source_snapshot_version: 1"));
+
+        for workflow in [weekly, monthly] {
+            assert!(workflow.contains("source_snapshot_version: 2"));
+            assert!(
+                workflow.contains("source_fingerprint: (((.memory.data.metadata // \"{}\") | fromjson | .source_fingerprint) // \"\")"),
+                "downstream snapshots must include the upstream fingerprint so re-summaries propagate"
+            );
+        }
+    }
+
+    #[test]
+    fn period_batches_have_granularity_specific_timeouts() {
+        for (yaml, budget) in [
+            (
+                include_str!("../workflows/daily-work-summary/daily-work-summary-batch.yaml"),
+                "days: 31",
+            ),
+            (
+                include_str!("../workflows/weekly-work-summary/weekly-work-summary-batch.yaml"),
+                "days: 7",
+            ),
+            (
+                include_str!("../workflows/monthly-work-summary/monthly-work-summary-batch.yaml"),
+                "days: 31",
+            ),
+        ] {
+            assert!(yaml.contains(&format!("timeout:\n  after:\n    {budget}")));
+            assert!(yaml.contains(&format!("timeout:\n        after:\n          {budget}")));
+        }
+    }
+
+    #[test]
     fn reflection_single_uses_mode_selected_prompt_variables() {
         let yaml = include_str!("../workers/thread-reflection/thread-reflection-single.yaml");
         assert!(!yaml.contains("$context."));

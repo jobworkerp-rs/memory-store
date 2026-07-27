@@ -9,6 +9,13 @@ summary layer.
 agent-chat-import -> thread-summary-single -> daily-work-summary-single
 ```
 
+## Batch outcome contract
+
+The batch exposes generated, skipped, and failed counts and date arrays.
+`skipped=true` is a successful outcome and is included in `succeeded_count`,
+so a serial parent can continue to weekly aggregation. A child result with
+both `completed=false` and `skipped=false` is recorded as a failure.
+
 ## Files
 
 | File | Description |

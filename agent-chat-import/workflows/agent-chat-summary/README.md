@@ -7,6 +7,12 @@ summary, and optionally thread reflection and personality extraction. It is the
 summary half of the split pipeline; the import half is
 `../agent-chat-import/agent-chat-import.yaml`.
 
+The summary branch remains serial because each layer consumes the preceding
+layer. A child batch skip means that an existing aggregate is usable; it is
+successful and does not suppress the next layer. Item failures in the thread
+or daily batch do not stop the next layer, but are reported as a `partial`
+result (`completed: false`). A runner-level stage failure remains fatal.
+
 ```text
 fork:
   summaryBranch (fatal, serial):
@@ -26,6 +32,7 @@ fork:
 |---|---|
 | Processing window | Received as inputs from the import workflow |
 | Stage coupling | Via memories labels only; each stage can be rerun independently |
+| Partial batch failures | Continue dependent generation and expose `outcome: partial` with stage failure flags |
 | Reflection failure | Fatal; workflow fails to avoid silent reflector misconfiguration |
 | Personality failure | Non-fatal; exposed through `personality_error` |
 

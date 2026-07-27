@@ -11,7 +11,7 @@ input:
       required: [user_id, thread_id, memories_grpc_host, memories_grpc_port]
       properties:
         user_id: { type: integer }
-        thread_id: { type: integer }
+        thread_id: { type: string }
         memories_grpc_host: { type: string, default: "localhost" }
         memories_grpc_port: { type: integer, default: 9100 }
         memories_grpc_tls: { type: boolean, default: false }

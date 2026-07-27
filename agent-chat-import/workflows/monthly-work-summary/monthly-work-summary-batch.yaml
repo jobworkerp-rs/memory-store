@@ -56,7 +56,7 @@ input:
 
 timeout:
   after:
-    hours: 24
+    days: 31
 
 do:
   # Step 1: Resolve the month list. Modes (in priority order):
@@ -128,7 +128,8 @@ do:
   # iterations ran.
   - initOutcomeAccumulators:
       set:
-        succeeded_months: "${ [] }"
+        generated_months: "${ [] }"
+        skipped_months: "${ [] }"
         failed_months: "${ [] }"
         last_error: "${ null }"
 
@@ -137,7 +138,7 @@ do:
   - summarizeEachMonth:
       timeout:
         after:
-          hours: 24
+          days: 31
       for:
         each: target_month
         in: "${ $month_list }"
@@ -174,9 +175,28 @@ do:
                             output_language: $workflow.input.output_language,
                             force_resummarize: $workflow.input.force_resummarize
                           } | tojson }
-              - recordSuccess:
+                  export:
+                    as:
+                      single_result: "${ .output | fromjson }"
+              - rejectLogicalFailure:
+                  if: >-
+                    ${ (($single_result.completed // false)
+                        or ($single_result.skipped // false)) | not }
+                  raise:
+                    error:
+                      type: "https://memories.local/errors/monthly-work-summary/incomplete"
+                      status: 500
+                      title: "monthly summary returned neither completed nor skipped"
+              - recordGenerated:
+                  if: >-
+                    ${ ($single_result.completed // false)
+                       and (($single_result.skipped // false) | not) }
                   set:
-                    succeeded_months: "${ $succeeded_months + [$target_month] }"
+                    generated_months: "${ $generated_months + [$target_month] }"
+              - recordSkipped:
+                  if: "${ $single_result.skipped // false }"
+                  set:
+                    skipped_months: "${ $skipped_months + [$target_month] }"
             catch:
               as: error
               do:
@@ -189,9 +209,14 @@ output:
   as:
     completed: ${ ($failed_months | length) == 0 }
     processed_months: ${ $month_list | length }
-    succeeded_count: ${ $succeeded_months | length }
+    generated_count: ${ $generated_months | length }
+    skipped_count: ${ $skipped_months | length }
+    succeeded_count: >-
+      ${ ($generated_months | length) + ($skipped_months | length) }
     failed_count: ${ $failed_months | length }
     months: ${ $month_list }
-    succeeded_months: ${ $succeeded_months }
+    generated_months: ${ $generated_months }
+    skipped_months: ${ $skipped_months }
+    succeeded_months: ${ $generated_months + $skipped_months }
     failed_months: ${ $failed_months }
     last_error: ${ $last_error }

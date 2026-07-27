@@ -660,7 +660,7 @@ impl EmbeddingDispatcherCore {
         // workflow itself reads `embedding_model` from the runner output
         // (`model_info.model_name`), so it does not appear here.
         let inner = serde_json::json!({
-            self.spec.id_field_name: target_id,
+            self.spec.id_field_name: target_id.to_string(),
             "content": content,
         });
         serde_json::json!({ "input": inner.to_string() })
@@ -1142,10 +1142,10 @@ mod tests {
     #[test]
     fn build_job_args_uses_memory_id_for_memory_spec() {
         let c = test_core(memory_spec(), 8192);
-        let json = c.build_job_args_json(12345, "hello");
+        let json = c.build_job_args_json(7_465_246_090_942_480_532, "hello");
         let input: serde_json::Value =
             serde_json::from_str(json["input"].as_str().unwrap()).unwrap();
-        assert_eq!(input["memory_id"], 12345);
+        assert_eq!(input["memory_id"], "7465246090942480532");
         assert_eq!(input["content"], "hello");
         // embedding_model is no longer a workflow input; it is read from
         // the runner's `model_info.model_name` inside the workflow YAML.
@@ -1155,12 +1155,30 @@ mod tests {
     #[test]
     fn build_job_args_uses_thread_id_for_thread_spec() {
         let c = test_core(thread_spec(), 8192);
-        let json = c.build_job_args_json(999, "hi");
+        let json = c.build_job_args_json(7_465_246_090_942_480_532, "hi");
         let input: serde_json::Value =
             serde_json::from_str(json["input"].as_str().unwrap()).unwrap();
-        assert_eq!(input["thread_id"], 999);
+        assert_eq!(input["thread_id"], "7465246090942480532");
         assert!(input.get("memory_id").is_none());
         assert!(input.get("embedding_model").is_none());
+    }
+
+    #[test]
+    fn embedding_workflow_ids_are_decimal_strings() {
+        for yaml in [
+            include_str!("../../../workflows/auto-embedding.yaml"),
+            include_str!("../../../workflows/auto-thread-embedding.yaml"),
+            include_str!("../../../workflows/auto-image-embedding.yaml"),
+            include_str!(
+                "../../../workflows/thread-reflection/auto-reflection-summary-embedding.yaml"
+            ),
+            include_str!(
+                "../../../workflows/thread-reflection/auto-reflection-intent-embedding.yaml"
+            ),
+        ] {
+            assert!(!yaml.contains("type: integer"));
+            assert!(yaml.contains("type: string"));
+        }
     }
 
     #[test]

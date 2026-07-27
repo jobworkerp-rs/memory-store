@@ -9,6 +9,13 @@ groups, topics, and trends. This is the fourth summary layer.
 thread summaries -> daily summaries -> weekly summaries -> monthly summaries
 ```
 
+## Batch outcome contract
+
+The batch exposes generated, skipped, and failed counts and week arrays.
+`skipped=true` is a successful outcome and is included in `succeeded_count`,
+so a serial parent can continue to monthly aggregation. A child result with
+both `completed=false` and `skipped=false` is recorded as a failure.
+
 ## Files
 
 | File | Description |

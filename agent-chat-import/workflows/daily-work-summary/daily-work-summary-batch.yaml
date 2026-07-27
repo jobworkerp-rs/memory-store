@@ -54,7 +54,7 @@ input:
 
 timeout:
   after:
-    hours: 24
+    days: 31
 
 do:
   # Step 1: Resolve the date list. Modes (in priority order):
@@ -113,7 +113,8 @@ do:
   # iterations ran.
   - initOutcomeAccumulators:
       set:
-        succeeded_dates: "${ [] }"
+        generated_dates: "${ [] }"
+        skipped_dates: "${ [] }"
         failed_dates: "${ [] }"
         last_error: "${ null }"
 
@@ -124,7 +125,7 @@ do:
   - summarizeEachDay:
       timeout:
         after:
-          hours: 24
+          days: 31
       for:
         each: target_date
         in: "${ $date_list }"
@@ -161,9 +162,28 @@ do:
                             output_language: $workflow.input.output_language,
                             force_resummarize: $workflow.input.force_resummarize
                           } | tojson }
-              - recordSuccess:
+                  export:
+                    as:
+                      single_result: "${ .output | fromjson }"
+              - rejectLogicalFailure:
+                  if: >-
+                    ${ (($single_result.completed // false)
+                        or ($single_result.skipped // false)) | not }
+                  raise:
+                    error:
+                      type: "https://memories.local/errors/daily-work-summary/incomplete"
+                      status: 500
+                      title: "daily summary returned neither completed nor skipped"
+              - recordGenerated:
+                  if: >-
+                    ${ ($single_result.completed // false)
+                       and (($single_result.skipped // false) | not) }
                   set:
-                    succeeded_dates: "${ $succeeded_dates + [$target_date] }"
+                    generated_dates: "${ $generated_dates + [$target_date] }"
+              - recordSkipped:
+                  if: "${ $single_result.skipped // false }"
+                  set:
+                    skipped_dates: "${ $skipped_dates + [$target_date] }"
             catch:
               as: error
               do:
@@ -178,9 +198,13 @@ output:
     # When false, inspect `failed_dates` to know what to re-run.
     completed: ${ ($failed_dates | length) == 0 }
     processed_dates: ${ $date_list | length }
-    succeeded_count: ${ $succeeded_dates | length }
+    generated_count: ${ $generated_dates | length }
+    skipped_count: ${ $skipped_dates | length }
+    succeeded_count: ${ ($generated_dates | length) + ($skipped_dates | length) }
     failed_count: ${ $failed_dates | length }
     dates: ${ $date_list }
-    succeeded_dates: ${ $succeeded_dates }
+    generated_dates: ${ $generated_dates }
+    skipped_dates: ${ $skipped_dates }
+    succeeded_dates: ${ $generated_dates + $skipped_dates }
     failed_dates: ${ $failed_dates }
     last_error: ${ $last_error }

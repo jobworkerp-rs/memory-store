@@ -50,3 +50,10 @@ jobworkerp-client job enqueue-workflow \
   }' \
   -w /absolute/path/to/monthly-work-summary-batch.yaml
 ```
+
+## Batch outcome contract
+
+The batch exposes generated, skipped, and failed counts and month arrays.
+`skipped=true` is a successful outcome and is included in `succeeded_count`.
+A child result with both `completed=false` and `skipped=false` is recorded as
+a failure.

@@ -25,6 +25,7 @@ fork:
 |---|---|---|
 | 処理窓 | 入力 (`since_date`, `end_date`, `range_start_ms`, `since_ms_utc`) で受け取る | import 側で算出した処理窓と完全一致させるため。summary を単独で起動する split-execution でも、import 側と同じ値を渡すことで挙動を揃えられる |
 | stage 間結合 | memories のラベル経由のみ | `daily-work-summary-batch` は `thread-summary-batch` の出力を memory query で読み戻すだけ。workflow output 渡しは無い (= 各 stage を独立に再実行可能) |
+| skip の扱い | 正常完了として次の依存段へ進む | 既存・最新または入力不足の `skipped` は `succeeded_count` に含める。個別失敗は後段を止めず、`outcome: partial` と失敗フラグで報告する。runner レベルの例外は workflow を失敗させる |
 | reflection 失敗 | **致命** (try/catch なし) | reflection は summary の最終段。reflector LLM / 設定ミスを silent に握り潰さないため、失敗で workflow 全体を fail させる |
 | personality 失敗 | **非致命** (branch 内 try/catch) | personality は補足シグナル。failure で summary 側の結果を巻き戻さない (`personality_error` 出力で検出) |
 
@@ -112,9 +113,12 @@ reflection は summary と同じ `updated_after_ms` 窓 (= `max(since_ms_utc, ra
 
 | キー | 説明 |
 |---|---|
-| `completed` | `daily_summary_succeeded && (reflection 無効 ∨ reflection 成功)` |
+| `completed` | thread/daily の個別失敗がなく、daily が有効なら成功し、reflection が有効なら成功したとき `true`。個別失敗があると `false` |
+| `outcome` | `succeeded` または `partial`。thread/daily batch が個別失敗を返した場合は `partial` |
 | `thread_summary_succeeded` | bool |
+| `thread_summary_failed` | thread-summary batch が個別スレッドの失敗を返したか |
 | `daily_summary_succeeded` | bool |
+| `daily_summary_failed` | daily-work-summary batch が個別日の失敗を返したか |
 | `reflection_enabled` | bool |
 | `reflection_succeeded` | bool。reflection 致命扱いのため、これが false で `completed=true` のケースは reflection 無効化時のみ |
 | `personality_enabled` | bool |
@@ -197,7 +201,8 @@ jobworkerp-client -a http://localhost:9000 job enqueue-workflow \
 | 失敗箇所 | jobworkerp 上の表示 | 復旧手順 |
 |---|---|---|
 | threadSummaryBatch が失敗 | ワークフロー失敗 | thread-summary-batch.yaml を再実行 (差分判定で skip される thread が多い) |
-| dailyWorkSummary が失敗 | ワークフロー失敗 (batch 完走前の死亡時のみ。個別日の失敗は `output.failed_dates` で報告され完走扱い) | daily-work-summary-batch.yaml を再実行、または `daily-work-summary-single.yaml` を `target_date` で個別再実行 |
+| threadSummaryBatch / dailyWorkSummary が個別失敗を返す | ワークフローは完走するが `completed=false` / `outcome=partial`。後段は可能な既存要約を使って継続する | 対応 batch を再実行。差分判定により健全な項目は skip される |
+| threadSummaryBatch / dailyWorkSummary が実行中に失敗 | ワークフロー失敗 | 設定・runner・接続を修正して再実行 |
 | reflectionStage が失敗 | **ワークフロー失敗 (致命)** | reflector model / base_url を見直して再実行。reflection だけ単独で再実行したい場合は `thread-reflection-batch.yaml` を直接 enqueue |
 | threadPersonalityBatch / userPersonalityMerge が失敗 | **ワークフロー成功扱い** (`personality_error` にエラー文字列、`*_succeeded` flag が false) | personality 関連 YAML だけ別途再実行 |
 | 個別スレッドの reflection / personality 失敗 | **検出できない** (batch 内 `onError: continue` で握り潰される) | jobworkerp の per-job ログまたは memories DB の件数で確認 |

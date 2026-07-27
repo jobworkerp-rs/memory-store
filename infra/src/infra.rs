@@ -2,7 +2,6 @@ pub mod embedding_dispatch;
 pub mod media_object;
 pub mod media_storage;
 pub mod memory;
-pub mod memory_kind_migration;
 pub mod memory_rating;
 pub mod memory_vector;
 pub mod module;
@@ -17,6 +16,11 @@ pub mod thread_label;
 pub mod thread_memory;
 pub mod thread_vector;
 
+// Pins the post-migration memory_kind contract (NOT NULL, no default,
+// no CHECK) on a fresh schema so a later edit can't silently reintroduce
+// the old nullable/defaulted shape.
+#[cfg(test)]
+mod memory_kind_schema_test;
 // Phase A smoke tests for the reflection schema migration. The full
 // repositories land in Phase B; this file only confirms the migration
 // is wired up and the seed data is present.

@@ -9,7 +9,7 @@ input:
       type: object
       properties:
         thread_id:
-          type: integer
+          type: string
         content:
           type: string
       required: [thread_id, content]

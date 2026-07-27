@@ -338,9 +338,9 @@ do not create duplicates.
 
 Sessions use `source:<thread-creator-id>:<source-specific-id>`. If that form
 would exceed the database's 512-byte limit, it deterministically becomes
-`source:<thread-creator-id>:~<sha256>`. Migrate existing data with
-`migrate-memory-kind apply` and `verify` during the maintenance window before
-deploying this importer; it does not query or reuse legacy external IDs.
+`source:<thread-creator-id>:~<sha256>`. This importer requires a database where
+`thread.memory_kind` and `memory.memory_kind` have already been contract-migrated
+(`NOT NULL`); it does not query or reuse legacy external IDs.
 
 For long-running imports, glibc arena fragmentation can accumulate RSS. Consider
 setting:

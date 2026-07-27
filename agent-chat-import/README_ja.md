@@ -544,7 +544,7 @@ memories サーバ側 (cnpg PostgreSQL) で `AddMemoriesBatch` の INSERT が遅
 
 ### external_id
 
-会話memoryは `source:<thread作成者ID>:<source固有ID>` を使います。作成後にDBの512バイト上限を超える場合は `source:<thread作成者ID>:~<sha256>` へ決定的に短縮します。既存データは新バックエンドの導入前に `migrate-memory-kind apply` と `verify` で一括移行してください。importerは旧形式のexternal IDを検索・再利用しません。
+会話memoryは `source:<thread作成者ID>:<source固有ID>` を使います。作成後にDBの512バイト上限を超える場合は `source:<thread作成者ID>:~<sha256>` へ決定的に短縮します。importer は `thread.memory_kind` と `memory.memory_kind` が contract 済み（`NOT NULL`）の DB を前提とし、旧形式のexternal IDを検索・再利用しません。
 
 ### 長時間プロセスでのメモリ管理 (推奨)
 

@@ -9,7 +9,7 @@ input:
       type: object
       properties:
         memory_id:
-          type: integer
+          type: string
         content:
           type: string
       required: [memory_id, content]

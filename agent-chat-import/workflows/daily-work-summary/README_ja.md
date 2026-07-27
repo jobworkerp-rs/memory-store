@@ -221,6 +221,9 @@ batch は `output_language` に応じて `memories-daily-work-summary-single-ja`
 
 1. 同 (user_id, date, scope) の `external_id = "daily:<user_id>:YYYY-MM-DD:<scope_key>"` 集約メモリが存在
 2. その集約メモリの `updated_at` が、当日の入力スレッド群の最大 `updated_at` 以上
+3. 入力要約の ID と `updated_at` から作る source fingerprint が、保存済み metadata の fingerprint と一致する
+
+入力の追加・削除を最大 `updated_at` が変わらない場合にも検知するため、2 と 3 の両方を満たしたときだけスキップする。
 
 ## 出力データの構造
 
@@ -234,9 +237,8 @@ batch は `output_language` に応じて `memories-daily-work-summary-single-ja`
 
 - `content`: 下記 JSON 構造を `tojson` した文字列
 - `external_id`: `daily:<user_id>:YYYY-MM-DD:<scope_key>`
-- `metadata`: `{daily_date, scope, extra_labels[], source_memory_count, source_memory_ids[], source_thread_ids[], summary_version}`
-  - `scope` / `extra_labels` で「どのフィルタ条件で生成された要約か」をトレース可能
-  - 主軸は `source_memory_ids`（要約メモリ単位の正確なトレース）。`source_thread_ids` は集計の便宜のため要約メモリの所属スレッドを `unique` した補助情報として残す
+- `metadata`: `{daily_date, scope, extra_labels[], source_memory_count, source_snapshot_version, source_max_updated_at, source_fingerprint_algorithm, source_fingerprint, summary_version}`
+  - `source_fingerprint` は入力要約の ID と `updated_at` を SHA-256 で固定長化した値。`updated_at` だけでは検出できない入力の追加・削除も検知する
 
 ```json
 {
@@ -264,7 +266,13 @@ batch は `output_language` に応じて `memories-daily-work-summary-single-ja`
 
 ## 注意事項
 
-- **`thread-summary-batch` は `daily_summary` ラベル付きスレッドを除外していない**。デフォルト（`labels_filter` 未指定）で全スレッドを引いてくるため、本ワークフローの出力スレッドが次の thread-summary-batch 実行で再要約対象になり得る。当面は `thread-summary-batch` 起動時に `labels_filter: ["coding_agent"]` などプロジェクト側ラベルを必ず指定する運用で回避する。恒久対応はサーバ側の除外フィルタ追加 or batch ワークフローの改修（別 PR）。
+- **`thread-summary-batch` は `MEMORY_KIND_RAW` のみを取得する**ため、日次要約スレッドは次回のスレッド要約対象に含まれない。
 - **`extra_labels_filter` を変えると別スレッドができる**。同一日に「全 project 横断」と「`agent:claude_code` のみ」の両方を実行すると、`labels` が異なる 2 本の集約スレッドが作られる。狙ったとおりなら問題ないが、運用は揃えたほうが listing が綺麗。
 - **タイムゾーンの取り扱い**。日界は jq を評価する jobworkerp worker の `TZ` 環境変数（例 `TZ=Asia/Tokyo`）で決まり、夏時間 (DST) と負オフセットに対応する。`TZ` 未設定時のフォールバック `timezone_offset_hours` は時単位（0..23）なので、半端なオフセット（IST 等）や負オフセットには未対応。それらが必要なら worker の `TZ` を設定する。
 - **LLM のコンテキスト長**。`max_context_chars=200000` は Qwen3.6:27b（256k トークン）を想定。モデルを変える場合は調整すること。
+
+## バッチ結果
+
+`generated_count` / `skipped_count` / `failed_count` と対応する日付配列を返す。
+既存・最新または入力不足による `skipped` は正常結果として `succeeded_count` に含まれ、
+上位ワークフローは週次要約へ進む。`completed=false, skipped=false` のみ失敗として記録する。

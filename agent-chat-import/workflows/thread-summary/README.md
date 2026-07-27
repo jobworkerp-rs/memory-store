@@ -76,3 +76,13 @@ The structured summary `status` uses these values:
 | `abandoned` | The work was explicitly discontinued. |
 
 `in_review`, `blocked`, and `deferred` are carryover states for downstream summaries.
+
+## Batch outcome contract
+
+The batch returns `generated_count`, `skipped_count`, and `failed_count` plus
+the corresponding thread ID arrays. An up-to-date summary is a successful
+skip and remains part of `succeeded_count`, allowing a serial parent workflow
+to continue to daily aggregation. Only `completed=false, skipped=false` is a
+logical failure. Up-to-date summaries are detected in one preflight query;
+only missing, stale, relabeled, forced, or description-less threads dispatch
+the single worker.

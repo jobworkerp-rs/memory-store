@@ -48,7 +48,7 @@
 #                                       or http://localhost:9000
 #   --memories-grpc-host <host>         default: localhost
 #   --memories-grpc-port <port>         default: 9100
-#   --timeout-sec <sec>                 default: 86400 (24h, matches workflow timeout)
+#   --timeout-sec <sec>                 default: 604800 (7d, matches workflow timeout)
 #   --channel <name>                    default: workflow_base
 #   --format <table|card|json>          default: card
 #
@@ -98,7 +98,7 @@ JOBWORKERP_ADDR_DEFAULT="${JOBWORKERP_ADDR:-http://localhost:9000}"
 JOBWORKERP_ADDR="${JOBWORKERP_ADDR_DEFAULT}"
 MEMORIES_GRPC_HOST="localhost"
 MEMORIES_GRPC_PORT="9100"
-TIMEOUT_SEC="86400"
+TIMEOUT_SEC="604800"
 CHANNEL="workflow_base"
 FORMAT="card"
 

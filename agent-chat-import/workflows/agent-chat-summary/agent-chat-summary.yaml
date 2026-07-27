@@ -23,10 +23,12 @@ document:
 # scripts can pass the same values they passed to memories-import.
 #
 # Failure semantics:
-#   summaryBranch (致命):  threadSummaryBatch failure or
-#                          dailyWorkSummary failure or
-#                          reflectionStage failure → branch fails →
-#                          fork fails → workflow fails.
+#   summaryBranch (致命):  runner-level threadSummaryBatch or
+#                          dailyWorkSummary failure, an all-failed daily
+#                          batch, or reflectionStage failure → branch
+#                          fails → fork fails → workflow fails. Item-level
+#                          thread/daily batch failures are reported as
+#                          `outcome: partial` after dependent stages run.
 #   personalityBranch:     branch-level try/catch keeps the failure
 #                          non-fatal (personality is supplementary).
 #
@@ -259,7 +261,7 @@ input:
 
 timeout:
   after:
-    hours: 24
+    days: 32
 
 do:
   # Step 0: Initialize variables that may be referenced from output.as
@@ -267,7 +269,11 @@ do:
   - initOutputVars:
       set:
         thread_summary_succeeded: "${ false }"
+        thread_summary_failed: "${ false }"
         daily_summary_succeeded: "${ false }"
+        daily_summary_failed: "${ false }"
+        thread_summary_result: "${ null }"
+        daily_summary_result: "${ null }"
         thread_personality_succeeded: "${ false }"
         personality_batch_result: "${ null }"
         personality_error: "${ null }"
@@ -369,7 +375,7 @@ do:
   - downstreamStages:
       timeout:
         after:
-          hours: 24
+          days: 32
       fork:
         branches:
           - summaryBranch:
@@ -412,13 +418,24 @@ do:
                             } | tojson }
                     export:
                       as:
-                        thread_summary_succeeded: true
+                        thread_summary_result: "${ .output | fromjson }"
+
+                - recordThreadSummarySuccess:
+                    set:
+                      thread_summary_succeeded: true
+
+                # Keep the daily stage runnable from already stored thread
+                # summaries, but make batch item failures visible to callers.
+                - recordThreadSummaryPartialFailure:
+                    if: "${ ($thread_summary_result.failed_count // 0) > 0 }"
+                    set:
+                      thread_summary_failed: "${ true }"
 
                 - dailyWorkSummary:
                     if: "${ $daily_summary_enabled }"
                     timeout:
                       after:
-                        hours: 24
+                        days: 31
                     run:
                       function:
                         runnerName: WORKFLOW
@@ -449,7 +466,32 @@ do:
                             } | tojson }
                     export:
                       as:
-                        daily_summary_succeeded: true
+                        daily_summary_result: "${ .output | fromjson }"
+
+                - dailySummaryFatalCheck:
+                    if: >-
+                      ${ $daily_summary_enabled
+                         and ($daily_summary_result.processed_dates // 0) > 0
+                         and ($daily_summary_result.succeeded_count // 0) == 0
+                         and ($daily_summary_result.failed_count // 0) > 0 }
+                    raise:
+                      error:
+                        type: "https://serverlessworkflow.io/spec/1.0.0/errors/runtime"
+                        status: 500
+                        title: "daily summary stage failed entirely"
+                        detail: "all daily summaries failed"
+
+                - recordDailySummaryPartialFailure:
+                    if: >-
+                      ${ $daily_summary_enabled
+                         and (($daily_summary_result.failed_count // 0) > 0) }
+                    set:
+                      daily_summary_failed: "${ true }"
+
+                - recordDailySummarySuccess:
+                    if: "${ $daily_summary_enabled }"
+                    set:
+                      daily_summary_succeeded: true
 
                 # Reflection stage (opt-in, fatal). No try/catch — a
                 # reflection failure halts summaryBranch and fails the
@@ -563,11 +605,20 @@ output:
     # actually reach this point — keeping the term documents intent.
     completed: >-
       ${ $thread_summary_succeeded
+         and ($thread_summary_failed | not)
          and (($daily_summary_enabled | not) or $daily_summary_succeeded)
+         and (($daily_summary_failed | not) or ($daily_summary_enabled | not))
          and (($reflection_enabled | not) or $reflection_succeeded) }
+    outcome: >-
+      ${ if $thread_summary_failed or $daily_summary_failed
+         then "partial"
+         else "succeeded"
+         end }
     thread_summary_succeeded: ${ $thread_summary_succeeded }
+    thread_summary_failed: ${ $thread_summary_failed }
     daily_summary_enabled: ${ $daily_summary_enabled // false }
     daily_summary_succeeded: ${ $daily_summary_succeeded }
+    daily_summary_failed: ${ $daily_summary_failed }
     personality_enabled: ${ $personality_enabled // false }
     thread_personality_succeeded: ${ $thread_personality_succeeded // false }
     user_personality_merge_succeeded: ${ $personality_batch_result.merged // false }

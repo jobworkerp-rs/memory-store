@@ -9,9 +9,9 @@ input:
       type: object
       properties:
         memory_id:
-          type: integer
+          type: string
         media_object_id:
-          type: integer
+          type: string
         image_search_mode:
           type: string
       required: [memory_id, media_object_id, image_search_mode]

@@ -95,6 +95,8 @@ do:
         result: "${ null }"
         target_date_resolved: "${ null }"
         target_memories: "${ [] }"
+        source_snapshot_json: "${ \"[]\" }"
+        source_fingerprint: "${ \"\" }"
 
   # Step 0.5: Expose the fallback fixed offset (seconds) for the branches
   # below. The TZ-vs-offset choice itself is read inline per expression
@@ -230,6 +232,25 @@ do:
           result: "skipped: not enough source summary memories for the day"
       then: exit
 
+  - buildSourceSnapshot:
+      set:
+        source_snapshot_json: >-
+          ${ ($target_memories | map({id: (.memory.id.value | tostring), updated_at: .memory.data.updatedAt}) | sort_by(.id) | tojson) }
+
+  - fingerprintSourceSnapshot:
+      run:
+        function:
+          runnerName: COMMAND
+          settings: {}
+          arguments:
+            command: "/bin/sh"
+            args: ["-c", "if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi | awk '{print $1}'"]
+            stdin: "${ $source_snapshot_json }"
+            treat_nonzero_as_error: true
+      export:
+        as:
+          source_fingerprint: "${ .stdout | split(\" \")[0] }"
+
   # Step 6: Build LLM input. FindListByCondition defaults to
   # `MemoryListSort = UPDATED_DESC`, so a greedy prefix walk drops the
   # oldest entries first when the combined content text would exceed
@@ -340,7 +361,8 @@ do:
           ${ $workflow.input.force_resummarize
              or ($existing_daily_memory == null)
              or ($existing_daily_memory.data.updatedAt
-                 < ($target_memories | map(.memory.data.updatedAt) | max // 0)) }
+                 < ($target_memories | map(.memory.data.updatedAt) | max // 0))
+             or ((($existing_daily_memory.data.metadata // "{}") | fromjson | .source_fingerprint // "") != $source_fingerprint) }
 
   - skipIfNotEligible:
       if: "${ $eligible | not }"
@@ -482,10 +504,10 @@ do:
               scope: $scope_key,
               extra_labels: $sorted_extra_labels,
               source_memory_count: ($target_memories | length),
-              source_memory_ids: ($target_memories
-                | map(.memory.id.value | tostring)),
-              source_thread_ids: ($target_memories
-                | map(.threadId.value | tostring) | unique),
+              source_snapshot_version: 1,
+              source_max_updated_at: $max_source_updated_at,
+              source_fingerprint_algorithm: "sha256",
+              source_fingerprint: $source_fingerprint,
               summary_version: "1.0"
             } | tojson }
 

@@ -20,7 +20,7 @@ input:
         memories_grpc_port: { type: integer, default: 9100 }
         thread_ids:
           type: array
-          items: { type: integer }
+          items: { type: string }
           description: When specified, only these threads are processed.
         labels_filter:
           type: array
@@ -204,7 +204,7 @@ do:
                         input: >-
                           ${ {
                             user_id: $workflow.input.user_id,
-                            thread_id: ($thread.id.value | tonumber),
+                            thread_id: ($thread.id.value | tostring),
                             memories_grpc_host: $workflow.input.memories_grpc_host,
                             memories_grpc_port: $workflow.input.memories_grpc_port,
                             memories_grpc_tls: $workflow.input.memories_grpc_tls,
