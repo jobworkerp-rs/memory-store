@@ -5,7 +5,6 @@ pub struct VectorDBConfig {
     pub table_name: String,
     pub vector_size: usize,
     pub distance_type: DistanceType,
-    pub optimize: OptimizeConfig,
     pub fts: FtsConfig,
     pub vector_index: VectorIndexConfig,
 }
@@ -40,11 +39,10 @@ impl VectorDBConfig {
                 "dot" => DistanceType::Dot,
                 _ => DistanceType::Cosine,
             },
-            optimize: OptimizeConfig::from_env_with_prefixes(&["MEMORY_"]),
             fts: FtsConfig::from_env()?,
             vector_index: VectorIndexConfig::from_env_with_prefixes(&["MEMORY_"]),
         };
-        warn_if_deprecated_auto_optimize_interval(&["MEMORY_"]);
+        crate::infra::search_index_maintenance::reject_legacy_environment()?;
         Ok(cfg)
     }
 }
@@ -56,15 +54,14 @@ impl VectorDBConfig {
 /// `*_OPTIMIZE_PRUNE_INTERVAL` thresholds. We log (rather than fail) so a
 /// stale value in a long-lived `.env` does not break startup, but the
 /// operator is told it is now a no-op and how to migrate.
+///
+/// Reflection-intent vectors intentionally retain their independent legacy
+/// policy and are outside the memory/thread maintenance migration.
 pub(crate) fn warn_if_deprecated_auto_optimize_interval(prefixes: &[&str]) {
-    for p in prefixes {
-        let name = format!("{p}AUTO_OPTIMIZE_INTERVAL");
-        if std::env::var(&name).is_ok() {
-            tracing::warn!(
-                "{name} is deprecated and ignored. Use {p}OPTIMIZE_COMPACT_INTERVAL \
-                 (heavy compaction/index cadence) and {p}OPTIMIZE_PRUNE_INTERVAL \
-                 (version pruning cadence) instead."
-            );
+    for prefix in prefixes {
+        let name = format!("{prefix}AUTO_OPTIMIZE_INTERVAL");
+        if std::env::var_os(&name).is_some() {
+            tracing::warn!("{name} is deprecated and ignored");
         }
     }
 }

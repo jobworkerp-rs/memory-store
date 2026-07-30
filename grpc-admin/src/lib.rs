@@ -11,6 +11,19 @@ use anyhow::Result;
 use std::env;
 use std::net::SocketAddr;
 
+fn parse_listener_addresses(
+    grpc_addr_raw: &str,
+    maintenance_addr_raw: &str,
+) -> Result<(SocketAddr, SocketAddr)> {
+    let grpc_addr = grpc_addr_raw.parse().map_err(|e| {
+        anyhow::anyhow!("GRPC_ADDR is not a valid socket address ({grpc_addr_raw:?}): {e}")
+    })?;
+    let maintenance_addr = maintenance_addr_raw.parse().map_err(|e| {
+        anyhow::anyhow!("SEARCH_INDEX_MAINTENANCE_GRPC_ADDR is not a valid socket address ({maintenance_addr_raw:?}): {e}")
+    })?;
+    Ok((grpc_addr, maintenance_addr))
+}
+
 pub async fn setup_and_start_front_server() -> Result<()> {
     use infra::infra::startup_error::StartupError;
 
@@ -21,13 +34,30 @@ pub async fn setup_and_start_front_server() -> Result<()> {
         }
         .fatal()
     });
-    let grpc_addr: SocketAddr = grpc_addr_raw.parse().unwrap_or_else(|e| {
-        StartupError::EnvVarInvalid {
-            name: "GRPC_ADDR".into(),
-            message: format!("not a valid socket address ({grpc_addr_raw:?}): {e}"),
+    let maintenance_addr_raw =
+        env::var("SEARCH_INDEX_MAINTENANCE_GRPC_ADDR").unwrap_or_else(|_| {
+            StartupError::EnvVarInvalid {
+                name: "SEARCH_INDEX_MAINTENANCE_GRPC_ADDR".into(),
+                message: "must be specified".into(),
+            }
+            .fatal()
+        });
+    let (grpc_addr, maintenance_addr) =
+        parse_listener_addresses(&grpc_addr_raw, &maintenance_addr_raw).unwrap_or_else(|e| {
+            StartupError::EnvVarInvalid {
+                name: "GRPC_ADDR / SEARCH_INDEX_MAINTENANCE_GRPC_ADDR".into(),
+                message: e.to_string(),
+            }
+            .fatal()
+        });
+    if let Err(e) = infra::infra::search_index_maintenance::SearchIndexMaintenanceConfig::from_env()
+    {
+        StartupError::ConfigLoadFailed {
+            component: "search index maintenance".into(),
+            message: e.to_string(),
         }
-        .fatal()
-    });
+        .fatal();
+    }
 
     if let Err(e) = infra::infra::embedding_dispatch::validate_document_prefix_configuration() {
         StartupError::ConfigLoadFailed {
@@ -110,7 +140,7 @@ pub async fn setup_and_start_front_server() -> Result<()> {
             .fatal()
         })
     });
-    front::server::create_server(grpc_addr, use_web, max_frame_size)
+    front::server::create_server(grpc_addr, maintenance_addr, use_web, max_frame_size)
         .await
         .map_err(|err| {
             tracing::error!("failed to create server: {:?}", err);
@@ -177,5 +207,24 @@ mod validate_rag_prerequisites_tests {
             err.contains("memories-mm-embedding"),
             "error must explain the underlying worker dependency: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod listener_address_tests {
+    use super::parse_listener_addresses;
+
+    #[test]
+    fn accepts_a_shared_normal_and_maintenance_address() {
+        let (normal, maintenance) =
+            parse_listener_addresses("127.0.0.1:9000", "127.0.0.1:9000").unwrap();
+        assert_eq!(normal, maintenance);
+    }
+
+    #[test]
+    fn accepts_two_valid_distinct_addresses() {
+        let (normal, maintenance) =
+            parse_listener_addresses("127.0.0.1:9000", "127.0.0.1:9001").unwrap();
+        assert_ne!(normal, maintenance);
     }
 }

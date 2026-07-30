@@ -13,6 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "../protobuf/protobuf/llm_memory/service/memory_rating.proto",
                 "../protobuf/protobuf/llm_memory/service/memory_vector.proto",
                 "../protobuf/protobuf/llm_memory/service/thread_vector.proto",
+                "../protobuf/protobuf/llm_memory/service/search_index_maintenance.proto",
             ],
             &["../protobuf/protobuf/"],
         )

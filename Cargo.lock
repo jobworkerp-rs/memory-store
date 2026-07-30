@@ -3537,6 +3537,7 @@ dependencies = [
  "anyhow",
  "app",
  "async-stream",
+ "async-trait",
  "base64",
  "bytes",
  "clap",

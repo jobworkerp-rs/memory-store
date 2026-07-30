@@ -1,0 +1,48 @@
+# Conductor schedules this workflow; the workflow itself performs one
+# reconciliation request and never starts more than one maintenance task.
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: search-index-maintenance-reconcile
+  version: "1.0.0"
+  title: "LanceDB 検索 index の定期メンテナンス"
+  summary: "管理専用 gRPC listener に reconcile を一度だけ要求する。"
+  tags:
+    component: search-index-maintenance
+    trigger: conductor-scheduler
+
+input:
+  schema:
+    document:
+      type: object
+      additionalProperties: false
+      properties:
+        maintenance_host:
+          type: string
+          minLength: 1
+          description: "maintenance 専用 gRPC Service の host 名または IP アドレス"
+        maintenance_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: "maintenance 専用 gRPC Service の TCP port"
+      required: [maintenance_host, maintenance_port]
+
+do:
+  - reconcileSearchIndices:
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            # The generic runner evaluates these input expressions before it
+            # initializes the gRPC connection. This keeps host and port in the
+            # scheduler request rather than in the worker environment.
+            host: "${ $workflow.input.maintenance_host }"
+            port: "${ $workflow.input.maintenance_port }"
+            tls: false
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.SearchIndexMaintenanceService/ReconcileSearchIndices"
+            as_json: true
+            json_body: "{}"

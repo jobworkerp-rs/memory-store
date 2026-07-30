@@ -7,6 +7,7 @@ pub mod memory_rating;
 pub mod memory_vector;
 pub mod reflection;
 pub mod reflection_vector;
+pub mod search_index_maintenance;
 pub mod thread;
 pub mod thread_vector;
 mod vector_decode;

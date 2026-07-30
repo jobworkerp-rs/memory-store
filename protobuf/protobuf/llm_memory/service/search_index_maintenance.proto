@@ -1,0 +1,143 @@
+syntax = "proto3";
+
+package llm_memory.service;
+
+// This API intentionally accepts logical targets only.  A caller cannot turn
+// the maintenance listener into an arbitrary LanceDB DDL endpoint.
+enum SearchIndexMaintenanceTarget {
+  SEARCH_INDEX_MAINTENANCE_TARGET_UNSPECIFIED = 0;
+  MEMORY_FTS = 1;
+  MEMORY_VECTOR = 2;
+  MEMORY_TABLE = 3;
+  THREAD_FTS = 4;
+  THREAD_VECTOR = 5;
+  THREAD_TABLE = 6;
+}
+
+enum SearchIndexMaintenanceAction {
+  SEARCH_INDEX_MAINTENANCE_ACTION_UNSPECIFIED = 0;
+  CHECK = 1;
+  BUILD = 2;
+  OPTIMIZE = 3;
+}
+
+enum SearchIndexOptimizeAction {
+  SEARCH_INDEX_OPTIMIZE_ACTION_UNSPECIFIED = 0;
+  INDEX = 1;
+  COMPACT = 2;
+  PRUNE = 3;
+}
+
+enum SearchIndexMaintenanceDisposition {
+  SEARCH_INDEX_MAINTENANCE_DISPOSITION_UNSPECIFIED = 0;
+  ACCEPTED = 1;
+  ALREADY_RUNNING = 2;
+}
+
+enum SearchIndexMaintenanceStatus {
+  SEARCH_INDEX_MAINTENANCE_STATUS_UNSPECIFIED = 0;
+  RUNNING = 1;
+  SUCCEEDED = 2;
+  FAILED = 3;
+  SKIPPED = 4;
+  SKIPPED_DISABLED = 5;
+  DEFERRED = 6;
+}
+
+enum SearchIndexMaintenanceSkipReason {
+  SEARCH_INDEX_MAINTENANCE_SKIP_REASON_UNSPECIFIED = 0;
+  CANDIDATE_NONE = 1;
+  RUNNING_SKIP = 2;
+  CHECK_RUNNING = 3;
+  RECONCILE_RUNNING = 4;
+  BACKOFF = 5;
+  NON_RETRYABLE = 6;
+  DEFERRED_SKIP = 7;
+  DISABLED = 8;
+  OBSERVATION_UNAVAILABLE = 9;
+}
+
+enum SearchIndexObservationStatus {
+  SEARCH_INDEX_OBSERVATION_STATUS_UNSPECIFIED = 0;
+  OBSERVED = 1;
+  UNAVAILABLE = 2;
+}
+
+message SearchIndexMaintenanceObservation {
+  SearchIndexMaintenanceTarget target = 1;
+  int64 observed_at_unix_ms = 2;
+  optional bool index_present = 3;
+  optional uint64 unindexed_rows = 4;
+  SearchIndexObservationStatus status = 5;
+  string error_summary = 6;
+}
+
+message SearchIndexMaintenanceWarning {
+  string category = 1;
+  int64 recorded_at_unix_ms = 2;
+  string summary = 3;
+}
+
+message SearchIndexMaintenanceSubActionResult {
+  SearchIndexOptimizeAction action = 1;
+  SearchIndexMaintenanceStatus status = 2;
+  string error_summary = 3;
+}
+
+message StartSearchIndexMaintenanceRequest {
+  SearchIndexMaintenanceTarget target = 1;
+  SearchIndexMaintenanceAction action = 2;
+  bool force = 3;
+  repeated SearchIndexOptimizeAction optimize_actions = 4;
+}
+
+message SearchIndexMaintenanceTask {
+  string task_id = 1;
+  SearchIndexMaintenanceTarget requested_target = 2;
+  SearchIndexMaintenanceTarget physical_table = 3;
+  SearchIndexMaintenanceAction action = 4;
+  SearchIndexMaintenanceStatus status = 5;
+  int64 started_at_unix_ms = 6;
+  optional int64 finished_at_unix_ms = 7;
+  string error_summary = 8;
+  repeated SearchIndexMaintenanceObservation observations = 9;
+  repeated SearchIndexMaintenanceWarning warnings = 10;
+  repeated SearchIndexMaintenanceSubActionResult sub_actions = 11;
+}
+
+message StartSearchIndexMaintenanceResponse {
+  optional string task_id = 1;
+  SearchIndexMaintenanceTarget target = 2;
+  SearchIndexMaintenanceAction action = 3;
+  SearchIndexMaintenanceDisposition disposition = 4;
+  repeated SearchIndexMaintenanceTask blocking_tasks = 5;
+}
+
+message GetSearchIndexMaintenanceStatusRequest {
+  optional string task_id = 1;
+  optional SearchIndexMaintenanceTarget target = 2;
+}
+
+message GetSearchIndexMaintenanceStatusResponse {
+  repeated SearchIndexMaintenanceTask running_tasks = 1;
+  repeated SearchIndexMaintenanceTask last_results = 2;
+}
+
+message SearchIndexMaintenanceSkippedTarget {
+  SearchIndexMaintenanceTarget target = 1;
+  SearchIndexMaintenanceSkipReason reason = 2;
+}
+
+message ReconcileSearchIndicesRequest {}
+
+message ReconcileSearchIndicesResponse {
+  optional string started_task_id = 1;
+  optional SearchIndexMaintenanceAction started_action = 2;
+  repeated SearchIndexMaintenanceSkippedTarget skipped_targets = 3;
+}
+
+service SearchIndexMaintenanceService {
+  rpc StartSearchIndexMaintenance(StartSearchIndexMaintenanceRequest) returns (StartSearchIndexMaintenanceResponse);
+  rpc GetSearchIndexMaintenanceStatus(GetSearchIndexMaintenanceStatusRequest) returns (GetSearchIndexMaintenanceStatusResponse);
+  rpc ReconcileSearchIndices(ReconcileSearchIndicesRequest) returns (ReconcileSearchIndicesResponse);
+}

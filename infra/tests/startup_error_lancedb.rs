@@ -17,7 +17,7 @@
 //! its ability to explain the root cause to the user.
 
 use infra::infra::memory_vector::config::{
-    DistanceType, FtsConfig, OptimizeConfig, VectorDBConfig, VectorIndexConfig,
+    DistanceType, FtsConfig, VectorDBConfig, VectorIndexConfig,
 };
 use infra::infra::memory_vector::repository::MemoryVectorRepositoryImpl;
 use infra::infra::startup_error::StartupError;
@@ -30,10 +30,6 @@ fn vector_db_config(uri: &str, vector_size: usize) -> VectorDBConfig {
         table_name: "memories".to_string(),
         vector_size,
         distance_type: DistanceType::Cosine,
-        optimize: OptimizeConfig {
-            prune_on_startup: false,
-            ..Default::default()
-        },
         fts: FtsConfig::default(),
         vector_index: VectorIndexConfig::default(),
     }
@@ -45,10 +41,6 @@ fn thread_db_config(uri: &str, vector_size: usize) -> ThreadVectorDBConfig {
         table_name: "thread_vectors".to_string(),
         vector_size,
         distance_type: DistanceType::Cosine,
-        optimize: OptimizeConfig {
-            prune_on_startup: false,
-            ..Default::default()
-        },
         fts: FtsConfig::default(),
         vector_index: VectorIndexConfig::default(),
     }

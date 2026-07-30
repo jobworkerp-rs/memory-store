@@ -2502,10 +2502,6 @@ mod test {
                 table_name: "test_memories".to_string(),
                 vector_size: dim,
                 distance_type: DistanceType::Cosine,
-                optimize: infra::infra::memory_vector::config::OptimizeConfig {
-                    prune_on_startup: false,
-                    ..Default::default()
-                },
                 fts: infra::infra::memory_vector::config::FtsConfig::default(),
                 vector_index: infra::infra::memory_vector::config::VectorIndexConfig::default(),
             };
@@ -2834,6 +2830,7 @@ mod test {
                 .await?;
             app.upsert_embedding(id2, &random_embedding(dim), Some("test"))
                 .await?;
+            build_fts_index_for_test(&app).await?;
 
             let results = app
                 .search_by_text("neural network", None, None, None, 10, true)
@@ -2894,6 +2891,7 @@ mod test {
             app.thread_memory_repo
                 .insert_or_ignore_auto_position_tx(pool, 9_500_003, id_out, 1)
                 .await?;
+            build_fts_index_for_test(&app).await?;
 
             let tf = ThreadSearchFilter {
                 labels: vec!["match".into()],
@@ -2987,6 +2985,7 @@ mod test {
             app.thread_memory_repo
                 .insert_or_ignore_auto_position_tx(pool, 9_600_002, id_live_2, 1)
                 .await?;
+            build_fts_index_for_test(&app).await?;
 
             let tf = ThreadSearchFilter {
                 labels: vec!["match".into()],
@@ -3040,6 +3039,7 @@ mod test {
                 create_test_memory(&app.memory_repo, pool, "unrelated cooking topic", 10).await?;
             app.upsert_embedding(id2, &similar_embedding(&base_emb, 0.02), Some("test"))
                 .await?;
+            build_fts_index_for_test(&app).await?;
 
             let options = HybridOptions {
                 strategy: HybridStrategy::Rrf,
@@ -3096,6 +3096,7 @@ mod test {
             .await?;
             app.upsert_embedding(id2, &similar_embedding(&base_emb, 0.02), Some("test"))
                 .await?;
+            build_fts_index_for_test(&app).await?;
 
             let options = HybridOptions {
                 strategy: HybridStrategy::VectorThenFts,
@@ -5007,6 +5008,13 @@ mod test {
         Ok(ids)
     }
 
+    /// Tests that exercise BM25 build their index explicitly through the
+    /// maintenance-only repository entry point. User search paths must never
+    /// acquire this capability.
+    async fn build_fts_index_for_test(app: &MemoryVectorAppImpl) -> anyhow::Result<()> {
+        app.vector_repo.maintenance_build_fts(false).await
+    }
+
     /// Spec test #1: FILTER_ONLY exact count. role / user filtering.
     #[test]
     fn p2_count_filter_only_exact_with_user_filter() -> anyhow::Result<()> {
@@ -5089,6 +5097,7 @@ mod test {
                 ],
             )
             .await?;
+            build_fts_index_for_test(&app).await?;
 
             let out = app
                 .count_search_matches(CountSearchInput {
@@ -5136,6 +5145,7 @@ mod test {
                 ],
             )
             .await?;
+            build_fts_index_for_test(&app).await?;
 
             let out = app
                 .count_search_matches(CountSearchInput {
@@ -5205,6 +5215,7 @@ mod test {
                 &[(10, "fox alpha"), (20, "fox bravo"), (10, "no match")],
             )
             .await?;
+            build_fts_index_for_test(&app).await?;
 
             let filter = protobuf::llm_memory::data::MemorySearchFilter {
                 user_id: Some(10),
@@ -5314,6 +5325,7 @@ mod test {
                 &[(1, "a"), (1, "b"), (1, "c"), (1, "d"), (1, "e")],
             )
             .await?;
+            build_fts_index_for_test(&app).await?;
 
             let qv = vec![base.clone()];
             let out = app
@@ -5350,6 +5362,8 @@ mod test {
                 &[(1, "a"), (1, "b"), (1, "c"), (1, "d"), (1, "e")],
             )
             .await?;
+
+            build_fts_index_for_test(&app).await?;
 
             let qv = vec![base.clone()];
             let out = app
@@ -5461,6 +5475,8 @@ mod test {
                 ],
             )
             .await?;
+
+            build_fts_index_for_test(&app).await?;
 
             let qv = vec![base.clone()];
             let opts = HybridOptions {
@@ -5989,6 +6005,7 @@ mod test {
             .await?;
             app.upsert_embedding(mid, &random_embedding(dim), Some("m"))
                 .await?;
+            build_fts_index_for_test(&app).await?;
 
             let results = app
                 .search_by_text("deployment dashboard", None, None, None, 10, true)
@@ -6032,6 +6049,7 @@ mod test {
             .await?;
             app.upsert_embedding(mid, &random_embedding(dim), Some("m"))
                 .await?;
+            build_fts_index_for_test(&app).await?;
 
             let results = app
                 .search_by_text("image memory", None, None, None, 10, true)
@@ -6068,6 +6086,7 @@ mod test {
             .await?;
             app.upsert_embedding(mid, &random_embedding(dim), Some("m"))
                 .await?;
+            build_fts_index_for_test(&app).await?;
 
             let results = app
                 .search_by_text("elided image", None, None, None, 10, true)
@@ -6116,6 +6135,7 @@ mod test {
                 .delete_if_unreferenced_tx(&mut *tx, media_id)
                 .await?;
             tx.commit().await?;
+            build_fts_index_for_test(&app).await?;
 
             let results = app
                 .search_by_text("media row will vanish", None, None, None, 10, true)

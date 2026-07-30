@@ -9,12 +9,11 @@ use crate::infra::memory_vector::record::vector_kind;
 use crate::infra::memory_vector::repository::HybridOptions;
 pub use crate::infra::memory_vector::repository::HybridStrategy;
 pub use crate::infra::memory_vector::repository::IndexStats;
-use crate::infra::memory_vector::repository::apply_vector_query_options;
-use crate::infra::memory_vector::repository::ensure_vector_index_inner;
 use crate::infra::memory_vector::repository::{
-    InFlightGuard, compact_with, create_index_with_retry, drop_fts_index, prune_with,
-    try_claim_gate,
+    ExistingVectorIndex, ensure_vector_index_inner, probe_existing_vector_index,
 };
+use crate::infra::memory_vector::repository::{apply_vector_query_options, create_vector_index};
+use crate::infra::memory_vector::repository::{create_index_with_retry, drop_fts_index};
 use arc_swap::ArcSwap;
 use arrow_array::{
     Array, FixedSizeListArray, Float32Array, Int32Array, Int64Array, RecordBatch,
@@ -28,7 +27,9 @@ use lancedb::index::{Index, IndexType};
 use lancedb::query::{ExecutableQuery, QueryBase};
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use tokio::sync::Mutex;
 
 /// Maximum candidate IDs for two-phase hybrid search IN filter.
@@ -55,22 +56,13 @@ pub struct ThreadVectorSearchHit {
     pub distance: f32,
 }
 
+#[derive(Clone)]
 pub struct ThreadVectorRepositoryImpl {
     /// Lock-free table handle (see `MemoryVectorRepositoryImpl::table` for
     /// the `ArcSwap` rationale — readers never block on a `reload_table`).
     table: Arc<ArcSwap<Table>>,
     config: ThreadVectorDBConfig,
-    /// Monotonic write counter shared by the two maintenance gates. See
-    /// `MemoryVectorRepositoryImpl` for the two-gate rationale.
-    operation_count: Arc<AtomicUsize>,
-    /// `operation_count` value at which the prune path last fired.
-    last_prune_count: Arc<AtomicUsize>,
-    /// `operation_count` value at which the compact+index path last fired.
-    last_compact_count: Arc<AtomicUsize>,
     last_optimized_at: Arc<AtomicI64>,
-    /// Single-slot guard: at most one background compaction at a time.
-    /// Mirrors `MemoryVectorRepositoryImpl::compact_in_flight`.
-    compact_in_flight: Arc<AtomicBool>,
     fts_init_state: Arc<Mutex<Option<FtsInitState>>>,
     fts_init_ready: Arc<AtomicBool>,
     /// Vector (ANN) index gate. Same policy as the memory repository: a
@@ -98,6 +90,119 @@ struct FtsInitState {
 }
 
 impl ThreadVectorRepositoryImpl {
+    /// Returns the explicit one-process FTS rebuild request from configuration.
+    pub fn maintenance_fts_force_rebuild_enabled(&self) -> bool {
+        self.config.fts.force_rebuild
+    }
+
+    /// Reads index metadata for maintenance without starting a build.
+    pub async fn observe_maintenance_index(
+        &self,
+        vector: bool,
+    ) -> anyhow::Result<crate::infra::search_index_maintenance::IndexObservation> {
+        let table = self.table.load_full();
+        let indices = table.list_indices().await?;
+        let index = indices.iter().find(|index| {
+            if vector {
+                index.columns.iter().any(|column| column == "embedding")
+                    && !matches!(index.index_type, IndexType::FTS)
+            } else {
+                index
+                    .columns
+                    .iter()
+                    .any(|column| column == FTS_INDEX_COLUMN)
+                    && matches!(index.index_type, IndexType::FTS)
+            }
+        });
+        let index_present = index.is_some();
+        let unindexed_rows = match index {
+            Some(index) => Some(u64::try_from(
+                table
+                    .index_stats(&index.name)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("index statistics are unavailable"))?
+                    .num_unindexed_rows,
+            )?),
+            None => None,
+        };
+        Ok(crate::infra::search_index_maintenance::IndexObservation {
+            target: if vector {
+                crate::infra::search_index_maintenance::MaintenanceTarget::ThreadVector
+            } else {
+                crate::infra::search_index_maintenance::MaintenanceTarget::ThreadFts
+            },
+            observed_at_unix_ms: command_utils::util::datetime::now_millis(),
+            status: crate::infra::search_index_maintenance::ObservationStatus::Observed,
+            index_present: Some(index_present),
+            unindexed_rows,
+            error_summary: String::new(),
+        })
+    }
+    /// Executes a FTS build from the maintenance control plane only.
+    pub async fn maintenance_build_fts(&self, force: bool) -> anyhow::Result<()> {
+        if force {
+            let mut state = self.fts_init_state.lock().await;
+            let _ddl = self.index_ddl_lock.lock().await;
+            let table = self.table.load_full();
+            drop_fts_index(&table).await?;
+            *state = None;
+            self.fts_init_ready.store(false, Ordering::Release);
+            drop(_ddl);
+            drop(state);
+        }
+        self.ensure_fts_index().await
+    }
+
+    /// Executes an ANN build from the maintenance control plane only.
+    pub async fn maintenance_build_vector(&self, force: bool) -> anyhow::Result<()> {
+        if force {
+            let _build = self.vector_index_lock.lock().await;
+            let _ddl = self.index_ddl_lock.lock().await;
+            if !self.config.vector_index.enabled {
+                return Ok(());
+            }
+            let table = self.table.load_full();
+            if table.count_rows(None).await? < self.config.vector_index.effective_min_rows() {
+                return Ok(());
+            }
+            create_vector_index(&table, self.config.distance_type).await?;
+            self.vector_index_active.store(true, Ordering::Release);
+            self.vector_index_ready.store(true, Ordering::Release);
+            return Ok(());
+        }
+        self.ensure_vector_index().await
+    }
+
+    pub async fn maintenance_vector_build_status(
+        &self,
+    ) -> anyhow::Result<crate::infra::search_index_maintenance::TaskStatus> {
+        use crate::infra::search_index_maintenance::TaskStatus;
+        if !self.config.vector_index.enabled {
+            return Ok(TaskStatus::SkippedDisabled);
+        }
+        if self.table.load_full().count_rows(None).await?
+            < self.config.vector_index.effective_min_rows()
+        {
+            return Ok(TaskStatus::Deferred);
+        }
+        Ok(TaskStatus::Succeeded)
+    }
+
+    /// Executes exactly one table-wide maintenance action selected by the
+    /// management control plane.
+    pub async fn maintenance_optimize_action(
+        &self,
+        action: crate::infra::search_index_maintenance::OptimizeAction,
+        prune_older_than_secs: u64,
+    ) -> anyhow::Result<()> {
+        crate::infra::memory_vector::repository::maintenance_optimize_action(
+            &self.table,
+            &self.index_ddl_lock,
+            action,
+            prune_older_than_secs,
+        )
+        .await
+    }
     /// Mirrors `MemoryVectorRepositoryImpl::fts_config` so the app
     /// layer can re-tokenize a thread description against the same
     /// settings the BM25 inverted index runs on.
@@ -180,11 +285,7 @@ impl ThreadVectorRepositoryImpl {
         let repo = Self {
             table: Arc::new(ArcSwap::from_pointee(table)),
             config,
-            operation_count: Arc::new(AtomicUsize::new(0)),
-            last_prune_count: Arc::new(AtomicUsize::new(0)),
-            last_compact_count: Arc::new(AtomicUsize::new(0)),
             last_optimized_at: Arc::new(AtomicI64::new(0)),
-            compact_in_flight: Arc::new(AtomicBool::new(false)),
             fts_init_state: Arc::new(Mutex::new(None)),
             index_ddl_lock: Arc::new(Mutex::new(())),
             fts_init_ready: Arc::new(AtomicBool::new(false)),
@@ -192,6 +293,8 @@ impl ThreadVectorRepositoryImpl {
             vector_index_active: Arc::new(AtomicBool::new(false)),
             vector_index_lock: Arc::new(Mutex::new(())),
         };
+
+        repo.adopt_existing_vector_index().await;
 
         tracing::info!(
             "Thread LanceDB initialized: uri={}, table={}, vector_size={}, new={}",
@@ -201,17 +304,23 @@ impl ThreadVectorRepositoryImpl {
             is_new
         );
 
-        // Startup prune: clear the old-manifest backlog so the next boot is
-        // fast. Best-effort; live data is protected by LanceDB's 7-day floor.
-        // See `MemoryVectorRepositoryImpl::new` for the full rationale.
-        if repo.config.optimize.prune_on_startup {
-            tracing::info!("Thread LanceDB startup prune starting (clearing manifest backlog)...");
-            if let Err(e) = repo.prune().await {
-                tracing::warn!("Thread LanceDB startup prune failed (continuing): {e}");
-            }
-        }
-
         Ok(repo)
+    }
+
+    /// Adopts a compatible ANN index at startup without issuing DDL.
+    async fn adopt_existing_vector_index(&self) {
+        if !self.config.vector_index.enabled {
+            return;
+        }
+        let table = self.table.load_full();
+        if matches!(
+            probe_existing_vector_index(&table, self.config.distance_type).await,
+            ExistingVectorIndex::Matches
+        ) {
+            self.vector_index_active.store(true, Ordering::Release);
+            self.vector_index_ready.store(true, Ordering::Release);
+            tracing::debug!("Adopted existing vector index on `embedding`");
+        }
     }
 
     async fn create_indexes(table: &Table) -> anyhow::Result<()> {
@@ -287,7 +396,6 @@ impl ThreadVectorRepositoryImpl {
 
         drop(table);
         self.reload_table().await?;
-        self.track_operation(1).await;
         Ok(())
     }
 
@@ -327,7 +435,6 @@ impl ThreadVectorRepositoryImpl {
         }
 
         self.reload_table().await?;
-        self.track_operation(total).await;
         Ok(total)
     }
 
@@ -343,7 +450,6 @@ impl ThreadVectorRepositoryImpl {
         // A delete creates a new version too, so it must drive maintenance —
         // otherwise a delete-heavy workload grows `_versions/` without ever
         // tripping the prune gate.
-        self.track_operation(1).await;
         Ok(true)
     }
 
@@ -388,7 +494,6 @@ impl ThreadVectorRepositoryImpl {
             // Stale-delete path: the delete above created a new version but
             // no batch_upsert follows to count it, so track it here. The
             // non-empty path is covered by batch_upsert's own tracking.
-            self.track_operation(1).await;
             return Ok(0);
         }
         self.batch_upsert(records).await
@@ -560,8 +665,6 @@ impl ThreadVectorRepositoryImpl {
 
         // Build (once) the ANN index so this query avoids a brute-force
         // full-table scan. Cheap lock-free fast path after the first call.
-        self.ensure_vector_index().await?;
-
         let table = self.table.load_full();
         let mut query = apply_vector_query_options(
             table.query().nearest_to(query_vector)?,
@@ -599,33 +702,14 @@ impl ThreadVectorRepositoryImpl {
         filter: Option<&ThreadSafeFilter>,
         limit: usize,
     ) -> anyhow::Result<Vec<ThreadVectorSearchHit>> {
-        let mut attempted_recovery = false;
         // N-row: `limit` is the caller's entity-level distinct target (the
         // app's staged loop widens it). Fetch that many BM25 chunk rows,
         // then fold to one raw score per thread (max) before normalization
         // so the [0.1, 1.0] range is computed over thread-level scores.
         let fetch_limit = limit;
-        let raw_results = loop {
-            match self.run_bm25_query(query_text, filter, fetch_limit).await {
-                Ok(hits) => break hits,
-                Err(e) if !attempted_recovery && is_missing_fts_index_error(&e) => {
-                    tracing::warn!(
-                        "FTS index appears missing during search ({e}); \
-                         resetting init gate and rebuilding once before retry"
-                    );
-                    {
-                        let mut guard = self.fts_init_state.lock().await;
-                        self.fts_init_ready.store(false, Ordering::Release);
-                        *guard = None;
-                        self.drop_stale_fts_index_and_reload().await?;
-                        self.rebuild_fts_index_locked(&mut guard).await?;
-                    }
-                    attempted_recovery = true;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        };
+        // Search is read-only. Missing-index recovery belongs to the
+        // maintenance control plane, not a user-facing request.
+        let raw_results = self.run_bm25_query(query_text, filter, fetch_limit).await?;
 
         if raw_results.is_empty() {
             return Ok(Vec::new());
@@ -882,39 +966,6 @@ impl ThreadVectorRepositoryImpl {
         Ok(merged)
     }
 
-    // ===== Management =====
-
-    /// Compact data files and fold unindexed rows into the ANN/FTS indices.
-    /// The heavy maintenance path; does NOT prune (see [`prune`](Self::prune)).
-    /// Updates `last_optimized_at` for the GetIndexStats RPC. Mirrors
-    /// `MemoryVectorRepositoryImpl::compact_and_optimize_index`.
-    pub async fn compact_and_optimize_index(&self) -> anyhow::Result<()> {
-        // Shared with the spawned auto-compaction in `track_operation` via
-        // the same free function the memory repository uses. Pass
-        // `index_ddl_lock` so compaction serializes against `create_index`.
-        compact_with(
-            &self.table,
-            &self.last_optimized_at,
-            Some(&self.index_ddl_lock),
-        )
-        .await
-    }
-
-    /// Prune old manifests. Cheap; honors the configured retention (which
-    /// bounds time-travel history only). Passes `delete_unverified: Some(false)`
-    /// so LanceDB's 7-day floor always protects live data. Does NOT update
-    /// `last_optimized_at`. Mirrors `MemoryVectorRepositoryImpl::prune`.
-    pub async fn prune(&self) -> anyhow::Result<()> {
-        prune_with(&self.table, &self.config.optimize).await
-    }
-
-    /// Backward-compatible "do everything" entry point: heavy path + prune.
-    pub async fn optimize(&self) -> anyhow::Result<()> {
-        self.compact_and_optimize_index().await?;
-        self.prune().await?;
-        Ok(())
-    }
-
     pub async fn get_all_thread_ids(&self) -> anyhow::Result<Vec<i64>> {
         let table = self.table.load_full();
         let mut stream = table
@@ -1020,8 +1071,6 @@ impl ThreadVectorRepositoryImpl {
         filter_sql: Option<String>,
         hard_cap: u64,
     ) -> anyhow::Result<(u64, bool)> {
-        self.ensure_fts_index().await?;
-
         let table = self.table.load_full();
         let fts_query = lance_index::scalar::FullTextSearchQuery::new(query_text.to_owned());
         let mut query = table
@@ -1067,8 +1116,6 @@ impl ThreadVectorRepositoryImpl {
         // Build (once) the ANN index so this count avoids a brute-force
         // full-table scan (count paths can be the first vector traffic
         // after startup).
-        self.ensure_vector_index().await?;
-
         let filter_sql = match filter {
             Some(f) => Some(f.to_sql()?),
             None => None,
@@ -1121,8 +1168,6 @@ impl ThreadVectorRepositoryImpl {
         // Build (once) the ANN index so this count avoids a brute-force
         // full-table scan (count paths can be the first vector traffic
         // after startup).
-        self.ensure_vector_index().await?;
-
         let filter_sql = match filter {
             Some(f) => Some(f.to_sql()?),
             None => None,
@@ -1154,8 +1199,6 @@ impl ThreadVectorRepositoryImpl {
         filter: Option<&ThreadSafeFilter>,
         cap: u64,
     ) -> anyhow::Result<(HashSet<i64>, bool)> {
-        self.ensure_fts_index().await?;
-
         let filter_sql = match filter {
             Some(f) => Some(f.to_sql()?),
             None => None,
@@ -1232,8 +1275,6 @@ impl ThreadVectorRepositoryImpl {
         filter: Option<&ThreadSafeFilter>,
         limit: usize,
     ) -> anyhow::Result<Vec<(i64, f32)>> {
-        self.ensure_fts_index().await?;
-
         let table = self.table.load_full();
         let fts_query = lance_index::scalar::FullTextSearchQuery::new(query_text.to_owned());
         let mut query = table.query().full_text_search(fts_query);
@@ -1523,73 +1564,6 @@ impl ThreadVectorRepositoryImpl {
             .map_err(|e| anyhow::anyhow!("LanceDB reload_table (checkout_latest) failed: {e}"))?;
         Ok(())
     }
-
-    /// Drop the stale FTS index and refresh the table handle, in
-    /// preparation for a rebuild. See
-    /// `memory_vector::repository::MemoryVectorRepositoryImpl::drop_stale_fts_index_and_reload`
-    /// for the lance 8.0 rationale (a manifest-registered index whose
-    /// sidecar files are gone is not rewritten by `replace(true)`).
-    async fn drop_stale_fts_index_and_reload(&self) -> anyhow::Result<()> {
-        let _ddl = self.index_ddl_lock.lock().await;
-        let table = self.table.load_full();
-        if let Err(drop_err) = drop_fts_index(&table).await {
-            tracing::warn!(
-                "FTS recovery: dropping stale index failed ({drop_err}); \
-                 proceeding to rebuild anyway"
-            );
-        }
-        self.reload_table().await
-    }
-
-    /// Track writes and trigger maintenance on two independent cadences.
-    /// Mirrors `MemoryVectorRepositoryImpl::track_operation`: the heavy
-    /// compact+index gate is **spawned** under an [`InFlightGuard`] (at most
-    /// one background compaction), and prune is kept **ordered after** compact
-    /// (run inside the same task when compaction fires, inline otherwise, and
-    /// skipped while a compaction is in flight) so the two `optimize` commits
-    /// never race on the same table.
-    async fn track_operation(&self, count: usize) {
-        let opt = &self.config.optimize;
-        let now = self
-            .operation_count
-            .fetch_add(count, Ordering::Relaxed)
-            .saturating_add(count);
-
-        let prune_due = opt.prune_interval != 0
-            && try_claim_gate(now, opt.prune_interval, &self.last_prune_count);
-
-        if opt.compact_interval != 0
-            && try_claim_gate(now, opt.compact_interval, &self.last_compact_count)
-            && let Some(guard) = InFlightGuard::try_claim(&self.compact_in_flight)
-        {
-            let table = Arc::clone(&self.table);
-            let last_optimized_at = Arc::clone(&self.last_optimized_at);
-            let ddl_lock = Arc::clone(&self.index_ddl_lock);
-            let optimize = self.config.optimize; // Copy
-            tokio::spawn(async move {
-                let _guard = guard;
-                if let Err(e) = compact_with(&table, &last_optimized_at, Some(&ddl_lock)).await {
-                    tracing::warn!("Auto-compact failed: {e}");
-                }
-                if prune_due && let Err(e) = prune_with(&table, &optimize).await {
-                    tracing::warn!("Auto-prune failed: {e}");
-                }
-            });
-            return;
-        }
-
-        if prune_due
-            && !self.compact_in_flight.load(Ordering::Acquire)
-            && let Err(e) = self.prune().await
-        {
-            tracing::warn!("Auto-prune failed: {e}");
-        }
-    }
-}
-
-fn is_missing_fts_index_error(e: &anyhow::Error) -> bool {
-    let msg = e.to_string().to_lowercase();
-    msg.contains("not found") || msg.contains("no fts") || msg.contains("does not exist")
 }
 
 /// N-row: drive a count-only stream projecting `thread_id` and return
@@ -1823,7 +1797,6 @@ mod tests {
                 table_name: "test_threads".to_string(),
                 vector_size: dim,
                 distance_type: DistanceType::Cosine,
-                optimize: crate::infra::memory_vector::repository::test_optimize_config(),
                 fts: FtsConfig::default(),
                 vector_index: VectorIndexConfig::default(),
             };
@@ -1848,11 +1821,25 @@ mod tests {
                 table_name: "test_threads".to_string(),
                 vector_size: dim,
                 distance_type: DistanceType::Cosine,
-                optimize: crate::infra::memory_vector::repository::test_optimize_config(),
                 fts: FtsConfig::default(),
                 vector_index,
             };
             (config, Self { path })
+        }
+
+        fn config_reusing_path_with_vector_index(
+            &self,
+            dim: usize,
+            vector_index: VectorIndexConfig,
+        ) -> ThreadVectorDBConfig {
+            ThreadVectorDBConfig {
+                uri: self.path.clone(),
+                table_name: "test_threads".to_string(),
+                vector_size: dim,
+                distance_type: DistanceType::Cosine,
+                fts: FtsConfig::default(),
+                vector_index,
+            }
         }
 
         fn config_with_fts(dim: usize, fts: FtsConfig) -> (ThreadVectorDBConfig, Self) {
@@ -1868,7 +1855,6 @@ mod tests {
                 table_name: "test_threads".to_string(),
                 vector_size: dim,
                 distance_type: DistanceType::Cosine,
-                optimize: crate::infra::memory_vector::repository::test_optimize_config(),
                 fts,
                 vector_index: VectorIndexConfig::default(),
             };
@@ -1883,11 +1869,32 @@ mod tests {
                 table_name: "test_threads".to_string(),
                 vector_size: dim,
                 distance_type: DistanceType::Cosine,
-                optimize: crate::infra::memory_vector::repository::test_optimize_config(),
                 fts,
                 vector_index: VectorIndexConfig::default(),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn clone_shares_table_and_maintenance_guards() -> anyhow::Result<()> {
+        let (config, _db) = TestDb::config(4);
+        let repository = ThreadVectorRepositoryImpl::new(config).await?;
+        let clone = repository.clone();
+
+        assert!(Arc::ptr_eq(&repository.table, &clone.table));
+        assert!(Arc::ptr_eq(
+            &repository.index_ddl_lock,
+            &clone.index_ddl_lock
+        ));
+        assert!(Arc::ptr_eq(
+            &repository.vector_index_lock,
+            &clone.vector_index_lock
+        ));
+        assert!(Arc::ptr_eq(
+            &repository.vector_index_active,
+            &clone.vector_index_active
+        ));
+        Ok(())
     }
 
     impl Drop for TestDb {
@@ -1945,6 +1952,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "normal search no longer builds indexes"]
     async fn thread_vector_index_built_above_threshold() {
         let dim = 32;
         let (config, _db) = TestDb::config_with_vector_index(
@@ -1971,7 +1979,37 @@ mod tests {
         assert!(repo.vector_index_active.load(Ordering::Acquire));
     }
 
+    #[tokio::test]
+    async fn reopen_adopts_existing_vector_index_for_query_options() -> anyhow::Result<()> {
+        let dim = 32;
+        let vector_index = VectorIndexConfig {
+            enabled: true,
+            min_rows: 64,
+            nprobes: 37,
+        };
+        let (config, db) = TestDb::config_with_vector_index(dim, vector_index);
+        {
+            let repo = ThreadVectorRepositoryImpl::new(config).await?;
+            let records: Vec<_> = (1..=256).map(|i| rand_chunk(i, dim)).collect();
+            repo.batch_upsert(records).await?;
+            repo.maintenance_build_vector(false).await?;
+            assert!(repo.vector_index_active.load(Ordering::Acquire));
+        }
+
+        let reopened = ThreadVectorRepositoryImpl::new(
+            db.config_reusing_path_with_vector_index(dim, vector_index),
+        )
+        .await?;
+        assert!(
+            reopened.vector_index_active.load(Ordering::Acquire),
+            "a compatible persisted ANN index must enable configured nprobes after restart"
+        );
+        assert!(reopened.vector_index_ready.load(Ordering::Acquire));
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "normal search no longer builds indexes"]
     async fn thread_hybrid_build_survives_concurrent_writer() -> anyhow::Result<()> {
         // The first thread HybridSearch drives the vector AND FTS `create_index`
         // under try_join! while a writer streams merge_insert commits (each
@@ -2151,6 +2189,7 @@ mod tests {
     /// search would keep failing with `_indices/<uuid>/tokens.lance not
     /// found`.
     #[tokio::test]
+    #[ignore = "normal search does not repair indexes"]
     async fn thread_fts_missing_index_recovered_at_search_time() -> anyhow::Result<()> {
         let dim = 8;
         let fts = FtsConfig::apply_preset(FtsTokenizerKind::Ngram);
@@ -2184,6 +2223,38 @@ mod tests {
         assert!(
             !hits.is_empty(),
             "search must recover and hit after _indices removal"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn maintenance_force_fts_rebuild_recreates_index_from_the_same_handle()
+    -> anyhow::Result<()> {
+        let dim = 8;
+        let fts = crate::infra::memory_vector::config::FtsConfig::apply_preset(
+            crate::infra::memory_vector::config::FtsTokenizerKind::Ngram,
+        );
+        let (config, db) = TestDb::config_with_fts(dim, fts.clone());
+        let repo = ThreadVectorRepositoryImpl::new(config).await?;
+        repo.batch_upsert(vec![chunk_record_with_content(
+            1,
+            0,
+            "テスト",
+            vec![0.1; dim],
+        )])
+        .await?;
+        repo.maintenance_build_fts(false).await?;
+
+        repo.maintenance_build_fts(true).await?;
+
+        let reopened = ThreadVectorRepositoryImpl::new(db.config_reusing_path(dim, fts)).await?;
+        assert_eq!(
+            reopened
+                .observe_maintenance_index(false)
+                .await?
+                .index_present,
+            Some(true),
+            "force rebuild must recreate the FTS index after dropping it"
         );
         Ok(())
     }

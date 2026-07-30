@@ -116,6 +116,10 @@ cargo run --release --features lindera --bin front
 | Variable | Default | Description |
 |---|---|---|
 | `GRPC_ADDR` | none, required | gRPC listen address. `dot.env` uses `0.0.0.0:9000` |
+| `SEARCH_INDEX_MAINTENANCE_GRPC_ADDR` | none, required | Maintenance gRPC listen address. When equal to `GRPC_ADDR`, the maintenance service shares the normal listener; use a distinct address when network isolation is required. `dot.env` uses `0.0.0.0:9001` |
+| `SEARCH_INDEX_MAINTENANCE_TASK_HISTORY_LIMIT` | `256` | Maximum completed maintenance task records retained for `task_id` status lookups |
+| `SEARCH_INDEX_MAINTENANCE_CHECK_DEADLINE_SECS` | none, required | Positive read-only index check deadline in seconds |
+| `SEARCH_INDEX_MAINTENANCE_BACKOFF_INITIAL_SECS` / `SEARCH_INDEX_MAINTENANCE_BACKOFF_MULTIPLIER` / `SEARCH_INDEX_MAINTENANCE_BACKOFF_MAX_SECS` | none, required | Retry backoff; durations must be positive, multiplier must be at least 1, and max must not be smaller than initial |
 | `USE_GRPC_WEB` | `false` in code, `true` in `dot.env` | Enable gRPC-Web |
 | `MAX_FRAME_SIZE` | none | Maximum frame size. `dot.env` uses `16777215` |
 
@@ -128,16 +132,16 @@ cargo run --release --features lindera --bin front
 | `MEMORY_LANCEDB_TABLE` | `memories` | Table name |
 | `MEMORY_VECTOR_SIZE` | none | Embedding dimension, required when vectors are enabled |
 | `MEMORY_DISTANCE_TYPE` | `cosine` | `cosine`, `l2`, or `dot` |
-| `MEMORY_OPTIMIZE_COMPACT_INTERVAL` | `1000` | Compact + index optimization interval; `0` disables it |
-| `MEMORY_OPTIMIZE_PRUNE_INTERVAL` | `100` | LanceDB manifest prune interval; `0` disables it |
-| `MEMORY_OPTIMIZE_PRUNE_OLDER_THAN_SECS` | `300` | Manifest history retention in seconds |
-| `MEMORY_OPTIMIZE_PRUNE_ON_STARTUP` | `true` | Run prune once at startup |
+| `MEMORY_INDEX_UPDATE_INTERVAL_SECS` / `MEMORY_COMPACTION_INTERVAL_SECS` / `MEMORY_PRUNE_INTERVAL_SECS` | none, required | Automatic maintenance intervals in seconds; `0` disables the corresponding action |
+| `MEMORY_PRUNE_OLDER_THAN_SECS` | none, required | Old-manifest retention in seconds; `0` permits immediate eligibility |
+| `MEMORY_INDEX_UPDATE_UNINDEXED_ROWS` | none, required | Index-update row threshold; `0` disables this candidate |
 | `MEMORY_VECTOR_INDEX_ENABLED` | `true` | Enable ANN index creation |
 | `MEMORY_VECTOR_INDEX_MIN_ROWS` | `256` | Minimum row count before ANN index creation |
 | `MEMORY_VECTOR_INDEX_NPROBES` | `20` | IVF probe count |
 
-`MEMORY_AUTO_OPTIMIZE_INTERVAL` is obsolete. If it is set, it is ignored and a
-migration warning is logged at startup.
+`*_AUTO_OPTIMIZE_INTERVAL` and `*_OPTIMIZE_*` are no longer supported. Their
+operation-count and startup-prune semantics cannot be converted safely, so a
+set value stops startup with a configuration error.
 
 ### Thread Vector Search
 
@@ -148,7 +152,7 @@ migration warning is logged at startup.
 | `THREAD_LANCEDB_URI` | `MEMORY_LANCEDB_URI` | LanceDB URI for thread vectors |
 | `THREAD_LANCEDB_TABLE` | `threads` | Thread vector table |
 | `THREAD_DISTANCE_TYPE` | `MEMORY_DISTANCE_TYPE` | Distance function |
-| `THREAD_OPTIMIZE_*` / `THREAD_VECTOR_INDEX_*` | `MEMORY_*` | Maintenance and index settings for thread vectors |
+| `THREAD_INDEX_UPDATE_INTERVAL_SECS` / `THREAD_COMPACTION_INTERVAL_SECS` / `THREAD_PRUNE_INTERVAL_SECS` / `THREAD_PRUNE_OLDER_THAN_SECS` / `THREAD_INDEX_UPDATE_UNINDEXED_ROWS` | none, required | Thread-table maintenance policy; use the same zero semantics as `MEMORY_*` |
 
 ### FTS Tokenizer
 
@@ -156,7 +160,7 @@ migration warning is logged at startup.
 |---|---|---|
 | `MEMORY_FTS_TOKENIZER` | build-dependent | `lindera/ipadic` with the `lindera` feature, otherwise `ngram` |
 | `MEMORY_FTS_NGRAM_MIN` / `MEMORY_FTS_NGRAM_MAX` | `2` / `3` | ngram tokenizer sizes |
-| `MEMORY_FTS_FORCE_REBUILD` | `false` | Force FTS index rebuild |
+| `MEMORY_FTS_FORCE_REBUILD` | `false` | 次回の maintenance FTS build で既存 index を強制再構築する。完了後に必ず `false` へ戻す |
 | `LANCE_LANGUAGE_MODEL_HOME` | none | Lindera dictionary root |
 
 ### Automatic Embedding Generation
@@ -248,7 +252,7 @@ one logical entity can produce multiple rows keyed by `vector_kind` and
 Operational guides:
 
 - [docs/vectordb-rebuild-runbook.md](docs/vectordb-rebuild-runbook.md)
-- [docs/vectordb-optimize-tuning.md](docs/vectordb-optimize-tuning.md)
+- [docs/lancedb-search-index-maintenance-runbook_ja.md](docs/lancedb-search-index-maintenance-runbook_ja.md)
 
 ## Tests
 

@@ -2,6 +2,7 @@ use crate::protobuf::llm_memory::service::media_service_server::MediaServiceServ
 use crate::protobuf::llm_memory::service::memory_rating_service_server::MemoryRatingServiceServer;
 use crate::protobuf::llm_memory::service::memory_service_server::MemoryServiceServer;
 use crate::protobuf::llm_memory::service::memory_vector_service_server::MemoryVectorServiceServer;
+use crate::protobuf::llm_memory::service::search_index_maintenance_service_server::SearchIndexMaintenanceServiceServer;
 use crate::protobuf::llm_memory::service::thread_service_server::ThreadServiceServer;
 use crate::protobuf::llm_memory::service::thread_vector_service_server::ThreadVectorServiceServer;
 use crate::service::media::MediaGrpcImpl;
@@ -10,6 +11,7 @@ use crate::service::memory_rating::MemoryRatingGrpcImpl;
 use crate::service::memory_vector::MemoryVectorGrpcImpl;
 use crate::service::reflection::ReflectionGrpcImpl;
 use crate::service::reflection_vector::ReflectionVectorGrpcImpl;
+use crate::service::search_index_maintenance::SearchIndexMaintenanceGrpcImpl;
 use crate::service::thread::ThreadGrpcImpl;
 use crate::service::thread_vector::ThreadVectorGrpcImpl;
 // Reflection service stubs live in the shared `protobuf` crate (see
@@ -26,6 +28,10 @@ use protobuf::FILE_DESCRIPTOR_SET;
 use protobuf::llm_memory::service::reflection_service_server::ReflectionServiceServer;
 use protobuf::llm_memory::service::reflection_vector_service_server::ReflectionVectorServiceServer;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::net::TcpListener;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tonic_web::GrpcWebLayer;
 
@@ -37,6 +43,40 @@ use tonic_web::GrpcWebLayer;
 /// chunker both assume the server decodes the full message and
 /// returns `ResourceExhausted` from the handler if it is too big.
 const MAX_GRPC_MESSAGE_SIZE: usize = 16 * 1024 * 1024 - 1;
+
+enum MaintenanceListener {
+    Cohosted,
+    Separate(TcpListener),
+}
+
+enum MaintenanceServerTopology {
+    Cohosted,
+    Separate {
+        listener: TcpListener,
+        routes: tonic::service::Routes,
+    },
+}
+
+fn cohosts_maintenance_listener(addr: SocketAddr, maintenance_addr: SocketAddr) -> bool {
+    addr == maintenance_addr
+}
+
+fn listener_completion_result(shutdown_requested: bool, listener: &str) -> Result<()> {
+    if shutdown_requested {
+        Ok(())
+    } else {
+        anyhow::bail!("{listener} gRPC listener stopped unexpectedly")
+    }
+}
+
+fn shutdown_receivers(
+    shutdown_tx: &tokio::sync::broadcast::Sender<()>,
+) -> (
+    tokio::sync::broadcast::Receiver<()>,
+    tokio::sync::broadcast::Receiver<()>,
+) {
+    (shutdown_tx.subscribe(), shutdown_tx.subscribe())
+}
 
 /// Startup config-consistency check. The `inline` storage backend is
 /// test-only and the embedding workflow cannot read a data: URI, so
@@ -63,6 +103,7 @@ fn inline_image_mode_conflict(backend: &str, image_search_mode: &str) -> Option<
 
 pub async fn create_server(
     addr: SocketAddr,
+    maintenance_addr: SocketAddr,
     use_web: bool,
     max_frame_size: Option<u32>,
 ) -> Result<()> {
@@ -84,26 +125,56 @@ pub async fn create_server(
         }
     }
 
+    // When the addresses differ, bind both listeners before constructing or
+    // exposing either service. A maintenance-only failure must never leave a
+    // normal listener running without its paired control-plane endpoint.
+    // Matching addresses deliberately cohost the maintenance service on the
+    // normal listener for single-user/local deployments.
+    let normal_listener = TcpListener::bind(addr)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to bind normal gRPC listener {addr}: {error}"))?;
+    let maintenance_listener = if cohosts_maintenance_listener(addr, maintenance_addr) {
+        MaintenanceListener::Cohosted
+    } else {
+        MaintenanceListener::Separate(TcpListener::bind(maintenance_addr).await.map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "failed to bind maintenance gRPC listener {maintenance_addr}: {error}"
+                )
+            },
+        )?)
+    };
+
     // reflection
     let reflection = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
         .build_v1()
         .unwrap();
 
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(2);
+    // Subscribe before starting the signal task. A broadcast send with no
+    // receivers is intentionally discarded, which would otherwise lose a
+    // Ctrl-C delivered while the application modules are initializing.
+    let (mut normal_shutdown, mut maintenance_shutdown) = shutdown_receivers(&shutdown_tx);
+    let shutdown_signal = shutdown_tx.clone();
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let signal_shutdown_requested = Arc::clone(&shutdown_requested);
     tokio::spawn(async move {
         match tokio::signal::ctrl_c().await {
             Ok(()) => {
                 tracing::info!("received ctrl_c");
-                let _ = tx.send(()).inspect_err(|e| {
-                    tracing::error!("failed to send shutdown signal: {:?}", e);
-                });
+                signal_shutdown_requested.store(true, Ordering::Release);
+                let _ = shutdown_signal.send(());
             }
             Err(e) => tracing::error!("failed to listen for ctrl_c: {:?}", e),
         }
     });
 
+    let maintenance_config =
+        infra::infra::search_index_maintenance::SearchIndexMaintenanceConfig::from_env()
+            .expect("maintenance configuration was validated before server construction");
     let repository_module = RepositoryModule::new_by_env().await;
+    let maintenance_executor = repository_module.search_index_maintenance_executor.clone();
     let mut app_module = AppModule::new_by_env(repository_module).await;
     let memory_rating = MemoryRatingGrpcImpl::new(app_module.memory_rating_app);
     // Share the one MediaApp Arc between MediaService and MemoryService
@@ -118,7 +189,6 @@ pub async fn create_server(
     let thread_vector_app_arc: Option<
         std::sync::Arc<app::app::thread_vector::ThreadVectorAppImpl>,
     > = app_module.thread_vector_app.take();
-
     let memory = MemoryGrpcImpl::new(
         app_module.memory_app,
         vector_app_arc.clone(),
@@ -212,32 +282,104 @@ pub async fn create_server(
         tracing::info!("ReflectionVectorService registered");
     }
 
-    if use_web {
-        Server::builder()
-            .accept_http1(true)
-            .max_frame_size(max_frame_size)
-            .layer(GrpcWebLayer::new())
-            .add_routes(routes)
-            .serve_with_shutdown(addr, async {
-                rx.await.ok();
-            })
-            .await
-            .map_err(|e| e.into())
-    } else {
-        Server::builder()
-            .max_frame_size(max_frame_size)
-            .add_routes(routes)
-            .serve_with_shutdown(addr, async {
-                rx.await.ok();
-            })
-            .await
-            .map_err(|e| e.into())
+    let maintenance =
+        SearchIndexMaintenanceGrpcImpl::new(maintenance_executor, &maintenance_config);
+    let maintenance_service = SearchIndexMaintenanceServiceServer::new(maintenance)
+        .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+        .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
+    let maintenance_server = match maintenance_listener {
+        MaintenanceListener::Cohosted => {
+            routes = routes.add_service(maintenance_service);
+            MaintenanceServerTopology::Cohosted
+        }
+        MaintenanceListener::Separate(listener) => {
+            let maintenance_reflection = tonic_reflection::server::Builder::configure()
+                .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
+                .build_v1()
+                .unwrap();
+            MaintenanceServerTopology::Separate {
+                listener,
+                routes: tonic::service::Routes::new(maintenance_reflection)
+                    .add_service(maintenance_service),
+            }
+        }
+    };
+    let normal_server = async move {
+        if use_web {
+            Server::builder()
+                .accept_http1(true)
+                .max_frame_size(max_frame_size)
+                .layer(GrpcWebLayer::new())
+                .add_routes(routes)
+                .serve_with_incoming_shutdown(TcpListenerStream::new(normal_listener), async move {
+                    let _ = normal_shutdown.recv().await;
+                })
+                .await?;
+        } else {
+            Server::builder()
+                .max_frame_size(max_frame_size)
+                .add_routes(routes)
+                .serve_with_incoming_shutdown(TcpListenerStream::new(normal_listener), async move {
+                    let _ = normal_shutdown.recv().await;
+                })
+                .await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    match maintenance_server {
+        MaintenanceServerTopology::Separate {
+            listener: maintenance_listener,
+            routes: maintenance_routes,
+        } => {
+            let maintenance_server = async move {
+                Server::builder()
+                    .add_routes(maintenance_routes)
+                    .serve_with_incoming_shutdown(
+                        TcpListenerStream::new(maintenance_listener),
+                        async move {
+                            let _ = maintenance_shutdown.recv().await;
+                        },
+                    )
+                    .await?;
+                Ok::<(), anyhow::Error>(())
+            };
+            tokio::select! {
+                result = normal_server => {
+                    let _ = shutdown_tx.send(());
+                    result?;
+                    listener_completion_result(shutdown_requested.load(Ordering::Acquire), "normal")
+                }
+                result = maintenance_server => {
+                    let _ = shutdown_tx.send(());
+                    result?;
+                    listener_completion_result(shutdown_requested.load(Ordering::Acquire), "maintenance")
+                }
+            }
+        }
+        MaintenanceServerTopology::Cohosted => {
+            normal_server.await?;
+            listener_completion_result(shutdown_requested.load(Ordering::Acquire), "normal")
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::inline_image_mode_conflict;
+    use super::{
+        cohosts_maintenance_listener, inline_image_mode_conflict, listener_completion_result,
+        shutdown_receivers,
+    };
+    use std::net::SocketAddr;
+
+    #[test]
+    fn cohosts_maintenance_only_for_the_same_listener_address() {
+        let normal: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        assert!(cohosts_maintenance_listener(normal, normal));
+        assert!(!cohosts_maintenance_listener(
+            normal,
+            "127.0.0.1:9001".parse().unwrap()
+        ));
+    }
 
     #[test]
     fn inline_with_image_mode_is_a_conflict() {
@@ -266,5 +408,22 @@ mod tests {
                 "backend={backend} must not conflict"
             );
         }
+    }
+
+    #[test]
+    fn requested_shutdown_is_not_a_listener_failure() {
+        assert!(listener_completion_result(true, "normal").is_ok());
+        assert!(listener_completion_result(false, "maintenance").is_err());
+    }
+
+    #[tokio::test]
+    async fn pre_registered_shutdown_receivers_observe_early_signal() {
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(2);
+        let (mut normal, mut maintenance) = shutdown_receivers(&shutdown_tx);
+
+        shutdown_tx.send(()).unwrap();
+
+        assert!(normal.recv().await.is_ok());
+        assert!(maintenance.recv().await.is_ok());
     }
 }

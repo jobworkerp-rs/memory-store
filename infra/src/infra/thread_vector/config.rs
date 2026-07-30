@@ -1,7 +1,4 @@
-use super::super::memory_vector::config::{
-    DistanceType, FtsConfig, OptimizeConfig, VectorIndexConfig,
-    warn_if_deprecated_auto_optimize_interval,
-};
+use super::super::memory_vector::config::{DistanceType, FtsConfig, VectorIndexConfig};
 
 /// LanceDB vector storage configuration for thread descriptions.
 /// Uses THREAD_VECTOR_* environment variables; falls back to same
@@ -12,7 +9,6 @@ pub struct ThreadVectorDBConfig {
     pub table_name: String,
     pub vector_size: usize,
     pub distance_type: DistanceType,
-    pub optimize: OptimizeConfig,
     pub fts: FtsConfig,
     pub vector_index: VectorIndexConfig,
 }
@@ -46,11 +42,10 @@ impl ThreadVectorDBConfig {
                 "dot" => DistanceType::Dot,
                 _ => DistanceType::Cosine,
             },
-            optimize: OptimizeConfig::from_env_with_prefixes(&["THREAD_", "MEMORY_"]),
             fts: FtsConfig::from_env()?,
             vector_index: VectorIndexConfig::from_env_with_prefixes(&["THREAD_", "MEMORY_"]),
         };
-        warn_if_deprecated_auto_optimize_interval(&["THREAD_", "MEMORY_"]);
+        crate::infra::search_index_maintenance::reject_legacy_environment()?;
         Ok(cfg)
     }
 }

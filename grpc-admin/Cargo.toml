@@ -29,6 +29,10 @@ path = "src/bin/cleanup_orphan_media.rs"
 name = "memories-admin"
 path = "src/bin/memories_admin.rs"
 
+[[bin]]
+name = "memories-maintenance"
+path = "src/bin/memories_maintenance.rs"
+
 # Phase 3's one-shot data migration binary (`migrate_sp_to_memory`) was
 # removed in Phase 4. Phase 4 assumes that every production environment has
 # already run Phase 3 end-to-end; the Phase 4 SQL drop scripts physically
@@ -54,6 +58,7 @@ serde_yaml = { version = "0.9" }
 
 
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 async-stream = { workspace = true }
 # Streaming media Upload chunk type (MediaService).
 bytes = { workspace = true }
@@ -98,6 +103,7 @@ tracing-subscriber = { workspace = true, features = [
     "tracing-log",
     "env-filter",
 ] }
+tokio-stream = { workspace = true, features = ["net"] }
 
 
 [features]
@@ -110,7 +116,6 @@ lindera = ["infra/lindera", "app/lindera"]
 [dev-dependencies]
 serial_test = "3"
 # Client-streaming Upload in the #[ignore] image-memory e2e test.
-tokio-stream = { workspace = true }
 # `infra::test_helper::shared_id_generator` (one monotonic Snowflake
 # bucket) for the cleanup-orphan-media sweep e2e: separate
 # IdGeneratorWrapper::new() calls within a millisecond collide on

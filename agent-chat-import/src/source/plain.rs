@@ -1103,6 +1103,27 @@ mod tests {
     use crate::source::test_support::{entries_from_outcome, session_from_outcome, unpack_outcome};
     use std::io::Write;
 
+    static CURRENT_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct CurrentDirGuard {
+        previous: PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn change_to(path: &Path) -> Self {
+            let previous = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self { previous }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.previous)
+                .expect("test must restore the process working directory");
+        }
+    }
+
     fn args(root: PathBuf, strategy: ThreadStrategy) -> PlainArgs {
         PlainArgs {
             root,
@@ -1212,15 +1233,14 @@ mod tests {
         let vault = parent.path().join("notes-vault");
         write(&vault.join("a.md"), "x");
 
-        let prev_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&vault).unwrap();
+        let _cwd_lock = CURRENT_DIR_LOCK.lock().unwrap();
+        let _cwd = CurrentDirGuard::change_to(&vault);
         let s_dot = PlainSource::new(args(PathBuf::from("."), ThreadStrategy::Single));
         let session_dot = session_from_outcome(
             s_dot
                 .read_session(&s_dot.discover().unwrap()[0], None)
                 .unwrap(),
         );
-        std::env::set_current_dir(&prev_cwd).unwrap();
 
         // Same vault addressed by absolute path must produce the same
         // session id.
@@ -1892,8 +1912,8 @@ mod tests {
 
         // Mimic running `memories-import plain --root vault-rel` from
         // the parent dir: `args.root` is the bare relative segment.
-        let prev_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(parent.path()).unwrap();
+        let _cwd_lock = CURRENT_DIR_LOCK.lock().unwrap();
+        let _cwd = CurrentDirGuard::change_to(parent.path());
         let s = PlainSource::new(args(
             std::path::PathBuf::from(vault_name),
             ThreadStrategy::PerFile,
@@ -1920,8 +1940,6 @@ mod tests {
         }
         bodies.sort();
         assert_eq!(bodies, vec!["body-a".to_string(), "body-b".to_string()]);
-
-        std::env::set_current_dir(prev_cwd).unwrap();
     }
 
     #[test]
@@ -1950,15 +1968,14 @@ mod tests {
             .expect("path: label must exist");
 
         // Case 2: relative --root from the parent dir
-        let prev_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(parent.path()).unwrap();
+        let _cwd_lock = CURRENT_DIR_LOCK.lock().unwrap();
+        let _cwd = CurrentDirGuard::change_to(parent.path());
         let s_rel = PlainSource::new(args(
             std::path::PathBuf::from(vault_name),
             ThreadStrategy::PerFile,
         ));
         let inputs = s_rel.discover().unwrap();
         let session_rel = session_from_outcome(s_rel.read_session(&inputs[0], None).unwrap());
-        std::env::set_current_dir(prev_cwd).unwrap();
         let path_label_rel = session_rel
             .source_labels
             .iter()

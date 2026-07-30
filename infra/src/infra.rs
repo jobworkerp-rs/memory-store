@@ -10,6 +10,7 @@ pub mod reflection_intent_dispatch;
 pub mod reflection_intent_vector;
 pub mod reflection_summary_dispatch;
 pub(in crate::infra) mod resource;
+pub mod search_index_maintenance;
 pub mod startup_error;
 pub mod thread;
 pub mod thread_label;

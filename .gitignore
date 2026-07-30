@@ -28,3 +28,6 @@ target/
 refine/
 docker-compose-test.yml
 CLAUDE.md
+__pycache__/
+/lancedb-maintenance/
+

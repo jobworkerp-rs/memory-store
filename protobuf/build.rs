@@ -32,6 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "protobuf/llm_memory/data/reflection_filter.proto",
                 "protobuf/llm_memory/service/reflection.proto",
                 "protobuf/llm_memory/service/reflection_vector.proto",
+                "protobuf/llm_memory/service/search_index_maintenance.proto",
             ],
             &["protobuf"],
         )

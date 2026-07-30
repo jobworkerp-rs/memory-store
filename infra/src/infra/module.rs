@@ -16,6 +16,7 @@ use super::{
     thread_memory::rdb::ThreadMemoryRepositoryImpl,
 };
 use infra_utils::infra::rdb::RdbPool;
+use std::sync::Arc;
 
 /// Inspect an `anyhow::Error` produced by a LanceDB-init call and route
 /// to the right `StartupError::fatal()` branch. Used by every vector
@@ -62,6 +63,8 @@ pub struct RepositoryModule {
         Option<super::memory_vector::repository::MemoryVectorRepositoryImpl>,
     pub thread_vector_repository:
         Option<super::thread_vector::repository::ThreadVectorRepositoryImpl>,
+    pub search_index_maintenance_executor:
+        Arc<dyn super::search_index_maintenance::MaintenanceExecutor>,
     /// Reflection intent-vector store. `None` until both
     /// `MEMORY_VECTOR_ENABLED=true` and reflection-vector knobs are
     /// satisfied — the app layer falls back to RDB-only behaviour
@@ -131,6 +134,33 @@ impl RepositoryModule {
             }
         };
 
+        let thread_vector_repository = {
+            if std::env::var("THREAD_VECTOR_ENABLED").unwrap_or_default() == "true" {
+                let config = super::thread_vector::config::ThreadVectorDBConfig::from_env()
+                    .unwrap_or_else(|e| {
+                        StartupError::ConfigLoadFailed {
+                            component: "ThreadVectorDBConfig".into(),
+                            message: format!("{e:#}"),
+                        }
+                        .fatal()
+                    });
+                let uri = config.uri.clone();
+                Some(
+                    super::thread_vector::repository::ThreadVectorRepositoryImpl::new(config)
+                        .await
+                        .unwrap_or_else(|e| fatal_lancedb_init_error(&uri, e)),
+                )
+            } else {
+                None
+            }
+        };
+        let search_index_maintenance_executor = Arc::new(
+            super::search_index_maintenance::repository_executor::RepositoryMaintenanceExecutor::new(
+                memory_vector_repository.clone(),
+                thread_vector_repository.clone(),
+            ),
+        );
+
         RepositoryModule {
             memory_repository: MemoryRepositoryImpl::new(id_generator.clone(), pool),
             memory_rating_repository: MemoryRatingRepositoryImpl::new(id_generator.clone(), pool),
@@ -154,26 +184,8 @@ impl RepositoryModule {
             reflection_aggregate_thread_repository: ThreadAggregateKeyRepositoryImpl::new(pool),
 
             memory_vector_repository,
-            thread_vector_repository: {
-                if std::env::var("THREAD_VECTOR_ENABLED").unwrap_or_default() == "true" {
-                    let config = super::thread_vector::config::ThreadVectorDBConfig::from_env()
-                        .unwrap_or_else(|e| {
-                            StartupError::ConfigLoadFailed {
-                                component: "ThreadVectorDBConfig".into(),
-                                message: format!("{e:#}"),
-                            }
-                            .fatal()
-                        });
-                    let uri = config.uri.clone();
-                    Some(
-                        super::thread_vector::repository::ThreadVectorRepositoryImpl::new(config)
-                            .await
-                            .unwrap_or_else(|e| fatal_lancedb_init_error(&uri, e)),
-                    )
-                } else {
-                    None
-                }
-            },
+            thread_vector_repository,
+            search_index_maintenance_executor,
             reflection_intent_vector_repository,
             pool,
             id_generator,
