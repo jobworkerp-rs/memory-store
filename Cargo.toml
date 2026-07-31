@@ -96,20 +96,20 @@ url = { version = "2" }
 # `datafusion`. Mismatched arrow/datafusion majors surface as E0271/E0308
 # `RecordBatch`/`RecordBatchReader` type mismatches at the lancedb API
 # boundary (the two crates are then in the graph twice). The current set:
-#   lancedb 0.31  -> lance-index 8.0 -> arrow 58 / datafusion 53
+#   lancedb 0.33  -> lance-index 9.0 -> arrow 58 / datafusion 54
 # When raising lancedb, re-check the transitive arrow/datafusion majors
 # (`cargo tree -i arrow` / `-i datafusion-common`) and align them here.
 # The `infra` crate's `lindera` dep must also track the version that
 # `lance-index`'s `tokenizer-lindera` uses (currently 3.x) — otherwise the
 # highlight-side tokenizer diverges from the index tokenizer. See
 # `infra/Cargo.toml`.
-lancedb = { version = "0.31" }
+lancedb = { version = "0.33" }
 arrow = { version = "58", default-features = false }
 arrow-array = { version = "58" }
 arrow-schema = { version = "58" }
-lance-index = { version = "8.0" }
-datafusion-common = { version = "53" }
-datafusion-expr = { version = "53" }
+lance-index = { version = "9.0" }
+datafusion-common = { version = "54" }
+datafusion-expr = { version = "54" }
 rand = { version = "0.10" }
 
 #[workspace.lints.rust]
