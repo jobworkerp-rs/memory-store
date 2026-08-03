@@ -72,7 +72,7 @@ jobs:
           key: ${{ runner.os }}-cargo-test-sqlite-${{ hashFiles('**/Cargo.lock') }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Run test (SQLite)
-        run: cargo test -- --test-threads=1
+        run: CARGO_BUILD_JOBS=1 cargo test -- --test-threads=1
         env:
           TEST_REDIS_URL: "redis://127.0.0.1:6379"
           RUST_BACKTRACE: 1
@@ -134,7 +134,7 @@ jobs:
           key: ${{ runner.os }}-cargo-test-postgres-${{ hashFiles('**/Cargo.lock') }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Run test (PostgreSQL)
-        run: cargo test --features postgres -- --test-threads=1
+        run: CARGO_BUILD_JOBS=1 cargo test --features postgres -- --test-threads=1
         env:
           TEST_POSTGRES_URL: "postgres://postgres:postgres@127.0.0.1:5432/test"
           TEST_REDIS_URL: "redis://127.0.0.1:6379"
@@ -165,7 +165,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push memories-grpc Docker image
+      - name: Build and push memories Docker image
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -177,3 +178,18 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Record immutable image reference
+        id: image
+        run: |
+          image="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}"
+          printf '%s\n' "$image" | tee memories-image-reference.txt
+          printf 'image=%s\n' "$image" >> "$GITHUB_OUTPUT"
+          printf '## Published immutable image\n\n`%s`\n' "$image" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload immutable image reference
+        uses: actions/upload-artifact@v4
+        with:
+          name: memories-image-reference-${{ github.ref_name }}
+          path: memories-image-reference.txt
+          if-no-files-found: error
