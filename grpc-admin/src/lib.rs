@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate debug_stub_derive;
 
+pub mod db_migrate;
 pub mod front;
 pub mod protobuf;
 pub mod service;

@@ -25,6 +25,10 @@ impl ThreadSafeFilter {
         Self::from_expr(col("thread_id").eq(lit(ScalarValue::Int64(Some(id)))))
     }
 
+    pub fn thread_id_after(id: i64) -> Self {
+        Self::from_expr(col("thread_id").gt(lit(ScalarValue::Int64(Some(id)))))
+    }
+
     /// Match a single chunk position (N-row schema). Used to pick the
     /// representative chunk-0 row for distinct-thread counting / scalar
     /// sync.
@@ -54,6 +58,22 @@ impl ThreadSafeFilter {
 
     pub fn updated_before(ts: i64) -> Self {
         Self::from_expr(col("updated_at").lt(lit(ScalarValue::Int64(Some(ts)))))
+    }
+
+    pub fn first_message_after(ts: i64) -> Self {
+        Self::from_expr(col("first_message_at").gt(lit(ScalarValue::Int64(Some(ts)))))
+    }
+
+    pub fn first_message_before(ts: i64) -> Self {
+        Self::from_expr(col("first_message_at").lt(lit(ScalarValue::Int64(Some(ts)))))
+    }
+
+    pub fn last_message_after(ts: i64) -> Self {
+        Self::from_expr(col("last_message_at").gt(lit(ScalarValue::Int64(Some(ts)))))
+    }
+
+    pub fn last_message_before(ts: i64) -> Self {
+        Self::from_expr(col("last_message_at").lt(lit(ScalarValue::Int64(Some(ts)))))
     }
 
     /// Filter threads whose kind matches any value in the request.
@@ -167,17 +187,29 @@ impl ThreadSafeFilter {
             combine_and(Self::channel(ch));
         }
 
-        if let Some(after) = filter.created_after {
+        if let Some(after) = filter.thread_created_after {
             combine_and(Self::created_after(after));
         }
-        if let Some(before) = filter.created_before {
+        if let Some(before) = filter.thread_created_before {
             combine_and(Self::created_before(before));
         }
-        if let Some(after) = filter.updated_after {
+        if let Some(after) = filter.thread_updated_after {
             combine_and(Self::updated_after(after));
         }
-        if let Some(before) = filter.updated_before {
+        if let Some(before) = filter.thread_updated_before {
             combine_and(Self::updated_before(before));
+        }
+        if let Some(after) = filter.first_message_after {
+            combine_and(Self::first_message_after(after));
+        }
+        if let Some(before) = filter.first_message_before {
+            combine_and(Self::first_message_before(before));
+        }
+        if let Some(after) = filter.last_message_after {
+            combine_and(Self::last_message_after(after));
+        }
+        if let Some(before) = filter.last_message_before {
+            combine_and(Self::last_message_before(before));
         }
         if !filter.memory_kinds.is_empty() {
             combine_and(Self::memory_kinds_any(&filter.memory_kinds).expect("non-empty kinds"));
@@ -309,11 +341,12 @@ mod test {
             labels: vec!["test".to_string()],
             label_match_mode: Some(0), // ANY
             channel: Some("slack".to_string()),
-            created_after: Some(500),
-            created_before: None,
-            updated_after: None,
-            updated_before: Some(2000),
+            thread_created_after: Some(500),
+            thread_created_before: None,
+            thread_updated_after: None,
+            thread_updated_before: Some(2000),
             memory_kinds: vec![],
+            ..Default::default()
         };
         let sf = ThreadSafeFilter::from_proto_filter(&pf).unwrap();
         let sql = sf.to_sql().unwrap();

@@ -348,7 +348,6 @@ async fn batch_import_image_media_e2e() {
             parent_external_ids: vec![],
         }],
         upsert_by_external_id: true,
-        thread_updated_at_override: 0,
         labels: vec![],
     };
     let resp = threads
@@ -614,7 +613,6 @@ async fn find_memories_by_thread_id_returns_media_payload_e2e() {
                 parent_external_ids: vec![],
             }],
             upsert_by_external_id: true,
-            thread_updated_at_override: 0,
             labels: vec![],
         })
         .await

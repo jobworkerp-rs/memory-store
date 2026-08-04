@@ -41,13 +41,21 @@ CREATE TABLE IF NOT EXISTS thread (
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL,
     metadata JSONB,
-    memory_kind INT NOT NULL
+    memory_kind INT NOT NULL,
+    first_message_at BIGINT,
+    last_message_at BIGINT
 );
 
 CREATE INDEX IF NOT EXISTS thread_default_system_memory_id ON thread (default_system_memory_id);
 CREATE INDEX IF NOT EXISTS thread_user_id ON thread (user_id);
 CREATE INDEX IF NOT EXISTS thread_updated_at ON thread (updated_at);
 CREATE INDEX IF NOT EXISTS thread_user_memory_kind_updated_at ON thread (user_id, memory_kind, updated_at);
+CREATE INDEX IF NOT EXISTS thread_user_memory_kind_last_message_at_id ON thread (user_id, memory_kind, last_message_at DESC NULLS LAST, id DESC);
+CREATE INDEX IF NOT EXISTS thread_user_last_message_at_id ON thread (user_id, last_message_at DESC NULLS LAST, id DESC);
+CREATE INDEX IF NOT EXISTS thread_last_message_at_id ON thread (last_message_at DESC NULLS LAST, id DESC);
+CREATE INDEX IF NOT EXISTS thread_user_memory_kind_first_message_at ON thread (user_id, memory_kind, first_message_at);
+CREATE INDEX IF NOT EXISTS thread_user_first_message_at ON thread (user_id, first_message_at);
+CREATE INDEX IF NOT EXISTS thread_first_message_at ON thread (first_message_at);
 
 CREATE TABLE IF NOT EXISTS memory (
     id BIGINT NOT NULL PRIMARY KEY,

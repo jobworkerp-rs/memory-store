@@ -4255,6 +4255,8 @@ mod test {
             .bind(None::<i32>)
             .bind(created_at)
             .bind(updated_at)
+            .bind(None::<i64>)
+            .bind(None::<i64>)
             .bind(None::<String>) // metadata
             .bind(MemoryKind::Raw as i32)
             .execute(pool)
@@ -4356,7 +4358,7 @@ mod test {
             // Intersection = thread 1 only → memory m_a only.
             let filter = ThreadSearchFilter {
                 labels: vec!["rust".into()],
-                updated_after: Some(100),
+                thread_updated_after: Some(100),
                 ..Default::default()
             };
             let result = app
@@ -4500,6 +4502,8 @@ mod test {
             .bind(None::<i32>)
             .bind(1_000_i64)
             .bind(1_000_i64)
+            .bind(None::<i64>)
+            .bind(None::<i64>)
             .bind(None::<String>) // metadata
             .bind(MemoryKind::Raw as i32)
             .execute(pool)

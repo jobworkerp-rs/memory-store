@@ -87,9 +87,9 @@ workers:
         passed as a decimal string to avoid JS-number precision loss):
         {"query": "chat-workflow-app search feature design discussion", "user_id": "1", "limit": 5}
 
-        Example invocation (with filter — narrow to threads updated
-        after a given epoch-ms timestamp):
-        {"query": "search feature design", "user_id": "1", "limit": 5, "filter": {"updated_after": 1777003200000}}
+        Example invocation (with filter — narrow to conversations whose
+        latest message is after a given epoch-ms timestamp):
+        {"query": "search feature design", "user_id": "1", "limit": 5, "filter": {"last_message_after": 1777003200000}}
       channel: %{MEMORY_RAG_CHANNEL:-rag}
       settings:
         workflow_data:

@@ -172,7 +172,7 @@ MEMORY_REPO_ROOT=/opt/memories/agent-chat-import \
 
 import 完了 (および embedding redispatch) のあとに `agent-chat-import/workflows/thread-summary/thread-summary-batch.yaml` を jobworkerp 経由で起動する。`summarize-after` feature が有効 (default) かつ `JOBWORKERP_ADDR` 指定時のみ動作する。
 
-`user_id` / `updated_after_ms` は memories-import の引数 (`--user-id` と `--since`) から自動的に上書きされる。`--since` 未指定なら `updated_after_ms` は touch しない (テンプレ側の値を尊重)。`--since` を絶対値 (epoch ms) として workflow にそのまま渡すため、jobworkerp のキュー待ち時間が長くても要約対象の下限が import 範囲と揃う。
+`user_id` / `updated_after_ms` は memories-import の引数 (`--user-id` と `--since`) から自動的に上書きされる。`updated_after_ms` は workflow 入力の互換名であり、thread 一覧では `last_message_after` に変換される。`--since` 未指定なら `updated_after_ms` は touch しない (テンプレ側の値を尊重)。`--since` を絶対値 (epoch ms) として workflow にそのまま渡すため、jobworkerp のキュー待ち時間が長くても要約対象の下限が import 範囲と揃う。
 
 import が `summary.errors > 0` で終わった場合、要約 dispatch は skip される (中途半端なスレッドを要約してしまわないためのガード)。
 
@@ -217,7 +217,7 @@ memories-import --user-id 1 \
   claude-code --all-projects
 ```
 
-`--since` の epoch ms (この例では `1745884800000`) が `updated_after_ms` として batch input にセットされ、workflow 内の `updated_after` フィルタにそのまま使われる。
+`--since` の epoch ms (この例では `1745884800000`) が `updated_after_ms` として batch input にセットされ、workflow 内では会話時刻の `last_message_after` filter に使われる。
 
 ### インライン JSON + チャンネル + 短い timeout
 
@@ -264,7 +264,7 @@ memories-import --user-id 1 -v \
 
 import 完了 (および embedding redispatch) のあとに `agent-chat-import/workflows/personality/thread-personality-batch.yaml` を jobworkerp 経由で起動する。`personality-after` feature が有効 (default) かつ `JOBWORKERP_ADDR` 指定時のみ動作する。
 
-`--summarize-after-*` と独立した別系統で、両方を同時に指定すると **summarize と personality を並列に dispatch** する (失敗は片方ずつ独立して扱われる)。`user_id` / `updated_after_ms` の自動上書き、`--since` の絶対 epoch ms 渡し、`summary.errors > 0` 時の skip ガードはすべて summarize 系と同じ挙動。
+`--summarize-after-*` と独立した別系統で、両方を同時に指定すると **summarize と personality を並列に dispatch** する (失敗は片方ずつ独立して扱われる)。`user_id` / `updated_after_ms` の自動上書き、`--since` の絶対 epoch ms 渡し（thread 一覧では `last_message_after` に変換）、`summary.errors > 0` 時の skip ガードはすべて summarize 系と同じ挙動。
 
 import 完了後の dispatch 関係:
 
@@ -511,11 +511,12 @@ channel / `external_id` / `agent:<source-name>` ラベルすべての prefix に
 | オプション | 必須 | デフォルト | 備考 |
 |---|---|---|---|
 | `-u, --user-id` | import 系で ○ | — | i64。`upsert-generation-workers` では不要 |
-| `-s, --since` | — | (なし) | ISO 8601。要約時は `updated_after_ms` (絶対 epoch ms) として workflow に渡される |
+| `-s, --since` | — | (なし) | ISO 8601。要約時は `updated_after_ms` (絶対 epoch ms) として workflow に渡され、thread 一覧の `last_message_after` に変換される |
 | `--mtime-margin-seconds` | — | `60` | `--since` 指定時、`since - margin` より古い session ファイルは parse skip する保守側マージン (秒)。書き込み中ファイルの誤 skip を防ぐ |
 | `--no-mtime-filter` | — | `false` | `--since` 指定時の session-level mtime filter を完全 disable。NFS / クラウドストレージ等 mtime が信頼できない環境向け |
 | `-l, --labels` | — | (なし) | 追加ラベル (カンマ区切り)。多重指定可 (`ArgAction::Append`)、512 byte 超は parse error |
 | `-n, --dry-run` | — | `false` | DB 接続なしで件数だけ表示 |
+| `--events-jsonl` | — | `false` | import lifecycle eventを標準出力へJSONLで追加する。通常の人間向け出力は維持される |
 | `-v, --verbose` | — | `false` | `RUST_LOG=debug` 相当 |
 | `-b, --batch-size` | — | `100` | 進捗ログ間隔 |
 | `--summarize-after-file` / `--summarize-after-json` | — | (なし) | 排他、`--summarize-workflow` 必須 |
@@ -528,12 +529,30 @@ channel / `external_id` / `agent:<source-name>` ラベルすべての prefix に
 | `--personality-channel` | — | (なし) | jobworkerp チャンネル名 |
 | `--personality-timeout-sec` | — | `86400` (24h) | personality job の timeout (秒)。理由は summarize 側と同じ |
 | `--server-retry-max` | — | `3` | 1 RPC あたりの最大試行回数 (初回含む)。 retry 対象は `Unavailable` / `DeadlineExceeded` / `ResourceExhausted` および PostgreSQL `40001` / `40P01` SQLSTATE。`--server-retry-max 1` または `--no-retry` で完全に無効化できる |
+
 | `--server-retry-base-ms` | — | `1000` | 指数バックオフの基底 ms (試行 N の待機は `min(base * 2^(N-1), cap)` を jitter 倍したもの) |
 | `--server-retry-cap-ms` | — | `30000` | バックオフの上限 ms |
 | `--server-retry-jitter-ratio` | — | `0.25` | jitter 比率 (0.0 で完全停止、`0.25` で `[delay, delay * 1.25)` の一様分布) |
 | `--no-retry` | — | `false` | RPC retry を完全無効化 (デバッグ用) |
 | `--chunk-max-entries` | — | `200` | 1 AddMemoriesBatch あたりの memory 数上限。cnpg PostgreSQL 上で 1 transaction が長期化することを避けるため小さく取る |
 | `--chunk-max-bytes` | — | `4194304` (4 MiB) | 1 AddMemoriesBatch の prost エンコード後上限 bytes。tonic frame 16 MiB の余裕を考慮した既定値 |
+
+### import lifecycle event
+
+`--events-jsonl`を指定すると、通常の標準出力に加えて、`schema="memories-import-event"`、
+`version=1`のJSON objectを1行1件で出力する。`thread_created`は最初の
+`AddMemoriesBatch`応答で新規thread作成が判明した直後に出力し、`session_completed`は
+同じ実セッションが終了した時点で出力する。`thread_id`はJavaScriptの安全整数範囲を
+超えても失われない10進文字列である。
+
+`source`はCLI subcommandを表す`claude-code`、`codex`、`plain`のいずれかである。
+`session_key`は再試行で安定したcanonical channelであり、plainでは任意の
+`--source-name`を含む。`session_completed.imported_count`は、その試行で新規作成または
+重複upsertとして存在を確認した累積件数である。既存threadへの成功した再試行も
+`thread_id`付きの完了eventを出力する。thread IDを得る前にparse skipまたは入力エラーに
+なったセッションはeventを出力しない。creation event後に後続chunkが失敗した場合は、
+同じkeyとIDの`success=false` completionを出力する。eventの書込みに失敗したimportは
+非成功として扱う。
 
 ### Back-pressure と再試行
 

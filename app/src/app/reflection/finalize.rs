@@ -20,7 +20,7 @@
 //!                                anything still in PENDING.
 
 use anyhow::Result;
-use protobuf::llm_memory::data::{MemoryKind, ReflectionId, ThreadData, UserId};
+use protobuf::llm_memory::data::{MemoryKind, ReflectionId, ThreadData, ThreadId, UserId};
 use protobuf::llm_memory::service::FinalizeReflectionRequest;
 use sha2::{Digest, Sha256};
 
@@ -127,7 +127,7 @@ pub async fn finalize(
 
     const MAX_PHASE3_RETRIES: u32 = 3;
     let mut attempt = 0u32;
-    let memory_id = loop {
+    let (memory_id, inserted) = loop {
         attempt += 1;
         let now_attempt = command_utils::util::datetime::now_millis();
         match run_phase3(
@@ -145,8 +145,8 @@ pub async fn finalize(
         )
         .await
         {
-            Ok(Phase3Outcome::Inserted(id)) => break id,
-            Ok(Phase3Outcome::Existing(id)) => break id,
+            Ok(Phase3Outcome::Inserted(id)) => break (id, true),
+            Ok(Phase3Outcome::Existing(id)) => break (id, false),
             Err(e) if is_unique_violation(&e) && attempt < MAX_PHASE3_RETRIES => {
                 tracing::warn!(
                     target = "reflection.finalize",
@@ -158,6 +158,20 @@ pub async fn finalize(
             Err(e) => return Err(e),
         }
     };
+
+    // Phase 3 committed the new membership and its derived bounds. Keep
+    // existing LanceDB rows filterable by the same time scalars; an
+    // idempotent Existing outcome made no RDB change, so it needs no sync.
+    if inserted
+        && let Some(thread_vector_app) = app.thread_vector_app.as_ref()
+        && let Err(e) = thread_vector_app
+            .sync_thread_scalars(aggregate_thread_id)
+            .await
+    {
+        tracing::warn!(
+            "sync_thread_scalars after reflection finalize failed for thread {aggregate_thread_id}: {e}"
+        );
+    }
 
     // ===== Phase 4: fire-and-forget dispatch =====
     dispatch_embeddings(
@@ -201,6 +215,22 @@ async fn run_phase3(
 
     let mut tx = app.pool.begin().await?;
 
+    // Serialize every aggregate-thread membership change before deriving
+    // extrema; otherwise concurrent finalize/delete transactions can each
+    // aggregate a stale membership snapshot and overwrite the other result.
+    #[cfg(feature = "postgres")]
+    app.thread_repo
+        .find_row_for_update_tx(
+            &mut *tx,
+            &ThreadId {
+                value: aggregate_thread_id,
+            },
+        )
+        .await?
+        .ok_or_else(|| {
+            LlmMemoryError::NotFound(format!("aggregate thread {aggregate_thread_id} not found"))
+        })?;
+
     // 3-a. Memory insert with external_id UNIQUE idempotency (F-G3).
     let memory_id = match app.memory_repo.create(&mut *tx, memory_data).await {
         Ok(id) => id.value,
@@ -241,6 +271,15 @@ async fn run_phase3(
         tx.rollback().await.ok();
         return Err(e);
     }
+    app.thread_repo
+        .refresh_message_bounds_tx(
+            &mut tx,
+            &ThreadId {
+                value: aggregate_thread_id,
+            },
+            now,
+        )
+        .await?;
 
     // 3-c. Sidecar.
     let index_row = build_index_row(IndexRowInput {
@@ -444,6 +483,8 @@ async fn resolve_or_create_aggregate_thread(
         embedding_dim: None,
         created_at: now,
         updated_at: now,
+        first_message_at: None,
+        last_message_at: None,
         metadata: None,
         labels: target_labels.to_vec(),
         memory_kind: MemoryKind::Reflection as i32,

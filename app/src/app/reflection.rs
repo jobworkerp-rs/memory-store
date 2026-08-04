@@ -370,6 +370,9 @@ pub struct ReflectionAppImpl {
     /// TTL window. Optional so test wiring that does not exercise
     /// cross-app cache invariants can pass `None`.
     pub(crate) memory_cache: Option<TokioCache<Arc<String>, Memory>>,
+    /// Shared optional thread-vector surface. Reflection membership changes
+    /// alter aggregate-thread message bounds, which are indexed scalars.
+    pub(crate) thread_vector_app: Option<Arc<crate::app::thread_vector::ThreadVectorAppImpl>>,
 }
 
 impl ReflectionAppImpl {
@@ -429,7 +432,17 @@ impl ReflectionAppImpl {
             intent_dispatcher,
             jobworkerp_client,
             memory_cache,
+            thread_vector_app: None,
         }
+    }
+
+    /// Wire the shared optional thread-vector application after construction.
+    pub fn with_thread_vector_app(
+        mut self,
+        thread_vector_app: Option<Arc<crate::app::thread_vector::ThreadVectorAppImpl>>,
+    ) -> Self {
+        self.thread_vector_app = thread_vector_app;
+        self
     }
 }
 

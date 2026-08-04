@@ -111,6 +111,10 @@ pub struct GlobalArgs {
     #[arg(short = 'n', long, global = true)]
     pub dry_run: bool,
 
+    /// Emit versioned machine-readable import lifecycle events as JSONL.
+    #[arg(long, global = true)]
+    pub events_jsonl: bool,
+
     /// Verbose output (sets RUST_LOG=debug if not already set)
     #[arg(short = 'v', long, global = true)]
     pub verbose: bool,
@@ -832,6 +836,16 @@ mod tests {
             Subcmd::ClaudeCode(args) => assert!(args.all_projects),
             other => panic!("expected ClaudeCode, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn events_jsonl_is_an_opt_in_global_flag() {
+        let default_cli = parse(&["-u", "1", "claude-code", "--all-projects"]).unwrap();
+        assert!(!default_cli.global.events_jsonl);
+
+        let enabled_cli =
+            parse(&["claude-code", "--all-projects", "-u", "1", "--events-jsonl"]).unwrap();
+        assert!(enabled_cli.global.events_jsonl);
     }
 
     #[test]

@@ -1,0 +1,11 @@
+{
+  "entries": [
+    {
+      "identity": "thread-message-times-v1@1",
+      "canonical_definition_digest": "d2fe9980cf1048115967a8ab019a53c4422b284f3a8cf185ce2c55988506ed1d"
+    }
+  ],
+  "lifecycle_transitions": [],
+  "previous_history_digest": null,
+  "history_digest": "fdd741d1743b0aa74fc9da8c5b916ce6e2940dc6206b3a854a8434ea20e37255"
+}

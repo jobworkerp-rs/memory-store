@@ -24,7 +24,8 @@ use arrow_schema::{DataType, Field, Schema};
 use futures::StreamExt;
 use lancedb::Table;
 use lancedb::index::{Index, IndexType};
-use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::query::{ColumnOrdering, ExecutableQuery, QueryBase};
+use lancedb::table::NewColumnTransform;
 use std::collections::HashSet;
 use std::sync::Arc;
 #[cfg(test)]
@@ -39,6 +40,34 @@ const MAX_HYBRID_CANDIDATES: usize = 200;
 /// substring (not the whole `description`) so a multi-chunk thread has
 /// every chunk searchable. Search folds chunk hits back to one per thread.
 const FTS_INDEX_COLUMN: &str = "content";
+const MAINTENANCE_INDEX_QUERY_PROBE_TERM: &str = "memories_index_probe";
+
+/// Extend tables created before thread message extrema existed. NULL is the
+/// only sound historical value here: a vector table cannot reconstruct the
+/// RDB membership aggregate on its own, and scalar sync/backfill will later
+/// write the authoritative values.
+async fn add_legacy_message_time_columns_if_missing(
+    table: &Table,
+    mut schema: Arc<Schema>,
+) -> anyhow::Result<Arc<Schema>> {
+    let mut columns = Vec::new();
+    for name in ["first_message_at", "last_message_at"] {
+        if schema.field_with_name(name).is_err() {
+            columns.push((name.to_string(), "CAST(NULL AS BIGINT)".to_string()));
+        }
+    }
+    if columns.is_empty() {
+        return Ok(schema);
+    }
+    table
+        .add_columns(NewColumnTransform::SqlExpressions(columns), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("LanceDB add thread message time columns failed: {e}"))?;
+    schema = table.schema().await.map_err(|e| {
+        anyhow::anyhow!("LanceDB schema read after thread time migration failed: {e}")
+    })?;
+    Ok(schema)
+}
 
 /// Over-fetch factor for the distinct-thread COUNT path only. A thread
 /// owns N chunk rows, so counting distinct threads up to `hard_cap`
@@ -90,6 +119,101 @@ struct FtsInitState {
 }
 
 impl ThreadVectorRepositoryImpl {
+    /// Check whether a canonical ThreadVector table already exists without
+    /// creating or evolving it. Maintenance commands use this to keep a
+    /// disabled vector deployment read-only unless the operator explicitly
+    /// requests creation for a future cutover.
+    pub async fn table_exists(config: &ThreadVectorDBConfig) -> anyhow::Result<bool> {
+        let database = lancedb::connect(&config.uri)
+            .execute()
+            .await
+            .map_err(|e| anyhow::anyhow!("LanceDB connect failed: {e}"))?;
+        let names = database
+            .table_names()
+            .execute()
+            .await
+            .map_err(|e| anyhow::anyhow!("LanceDB table_names failed: {e}"))?;
+        Ok(names.iter().any(|name| name == &config.table_name))
+    }
+
+    /// Drop a named table when it exists. This is intentionally a migration
+    /// primitive rather than a normal repository operation: application
+    /// traffic must never replace the canonical vector table.
+    pub async fn drop_table_if_exists(
+        config: &ThreadVectorDBConfig,
+        table_name: &str,
+    ) -> anyhow::Result<()> {
+        let database = lancedb::connect(&config.uri)
+            .execute()
+            .await
+            .map_err(|e| anyhow::anyhow!("LanceDB connect failed: {e}"))?;
+        let names = database
+            .table_names()
+            .execute()
+            .await
+            .map_err(|e| anyhow::anyhow!("LanceDB table_names failed: {e}"))?;
+        if names.iter().any(|name| name == table_name) {
+            database
+                .drop_table(table_name, &[])
+                .await
+                .map_err(|e| anyhow::anyhow!("LanceDB drop_table failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Replace the canonical table from a fully verified staging table.
+    /// The staging source remains untouched, so a failure after the canonical
+    /// drop is resumable by calling this method again.
+    pub async fn replace_table_from_staging(
+        config: &ThreadVectorDBConfig,
+        staging_table_name: &str,
+    ) -> anyhow::Result<()> {
+        let database = lancedb::connect(&config.uri)
+            .execute()
+            .await
+            .map_err(|e| anyhow::anyhow!("LanceDB connect failed: {e}"))?;
+        let staging = database
+            .open_table(staging_table_name)
+            .execute()
+            .await
+            .map_err(|e| anyhow::anyhow!("LanceDB open staging table failed: {e}"))?;
+        let schema = staging
+            .schema()
+            .await
+            .map_err(|e| anyhow::anyhow!("LanceDB read staging schema failed: {e}"))?;
+        let mut stream = staging
+            .query()
+            .execute()
+            .await
+            .map_err(|e| anyhow::anyhow!("LanceDB read staging rows failed: {e}"))?;
+        Self::drop_table_if_exists(config, &config.table_name).await?;
+        let empty = arrow_array::RecordBatch::new_empty(schema.clone());
+        let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
+            RecordBatchIterator::new(vec![Ok::<_, arrow_schema::ArrowError>(empty)], schema),
+        );
+        let canonical = database
+            .create_table(&config.table_name, reader)
+            .execute()
+            .await
+            .map_err(|e| anyhow::anyhow!("LanceDB recreate canonical table failed: {e}"))?;
+        while let Some(batch) = stream.next().await {
+            let batch =
+                batch.map_err(|e| anyhow::anyhow!("LanceDB read staging batch failed: {e}"))?;
+            let batch_schema = batch.schema();
+            let reader: Box<dyn arrow_array::RecordBatchReader + Send> =
+                Box::new(RecordBatchIterator::new(
+                    vec![Ok::<_, arrow_schema::ArrowError>(batch)],
+                    batch_schema,
+                ));
+            canonical
+                .add(reader)
+                .execute()
+                .await
+                .map_err(|e| anyhow::anyhow!("LanceDB append canonical batch failed: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Returns the explicit one-process FTS rebuild request from configuration.
     pub fn maintenance_fts_force_rebuild_enabled(&self) -> bool {
         self.config.fts.force_rebuild
@@ -138,6 +262,56 @@ impl ThreadVectorRepositoryImpl {
             error_summary: String::new(),
         })
     }
+
+    /// Executes a query against the persisted FTS index without changing it.
+    /// A deterministic term is valid for every tokenizer and lets an empty
+    /// table prove queryability without requiring a matching document.
+    pub async fn verify_maintenance_fts_query(&self) -> anyhow::Result<()> {
+        let table = self.table.load_full();
+        let query = lance_index::scalar::FullTextSearchQuery::new(
+            MAINTENANCE_INDEX_QUERY_PROBE_TERM.to_string(),
+        );
+        let mut stream = table
+            .query()
+            .full_text_search(query)
+            .limit(1)
+            .execute()
+            .await
+            .map_err(|error| anyhow::anyhow!("ThreadVector FTS index query failed: {error}"))?;
+        while let Some(batch) = stream.next().await {
+            batch
+                .map_err(|error| anyhow::anyhow!("ThreadVector FTS index query failed: {error}"))?;
+        }
+        Ok(())
+    }
+
+    /// Executes a nearest-neighbor query using the persisted ANN index.
+    /// This is intentionally separate from normal search because migration
+    /// verification must fail rather than fall back to brute-force scanning.
+    pub async fn verify_maintenance_vector_query(&self) -> anyhow::Result<()> {
+        if !self.config.vector_index.enabled {
+            anyhow::bail!("ThreadVector ANN index query is unavailable while ANN is disabled");
+        }
+        let probe = vec![0.0; self.config.vector_size];
+        let table = self.table.load_full();
+        let query = apply_vector_query_options(
+            table.query().nearest_to(probe.as_slice())?,
+            self.config.vector_index,
+            self.config.distance_type,
+            true,
+        )
+        .limit(1);
+        let mut stream = query
+            .execute()
+            .await
+            .map_err(|error| anyhow::anyhow!("ThreadVector ANN index query failed: {error}"))?;
+        while let Some(batch) = stream.next().await {
+            batch
+                .map_err(|error| anyhow::anyhow!("ThreadVector ANN index query failed: {error}"))?;
+        }
+        Ok(())
+    }
+
     /// Executes a FTS build from the maintenance control plane only.
     pub async fn maintenance_build_fts(&self, force: bool) -> anyhow::Result<()> {
         if force {
@@ -246,6 +420,7 @@ impl ThreadVectorRepositoryImpl {
                     &table,
                 )
                 .await?;
+            let actual = add_legacy_message_time_columns_if_missing(&table, actual).await?;
             let actual_arrow = actual.as_ref().clone();
             let expected_fp =
                 crate::infra::memory_vector::repository::schema_fingerprint(schema.as_ref());
@@ -334,6 +509,8 @@ impl ThreadVectorRepositoryImpl {
             "user_id",
             "created_at",
             "updated_at",
+            "first_message_at",
+            "last_message_at",
         ];
         for col_name in btree_columns {
             if let Err(e) = table
@@ -542,6 +719,12 @@ impl ThreadVectorRepositoryImpl {
                 .map(|a| a.value(row))
                 .unwrap_or(0)
         };
+        let nullable_i64 = |col: &str| -> Option<i64> {
+            batch
+                .column_by_name(col)
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                .and_then(|a| (!a.is_null(row)).then(|| a.value(row)))
+        };
 
         let embedding = batch
             .column_by_name("embedding")
@@ -587,6 +770,8 @@ impl ThreadVectorRepositoryImpl {
             channel: nullable_str("channel"),
             created_at: Self::extract_i64(batch, "created_at", row)?,
             updated_at: Self::extract_i64(batch, "updated_at", row)?,
+            first_message_at: nullable_i64("first_message_at"),
+            last_message_at: nullable_i64("last_message_at"),
             indexed_at: Self::extract_i64(batch, "indexed_at", row)?,
         })
     }
@@ -983,6 +1168,52 @@ impl ThreadVectorRepositoryImpl {
             {
                 for i in 0..col.len() {
                     ids.push(col.value(i));
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Return one stable, distinct-thread keyset page.
+    pub async fn thread_id_keyset_page(
+        &self,
+        after: Option<i64>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<i64>> {
+        if limit == 0 {
+            anyhow::bail!("thread_id_keyset_page limit must be positive");
+        }
+        let filter = after.map(ThreadSafeFilter::thread_id_after);
+        let table = self.table.load_full();
+        let mut query = table.query();
+        if let Some(filter) = filter {
+            query = query.only_if(filter.to_sql()?);
+        }
+        let mut stream = query
+            .select(lancedb::query::Select::columns(&["thread_id"]))
+            .order_by(Some(vec![ColumnOrdering {
+                column_name: "thread_id".to_string(),
+                ascending: true,
+                nulls_first: false,
+            }]))
+            .execute()
+            .await?;
+
+        let mut ids = Vec::with_capacity(limit);
+        let mut seen = HashSet::with_capacity(limit);
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result?;
+            let column = batch
+                .column_by_name("thread_id")
+                .and_then(|value| value.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(|| anyhow::anyhow!("thread_id keyset query returned no int64 id"))?;
+            for index in 0..column.len() {
+                let thread_id = column.value(index);
+                if seen.insert(thread_id) {
+                    ids.push(thread_id);
+                    if ids.len() == limit {
+                        return Ok(ids);
+                    }
                 }
             }
         }
@@ -1504,6 +1735,10 @@ impl ThreadVectorRepositoryImpl {
         let channels: Vec<Option<&str>> = records.iter().map(|r| r.channel.as_deref()).collect();
         let created_ats: Vec<i64> = records.iter().map(|r| r.created_at).collect();
         let updated_ats: Vec<i64> = records.iter().map(|r| r.updated_at).collect();
+        let first_message_ats: Vec<Option<i64>> =
+            records.iter().map(|r| r.first_message_at).collect();
+        let last_message_ats: Vec<Option<i64>> =
+            records.iter().map(|r| r.last_message_at).collect();
         let indexed_ats: Vec<i64> = records.iter().map(|r| r.indexed_at).collect();
 
         // Build FixedSizeList for embeddings
@@ -1545,6 +1780,8 @@ impl ThreadVectorRepositoryImpl {
                 Arc::new(Int64Array::from(updated_ats)),
                 Arc::new(Int64Array::from(indexed_ats)),
                 Arc::new(Int32Array::from(memory_kinds)),
+                Arc::new(Int64Array::from(first_message_ats)),
+                Arc::new(Int64Array::from(last_message_ats)),
             ],
         )
         .map_err(|e| anyhow::anyhow!("Failed to build RecordBatch: {e}"))
@@ -1913,7 +2150,12 @@ mod tests {
             expected
                 .fields()
                 .iter()
-                .filter(|field| field.name() != "memory_kind")
+                .filter(|field| {
+                    !matches!(
+                        field.name().as_str(),
+                        "memory_kind" | "first_message_at" | "last_message_at"
+                    )
+                })
                 .cloned()
                 .collect::<Vec<_>>(),
         ));
@@ -1930,6 +2172,11 @@ mod tests {
         let schema = repo.table.load_full().schema().await.unwrap();
         let field = schema.field_with_name("memory_kind").unwrap();
         assert_eq!(field.data_type(), &DataType::Int32);
+        for name in ["first_message_at", "last_message_at"] {
+            let field = schema.field_with_name(name).unwrap();
+            assert_eq!(field.data_type(), &DataType::Int64);
+            assert!(field.is_nullable());
+        }
     }
 
     async fn embedding_vector_index_count(repo: &ThreadVectorRepositoryImpl) -> usize {
@@ -1949,6 +2196,103 @@ mod tests {
         let mut rng = rand::rng();
         let embedding: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect();
         chunk_record(thread_id, 0, embedding)
+    }
+
+    #[tokio::test]
+    async fn replace_table_from_staging_preserves_chunk_rows() -> anyhow::Result<()> {
+        let (config, _db) = TestDb::config(4);
+        let canonical = ThreadVectorRepositoryImpl::new(config.clone()).await?;
+        canonical
+            .batch_upsert(vec![rand_chunk(10, 4), rand_chunk(20, 4)])
+            .await?;
+
+        let staging_name = "test_threads__thread_time_fields_v1_staging";
+        let mut staging_config = config.clone();
+        staging_config.table_name = staging_name.to_string();
+        let staging = ThreadVectorRepositoryImpl::new(staging_config).await?;
+        for id in canonical.get_all_thread_ids().await? {
+            staging
+                .batch_upsert(canonical.find_records_by_thread_id(id).await?)
+                .await?;
+        }
+
+        ThreadVectorRepositoryImpl::replace_table_from_staging(&config, staging_name).await?;
+        let reopened = ThreadVectorRepositoryImpl::new(config.clone()).await?;
+        assert_eq!(reopened.get_all_thread_ids().await?, vec![10, 20]);
+        assert_eq!(reopened.find_records_by_thread_id(10).await?.len(), 1);
+        assert_eq!(reopened.find_records_by_thread_id(20).await?.len(), 1);
+        reopened.maintenance_build_fts(false).await?;
+        assert_eq!(
+            reopened
+                .observe_maintenance_index(false)
+                .await?
+                .index_present,
+            Some(true)
+        );
+        assert!(ThreadVectorRepositoryImpl::table_exists(&config).await?);
+        ThreadVectorRepositoryImpl::drop_table_if_exists(&config, staging_name).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn maintenance_fts_query_probe_requires_a_usable_reopened_index() -> anyhow::Result<()> {
+        let (config, db) = TestDb::config(4);
+        {
+            let repository = ThreadVectorRepositoryImpl::new(config.clone()).await?;
+            repository
+                .batch_upsert(vec![chunk_record(1, 0, vec![0.1, 0.2, 0.3, 0.4])])
+                .await?;
+            repository.maintenance_build_fts(false).await?;
+        }
+
+        let reopened =
+            ThreadVectorRepositoryImpl::new(db.config_reusing_path(4, FtsConfig::default()))
+                .await?;
+        assert_eq!(
+            reopened
+                .observe_maintenance_index(false)
+                .await?
+                .index_present,
+            Some(true)
+        );
+        reopened.verify_maintenance_fts_query().await?;
+
+        let table = reopened.table.load_full();
+        drop_fts_index(&table).await?;
+        reopened.reload_table().await?;
+        assert!(
+            reopened.verify_maintenance_fts_query().await.is_err(),
+            "a metadata-free FTS query must not be accepted as a verified index"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_id_keyset_page_includes_threads_without_chunk_zero() -> anyhow::Result<()> {
+        let (config, _db) = TestDb::config(4);
+        let repository = ThreadVectorRepositoryImpl::new(config).await?;
+        repository
+            .batch_upsert(vec![
+                chunk_record(10, 1, vec![0.1; 4]),
+                chunk_record(10, 2, vec![0.2; 4]),
+                chunk_record(20, 1, vec![0.3; 4]),
+                rand_chunk(30, 4),
+            ])
+            .await?;
+
+        let first = repository.thread_id_keyset_page(None, 2).await?;
+        assert_eq!(first, vec![10, 20]);
+        let second = repository
+            .thread_id_keyset_page(first.last().copied(), 2)
+            .await?;
+        assert_eq!(second, vec![30]);
+        assert!(
+            repository
+                .thread_id_keyset_page(Some(30), 2)
+                .await?
+                .is_empty()
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -2005,6 +2349,7 @@ mod tests {
             "a compatible persisted ANN index must enable configured nprobes after restart"
         );
         assert!(reopened.vector_index_ready.load(Ordering::Acquire));
+        reopened.verify_maintenance_vector_query().await?;
         Ok(())
     }
 
@@ -2164,6 +2509,8 @@ mod tests {
             channel: None,
             created_at: 1,
             updated_at: 1,
+            first_message_at: None,
+            last_message_at: None,
             indexed_at: 1,
         }
     }

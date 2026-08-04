@@ -4,6 +4,7 @@
 //! is the single source of truth for parent links.
 
 use crate::client::ImportClient;
+use crate::events::ImportEventSink;
 use crate::source::{CanonicalEntry, CanonicalSession, ChatSource, ReadSessionOutcome, StreamItem};
 use anyhow::Result;
 use common::external_id::{EXTERNAL_ID_MAX_BYTES, namespace_for_external_id, owner_scoped};
@@ -147,6 +148,7 @@ pub fn is_entry_importable(entry: &CanonicalEntry, since_millis: Option<i64>) ->
 #[derive(Debug, Default, Clone)]
 pub struct CanonicalSessionResult {
     pub session_id: String,
+    pub session_key: Option<String>,
     pub thread_id: Option<i64>,
     pub thread_created: bool,
     pub memories_imported: usize,
@@ -163,8 +165,60 @@ pub struct CanonicalSessionResult {
     pub skip_reason: Option<String>,
 }
 
+impl CanonicalSessionResult {
+    /// Entries confirmed present by this logical session attempt. Duplicate
+    /// upserts count because a retry may be completing a thread created by a
+    /// previous partial attempt.
+    pub fn cumulative_imported_count(&self) -> usize {
+        self.memories_imported + self.memories_skipped_duplicate
+    }
+}
+
+fn emit_session_completion(
+    result: &mut CanonicalSessionResult,
+    event_sink: Option<&dyn ImportEventSink>,
+) {
+    let (Some(sink), Some(session_key), Some(thread_id)) =
+        (event_sink, result.session_key.as_deref(), result.thread_id)
+    else {
+        return;
+    };
+    let success = result.error.is_none();
+    if let Err(error) = sink.session_completed(
+        session_key,
+        thread_id,
+        result.cumulative_imported_count(),
+        success,
+    ) {
+        result.error = Some(error);
+    }
+}
+
 /// Shared per-session import path.
 pub async fn run_import(
+    client: &dyn ImportClient,
+    session: &CanonicalSession,
+    entries: Vec<CanonicalEntry>,
+    source_filtered_count: usize,
+    since_millis: Option<i64>,
+    user_id: i64,
+    extra_labels: &[String],
+) -> CanonicalSessionResult {
+    run_import_with_event_sink(
+        client,
+        session,
+        entries,
+        source_filtered_count,
+        since_millis,
+        user_id,
+        extra_labels,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_import_with_event_sink(
     client: &dyn ImportClient,
     session: &CanonicalSession,
     mut entries: Vec<CanonicalEntry>,
@@ -172,9 +226,11 @@ pub async fn run_import(
     since_millis: Option<i64>,
     user_id: i64,
     extra_labels: &[String],
+    event_sink: Option<&dyn ImportEventSink>,
 ) -> CanonicalSessionResult {
     let mut result = CanonicalSessionResult {
         session_id: session.session_id.clone(),
+        session_key: Some(session.channel.clone()),
         memories_skipped_filtered: source_filtered_count,
         ..Default::default()
     };
@@ -199,18 +255,6 @@ pub async fn run_import(
     }
 
     let labels = build_labels(session, extra_labels);
-    // Match the legacy importer: align thread.updated_at with the
-    // canonical session's metadata-derived `updated_at_ms`, falling
-    // back to the latest entry timestamp when the source did not
-    // record one. The server-side override clamps this to a max
-    // against the live row so existing-thread updated_at never moves
-    // backwards (spec §3.2.4 revised).
-    let entry_max_ms = importable.iter().map(|e| e.timestamp_ms).max().unwrap_or(0);
-    let session_updated_at_ms = if session.updated_at_ms > 0 {
-        session.updated_at_ms
-    } else {
-        entry_max_ms
-    };
     // The existing-external_id pre-fetch only matters when there is an
     // attachment to (potentially) skip. Pre-fetched external_ids belong to
     // memories that `upsert_by_external_id` will reuse; resolving their
@@ -286,7 +330,6 @@ pub async fn run_import(
             thread_target: Some(thread_target),
             memories: pb_memories,
             upsert_by_external_id: true,
-            thread_updated_at_override: if is_last { session_updated_at_ms } else { 0 },
             labels: if is_last { labels.clone() } else { Vec::new() },
         };
 
@@ -307,6 +350,13 @@ pub async fn run_import(
         if current_thread_id.is_none() {
             result.thread_id = Some(batch_thread_id.value);
             result.thread_created = response.thread_created;
+            if response.thread_created
+                && let Some(sink) = event_sink
+                && let Err(error) = sink.thread_created(&session.channel, batch_thread_id.value)
+            {
+                result.error = Some(error);
+                return result;
+            }
         }
         current_thread_id = Some(batch_thread_id);
 
@@ -387,6 +437,8 @@ fn build_thread_data(session: &CanonicalSession, user_id: i64) -> ThreadData {
         embedding_dim: None,
         created_at: session.created_at_ms,
         updated_at: session.created_at_ms,
+        first_message_at: None,
+        last_message_at: None,
         labels: Vec::new(),
         metadata: None,
         memory_kind: MemoryKind::Raw as i32,
@@ -706,10 +758,34 @@ pub async fn run_all<S: ChatSource>(
     extra_labels: &[String],
     chunk_limits: ChunkLimits,
 ) -> Result<Vec<CanonicalSessionResult>> {
+    run_all_with_event_sink(
+        source,
+        client,
+        since_millis,
+        since_millis_with_margin,
+        user_id,
+        extra_labels,
+        chunk_limits,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_all_with_event_sink<S: ChatSource>(
+    source: &S,
+    client: Option<&dyn ImportClient>,
+    since_millis: Option<i64>,
+    since_millis_with_margin: Option<i64>,
+    user_id: i64,
+    extra_labels: &[String],
+    chunk_limits: ChunkLimits,
+    event_sink: Option<&dyn ImportEventSink>,
+) -> Result<Vec<CanonicalSessionResult>> {
     let inputs = source.discover()?;
     let mut results = Vec::with_capacity(inputs.len());
     for input in &inputs {
-        let res = run_session_dispatch(
+        let mut res = run_session_dispatch(
             source,
             input,
             client,
@@ -718,8 +794,10 @@ pub async fn run_all<S: ChatSource>(
             user_id,
             extra_labels,
             chunk_limits,
+            event_sink,
         )
         .await;
+        emit_session_completion(&mut res, event_sink);
         results.push(res);
     }
     Ok(results)
@@ -741,7 +819,31 @@ pub async fn run_all_with_entry_collector<'a, S: ChatSource>(
     since_millis_with_margin: Option<i64>,
     user_id: i64,
     extra_labels: &[String],
+    collect: impl FnMut(&[CanonicalEntry]) + 'a,
+) -> Result<Vec<CanonicalSessionResult>> {
+    run_all_with_entry_collector_and_event_sink(
+        source,
+        client,
+        since_millis,
+        since_millis_with_margin,
+        user_id,
+        extra_labels,
+        collect,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_all_with_entry_collector_and_event_sink<'a, S: ChatSource>(
+    source: &S,
+    client: Option<&dyn ImportClient>,
+    since_millis: Option<i64>,
+    since_millis_with_margin: Option<i64>,
+    user_id: i64,
+    extra_labels: &[String],
     mut collect: impl FnMut(&[CanonicalEntry]) + 'a,
+    event_sink: Option<&dyn ImportEventSink>,
 ) -> Result<Vec<CanonicalSessionResult>> {
     // Note: the collector path still feeds the legacy `run_import`
     // (Vec-based) flow, which has its own hard-coded chunk caps
@@ -752,7 +854,7 @@ pub async fn run_all_with_entry_collector<'a, S: ChatSource>(
     let inputs = source.discover()?;
     let mut results = Vec::with_capacity(inputs.len());
     for input in &inputs {
-        let res = run_session_with_collector(
+        let mut res = run_session_with_collector(
             source,
             input,
             client,
@@ -761,8 +863,10 @@ pub async fn run_all_with_entry_collector<'a, S: ChatSource>(
             user_id,
             extra_labels,
             &mut collect,
+            event_sink,
         )
         .await;
+        emit_session_completion(&mut res, event_sink);
         results.push(res);
     }
     Ok(results)
@@ -786,6 +890,7 @@ async fn run_session<S: ChatSource>(
         user_id,
         extra_labels,
         &mut |_| {},
+        None,
     )
     .await
 }
@@ -806,6 +911,7 @@ async fn run_session_dispatch<S: ChatSource>(
     user_id: i64,
     extra_labels: &[String],
     chunk_limits: ChunkLimits,
+    event_sink: Option<&dyn ImportEventSink>,
 ) -> CanonicalSessionResult {
     let outcome = match source.read_session(input, since_millis_with_margin) {
         Ok(o) => o,
@@ -834,7 +940,7 @@ async fn run_session_dispatch<S: ChatSource>(
             source_filtered_count,
         } => match client {
             Some(c) => {
-                run_import_streaming(
+                run_import_streaming_with_event_sink(
                     c,
                     &session,
                     crate::source::CanonicalEntryStream::from_vec(entries),
@@ -843,6 +949,7 @@ async fn run_session_dispatch<S: ChatSource>(
                     user_id,
                     extra_labels,
                     chunk_limits,
+                    event_sink,
                 )
                 .await
             }
@@ -854,7 +961,7 @@ async fn run_session_dispatch<S: ChatSource>(
             source_filtered_count_initial,
         } => match client {
             Some(c) => {
-                run_import_streaming(
+                run_import_streaming_with_event_sink(
                     c,
                     &session,
                     stream,
@@ -863,6 +970,7 @@ async fn run_session_dispatch<S: ChatSource>(
                     user_id,
                     extra_labels,
                     chunk_limits,
+                    event_sink,
                 )
                 .await
             }
@@ -914,6 +1022,7 @@ async fn run_session_with_collector<S: ChatSource>(
     user_id: i64,
     extra_labels: &[String],
     collect: &mut dyn FnMut(&[CanonicalEntry]),
+    event_sink: Option<&dyn ImportEventSink>,
 ) -> CanonicalSessionResult {
     let outcome = match source.read_session(input, since_millis_with_margin) {
         Ok(o) => o,
@@ -941,6 +1050,7 @@ async fn run_session_with_collector<S: ChatSource>(
                 user_id,
                 extra_labels,
                 collect,
+                event_sink,
             )
             .await
         }
@@ -977,6 +1087,7 @@ async fn run_session_with_collector<S: ChatSource>(
                 user_id,
                 extra_labels,
                 collect,
+                event_sink,
             )
             .await
         }
@@ -1007,6 +1118,7 @@ async fn run_import_for_vec(
     user_id: i64,
     extra_labels: &[String],
     collect: &mut dyn FnMut(&[CanonicalEntry]),
+    event_sink: Option<&dyn ImportEventSink>,
 ) -> CanonicalSessionResult {
     // Collector must only see entries that are actually going to be
     // sent to AddMemoriesBatch. plain's `--prune-missing` keys off
@@ -1029,7 +1141,7 @@ async fn run_import_for_vec(
     }
     match client {
         Some(c) => {
-            run_import(
+            run_import_with_event_sink(
                 c,
                 &session,
                 entries,
@@ -1037,6 +1149,7 @@ async fn run_import_for_vec(
                 since_millis,
                 user_id,
                 extra_labels,
+                event_sink,
             )
             .await
         }
@@ -1079,8 +1192,6 @@ fn dry_run_session_result(
 // set is one in-flight batch plus the entry currently being processed.
 //
 // Trade-offs vs `run_import`:
-//   * `entry_max_ms` is computed online (max of seen timestamps) rather
-//     than from a slice in one pass.
 //   * `already_imported` is fetched lazily on the first attachment
 //     encountered so transcripts without attachments never round-trip
 //     `find_memories_by_external_id_prefix`.
@@ -1173,8 +1284,35 @@ pub async fn run_import_streaming(
     extra_labels: &[String],
     chunk_limits: ChunkLimits,
 ) -> CanonicalSessionResult {
+    run_import_streaming_with_event_sink(
+        client,
+        session,
+        entries_stream,
+        source_filtered_count_initial,
+        since_millis,
+        user_id,
+        extra_labels,
+        chunk_limits,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_import_streaming_with_event_sink(
+    client: &dyn ImportClient,
+    session: &CanonicalSession,
+    entries_stream: crate::source::CanonicalEntryStream,
+    source_filtered_count_initial: usize,
+    since_millis: Option<i64>,
+    user_id: i64,
+    extra_labels: &[String],
+    chunk_limits: ChunkLimits,
+    event_sink: Option<&dyn ImportEventSink>,
+) -> CanonicalSessionResult {
     let mut result = CanonicalSessionResult {
         session_id: session.session_id.clone(),
+        session_key: Some(session.channel.clone()),
         memories_skipped_filtered: source_filtered_count_initial,
         ..Default::default()
     };
@@ -1188,7 +1326,6 @@ pub async fn run_import_streaming(
 
     // Streaming state.
     let mut builder = ChunkBuilder::new(chunk_limits);
-    let mut entry_max_ms: i64 = 0;
     let mut current_thread_id: Option<ThreadId> = None;
 
     // Source-side warnings are accumulated to `memories_skipped_filtered`
@@ -1260,12 +1397,10 @@ pub async fn run_import_streaming(
         };
         let size = pb.encoded_len();
 
-        entry_max_ms = entry_max_ms.max(entry.timestamp_ms);
-
         if builder.would_overflow(size) {
             // Flush the current batch before pushing the new entry.
             // We don't yet know whether this is the last chunk, so
-            // labels / updated_at_override are deferred.
+            // labels are deferred until the final request.
             if let Err(err) = flush_chunk(
                 client,
                 session,
@@ -1276,6 +1411,7 @@ pub async fn run_import_streaming(
                 /*is_last=*/ false,
                 0,
                 &[],
+                event_sink,
             )
             .await
             {
@@ -1290,12 +1426,8 @@ pub async fn run_import_streaming(
         return result;
     }
 
-    // Final flush carries labels + thread.updated_at override.
-    let session_updated_at_ms = if session.updated_at_ms > 0 {
-        session.updated_at_ms
-    } else {
-        entry_max_ms
-    };
+    // The server derives thread extrema from the accepted memories. Source
+    // session timestamps are intentionally not sent as thread audit values.
     if let Err(err) = flush_chunk(
         client,
         session,
@@ -1304,8 +1436,9 @@ pub async fn run_import_streaming(
         &mut current_thread_id,
         &mut result,
         /*is_last=*/ true,
-        session_updated_at_ms,
+        0,
         &labels,
+        event_sink,
     )
     .await
     {
@@ -1417,8 +1550,9 @@ async fn flush_chunk(
     current_thread_id: &mut Option<ThreadId>,
     result: &mut CanonicalSessionResult,
     is_last: bool,
-    session_updated_at_ms: i64,
+    _session_updated_at_ms: i64,
     labels: &[String],
+    event_sink: Option<&dyn ImportEventSink>,
 ) -> Result<(), String> {
     let chunk_len = builder.len();
     let (mut chunk_entries, chunk_inputs) = builder.take();
@@ -1443,7 +1577,6 @@ async fn flush_chunk(
         thread_target: Some(thread_target),
         memories: pb_sorted,
         upsert_by_external_id: true,
-        thread_updated_at_override: if is_last { session_updated_at_ms } else { 0 },
         labels: if is_last { labels.to_vec() } else { Vec::new() },
     };
 
@@ -1458,6 +1591,11 @@ async fn flush_chunk(
     if current_thread_id.is_none() {
         result.thread_id = Some(batch_thread_id.value);
         result.thread_created = response.thread_created;
+        if response.thread_created
+            && let Some(sink) = event_sink
+        {
+            sink.thread_created(&session.channel, batch_thread_id.value)?;
+        }
     }
     *current_thread_id = Some(batch_thread_id);
 
@@ -1834,6 +1972,7 @@ mod tests {
         fail_prefix_query: Mutex<bool>,
         exact_external_id_queries: Mutex<Vec<String>>,
         prefix_queries: Mutex<Vec<String>>,
+        fail_batch_call: Mutex<Option<usize>>,
     }
 
     impl FakeImportClient {
@@ -1881,6 +2020,9 @@ mod tests {
         fn prefix_queries(&self) -> Vec<String> {
             self.prefix_queries.lock().unwrap().clone()
         }
+        fn fail_batch_call(&self, call: usize) {
+            *self.fail_batch_call.lock().unwrap() = Some(call);
+        }
     }
 
     #[async_trait]
@@ -1890,6 +2032,10 @@ mod tests {
             request: AddMemoriesBatchRequest,
         ) -> anyhow::Result<AddMemoriesBatchResponse> {
             self.recorded_batches.lock().unwrap().push(request.clone());
+            let call = self.recorded_batches.lock().unwrap().len();
+            if *self.fail_batch_call.lock().unwrap() == Some(call) {
+                anyhow::bail!("simulated batch failure at call {call}");
+            }
             let mut q = self.canned_batches.lock().unwrap();
             if let Some(r) = (!q.is_empty()).then(|| q.remove(0)) {
                 return Ok(r);
@@ -2353,11 +2499,9 @@ mod tests {
         let batches = fake.batches();
         // total=505 with chunk size 500 → 2 chunks.
         assert_eq!(batches.len(), 2);
-        // Labels and updated_at override only on the final chunk.
+        // Labels are attached only on the final chunk.
         assert!(batches[0].labels.is_empty());
-        assert_eq!(batches[0].thread_updated_at_override, 0);
         assert_eq!(batches[1].labels, labels);
-        assert!(batches[1].thread_updated_at_override > 0);
     }
 
     /// A handful of entries whose individual encoded sizes already
@@ -2739,6 +2883,165 @@ mod tests {
 
     fn stream_of(entries: Vec<CanonicalEntry>) -> crate::source::CanonicalEntryStream {
         crate::source::CanonicalEntryStream::from_vec(entries)
+    }
+
+    #[derive(Default)]
+    struct RecordingEventSink {
+        creations: Mutex<Vec<(String, i64)>>,
+        completions: Mutex<Vec<(String, i64, usize, bool)>>,
+    }
+
+    impl ImportEventSink for RecordingEventSink {
+        fn thread_created(&self, session_key: &str, thread_id: i64) -> Result<(), String> {
+            self.creations
+                .lock()
+                .unwrap()
+                .push((session_key.to_string(), thread_id));
+            Ok(())
+        }
+
+        fn session_completed(
+            &self,
+            session_key: &str,
+            thread_id: i64,
+            imported_count: usize,
+            success: bool,
+        ) -> Result<(), String> {
+            self.completions.lock().unwrap().push((
+                session_key.to_string(),
+                thread_id,
+                imported_count,
+                success,
+            ));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn completion_events_cover_existing_retry_failure_and_threadless_results() {
+        let sink = RecordingEventSink::default();
+        let mut retry = CanonicalSessionResult {
+            session_id: "retry".into(),
+            session_key: Some("codex:retry".into()),
+            thread_id: Some(9_007_199_254_740_993),
+            thread_created: false,
+            memories_skipped_duplicate: 3,
+            ..Default::default()
+        };
+        let mut failure = CanonicalSessionResult {
+            session_id: "failure".into(),
+            session_key: Some("codex:failure".into()),
+            thread_id: Some(43),
+            memories_imported: 1,
+            error: Some("later chunk failed".into()),
+            ..Default::default()
+        };
+        let mut threadless = CanonicalSessionResult {
+            session_id: "parse-failure".into(),
+            error: Some("invalid input".into()),
+            ..Default::default()
+        };
+
+        emit_session_completion(&mut retry, Some(&sink));
+        emit_session_completion(&mut failure, Some(&sink));
+        emit_session_completion(&mut threadless, Some(&sink));
+
+        assert_eq!(
+            *sink.completions.lock().unwrap(),
+            vec![
+                ("codex:retry".into(), 9_007_199_254_740_993, 3, true),
+                ("codex:failure".into(), 43, 1, false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn creation_event_precedes_a_later_chunk_failure() {
+        let fake = FakeImportClient::default();
+        fake.push_batch(AddMemoriesBatchResponse {
+            thread_id: Some(PbThreadId {
+                value: 9_007_199_254_740_993,
+            }),
+            thread_created: true,
+            outcomes: vec![AddMemoryOutcome {
+                memory_id: Some(PbMemoryId { value: 1 }),
+                created: true,
+                position: 0,
+                existing_parent_ids_empty: false,
+                resolved_parent_ids: Vec::new(),
+            }],
+        });
+        fake.fail_batch_call(2);
+        let sink = RecordingEventSink::default();
+
+        let result = run_import_streaming_with_event_sink(
+            &fake,
+            &fake_session(),
+            stream_of(vec![
+                entry_with("first", 1, vec![]),
+                entry_with("second", 2, vec![]),
+            ]),
+            0,
+            None,
+            1,
+            &[],
+            ChunkLimits {
+                max_entries: 1,
+                max_bytes: usize::MAX,
+            },
+            Some(&sink),
+        )
+        .await;
+
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("simulated batch failure"))
+        );
+        assert_eq!(
+            *sink.creations.lock().unwrap(),
+            vec![("codex:sfake".to_string(), 9_007_199_254_740_993)]
+        );
+        assert_eq!(result.cumulative_imported_count(), 1);
+    }
+
+    struct FailingEventSink;
+
+    impl ImportEventSink for FailingEventSink {
+        fn thread_created(&self, _session_key: &str, _thread_id: i64) -> Result<(), String> {
+            Err("event stdout closed".into())
+        }
+
+        fn session_completed(
+            &self,
+            _session_key: &str,
+            _thread_id: i64,
+            _imported_count: usize,
+            _success: bool,
+        ) -> Result<(), String> {
+            Err("event stdout closed".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn creation_event_output_failure_fails_the_session_immediately() {
+        let result = run_import_streaming_with_event_sink(
+            &FakeImportClient::default(),
+            &fake_session(),
+            stream_of(vec![entry_with("first", 1, vec![])]),
+            0,
+            None,
+            1,
+            &[],
+            ChunkLimits::default(),
+            Some(&FailingEventSink),
+        )
+        .await;
+
+        assert_eq!(result.thread_id, Some(9_000));
+        assert_eq!(result.error.as_deref(), Some("event stdout closed"));
+        assert_eq!(result.memories_imported, 0);
     }
 
     #[test]

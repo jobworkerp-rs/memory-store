@@ -33,6 +33,14 @@ path = "src/bin/memories_admin.rs"
 name = "memories-maintenance"
 path = "src/bin/memories_maintenance.rs"
 
+[[bin]]
+name = "migrate-thread-time-fields"
+path = "src/bin/migrate_thread_time_fields.rs"
+
+[[bin]]
+name = "memories-db-migrate"
+path = "src/bin/memories_db_migrate.rs"
+
 # Phase 3's one-shot data migration binary (`migrate_sp_to_memory`) was
 # removed in Phase 4. Phase 4 assumes that every production environment has
 # already run Phase 3 end-to-end; the Phase 4 SQL drop scripts physically
@@ -74,6 +82,7 @@ base64 = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
+url = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 sqlx = { workspace = true, features = [
@@ -115,6 +124,7 @@ lindera = ["infra/lindera", "app/lindera"]
 
 [dev-dependencies]
 serial_test = "3"
+tempfile = "3"
 # Client-streaming Upload in the #[ignore] image-memory e2e test.
 # `infra::test_helper::shared_id_generator` (one monotonic Snowflake
 # bucket) for the cleanup-orphan-media sweep e2e: separate

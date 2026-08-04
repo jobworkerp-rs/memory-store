@@ -20,7 +20,7 @@ use infra_utils::infra::rdb::UseRdbPool;
 use memory_utils::cache::stretto::UseMemoryCache;
 use memory_utils::lock::RwLockWithKey;
 use protobuf::llm_memory::data::{
-    Memory, MemoryData, MemoryId, Thread, ThreadSearchFilter, UserId,
+    Memory, MemoryData, MemoryId, Thread, ThreadId, ThreadSearchFilter, UserId,
 };
 use std::{sync::Arc, time::Duration};
 use stretto::TokioCache;
@@ -79,6 +79,9 @@ pub trait MemoryApp:
     + Sized
     + 'static
 {
+    fn thread_vector_app(&self) -> Option<&super::thread_vector::ThreadVectorAppImpl> {
+        None
+    }
     async fn create_memory(&self, memory: &MemoryData) -> Result<MemoryId>;
 
     async fn update_memory(
@@ -105,10 +108,22 @@ pub trait MemoryApp:
         // PostgreSQL. The advisory lock taken above prevents another
         // transaction from adding a new reference to this memory while this
         // delete is in flight, so the locked id list is complete.
-        let affected_thread_ids = self
+        let mut affected_thread_ids = self
             .thread_repository()
             .find_thread_ids_by_default_system_memory_for_update_tx(&mut *tx, id.value)
             .await?;
+        let membership_thread_ids = self
+            .thread_memory_repository()
+            .find_all_threads_by_memory_tx(&mut *tx, id.value)
+            .await?;
+        affected_thread_ids.extend(membership_thread_ids);
+        affected_thread_ids.sort_unstable();
+        affected_thread_ids.dedup();
+        for thread_id in &affected_thread_ids {
+            self.thread_repository()
+                .find_row_for_update_tx(&mut *tx, &ThreadId { value: *thread_id })
+                .await?;
+        }
         // With the thread rows fixed, locking the memory row now serializes
         // against sibling validations that still need to read the memory as a
         // default candidate.
@@ -142,6 +157,10 @@ pub trait MemoryApp:
         self.thread_memory_repository()
             .delete_by_memory_tx(&mut *tx, id.value)
             .await?;
+        let now = command_utils::util::datetime::now_millis();
+        self.thread_repository()
+            .refresh_message_bounds_for_thread_ids_tx(&mut tx, &affected_thread_ids, now)
+            .await?;
         // media_object ref_count decrement in the SAME tx (design 2/3
         // §7.5.4). The claim winner runs the storage->DB delete after
         // commit. Skipped entirely when the media subsystem is not wired
@@ -168,6 +187,11 @@ pub trait MemoryApp:
         let _ = self.delete_cache(&k).await;
         for thread_id in affected_thread_ids {
             let _ = self.delete_thread_cache_by_id(thread_id).await;
+            if let Some(tva) = self.thread_vector_app()
+                && let Err(e) = tva.sync_thread_scalars(thread_id).await
+            {
+                tracing::warn!("sync_thread_scalars after delete_memory failed: {e}");
+            }
         }
         Ok(deleted)
     }
@@ -458,6 +482,9 @@ pub struct MemoryAppImpl {
     default_ttl: Duration,
     embedding_dispatcher:
         Option<Arc<infra::infra::memory_vector::dispatcher::EmbeddingJobDispatcher>>,
+    /// Shared with `ThreadAppImpl` so membership changes performed through
+    /// the memory surface can refresh indexed thread scalars after commit.
+    thread_vector_app: Option<Arc<super::thread_vector::ThreadVectorAppImpl>>,
     /// Read once from `MEMORY_IMAGE_SEARCH_MODE` (env is immutable) so the
     /// create/update dispatch hot path does not re-parse it, mirroring
     /// `thread_filter_config`. Decides whether a media-bearing memory
@@ -546,9 +573,21 @@ impl MemoryAppImpl {
             key_lock: RwLockWithKey::new(16 * 1024), // XXX  fix it
             default_ttl: Duration::from_secs(Self::DEFAULT_TTL_SEC),
             embedding_dispatcher,
+            thread_vector_app: None,
             image_search_mode: infra::infra::embedding_dispatch::ImageSearchMode::from_env(),
             media: None,
         }
+    }
+
+    /// Wire the optional thread vector application after it is assembled.
+    /// This stays a builder because vector search is optional and the DI
+    /// module creates the shared instance before moving repository fields.
+    pub fn with_thread_vector_app(
+        mut self,
+        thread_vector_app: Option<Arc<super::thread_vector::ThreadVectorAppImpl>>,
+    ) -> Self {
+        self.thread_vector_app = thread_vector_app;
+        self
     }
 
     /// Wire the media subsystem (image memory feature). Called from the
@@ -658,6 +697,10 @@ impl UseThreadMemoryRepository for MemoryAppImpl {
 
 #[async_trait]
 impl MemoryApp for MemoryAppImpl {
+    fn thread_vector_app(&self) -> Option<&super::thread_vector::ThreadVectorAppImpl> {
+        self.thread_vector_app.as_deref()
+    }
+
     fn media_subsystem(&self) -> Option<&MediaSubsystem> {
         self.media.as_ref()
     }
@@ -1052,9 +1095,12 @@ mod tests {
     use infra::infra::media_object::rdb::{GC_DELETING, GC_UNRESOLVABLE, MediaObjectReservation};
     use infra::infra::media_storage::StorageBackend;
     use infra::infra::media_storage::inline::InlineMediaStorage;
+    use infra::infra::memory_vector::config::{DistanceType, FtsConfig, VectorIndexConfig};
+    use infra::infra::thread_vector::config::ThreadVectorDBConfig;
+    use infra::infra::thread_vector::repository::ThreadVectorRepositoryImpl;
     use infra_utils::infra::rdb::RdbPool;
     use infra_utils::infra::test::{TEST_RUNTIME, setup_test_rdb_from};
-    use protobuf::llm_memory::data::MediaObjectId;
+    use protobuf::llm_memory::data::{MediaObjectId, ThreadData};
 
     async fn pool() -> &'static RdbPool {
         #[cfg(feature = "postgres")]
@@ -1101,6 +1147,116 @@ mod tests {
             media_app.clone(),
         );
         (app, media_app)
+    }
+
+    #[tokio::test]
+    async fn delete_memory_syncs_derived_message_times_to_thread_vector() {
+        let pool = pool().await;
+        let id_gen = infra::test_helper::shared_id_generator();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let vector_repo = ThreadVectorRepositoryImpl::new(ThreadVectorDBConfig {
+            uri: format!("/tmp/memory_app_thread_vector_{unique}"),
+            table_name: "threads".to_string(),
+            vector_size: 4,
+            distance_type: DistanceType::Cosine,
+            fts: FtsConfig::default(),
+            vector_index: VectorIndexConfig::default(),
+        })
+        .await
+        .unwrap();
+        let vector_repo_for_assert = vector_repo.clone();
+        let vector_app = Arc::new(crate::app::thread_vector::ThreadVectorAppImpl::new(
+            ThreadRepositoryImpl::new(id_gen.clone(), pool),
+            ThreadLabelRepositoryImpl::new(pool),
+            vector_repo,
+            None,
+        ));
+        let memory_app = MemoryAppImpl::new(
+            MemoryRepositoryImpl::new(id_gen.clone(), pool),
+            MemoryRatingRepositoryImpl::new(id_gen.clone(), pool),
+            ThreadRepositoryImpl::new(id_gen.clone(), pool),
+            ThreadMemoryRepositoryImpl::new(pool),
+            ThreadLabelRepositoryImpl::new(pool),
+            cache(),
+            cache(),
+            None,
+        )
+        .with_thread_vector_app(Some(vector_app.clone()));
+
+        let thread_repo = ThreadRepositoryImpl::new(id_gen.clone(), pool);
+        let thread_memory_repo = ThreadMemoryRepositoryImpl::new(pool);
+        let mut tx = pool.begin().await.unwrap();
+        let thread_id = thread_repo
+            .create(
+                &mut *tx,
+                &ThreadData {
+                    user_id: Some(UserId { value: 1 }),
+                    description: Some("thread description".to_string()),
+                    created_at: 10,
+                    updated_at: 10,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let memory_id = memory_app
+            .create_memory(&MemoryData {
+                user_id: Some(UserId { value: 1 }),
+                content: "message".to_string(),
+                created_at: 100,
+                updated_at: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        thread_memory_repo
+            .insert_auto_position_tx(&mut *tx, thread_id.value, memory_id.value, 100)
+            .await
+            .unwrap();
+        thread_repo
+            .refresh_message_bounds_tx(&mut tx, &thread_id, 100)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        vector_app
+            .batch_upsert_thread_embeddings_rows(
+                thread_id.value,
+                None,
+                &["text".to_string()],
+                vec![(
+                    "text".to_string(),
+                    0,
+                    0,
+                    18,
+                    "thread description".to_string(),
+                    vec![1.0, 0.0, 0.0, 0.0],
+                )],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            vector_repo_for_assert
+                .find_records_by_thread_id(thread_id.value)
+                .await
+                .unwrap()[0]
+                .last_message_at,
+            Some(100)
+        );
+
+        assert!(memory_app.delete_memory(&memory_id).await.unwrap());
+        let records = vector_repo_for_assert
+            .find_records_by_thread_id(thread_id.value)
+            .await
+            .unwrap();
+        assert_eq!(records[0].first_message_at, None);
+        assert_eq!(records[0].last_message_at, None);
     }
 
     /// Seed a confirmed orphan media_object (storage_uri set, gc_state=1)

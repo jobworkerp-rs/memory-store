@@ -23,7 +23,7 @@ use sqlx::Executor;
 // this constant would silently break under `--features postgres`.
 pub const INSERT_SQL: &str = concat!(
     "INSERT INTO thread (id, default_system_memory_id, user_id, description, channel, ",
-    "embedding, embedding_dim, created_at, updated_at, metadata, memory_kind) VALUES (",
+    "embedding, embedding_dim, created_at, updated_at, first_message_at, last_message_at, metadata, memory_kind) VALUES (",
     p!(1),
     ",",
     p!(2),
@@ -42,9 +42,13 @@ pub const INSERT_SQL: &str = concat!(
     ",",
     p!(9),
     ",",
-    p_jsonb!(10),
+    p!(10),
     ",",
     p!(11),
+    ",",
+    p_jsonb!(12),
+    ",",
+    p!(13),
     ")"
 );
 
@@ -109,7 +113,7 @@ const FIND_FOR_UPDATE_SQL: &str = concat!(
 const FIND_LIST_LIMIT_SQL: &str = concat!(
     "SELECT ",
     thread_columns!(),
-    " FROM thread ORDER BY id DESC LIMIT ",
+    " FROM thread ORDER BY last_message_at DESC NULLS LAST, id DESC LIMIT ",
     p!(1),
     " OFFSET ",
     p!(2),
@@ -119,7 +123,7 @@ const FIND_LIST_LIMIT_SQL: &str = concat!(
 const FIND_LIST_ALL_SQL: &str = concat!(
     "SELECT ",
     thread_columns!(),
-    " FROM thread ORDER BY id DESC;"
+    " FROM thread ORDER BY last_message_at DESC NULLS LAST, id DESC;"
 );
 
 // (P8) `FIND_BY_USER_LIMIT_SQL` / `FIND_BY_USER_ALL_SQL` were retired in
@@ -133,6 +137,7 @@ const FIND_LIST_ALL_SQL: &str = concat!(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThreadSort {
     #[default]
+    LastMessageDesc,
     UpdatedDesc,
     UpdatedAsc,
     CreatedDesc,
@@ -147,12 +152,14 @@ impl From<i32> for ThreadSort {
     /// pinned by `data/common.proto::ThreadListSort`.
     fn from(value: i32) -> Self {
         match value {
+            1 => Self::UpdatedDesc,
             2 => Self::UpdatedAsc,
             3 => Self::CreatedDesc,
             4 => Self::CreatedAsc,
             5 => Self::IdDesc,
-            // 0 (UNSPECIFIED) and 1 (UPDATED_DESC) both land here.
-            _ => Self::UpdatedDesc,
+            6 => Self::LastMessageDesc,
+            // 0 (UNSPECIFIED) maps to the current list default.
+            _ => Self::LastMessageDesc,
         }
     }
 }
@@ -178,6 +185,7 @@ fn limit_offset_sql_fragment(next_idx: usize) -> String {
 /// sort key gives the order a stable tiebreaker for paginated reads.
 fn order_by_thread(sort: ThreadSort) -> &'static str {
     match sort {
+        ThreadSort::LastMessageDesc => "last_message_at DESC NULLS LAST, id DESC",
         ThreadSort::UpdatedDesc => "updated_at DESC, id DESC",
         ThreadSort::UpdatedAsc => "updated_at ASC, id ASC",
         ThreadSort::CreatedDesc => "created_at DESC, id DESC",
@@ -204,12 +212,94 @@ const UPDATE_UPDATED_AT_SQL: &str = concat!(
     ";"
 );
 
+#[cfg(feature = "postgres")]
+const UPDATE_MESSAGE_BOUNDS_IF_CHANGED_SQL: &str = concat!(
+    "UPDATE thread SET first_message_at = ",
+    p!(1),
+    ", last_message_at = ",
+    p!(2),
+    ", updated_at = ",
+    p!(3),
+    " WHERE id = ",
+    p!(4),
+    " AND (first_message_at IS DISTINCT FROM ",
+    p!(5),
+    " OR last_message_at IS DISTINCT FROM ",
+    p!(6),
+    ");"
+);
+
+// Historical migration must not turn a derived-value backfill into a false
+// audit event. Normal membership mutations use the audited statement above.
+#[cfg(feature = "postgres")]
+const UPDATE_MESSAGE_BOUNDS_PRESERVING_AUDIT_SQL: &str = concat!(
+    "UPDATE thread SET first_message_at = ",
+    p!(1),
+    ", last_message_at = ",
+    p!(2),
+    " WHERE id = ",
+    p!(3),
+    " AND (first_message_at IS DISTINCT FROM ",
+    p!(4),
+    " OR last_message_at IS DISTINCT FROM ",
+    p!(5),
+    ");"
+);
+#[cfg(not(feature = "postgres"))]
+const UPDATE_MESSAGE_BOUNDS_PRESERVING_AUDIT_SQL: &str = concat!(
+    "UPDATE thread SET first_message_at = ",
+    p!(1),
+    ", last_message_at = ",
+    p!(2),
+    " WHERE id = ",
+    p!(3),
+    " AND (first_message_at IS NOT ",
+    p!(4),
+    " OR last_message_at IS NOT ",
+    p!(5),
+    ");"
+);
+#[cfg(not(feature = "postgres"))]
+const UPDATE_MESSAGE_BOUNDS_IF_CHANGED_SQL: &str = concat!(
+    "UPDATE thread SET first_message_at = ",
+    p!(1),
+    ", last_message_at = ",
+    p!(2),
+    ", updated_at = ",
+    p!(3),
+    " WHERE id = ",
+    p!(4),
+    " AND (first_message_at IS NOT ",
+    p!(5),
+    " OR last_message_at IS NOT ",
+    p!(6),
+    ");"
+);
+
 // Count threads that reference the given memory as their default system
 // prompt. Used by delete_memory to reject deletion while still referenced.
 const COUNT_THREADS_BY_DEFAULT_SYSTEM_MEMORY_SQL: &str = concat!(
     "SELECT COUNT(*) FROM thread WHERE default_system_memory_id = ",
     p!(1),
 );
+
+async fn find_message_bounds_tx(
+    tx: &mut infra_utils::infra::rdb::RdbTransaction<'_>,
+    id: &ThreadId,
+) -> Result<(Option<i64>, Option<i64>)> {
+    let aggregate_sql = format!(
+        "SELECT MIN(memory.created_at), MAX(memory.created_at) FROM thread_memory \
+         JOIN memory ON memory.id = thread_memory.memory_id \
+         WHERE thread_memory.thread_id = {}",
+        p!(1)
+    );
+    sqlx::query_as(sqlx::AssertSqlSafe(aggregate_sql))
+        .bind(id.value)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(LlmMemoryError::DBError)
+        .context("recompute thread message bounds")
+}
 
 // Clear default_system_memory_id on all threads that reference the given
 // memory. Used by delete_memory to detach dangling default references
@@ -259,8 +349,8 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         thread: &ThreadData,
     ) -> Result<ThreadId> {
         let id: i64 = self.id_generator().generate_id()?;
-        let (created_at, updated_at) =
-            crate::infra::fill_timestamps(thread.created_at, thread.updated_at);
+        let created_at = command_utils::util::datetime::now_millis();
+        let updated_at = created_at;
         let res = sqlx::query::<Rdb>(INSERT_SQL)
             .bind(id)
             .bind(thread.default_system_memory_id)
@@ -271,6 +361,8 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
             .bind(thread.embedding_dim)
             .bind(created_at)
             .bind(updated_at)
+            .bind(Option::<i64>::None)
+            .bind(Option::<i64>::None)
             .bind(&thread.metadata)
             .bind(thread.memory_kind)
             .execute(tx)
@@ -293,7 +385,7 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         id: &ThreadId,
         thread: &ThreadData,
     ) -> Result<bool> {
-        let updated_at = crate::infra::fill_updated_at(thread.updated_at);
+        let updated_at = command_utils::util::datetime::now_millis();
         sqlx::query(UPDATE_SQL)
             .bind(thread.default_system_memory_id)
             .bind(thread.user_id.map(|u| u.value).unwrap_or(0))
@@ -390,7 +482,7 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         for chunk in ids.chunks(IN_LIST_CHUNK_SIZE) {
             let placeholders = build_in_placeholders(chunk.len(), 1);
             let sql = format!(
-                "SELECT {} FROM thread WHERE id IN ({}) ORDER BY id DESC",
+                "SELECT {} FROM thread WHERE id IN ({}) ORDER BY last_message_at DESC NULLS LAST, id DESC",
                 thread_columns!(),
                 placeholders
             );
@@ -496,7 +588,7 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
             format!(" WHERE {kind_clause}")
         };
         let mut sql = format!(
-            "SELECT {} FROM thread{where_clause} ORDER BY id DESC",
+            "SELECT {} FROM thread{where_clause} ORDER BY last_message_at DESC NULLS LAST, id DESC",
             thread_columns!()
         );
         if limit.is_some() {
@@ -532,6 +624,10 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         created_before: Option<i64>,
         updated_after: Option<i64>,
         updated_before: Option<i64>,
+        first_message_after: Option<i64>,
+        first_message_before: Option<i64>,
+        last_message_after: Option<i64>,
+        last_message_before: Option<i64>,
         sort: ThreadSort,
         memory_kinds: &[i32],
     ) -> Result<Vec<Thread>> {
@@ -559,6 +655,18 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         }
         if updated_before.is_some() {
             push_clause("updated_at", "<=");
+        }
+        if first_message_after.is_some() {
+            push_clause("first_message_at", ">");
+        }
+        if first_message_before.is_some() {
+            push_clause("first_message_at", "<=");
+        }
+        if last_message_after.is_some() {
+            push_clause("last_message_at", ">");
+        }
+        if last_message_before.is_some() {
+            push_clause("last_message_at", "<=");
         }
         if !memory_kinds.is_empty() {
             #[cfg(feature = "postgres")]
@@ -600,6 +708,18 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
             query = query.bind(v);
         }
         if let Some(v) = updated_before {
+            query = query.bind(v);
+        }
+        if let Some(v) = first_message_after {
+            query = query.bind(v);
+        }
+        if let Some(v) = first_message_before {
+            query = query.bind(v);
+        }
+        if let Some(v) = last_message_after {
+            query = query.bind(v);
+        }
+        if let Some(v) = last_message_before {
             query = query.bind(v);
         }
         for kind in memory_kinds {
@@ -681,6 +801,10 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         created_before: Option<i64>,
         updated_after: Option<i64>,
         updated_before: Option<i64>,
+        first_message_after: Option<i64>,
+        first_message_before: Option<i64>,
+        last_message_after: Option<i64>,
+        last_message_before: Option<i64>,
         memory_kinds: &[i32],
         max: i64,
     ) -> Result<Vec<i64>> {
@@ -720,6 +844,18 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         }
         if updated_before.is_some() {
             push_clause(&mut clauses, "updated_at", "<");
+        }
+        if first_message_after.is_some() {
+            push_clause(&mut clauses, "first_message_at", ">");
+        }
+        if first_message_before.is_some() {
+            push_clause(&mut clauses, "first_message_at", "<");
+        }
+        if last_message_after.is_some() {
+            push_clause(&mut clauses, "last_message_at", ">");
+        }
+        if last_message_before.is_some() {
+            push_clause(&mut clauses, "last_message_at", "<");
         }
         if !memory_kinds.is_empty() {
             let placeholders = next_placeholders(memory_kinds.len());
@@ -765,6 +901,18 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         if let Some(v) = updated_before {
             query = query.bind(v);
         }
+        if let Some(v) = first_message_after {
+            query = query.bind(v);
+        }
+        if let Some(v) = first_message_before {
+            query = query.bind(v);
+        }
+        if let Some(v) = last_message_after {
+            query = query.bind(v);
+        }
+        if let Some(v) = last_message_before {
+            query = query.bind(v);
+        }
         for kind in memory_kinds {
             query = query.bind(*kind);
         }
@@ -791,6 +939,74 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
             .map(|r| r.rows_affected() > 0)
             .map_err(LlmMemoryError::DBError)
             .context(format!("error in update_updated_at: id = {}", id.value))
+    }
+
+    /// Recompute the extrema for a locked thread. A changed extrema is a
+    /// thread-record update, so the statement updates the audit timestamp
+    /// only when either derived value changes.
+    async fn refresh_message_bounds_tx(
+        &self,
+        tx: &mut infra_utils::infra::rdb::RdbTransaction<'_>,
+        id: &ThreadId,
+        now: i64,
+    ) -> Result<bool> {
+        let (first, last) = find_message_bounds_tx(tx, id).await?;
+        sqlx::query(UPDATE_MESSAGE_BOUNDS_IF_CHANGED_SQL)
+            .bind(first)
+            .bind(last)
+            .bind(now)
+            .bind(id.value)
+            .bind(first)
+            .bind(last)
+            .execute(&mut **tx)
+            .await
+            .map(|r| r.rows_affected() > 0)
+            .map_err(LlmMemoryError::DBError)
+            .context("update thread message bounds")
+    }
+
+    /// Refresh a set of affected threads in a stable order. Duplicate IDs are
+    /// ignored so one membership mutation cannot update a thread twice.
+    async fn refresh_message_bounds_for_thread_ids_tx(
+        &self,
+        tx: &mut infra_utils::infra::rdb::RdbTransaction<'_>,
+        thread_ids: &[i64],
+        now: i64,
+    ) -> Result<Vec<i64>> {
+        let mut ids = thread_ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+
+        let mut changed_ids = Vec::with_capacity(ids.len());
+        for id in ids {
+            let thread_id = ThreadId { value: id };
+            if self.refresh_message_bounds_tx(tx, &thread_id, now).await? {
+                changed_ids.push(id);
+            }
+        }
+        Ok(changed_ids)
+    }
+
+    /// Backfill extrema without changing historical thread audit timestamps.
+    /// This is deliberately restricted to the maintenance command; live
+    /// membership operations must use `refresh_message_bounds_tx`.
+    async fn backfill_message_bounds_preserving_audit_tx(
+        &self,
+        tx: &mut infra_utils::infra::rdb::RdbTransaction<'_>,
+        id: &ThreadId,
+    ) -> Result<bool> {
+        let (first, last) = find_message_bounds_tx(tx, id).await?;
+        sqlx::query(UPDATE_MESSAGE_BOUNDS_PRESERVING_AUDIT_SQL)
+            .bind(first)
+            .bind(last)
+            .bind(id.value)
+            .bind(first)
+            .bind(last)
+            .execute(&mut **tx)
+            .await
+            .map(|r| r.rows_affected() > 0)
+            .map_err(LlmMemoryError::DBError)
+            .context("backfill thread message bounds while preserving audit")
     }
 
     /// Count how many threads reference the given memory as their
@@ -900,6 +1116,7 @@ mod test {
     use super::ThreadSort;
     use super::ThreadSummary;
     use crate::infra::memory::rdb::{MemoryRepository, MemoryRepositoryImpl};
+    use crate::sql::p;
     use anyhow::Context;
     use anyhow::Result;
     use infra_utils::infra::rdb::RdbPool;
@@ -921,6 +1138,8 @@ mod test {
             embedding_dim: None,
             created_at: 9,
             updated_at: 10,
+            first_message_at: None,
+            last_message_at: None,
             labels: vec![],
             metadata: None,
             memory_kind: 0,
@@ -932,13 +1151,17 @@ mod test {
         tx.commit().await.context("error in test create commit")?;
 
         let id1 = id;
-        let expect = Thread {
+        let mut expect = Thread {
             id: Some(id1),
             data,
         };
 
         // find
         let found = repository.find(&id1).await?;
+        expect.data.as_mut().unwrap().created_at =
+            found.as_ref().unwrap().data.as_ref().unwrap().created_at;
+        expect.data.as_mut().unwrap().updated_at =
+            found.as_ref().unwrap().data.as_ref().unwrap().updated_at;
         assert_eq!(Some(&expect), found.as_ref());
 
         // update (created_at in update data is ignored — original value preserved)
@@ -952,6 +1175,8 @@ mod test {
             embedding_dim: None,
             created_at: 10,
             updated_at: 11,
+            first_message_at: None,
+            last_message_at: None,
             labels: vec![],
             metadata: None,
             memory_kind: 0,
@@ -962,17 +1187,20 @@ mod test {
         assert!(updated);
         tx.commit().await.context("error in test update commit")?;
 
-        // find after update — created_at should be preserved from original insert (9)
+        // find after update — the server-managed created_at is preserved.
         let found = repository.find(&expect.id.unwrap()).await?;
         let found_data = found.unwrap().data.unwrap();
-        assert_eq!(found_data.created_at, 9);
         assert_eq!(
-            found_data,
-            ThreadData {
-                created_at: 9,
-                ..update.clone()
-            }
+            found_data.created_at,
+            expect.data.as_ref().unwrap().created_at
         );
+        assert_eq!(found_data.description, update.description);
+        assert_eq!(found_data.channel, update.channel);
+        assert_eq!(
+            found_data.default_system_memory_id,
+            update.default_system_memory_id
+        );
+        assert!(found_data.updated_at >= found_data.created_at);
 
         // update_updated_at
         tx = db.begin().await.context("error in test")?;
@@ -994,6 +1222,8 @@ mod test {
             embedding_dim: None,
             created_at: 12,
             updated_at: 13,
+            first_message_at: None,
+            last_message_at: None,
             labels: vec![],
             metadata: None,
             memory_kind: MemoryKind::Personality as i32,
@@ -1021,6 +1251,10 @@ mod test {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
+                None,
                 ThreadSort::default(),
                 &[MemoryKind::Raw as i32],
             )
@@ -1034,6 +1268,10 @@ mod test {
         let personality_list = repository
             .find_by_user_id(
                 UserId { value: 4 },
+                None,
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1078,6 +1316,8 @@ mod test {
             embedding_dim: None,
             created_at: 100,
             updated_at: 100,
+            first_message_at: None,
+            last_message_at: None,
             labels: vec![],
             metadata: None,
             memory_kind: 0,
@@ -1160,6 +1400,8 @@ mod test {
             embedding_dim: None,
             created_at: 100,
             updated_at: 100,
+            first_message_at: None,
+            last_message_at: None,
             labels: vec![],
             metadata: None,
             memory_kind: 0,
@@ -1168,6 +1410,12 @@ mod test {
         let mut tx = db.begin().await.context("begin")?;
         let id = repository.create(&mut *tx, &data).await?;
         tx.commit().await.context("commit")?;
+        let original_created_at = repository
+            .find(&id)
+            .await?
+            .and_then(|thread| thread.data)
+            .map(|thread| thread.created_at)
+            .expect("created thread timestamp");
 
         // Update with updated_at=0 should auto-fill server timestamp
         let update_data = ThreadData {
@@ -1191,7 +1439,7 @@ mod test {
         );
         // created_at should be preserved from original insert, not changed by update
         assert_eq!(
-            found_data.created_at, 100,
+            found_data.created_at, original_created_at,
             "created_at should be preserved from original insert, got {}",
             found_data.created_at
         );
@@ -1215,6 +1463,8 @@ mod test {
             embedding_dim: None,
             created_at: 0,
             updated_at: 0,
+            first_message_at: None,
+            last_message_at: None,
             labels: vec![],
             metadata: None,
             memory_kind: 0,
@@ -1252,8 +1502,8 @@ mod test {
 
         let found2 = repository.find(&id2).await?.expect("should exist");
         let found_data2 = found2.data.unwrap();
-        assert_eq!(found_data2.created_at, 12345);
-        assert_eq!(found_data2.updated_at, 67890);
+        assert!(found_data2.created_at > 0);
+        assert!(found_data2.updated_at > 0);
 
         // cleanup
         repository.delete(&id).await?;
@@ -1288,6 +1538,200 @@ mod test {
                 pool
             }
         }
+    }
+
+    async fn _test_default_list_orders_by_last_message_at(pool: &'static RdbPool) -> Result<()> {
+        let repository = ThreadRepositoryImpl::new(crate::test_helper::shared_id_generator(), pool);
+        let data = ThreadData {
+            default_system_memory_id: None,
+            user_id: Some(UserId { value: 1 }),
+            description: None,
+            channel: None,
+            embedding: None,
+            embedding_dim: None,
+            created_at: 1,
+            updated_at: 1,
+            first_message_at: None,
+            last_message_at: None,
+            labels: vec![],
+            metadata: None,
+            memory_kind: MemoryKind::Raw as i32,
+        };
+        let mut tx = repository.db_pool().begin().await?;
+        let older = repository.create(&mut *tx, &data).await?;
+        let newer = repository.create(&mut *tx, &data).await?;
+        let empty = repository.create(&mut *tx, &data).await?;
+        let set_last_message_at_sql = format!(
+            "UPDATE thread SET last_message_at = {} WHERE id = {}",
+            p!(1),
+            p!(2)
+        );
+        sqlx::query(sqlx::AssertSqlSafe(set_last_message_at_sql.clone()))
+            .bind(100_i64)
+            .bind(older.value)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(sqlx::AssertSqlSafe(set_last_message_at_sql))
+            .bind(200_i64)
+            .bind(newer.value)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        let list = repository.find_list(None, None).await?;
+        let ids: Vec<i64> = list
+            .into_iter()
+            .map(|thread| thread.id.unwrap().value)
+            .collect();
+        assert_eq!(ids, vec![newer.value, older.value, empty.value]);
+        Ok(())
+    }
+
+    #[test]
+    fn run_default_list_orders_by_last_message_at_test() -> Result<()> {
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_pool().await;
+            _test_default_list_orders_by_last_message_at(pool).await
+        })
+    }
+
+    async fn _test_backfill_bounds_preserves_audit(pool: &'static RdbPool) -> Result<()> {
+        use crate::infra::thread_memory::rdb::{
+            ThreadMemoryRepository, ThreadMemoryRepositoryImpl,
+        };
+
+        let id_generator = crate::test_helper::shared_id_generator();
+        let thread_repo = ThreadRepositoryImpl::new(id_generator.clone(), pool);
+        let memory_repo = MemoryRepositoryImpl::new(id_generator, pool);
+        let membership_repo = ThreadMemoryRepositoryImpl::new(pool);
+        let thread = ThreadData {
+            default_system_memory_id: None,
+            user_id: Some(UserId { value: 1 }),
+            description: None,
+            channel: None,
+            embedding: None,
+            embedding_dim: None,
+            created_at: 1,
+            updated_at: 1,
+            first_message_at: None,
+            last_message_at: None,
+            labels: vec![],
+            metadata: None,
+            memory_kind: MemoryKind::Raw as i32,
+        };
+        let memory = MemoryData {
+            parent_ids: vec![],
+            user_id: Some(UserId { value: 1 }),
+            content: "migration fixture".to_string(),
+            content_type: 0,
+            params: None,
+            metadata: None,
+            created_at: 123,
+            updated_at: 123,
+            role: 0,
+            external_id: None,
+            media_object_id: None,
+            thread_ids: vec![],
+            memory_kind: MemoryKind::Raw as i32,
+        };
+        let mut tx = pool.begin().await?;
+        let thread_id = thread_repo.create(&mut *tx, &thread).await?;
+        let memory_id = memory_repo.create(&mut *tx, &memory).await?;
+        membership_repo
+            .insert_tx(&mut *tx, thread_id.value, memory_id.value, 0, 123)
+            .await?;
+        let set_audit_sql = format!(
+            "UPDATE thread SET created_at = 10, updated_at = 20 WHERE id = {}",
+            p!(1)
+        );
+        sqlx::query(sqlx::AssertSqlSafe(set_audit_sql))
+            .bind(thread_id.value)
+            .execute(&mut *tx)
+            .await?;
+        assert!(
+            thread_repo
+                .backfill_message_bounds_preserving_audit_tx(&mut tx, &thread_id)
+                .await?
+        );
+        tx.commit().await?;
+
+        let data = thread_repo.find(&thread_id).await?.unwrap().data.unwrap();
+        assert_eq!(data.first_message_at, Some(123));
+        assert_eq!(data.last_message_at, Some(123));
+        assert_eq!(data.created_at, 10);
+        assert_eq!(data.updated_at, 20);
+        Ok(())
+    }
+
+    #[test]
+    fn run_backfill_bounds_preserves_audit_test() -> Result<()> {
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_pool().await;
+            _test_backfill_bounds_preserves_audit(pool).await
+        })
+    }
+
+    #[test]
+    fn run_refresh_bounds_for_thread_ids_updates_audit_once_per_thread_test() -> Result<()> {
+        use crate::infra::thread_memory::rdb::{
+            ThreadMemoryRepository, ThreadMemoryRepositoryImpl,
+        };
+        use infra_utils::infra::test::TEST_RUNTIME;
+
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_pool().await;
+            let id_generator = crate::test_helper::shared_id_generator();
+            let thread_repo = ThreadRepositoryImpl::new(id_generator.clone(), pool);
+            let memory_repo = MemoryRepositoryImpl::new(id_generator, pool);
+            let membership_repo = ThreadMemoryRepositoryImpl::new(pool);
+            let thread = ThreadData {
+                user_id: Some(UserId { value: 1 }),
+                memory_kind: MemoryKind::Raw as i32,
+                ..Default::default()
+            };
+            let memory = MemoryData {
+                user_id: Some(UserId { value: 1 }),
+                content: "message bounds batch".to_string(),
+                created_at: 123,
+                updated_at: 123,
+                memory_kind: MemoryKind::Raw as i32,
+                ..Default::default()
+            };
+            let mut tx = pool.begin().await?;
+            let thread_id = thread_repo.create(&mut *tx, &thread).await?;
+            let memory_id = memory_repo.create(&mut *tx, &memory).await?;
+            membership_repo
+                .insert_tx(&mut *tx, thread_id.value, memory_id.value, 0, 123)
+                .await?;
+            let set_updated_at_sql = format!(
+                "UPDATE thread SET updated_at = {} WHERE id = {}",
+                p!(1),
+                p!(2)
+            );
+            sqlx::query(sqlx::AssertSqlSafe(set_updated_at_sql))
+                .bind(20_i64)
+                .bind(thread_id.value)
+                .execute(&mut *tx)
+                .await?;
+
+            let changed = thread_repo
+                .refresh_message_bounds_for_thread_ids_tx(
+                    &mut tx,
+                    &[thread_id.value, thread_id.value],
+                    30,
+                )
+                .await?;
+            assert_eq!(changed, vec![thread_id.value]);
+            tx.commit().await?;
+
+            let data = thread_repo.find(&thread_id).await?.unwrap().data.unwrap();
+            assert_eq!(data.first_message_at, Some(123));
+            assert_eq!(data.last_message_at, Some(123));
+            assert_eq!(data.updated_at, 30);
+            Ok(())
+        })
     }
 
     #[test]
@@ -1348,6 +1792,8 @@ mod test {
             embedding_dim: None,
             created_at: 100,
             updated_at: 100,
+            first_message_at: None,
+            last_message_at: None,
             labels: vec![],
             metadata: initial_metadata.clone(),
             memory_kind: 0,
@@ -1441,6 +1887,8 @@ mod test {
             .bind(None::<i32>) // embedding_dim
             .bind(created_at)
             .bind(updated_at)
+            .bind(None::<i64>) // first_message_at
+            .bind(None::<i64>) // last_message_at
             .bind(None::<String>) // metadata
             .bind(0_i32) // memory_kind (legacy fixture)
             .execute(pool)
@@ -1468,13 +1916,39 @@ mod test {
 
         // user_id only.
         let by_user = repo
-            .find_thread_ids_by_filter(Some(1), None, None, None, None, None, &[], max)
+            .find_thread_ids_by_filter(
+                Some(1),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                max,
+            )
             .await?;
         assert_eq!(to_set(by_user), to_set(vec![9_100_001, 9_100_002]));
 
         // channel only.
         let by_channel = repo
-            .find_thread_ids_by_filter(None, Some("alpha"), None, None, None, None, &[], max)
+            .find_thread_ids_by_filter(
+                None,
+                Some("alpha"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                max,
+            )
             .await?;
         assert_eq!(
             to_set(by_channel),
@@ -1483,7 +1957,20 @@ mod test {
 
         // user_id + channel (intersection).
         let by_uc = repo
-            .find_thread_ids_by_filter(Some(2), Some("alpha"), None, None, None, None, &[], max)
+            .find_thread_ids_by_filter(
+                Some(2),
+                Some("alpha"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                max,
+            )
             .await?;
         assert_eq!(to_set(by_uc), to_set(vec![9_100_003, 9_100_004]));
 
@@ -1491,6 +1978,10 @@ mod test {
         // backfill is in progress.
         let conversations = repo
             .find_thread_ids_by_filter(
+                None,
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1505,26 +1996,78 @@ mod test {
 
         // created_after — strictly greater (not >=).
         let after_100 = repo
-            .find_thread_ids_by_filter(None, None, Some(100), None, None, None, &[], max)
+            .find_thread_ids_by_filter(
+                None,
+                None,
+                Some(100),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                max,
+            )
             .await?;
         assert_eq!(to_set(after_100), to_set(vec![9_100_002, 9_100_004]));
 
         // created_before + updated_after combined.
         let combo = repo
-            .find_thread_ids_by_filter(None, None, None, Some(200), Some(100), None, &[], max)
+            .find_thread_ids_by_filter(
+                None,
+                None,
+                None,
+                Some(200),
+                Some(100),
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                max,
+            )
             .await?;
         assert_eq!(to_set(combo), to_set(vec![9_100_001, 9_100_002, 9_100_003]));
 
         // No conditions returns every thread (capped by max + 1).
         let none = repo
-            .find_thread_ids_by_filter(None, None, None, None, None, None, &[], max)
+            .find_thread_ids_by_filter(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                max,
+            )
             .await?;
         assert_eq!(none.len(), 5);
 
         // `max + 1` overfetch: ask for max=2 against 5 rows, get 3 (the
         // caller uses len > max to detect "exceeds max").
         let over = repo
-            .find_thread_ids_by_filter(None, None, None, None, None, None, &[], 2)
+            .find_thread_ids_by_filter(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                2,
+            )
             .await?;
         assert_eq!(over.len(), 3);
 

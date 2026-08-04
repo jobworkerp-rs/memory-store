@@ -164,6 +164,11 @@ const FIND_THREADS_BY_MEMORY_SQL: &str = concat!(
     " LIMIT 2",
 );
 
+const FIND_ALL_THREADS_BY_MEMORY_SQL: &str = concat!(
+    "SELECT thread_id FROM thread_memory WHERE memory_id = ",
+    p!(1),
+);
+
 #[async_trait]
 pub trait ThreadMemoryRepository: UseRdbPool + Sync + Send {
     async fn insert_tx<'c, E: Executor<'c, Database = Rdb>>(
@@ -371,6 +376,24 @@ pub trait ThreadMemoryRepository: UseRdbPool + Sync + Send {
             .map_err(LlmMemoryError::DBError)
             .context(format!(
                 "error in thread_memory find_threads_by_memory: memory={memory_id}"
+            ))
+    }
+
+    /// Reverse lookup for destructive membership changes. Unlike the
+    /// compatibility fallback above, this intentionally returns every
+    /// affected thread so each derived thread field can be refreshed.
+    async fn find_all_threads_by_memory_tx<'c, E: Executor<'c, Database = Rdb>>(
+        &self,
+        tx: E,
+        memory_id: i64,
+    ) -> Result<Vec<i64>> {
+        sqlx::query_scalar::<_, i64>(FIND_ALL_THREADS_BY_MEMORY_SQL)
+            .bind(memory_id)
+            .fetch_all(tx)
+            .await
+            .map_err(LlmMemoryError::DBError)
+            .context(format!(
+                "error in thread_memory find_all_threads_by_memory: memory={memory_id}"
             ))
     }
 

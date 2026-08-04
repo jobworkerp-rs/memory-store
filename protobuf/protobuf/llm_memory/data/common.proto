@@ -73,7 +73,7 @@ enum MemoryListSort {
 }
 
 // Sort key for ThreadService.FindThreadListByUserId / FindThreadListByLabels.
-// UNSPECIFIED (= 0) maps to UPDATED_DESC (default).
+// UNSPECIFIED (= 0) maps to LAST_MESSAGE_DESC (default).
 enum ThreadListSort {
     THREAD_LIST_SORT_UNSPECIFIED  = 0;
     THREAD_LIST_SORT_UPDATED_DESC = 1;
@@ -81,4 +81,5 @@ enum ThreadListSort {
     THREAD_LIST_SORT_CREATED_DESC = 3;
     THREAD_LIST_SORT_CREATED_ASC  = 4;
     THREAD_LIST_SORT_ID_DESC      = 5;
+    THREAD_LIST_SORT_LAST_MESSAGE_DESC = 6;
 }

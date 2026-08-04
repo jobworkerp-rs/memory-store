@@ -338,7 +338,10 @@ impl AppModule {
             // to a same-process `MemoryApp::find_memory`.
             Some(memory_cache.clone()),
         )
-        .await;
+        .await
+        // Reflection finalize/delete changes aggregate-thread membership,
+        // so preserve vector scalar consistency on both paths.
+        .with_thread_vector_app(thread_vector_app_arc.clone());
 
         // Build the MediaApp first (as an Arc) so MemoryAppImpl can share
         // the very same instance for post-commit `finish_delete` and the
@@ -412,6 +415,10 @@ impl AppModule {
                     memory_cache.clone(),
                     embedding_dispatcher.clone(),
                 )
+                // A memory deletion can change a thread's derived message
+                // bounds, so it must refresh the same vector scalar rows as
+                // the thread mutation surface.
+                .with_thread_vector_app(thread_vector_app_arc.clone())
                 // Wire the media subsystem so create/update/delete keep
                 // media_object.ref_count consistent in the memory tx.
                 .with_media(memory_media_object_repo, media_app_arc.clone())

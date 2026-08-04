@@ -306,12 +306,8 @@ impl ChatSource for CodexSource {
             }
         }
 
-        // Bump session.updated_at_ms to the latest entry timestamp so
-        // thread.updated_at reflects the latest activity, not the
-        // session start. Without this, --since + --summarize-after-*
-        // can fail to surface threads whose newest memory is past the
-        // since cutoff. Parity with claude-code's
-        // `extract_session_info` (max of entry timestamps).
+        // Keep source-session metadata consistent with its entries. Thread
+        // message extrema are derived server-side from imported memories.
         if let Some(max_ts) = entries.iter().map(|e| e.timestamp_ms).max()
             && max_ts > canonical_session.updated_at_ms
         {
@@ -2153,12 +2149,10 @@ mod tests {
     }
 
     #[test]
-    fn session_updated_at_advances_to_latest_entry_timestamp() {
+    fn source_session_updated_at_advances_to_latest_entry_timestamp() {
         // session_meta is at 01:00:00; the newest event is at 01:00:30.
-        // session.updated_at_ms must reflect 01:00:30 so that
-        // thread.updated_at (set from session.updated_at_ms on a fresh
-        // import) places the thread inside an updated_after_ms window
-        // that starts after session_meta but before the latest entry.
+        // Source metadata remains useful to source-specific callers even
+        // though the importer never writes it into thread audit fields.
         let (_d, p) = write_lines(&[
             meta_line(),
             r#"{"timestamp":"2026-04-20T01:00:10.000Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#,

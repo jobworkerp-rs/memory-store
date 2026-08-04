@@ -26,10 +26,11 @@ message ThreadData {
     optional bytes embedding = 5;
     // Dimensionality of `embedding`, used for restoration on decode.
     optional int32 embedding_dim = 6;
-    // Creation time (milliseconds since epoch). Server fills the current time when 0 is sent.
+    // Audit creation time (milliseconds since epoch), managed by the server.
+    // Client supplied values are ignored.
     int64 created_at = 7;
-    // Last-update time (milliseconds since epoch). Server fills the current time when 0 is sent.
-    // Bumped automatically when a Memory is attached via AddMemory.
+    // Audit update time (milliseconds since epoch), managed by the server.
+    // Client supplied values are ignored.
     int64 updated_at = 8;
     // Label list. Populated by server on Find/FindList.
     // On Create: if non-empty, labels are persisted atomically with the thread.
@@ -61,6 +62,10 @@ message ThreadData {
     // Data kind owned by this thread. Zero is accepted only during the
     // expand/compatibility migration and is rejected at the persistence boundary.
     MemoryKind memory_kind = 12;
+    // Earliest attached memory's creation time. Unset for an empty thread.
+    optional int64 first_message_at = 13;
+    // Latest attached memory's creation time. Unset for an empty thread.
+    optional int64 last_message_at = 14;
 }
 
 // Unique identifier for a thread.

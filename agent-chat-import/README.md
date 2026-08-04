@@ -49,8 +49,9 @@ Block decomposition creates these memories:
 - Direct `image` block: one `kind=attachment` memory.
 - `type=attachment` JSONL event: one `kind=attachment`, `role=meta` memory.
 
-Global options such as `-u`, `-s`, `-l`, `-n`, `-v`, `-b`, `--server-url`, and
-post-import generation options can be placed before or after the subcommand.
+Global options such as `-u`, `-s`, `-l`, `-n`, `-v`, `-b`, `--server-url`,
+`--events-jsonl`, and post-import generation options can be placed before or
+after the subcommand.
 
 ```bash
 memories-import claude-code -u 1 --all-projects
@@ -307,6 +308,30 @@ Important `plain` options:
 
 ## Global Options
 
+### Import lifecycle events
+
+`--events-jsonl` adds one JSON object per line to standard output while keeping
+the ordinary human-readable output. Event objects use
+`schema="memories-import-event"` and `version=1`.
+
+`thread_created` is emitted immediately after the first `AddMemoriesBatch`
+response reports that a new thread was created. `session_completed` is emitted
+when that real session finishes. A `thread_id` is always a decimal string, so
+IDs larger than JavaScript's safe integer range remain exact.
+
+`source` is the CLI subcommand name: `claude-code`, `codex`, or `plain`.
+`session_key` is the stable canonical channel used across retries; for `plain`,
+it preserves an arbitrary `--source-name`. A completion event's
+`imported_count` is the cumulative number of entries confirmed as newly
+created or already present through duplicate upserts during that attempt.
+Successful retries into an existing thread also emit a completion event with
+its `thread_id`, but do not emit a creation event.
+
+Sessions skipped before obtaining a thread ID, including parse skips and input
+errors, emit no lifecycle event. If a later chunk fails after a creation event,
+the importer emits a matching completion with `success=false`. Failure to write
+an event makes the import unsuccessful.
+
 | Option | Default | Description |
 |---|---|---|
 | `-u, --user-id` | required for import | Creator user ID for imported threads |
@@ -315,6 +340,7 @@ Important `plain` options:
 | `--no-mtime-filter` | `false` | Disable session-level mtime filtering |
 | `-l, --labels` | none | Additional labels; comma-separated and repeatable |
 | `-n, --dry-run` | `false` | Count without server writes |
+| `--events-jsonl` | `false` | Add versioned import lifecycle events to standard output |
 | `-v, --verbose` | `false` | Equivalent to `RUST_LOG=debug` |
 | `-b, --batch-size` | `100` | Progress logging interval |
 | `--summarize-after-file` / `--summarize-after-json` | none | Mutually exclusive; requires `--summarize-workflow` |

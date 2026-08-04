@@ -41,6 +41,10 @@ pub struct ThreadListOptions {
     pub created_before: Option<i64>,
     pub updated_after: Option<i64>,
     pub updated_before: Option<i64>,
+    pub first_message_after: Option<i64>,
+    pub first_message_before: Option<i64>,
+    pub last_message_after: Option<i64>,
+    pub last_message_before: Option<i64>,
     pub sort: ThreadSort,
     pub memory_kinds: Vec<i32>,
 }
@@ -52,6 +56,10 @@ impl ThreadListOptions {
             || self.created_before.is_some()
             || self.updated_after.is_some()
             || self.updated_before.is_some()
+            || self.first_message_after.is_some()
+            || self.first_message_before.is_some()
+            || self.last_message_after.is_some()
+            || self.last_message_before.is_some()
     }
 
     fn has_memory_kind_filter(&self) -> bool {
@@ -89,6 +97,30 @@ impl ThreadListOptions {
             return false;
         }
         if self
+            .first_message_after
+            .is_some_and(|after| d.first_message_at.is_none_or(|value| value <= after))
+        {
+            return false;
+        }
+        if self
+            .first_message_before
+            .is_some_and(|before| d.first_message_at.is_none_or(|value| value > before))
+        {
+            return false;
+        }
+        if self
+            .last_message_after
+            .is_some_and(|after| d.last_message_at.is_none_or(|value| value <= after))
+        {
+            return false;
+        }
+        if self
+            .last_message_before
+            .is_some_and(|before| d.last_message_at.is_none_or(|value| value > before))
+        {
+            return false;
+        }
+        if self
             .created_before
             .is_some_and(|before| d.created_at > before)
         {
@@ -117,8 +149,15 @@ fn sort_threads_in_place(threads: &mut [Thread], sort: ThreadSort) {
     use std::cmp::Reverse;
     let updated_at = |t: &Thread| t.data.as_ref().map(|d| d.updated_at).unwrap_or(0);
     let created_at = |t: &Thread| t.data.as_ref().map(|d| d.created_at).unwrap_or(0);
+    let last_message_at = |t: &Thread| t.data.as_ref().and_then(|d| d.last_message_at);
     let id = |t: &Thread| t.id.as_ref().map(|i| i.value).unwrap_or(0);
     match sort {
+        ThreadSort::LastMessageDesc => threads.sort_by_key(|t| {
+            (
+                std::cmp::Reverse(last_message_at(t)),
+                std::cmp::Reverse(id(t)),
+            )
+        }),
         ThreadSort::UpdatedDesc => threads.sort_by_key(|t| Reverse((updated_at(t), id(t)))),
         ThreadSort::UpdatedAsc => threads.sort_by_key(|t| (updated_at(t), id(t))),
         ThreadSort::CreatedDesc => threads.sort_by_key(|t| Reverse((created_at(t), id(t)))),
@@ -237,7 +276,7 @@ pub enum BatchThreadTarget {
     /// Upsert a thread keyed by `(user_id, channel)`. New thread metadata
     /// (description, default_system_memory_id, ...) is taken from
     /// `thread_data` only when creating a new row.
-    UpsertByChannel(ThreadData),
+    UpsertByChannel(Box<ThreadData>),
 }
 
 /// Inputs passed to `ThreadApp::add_memories_batch`. Keeping the bag of
@@ -248,8 +287,6 @@ pub struct AddMemoriesBatchInput {
     pub thread_target: BatchThreadTarget,
     pub memories: Vec<BatchMemoryInput>,
     pub upsert_by_external_id: bool,
-    /// 0 means "no override".
-    pub thread_updated_at_override: i64,
     pub labels: Vec<String>,
 }
 
@@ -354,6 +391,9 @@ pub trait ThreadApp:
             self.thread_memory_repository()
                 .insert_or_ignore_auto_position_tx(&mut *tx, id.value, default_id, now)
                 .await?;
+            self.thread_repository()
+                .refresh_message_bounds_tx(&mut tx, &id, now)
+                .await?;
         }
 
         if !to_insert.labels.is_empty() {
@@ -425,17 +465,35 @@ pub trait ThreadApp:
             )
             .await?;
             to_update.default_system_memory_id = normalized_default;
-            let updated = self
-                .thread_repository()
-                .update(&mut *tx, id, &to_update)
-                .await?;
-            if !updated {
+            let thread_changed = existing.default_system_memory_id
+                != to_update.default_system_memory_id
+                || existing.description != to_update.description
+                || existing.channel != to_update.channel
+                || existing.embedding != to_update.embedding
+                || existing.embedding_dim != to_update.embedding_dim
+                || existing.metadata != to_update.metadata
+                || existing.memory_kind.unwrap_or(0) != to_update.memory_kind;
+            if thread_changed
+                && !self
+                    .thread_repository()
+                    .update(&mut *tx, id, &to_update)
+                    .await?
+            {
                 return Err(LlmMemoryError::NotFound(format!(
                     "thread {} was deleted by a concurrent transaction",
                     id.value
                 ))
                 .into());
             }
+
+            let desired_labels = validate_labels(&w.labels)?;
+            let current_labels = self
+                .thread_label_repository()
+                .find_labels_by_thread_tx(&mut *tx, id.value)
+                .await?;
+            let current_set: HashSet<_> = current_labels.into_iter().collect();
+            let desired_set: HashSet<_> = desired_labels.iter().cloned().collect();
+            let labels_changed = current_set != desired_set;
 
             // Anchor the new default in the junction so delete_thread's
             // orphan check knows it is still referenced.
@@ -448,34 +506,40 @@ pub trait ThreadApp:
             // Removing it would silently break history reconstruction.
             // The old default stays in the junction and is cleaned up
             // only when the thread itself is deleted (orphan check).
+            let mut bounds_changed = false;
             if let Some(default_id) = normalized_default {
                 let now = command_utils::util::datetime::now_millis();
                 self.thread_memory_repository()
                     .insert_or_ignore_auto_position_tx(&mut *tx, id.value, default_id, now)
                     .await?;
+                bounds_changed = self
+                    .thread_repository()
+                    .refresh_message_bounds_tx(&mut tx, id, now)
+                    .await?;
             }
 
-            // Replace labels (PUT semantics: always replace, empty = clear all)
-            {
-                let validated = if !w.labels.is_empty() {
-                    Some(validate_labels(&w.labels)?)
-                } else {
-                    None
-                };
+            // Preserve existing junction rows for labels that stay in the set,
+            // including their created_at audit timestamp.
+            if labels_changed {
                 let now = command_utils::util::datetime::now_millis();
-                self.thread_label_repository()
-                    .delete_by_thread_tx(&mut *tx, id.value)
-                    .await?;
-                if let Some(validated) = validated {
-                    for label in &validated {
-                        self.thread_label_repository()
-                            .add_labels_tx(&mut *tx, id.value, label, now)
-                            .await?;
-                    }
+                let removed: Vec<_> = current_set.difference(&desired_set).cloned().collect();
+                let added: Vec<_> = desired_set.difference(&current_set).cloned().collect();
+                if !removed.is_empty() {
+                    self.thread_label_repository()
+                        .remove_labels_tx(&mut *tx, id.value, &removed)
+                        .await?;
+                }
+                for label in added {
+                    self.thread_label_repository()
+                        .add_labels_tx(&mut *tx, id.value, &label, now)
+                        .await?;
                 }
             }
 
             tx.commit().await.map_err(LlmMemoryError::DBError)?;
+            if !thread_changed && !labels_changed && !bounds_changed {
+                return Ok(true);
+            }
             let k = Arc::new(Self::find_cache_key(&id.value));
             let _ = self.delete_cache(&k).await;
 
@@ -719,6 +783,10 @@ pub trait ThreadApp:
                 opts.created_before,
                 opts.updated_after,
                 opts.updated_before,
+                opts.first_message_after,
+                opts.first_message_before,
+                opts.last_message_after,
+                opts.last_message_before,
                 opts.sort,
                 &opts.memory_kinds,
             )
@@ -807,10 +875,6 @@ pub trait ThreadApp:
         self.add_labels_core_tx(&mut tx, thread_id, &validated, now)
             .await?;
 
-        self.thread_repository()
-            .update_updated_at_tx(&mut *tx, thread_id, now)
-            .await?;
-
         tx.commit().await.map_err(LlmMemoryError::DBError)?;
 
         let k = Arc::new(Self::find_cache_key(&thread_id.value));
@@ -864,7 +928,6 @@ pub trait ThreadApp:
 
         let trimmed: Vec<String> = labels.iter().map(|l| l.trim().to_string()).collect();
         let pool = self.thread_repository().db_pool();
-        let now = command_utils::util::datetime::now_millis();
         let mut tx = pool.begin().await.map_err(LlmMemoryError::DBError)?;
 
         // Lock thread row — prevents concurrent deletion
@@ -879,11 +942,6 @@ pub trait ThreadApp:
         // Delete labels within the same transaction
         self.thread_label_repository()
             .remove_labels_tx(&mut *tx, thread_id.value, &trimmed)
-            .await?;
-
-        // Bump updated_at
-        self.thread_repository()
-            .update_updated_at_tx(&mut *tx, thread_id, now)
             .await?;
 
         tx.commit().await.map_err(LlmMemoryError::DBError)?;
@@ -1062,6 +1120,40 @@ pub trait ThreadApp:
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn find_distinct_labels_with_message_times(
+        &self,
+        user_id: Option<i64>,
+        limit: Option<i32>,
+        offset: Option<i64>,
+        created_after: Option<i64>,
+        created_before: Option<i64>,
+        updated_after: Option<i64>,
+        updated_before: Option<i64>,
+        first_message_after: Option<i64>,
+        first_message_before: Option<i64>,
+        last_message_after: Option<i64>,
+        last_message_before: Option<i64>,
+        memory_kinds: &[i32],
+    ) -> Result<Vec<LabelWithCountRow>> {
+        self.thread_label_repository()
+            .find_distinct_labels_with_message_times(
+                user_id,
+                limit,
+                offset,
+                created_after,
+                created_before,
+                updated_after,
+                updated_before,
+                first_message_after,
+                first_message_before,
+                last_message_after,
+                last_message_before,
+                memory_kinds,
+            )
+            .await
+    }
+
     /// Search labels by substring.
     ///
     /// (P9) Same time-range parameters and semantics as
@@ -1077,8 +1169,39 @@ pub trait ThreadApp:
         updated_after: Option<i64>,
         updated_before: Option<i64>,
     ) -> Result<Vec<LabelWithCountRow>> {
+        self.search_labels_with_message_times(
+            query,
+            user_id,
+            limit,
+            created_after,
+            created_before,
+            updated_after,
+            updated_before,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn search_labels_with_message_times(
+        &self,
+        query: &str,
+        user_id: Option<i64>,
+        limit: Option<i32>,
+        created_after: Option<i64>,
+        created_before: Option<i64>,
+        updated_after: Option<i64>,
+        updated_before: Option<i64>,
+        first_message_after: Option<i64>,
+        first_message_before: Option<i64>,
+        last_message_after: Option<i64>,
+        last_message_before: Option<i64>,
+    ) -> Result<Vec<LabelWithCountRow>> {
         self.thread_label_repository()
-            .search_labels(
+            .search_labels_with_message_times(
                 query,
                 user_id,
                 limit,
@@ -1086,6 +1209,10 @@ pub trait ThreadApp:
                 created_before,
                 updated_after,
                 updated_before,
+                first_message_after,
+                first_message_before,
+                last_message_after,
+                last_message_before,
             )
             .await
     }
@@ -1110,8 +1237,43 @@ pub trait ThreadApp:
         updated_before: Option<i64>,
         memory_kinds: &[i32],
     ) -> Result<Vec<LabelWithCountRow>> {
+        self.find_co_occurring_labels_with_message_times(
+            labels,
+            user_id,
+            limit,
+            offset,
+            created_after,
+            created_before,
+            updated_after,
+            updated_before,
+            None,
+            None,
+            None,
+            None,
+            memory_kinds,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn find_co_occurring_labels_with_message_times(
+        &self,
+        labels: &[String],
+        user_id: Option<i64>,
+        limit: Option<i32>,
+        offset: Option<i64>,
+        created_after: Option<i64>,
+        created_before: Option<i64>,
+        updated_after: Option<i64>,
+        updated_before: Option<i64>,
+        first_message_after: Option<i64>,
+        first_message_before: Option<i64>,
+        last_message_after: Option<i64>,
+        last_message_before: Option<i64>,
+        memory_kinds: &[i32],
+    ) -> Result<Vec<LabelWithCountRow>> {
         self.thread_label_repository()
-            .find_co_occurring_labels(
+            .find_co_occurring_labels_with_message_times(
                 labels,
                 user_id,
                 limit,
@@ -1120,6 +1282,10 @@ pub trait ThreadApp:
                 created_before,
                 updated_after,
                 updated_before,
+                first_message_after,
+                first_message_before,
+                last_message_after,
+                last_message_before,
                 memory_kinds,
             )
             .await
@@ -1131,10 +1297,33 @@ pub trait ThreadApp:
     /// Default TTL accessor for label operations.
     fn label_default_ttl(&self) -> Duration;
 
+    async fn sync_thread_scalars_best_effort(&self, thread_id: i64, operation: &str) {
+        if let Some(tva) = self.thread_vector_app()
+            && let Err(e) = tva.sync_thread_scalars(thread_id).await
+        {
+            tracing::warn!(
+                thread_id,
+                operation,
+                "sync_thread_scalars after thread membership change failed: {e}"
+            );
+        }
+    }
+
+    async fn invalidate_thread_cache(&self, thread_id: i64) {
+        let key = Arc::new(Self::find_cache_key(&thread_id));
+        let _ = self.delete_cache(&key).await;
+    }
+
+    async fn finish_thread_membership_change(&self, thread_id: i64, operation: &str) {
+        self.invalidate_thread_cache(thread_id).await;
+        self.sync_thread_scalars_best_effort(thread_id, operation)
+            .await;
+    }
+
     async fn add_memory(&self, thread_id: &ThreadId, memory: &MemoryData) -> Result<MemoryId>;
 
-    /// Add a memory without updating Thread.updated_at.
-    /// Used by the importer to control timestamps explicitly.
+    /// Add a memory while preserving the normal extrema-derived thread audit
+    /// timestamp rule. Embedding dispatch is intentionally skipped.
     async fn add_memory_only(&self, thread_id: &ThreadId, memory: &MemoryData) -> Result<MemoryId>;
 
     /// Idempotent batch insertion of memories under a thread.
@@ -1302,14 +1491,17 @@ pub trait ThreadApp:
                 .insert_or_ignore_auto_position_tx(&mut *tx, thread_id.value, parent.value, now)
                 .await?;
         }
+        self.thread_repository()
+            .refresh_message_bounds_tx(&mut tx, thread_id, now)
+            .await?;
 
         tx.commit().await.map_err(LlmMemoryError::DBError)?;
 
         // Invalidate caches
-        let k = Arc::new(Self::find_cache_key(&thread_id.value));
-        let _ = self.delete_cache(&k).await;
         let mk = Arc::new(crate::app::memory_cache_key(&memory_id.value));
         let _ = self.cache().try_remove(&mk).await;
+        self.finish_thread_membership_change(thread_id.value, "update_memory_parents")
+            .await;
 
         Ok(UpdateMemoryParentsOutcome::Rewired)
     }
@@ -1839,6 +2031,32 @@ impl ThreadAppImpl {
     ) {
         self.dispatch_embedding_if_enabled(memory_id, memory, media);
     }
+
+    async fn add_memory_with_membership_refresh(
+        &self,
+        thread_id: &ThreadId,
+        memory: &MemoryData,
+        dispatch_embedding: bool,
+        operation: &str,
+    ) -> Result<MemoryId> {
+        let pool = self.thread_repository().db_pool();
+        let mut tx = pool.begin().await.map_err(LlmMemoryError::DBError)?;
+        let (memory_id, stored_memory, now, media) = self
+            .add_memory_core_tx(&mut tx, thread_id, memory, false)
+            .await?;
+
+        self.thread_repository()
+            .refresh_message_bounds_tx(&mut tx, thread_id, now)
+            .await?;
+        tx.commit().await.map_err(LlmMemoryError::DBError)?;
+
+        self.finish_thread_membership_change(thread_id.value, operation)
+            .await;
+        if dispatch_embedding {
+            self.dispatch_embedding_if_enabled(&memory_id, &stored_memory, media);
+        }
+        Ok(memory_id)
+    }
 }
 
 impl UseThreadRepository for ThreadAppImpl {
@@ -1901,45 +2119,18 @@ impl ThreadApp for ThreadAppImpl {
     }
 
     async fn add_memory(&self, thread_id: &ThreadId, memory: &MemoryData) -> Result<MemoryId> {
-        let pool = self.thread_repository().db_pool();
-        let mut tx = pool.begin().await.map_err(LlmMemoryError::DBError)?;
-
-        let (memory_id, memory, now, media) = self
-            .add_memory_core_tx(&mut tx, thread_id, memory, false)
-            .await?;
-
-        self.thread_repository()
-            .update_updated_at_tx(&mut *tx, thread_id, now)
-            .await?;
-
-        tx.commit().await.map_err(LlmMemoryError::DBError)?;
-
-        let k = Arc::new(Self::find_cache_key(&thread_id.value));
-        let _ = self.delete_cache(&k).await;
-
-        self.dispatch_embedding_if_enabled(&memory_id, &memory, media);
-
-        Ok(memory_id)
+        self.add_memory_with_membership_refresh(thread_id, memory, true, "add_memory")
+            .await
     }
 
-    /// Add a memory without updating Thread.updated_at.
-    /// Used by the importer to control timestamps explicitly.
+    /// Add a memory without dispatching an embedding job.
+    /// Used by the importer, which dispatches after the bulk import completes.
+    /// A changed message-time bound still updates the thread audit timestamp.
     /// Embedding dispatch is intentionally skipped; use `redispatch_embeddings`
     /// after bulk import completes.
     async fn add_memory_only(&self, thread_id: &ThreadId, memory: &MemoryData) -> Result<MemoryId> {
-        let pool = self.thread_repository().db_pool();
-        let mut tx = pool.begin().await.map_err(LlmMemoryError::DBError)?;
-
-        let (memory_id, _memory, _now, _media) = self
-            .add_memory_core_tx(&mut tx, thread_id, memory, false)
-            .await?;
-
-        tx.commit().await.map_err(LlmMemoryError::DBError)?;
-
-        let k = Arc::new(Self::find_cache_key(&thread_id.value));
-        let _ = self.delete_cache(&k).await;
-
-        Ok(memory_id)
+        self.add_memory_with_membership_refresh(thread_id, memory, false, "add_memory_only")
+            .await
     }
 
     async fn add_memories_batch(
@@ -1950,7 +2141,6 @@ impl ThreadApp for ThreadAppImpl {
             thread_target,
             memories,
             upsert_by_external_id,
-            thread_updated_at_override,
             labels,
         } = input;
 
@@ -2009,7 +2199,7 @@ impl ThreadApp for ThreadAppImpl {
             }
             BatchThreadTarget::UpsertByChannel(thread_data) => {
                 let thread_data =
-                    normalize_thread_for_create(thread_data, "ThreadService.AddMemoriesBatch")?;
+                    normalize_thread_for_create(*thread_data, "ThreadService.AddMemoriesBatch")?;
                 let user_id = thread_data.user_id.ok_or_else(|| {
                     LlmMemoryError::InvalidArgument("thread_data.user_id is required".to_string())
                 })?;
@@ -2415,49 +2605,26 @@ impl ThreadApp for ThreadAppImpl {
             }
         }
 
-        // ----- Phase 3: finishing touches (labels, updated_at override) -----
+        // ----- Phase 3: finishing touches (labels, message extrema) -----
         if !labels.is_empty() {
             let validated = validate_labels(&labels)?;
             let now = command_utils::util::datetime::now_millis();
             self.add_labels_core_tx(&mut tx, &thread_id, &validated, now)
                 .await?;
         }
-        // Thread `updated_at` bump. Two sources can move it forward:
-        //   * `thread_updated_at_override` (explicit high-watermark from the
-        //     import source), and
-        //   * a content overwrite via `upsert_by_external_id`, which changed
-        //     thread content in place and so must surface the thread in
-        //     `updated_after` / sort-by-updated views (mirrors how a plain
-        //     add_memory bumps the thread).
-        // Both fold into a single `max(current, ...)` so we never move
-        // `updated_at` backwards — differential imports / `summarize-after`
-        // windows rely on it as a monotonic high-watermark.
-        let overwrite_bump = if overwritten_memory_ids.is_empty() {
-            0
-        } else {
-            command_utils::util::datetime::now_millis()
-        };
-        let updated_at_target = thread_updated_at_override.max(overwrite_bump);
-        if updated_at_target > 0 {
-            let current = self
-                .thread_repository()
-                .find_row_for_update_tx(&mut *tx, &thread_id)
-                .await?
-                .map(|t| t.updated_at)
-                .unwrap_or(0);
-            let new_value = current.max(updated_at_target);
-            if new_value != current {
-                self.thread_repository()
-                    .update_updated_at_tx(&mut *tx, &thread_id, new_value)
-                    .await?;
-            }
-        }
+        let message_bounds_changed = self
+            .thread_repository()
+            .refresh_message_bounds_tx(
+                &mut tx,
+                &thread_id,
+                command_utils::util::datetime::now_millis(),
+            )
+            .await?;
 
         tx.commit().await.map_err(LlmMemoryError::DBError)?;
 
         // Cache invalidation.
-        let k = Arc::new(Self::find_cache_key(&thread_id.value));
-        let _ = self.delete_cache(&k).await;
+        self.invalidate_thread_cache(thread_id.value).await;
         // Drop stale memory_cache entries for any content overwritten via
         // `upsert_by_external_id`, else `MemoryApp::find_memory` (sharing
         // this cache) would serve the pre-update content until TTL.
@@ -2472,14 +2639,9 @@ impl ThreadApp for ThreadAppImpl {
         // step with the RDB after a batch import.
         {
             let labels_changed = !labels.is_empty();
-            // `updated_at` may have moved from the explicit override OR from a
-            // content overwrite bump — both must trigger the scalar sync.
-            let timestamps_changed = updated_at_target > 0;
-            if (labels_changed || timestamps_changed)
-                && let Some(tva) = self.thread_vector_app()
-                && let Err(e) = tva.sync_thread_scalars(thread_id.value).await
-            {
-                tracing::warn!("sync_thread_scalars after add_memories_batch failed: {e}");
+            if labels_changed || message_bounds_changed {
+                self.sync_thread_scalars_best_effort(thread_id.value, "add_memories_batch")
+                    .await;
             }
         }
 
@@ -2828,6 +2990,8 @@ mod test {
             labels: vec![],
             memory_kind: MemoryKind::Raw as i32,
             metadata: None,
+            first_message_at: None,
+            last_message_at: None,
         };
         let pool = app.thread_repository().db_pool();
         let mut tx = pool.begin().await.context("begin")?;
@@ -2927,7 +3091,9 @@ mod test {
         let user_id = 43i64;
         let thread_id = create_thread_with_default(&app, user_id, None).await?;
 
-        let new_memory = user_message("hello without default", user_id, vec![]);
+        let mut new_memory = user_message("hello without default", user_id, vec![]);
+        new_memory.created_at = 123;
+        new_memory.updated_at = 123;
         let created_id = app.add_memory(&thread_id, &new_memory).await?;
 
         let stored = app
@@ -2940,7 +3106,45 @@ mod test {
             data.parent_ids.is_empty(),
             "no default → parent_ids should stay empty"
         );
+        let thread = app
+            .thread_repository()
+            .find(&thread_id)
+            .await?
+            .expect("thread should exist");
+        let thread_data = thread.data.expect("thread data");
+        assert_eq!(thread_data.first_message_at, Some(123));
+        assert_eq!(thread_data.last_message_at, Some(123));
         Ok(())
+    }
+
+    async fn _test_add_memory_only_refreshes_message_bounds(pool: &'static RdbPool) -> Result<()> {
+        let app = build_app(pool);
+        let user_id = 43_001i64;
+        let thread_id = create_thread_with_default(&app, user_id, None).await?;
+        let mut memory = user_message("imported message", user_id, vec![]);
+        memory.created_at = 456;
+        memory.updated_at = 456;
+
+        app.add_memory_only(&thread_id, &memory).await?;
+
+        let thread = app
+            .thread_repository()
+            .find(&thread_id)
+            .await?
+            .expect("thread should exist");
+        let data = thread.data.expect("thread data");
+        assert_eq!(data.first_message_at, Some(456));
+        assert_eq!(data.last_message_at, Some(456));
+        Ok(())
+    }
+
+    #[test]
+    fn run_test_add_memory_only_refreshes_message_bounds() -> Result<()> {
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_pool().await;
+            _test_add_memory_only_refreshes_message_bounds(pool).await
+        })
     }
 
     /// クライアントが明示的に ROLE_SYSTEM parent を指定した場合、
@@ -3172,6 +3376,8 @@ mod test {
             labels: vec![],
             memory_kind: MemoryKind::Raw as i32,
             metadata: None,
+            first_message_at: None,
+            last_message_at: None,
         };
         app.create_thread(&data).await
     }
@@ -3237,6 +3443,8 @@ mod test {
             labels: vec![],
             memory_kind: MemoryKind::Raw as i32,
             metadata: None,
+            first_message_at: None,
+            last_message_at: None,
         };
         app.update_thread(&thread_id, &Some(updated)).await?;
 
@@ -4465,9 +4673,10 @@ mod test {
             labels: vec!["alpha".to_string(), "beta".to_string()],
             metadata: None,
             memory_kind: 0,
+            first_message_at: None,
+            last_message_at: None,
         };
         let thread_id = app.create_thread(&data).await?;
-
         let found = app
             .find_thread(&thread_id, None)
             .await?
@@ -4501,8 +4710,16 @@ mod test {
             labels: vec!["a".to_string(), "b".to_string()],
             metadata: None,
             memory_kind: 0,
+            first_message_at: None,
+            last_message_at: None,
         };
         let thread_id = app.create_thread(&data).await?;
+        let initial_updated_at = app
+            .find_thread(&thread_id, None)
+            .await?
+            .and_then(|thread| thread.data)
+            .map(|data| data.updated_at)
+            .expect("created thread");
 
         // Update with different labels — should replace
         let update_data = ThreadData {
@@ -4515,6 +4732,14 @@ mod test {
         let mut labels = app.find_labels(&thread_id).await?;
         labels.sort();
         assert_eq!(labels, vec!["c", "d"]);
+        assert_eq!(
+            app.find_thread(&thread_id, None)
+                .await?
+                .and_then(|thread| thread.data)
+                .map(|data| data.updated_at),
+            Some(initial_updated_at),
+            "label-only update must not change thread.updated_at"
+        );
 
         // Update with empty labels — should clear all
         let clear_data = ThreadData {
@@ -4567,7 +4792,7 @@ mod test {
     /// post-filtered them, which silently under-filled pages whenever the
     /// filter rejected rows that fell inside the SQL slice while valid
     /// matches existed beyond it. We trigger that exact pattern by
-    /// staggering `updated_at` (drives the labels-SQL ordering) and
+    /// staggering `updated_at` (drives the requested ordering) and
     /// `created_at` (drives the user-supplied filter) so they disagree
     /// on which rows belong on page 0.
     async fn _test_find_threads_by_labels_paginates_after_post_filter(
@@ -4579,7 +4804,7 @@ mod test {
         let id_gen = infra::test_helper::shared_id_generator();
         let thread_repo = ThreadRepositoryImpl::new(id_gen.clone(), pool);
 
-        // updated_at -> created_at schedule (rows listed in labels-SQL
+        // updated_at -> created_at schedule (rows listed in requested
         // `updated_at DESC` order):
         //   updated=300 created=100  (NO match: created_at <= 150)
         //   updated=250 created=200  (match)
@@ -4610,9 +4835,25 @@ mod test {
                 labels: vec![],
                 memory_kind: MemoryKind::Raw as i32,
                 metadata: None,
+                first_message_at: None,
+                last_message_at: None,
             };
             let mut tx = pool.begin().await.context("begin")?;
             let id = thread_repo.create(&mut *tx, &data).await?;
+            // Thread audit timestamps are server-managed. Seed the values
+            // needed to isolate pagination behaviour instead of treating
+            // client-provided ThreadData timestamps as persisted values.
+            let audit_sql = if cfg!(feature = "postgres") {
+                "UPDATE thread SET created_at = $1, updated_at = $2 WHERE id = $3"
+            } else {
+                "UPDATE thread SET created_at = ?, updated_at = ? WHERE id = ?"
+            };
+            sqlx::query(audit_sql)
+                .bind(created_at)
+                .bind(updated_at)
+                .bind(id.value)
+                .execute(&mut *tx)
+                .await?;
             app.thread_label_repository()
                 .add_labels_tx(&mut *tx, id.value, label.as_str(), created_at)
                 .await?;
@@ -4622,6 +4863,7 @@ mod test {
 
         let opts = ThreadListOptions {
             created_after: Some(150),
+            sort: ThreadSort::UpdatedDesc,
             ..Default::default()
         };
 
@@ -4674,7 +4916,7 @@ mod test {
             .await?;
         assert!(page2.is_empty());
 
-        // Default opts (no time filter, default sort) must keep using the
+        // A matching explicit sort with no time filter must keep using the
         // SQL fast path — sanity check that the ordering is intact.
         let all = app
             .find_threads_by_labels(
@@ -4683,7 +4925,10 @@ mod test {
                 Some(user_id),
                 Some(10),
                 Some(0),
-                ThreadListOptions::default(),
+                ThreadListOptions {
+                    sort: ThreadSort::UpdatedDesc,
+                    ..Default::default()
+                },
             )
             .await?;
         assert_eq!(all.len(), 5);
@@ -4744,6 +4989,8 @@ mod test {
                 labels: vec![],
                 memory_kind,
                 metadata: None,
+                first_message_at: None,
+                last_message_at: None,
             };
             let mut tx = pool.begin().await.context("begin")?;
             let id = thread_repo.create(&mut *tx, &data).await?;
@@ -4825,6 +5072,8 @@ mod test {
                 labels: vec![],
                 memory_kind: MemoryKind::Raw as i32,
                 metadata: None,
+                first_message_at: None,
+                last_message_at: None,
             };
             let mut tx = pool.begin().await.context("begin")?;
             let id = thread_repo.create(&mut *tx, &data).await?;
@@ -4977,7 +5226,7 @@ mod test {
         upsert_by_external_id: bool,
     ) -> AddMemoriesBatchInput {
         AddMemoriesBatchInput {
-            thread_target: BatchThreadTarget::UpsertByChannel(ThreadData {
+            thread_target: BatchThreadTarget::UpsertByChannel(Box::new(ThreadData {
                 default_system_memory_id: None,
                 user_id: Some(UserId { value: user_id }),
                 description: Some("batch import test".to_string()),
@@ -4989,10 +5238,11 @@ mod test {
                 labels: vec![],
                 memory_kind: 0,
                 metadata: None,
-            }),
+                first_message_at: None,
+                last_message_at: None,
+            })),
             memories,
             upsert_by_external_id,
-            thread_updated_at_override: 0,
             labels: vec![],
         }
     }
@@ -5081,6 +5331,8 @@ mod test {
             labels: vec![],
             memory_kind: 0,
             metadata: Some(r#"{"git":{"last_commit":"abc"}}"#.to_string()),
+            first_message_at: None,
+            last_message_at: None,
         };
         let thread_id = app.create_thread(&seed).await?;
 
@@ -5382,9 +5634,7 @@ mod test {
         Ok(())
     }
 
-    /// A content overwrite via `upsert_by_external_id` must move the
-    /// thread's `updated_at` forward (even without `thread_updated_at_override`)
-    /// so the thread is not missed by `updated_after` / sort-by-updated views.
+    /// A content overwrite must not change thread audit or message extrema.
     async fn _test_batch_upsert_bumps_thread_updated_at(pool: &'static RdbPool) -> Result<()> {
         let app = build_app(pool);
         let user_id = 70_024i64;
@@ -5410,13 +5660,15 @@ mod test {
             .await?
             .unwrap()
             .data
-            .unwrap()
-            .updated_at;
+            .unwrap();
+        let baseline_updated_at = baseline.updated_at;
+        assert_eq!(baseline.first_message_at, Some(1_000));
+        assert_eq!(baseline.last_message_at, Some(1_000));
 
         // Ensure `now()` advances past the baseline millisecond.
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
-        // Overwrite the content WITHOUT a thread_updated_at_override.
+        // Overwrite the content using the same external id.
         app.add_memories_batch(channel_upsert_input(
             user_id,
             channel,
@@ -5436,13 +5688,11 @@ mod test {
             .await?
             .unwrap()
             .data
-            .unwrap()
-            .updated_at;
+            .unwrap();
 
-        assert!(
-            after > baseline,
-            "content overwrite must bump thread.updated_at (baseline={baseline}, after={after})"
-        );
+        assert_eq!(after.updated_at, baseline_updated_at);
+        assert_eq!(after.first_message_at, Some(1_000));
+        assert_eq!(after.last_message_at, Some(1_000));
 
         let _ = app.delete_thread(&first.thread_id).await;
         Ok(())
@@ -5474,13 +5724,11 @@ mod test {
             .unwrap()
             .updated_at;
 
-        // A past override on a NEW (non-colliding) memory must not pull
-        // updated_at backwards.
+        // A new memory must not pull the audit timestamp backwards.
         app.add_memories_batch(AddMemoriesBatchInput {
             thread_target: BatchThreadTarget::ExistingThreadId(first.thread_id),
             memories: vec![batch_memory_input("nr-2", user_id, "b", 0, vec![])],
             upsert_by_external_id: true,
-            thread_updated_at_override: 1, // far in the past
             labels: vec![],
         })
         .await?;
@@ -5715,7 +5963,6 @@ mod test {
                 vec![],
             )],
             upsert_by_external_id: true,
-            thread_updated_at_override: 0,
             labels: vec![],
         };
 
@@ -5737,89 +5984,6 @@ mod test {
         );
 
         let _ = app.delete_thread(&thread_id).await;
-        Ok(())
-    }
-
-    /// `thread_updated_at_override` clamps via max(current, override):
-    /// future overrides apply, past overrides are ignored so existing
-    /// updated_at never moves backwards. Spec §3.2.4.
-    async fn _test_batch_thread_updated_at_override(pool: &'static RdbPool) -> Result<()> {
-        let app = build_app(pool);
-        let user_id = 70_008i64;
-        let channel = "import:test:override-ts";
-
-        // First call creates the thread with `updated_at = now()` from
-        // `fill_timestamps`. The override only matters relative to that
-        // baseline.
-        let initial = channel_upsert_input(
-            user_id,
-            channel,
-            vec![batch_memory_input(
-                "eid-base",
-                user_id,
-                "x",
-                500_000,
-                vec![],
-            )],
-            true,
-        );
-        let out = app.add_memories_batch(initial).await?;
-        let baseline = app
-            .thread_repository()
-            .find(&out.thread_id)
-            .await?
-            .unwrap()
-            .data
-            .unwrap()
-            .updated_at;
-
-        // Override with a future timestamp → applied (max-of-two).
-        let future = baseline + 10_000;
-        let mut bump = AddMemoriesBatchInput {
-            thread_target: BatchThreadTarget::ExistingThreadId(out.thread_id),
-            memories: vec![batch_memory_input("eid-bump", user_id, "y", 0, vec![])],
-            upsert_by_external_id: true,
-            thread_updated_at_override: future,
-            labels: vec![],
-        };
-        bump.upsert_by_external_id = true;
-        let _ = app.add_memories_batch(bump).await?;
-        let after_future = app
-            .thread_repository()
-            .find(&out.thread_id)
-            .await?
-            .unwrap()
-            .data
-            .unwrap()
-            .updated_at;
-        assert_eq!(after_future, future);
-
-        // Override with a past timestamp → ignored (max-of-two retains
-        // the live value, preventing differential-import / summarize
-        // windows from being silently broken).
-        let past = future - 1_000_000;
-        let regress = AddMemoriesBatchInput {
-            thread_target: BatchThreadTarget::ExistingThreadId(out.thread_id),
-            memories: vec![batch_memory_input("eid-past", user_id, "z", 0, vec![])],
-            upsert_by_external_id: true,
-            thread_updated_at_override: past,
-            labels: vec![],
-        };
-        let _ = app.add_memories_batch(regress).await?;
-        let after_past = app
-            .thread_repository()
-            .find(&out.thread_id)
-            .await?
-            .unwrap()
-            .data
-            .unwrap()
-            .updated_at;
-        assert_eq!(
-            after_past, future,
-            "past override must not move updated_at backwards"
-        );
-
-        let _ = app.delete_thread(&out.thread_id).await;
         Ok(())
     }
 
@@ -5852,16 +6016,19 @@ mod test {
         let parent_id = out.outcomes[0].memory_id;
         let child_id = out.outcomes[1].memory_id;
 
-        // Insert a second potential parent to use as the "new" parent.
-        let create2 = AddMemoriesBatchInput {
-            thread_target: BatchThreadTarget::ExistingThreadId(thread_id),
-            memories: vec![batch_memory_input("guard-other", user_id, "o", 2, vec![])],
-            upsert_by_external_id: true,
-            thread_updated_at_override: 0,
-            labels: vec![],
+        // Create a valid but initially unattached parent with a newer
+        // message time. The rewire must attach it and refresh the thread
+        // extrema, not merely update the child's parent_ids column.
+        let parent_created_at = command_utils::util::datetime::now_millis() + 60_000;
+        let other_id = {
+            let mut data = user_message("guard-other", user_id, vec![]);
+            data.created_at = parent_created_at;
+            data.updated_at = parent_created_at;
+            let mut tx = pool.begin().await?;
+            let id = app.memory_repository().create(&mut *tx, &data).await?;
+            tx.commit().await?;
+            id
         };
-        let out2 = app.add_memories_batch(create2).await?;
-        let other_id = out2.outcomes[0].memory_id;
 
         // Default flags + child already has parent_id → skip.
         let outcome = app
@@ -5900,6 +6067,16 @@ mod test {
             .map(|d| d.parent_ids.iter().map(|p| p.value).collect())
             .unwrap_or_default();
         assert_eq!(parents2, vec![other_id.value]);
+        let rewired_thread = app
+            .thread_repository()
+            .find(&thread_id)
+            .await?
+            .expect("thread must remain after parent rewire");
+        assert_eq!(
+            rewired_thread.data.and_then(|data| data.last_message_at),
+            Some(parent_created_at),
+            "attaching an otherwise-unattached newer parent must refresh last_message_at"
+        );
 
         let _ = app.delete_thread(&thread_id).await;
         Ok(())
@@ -6079,15 +6256,6 @@ mod test {
         TEST_RUNTIME.block_on(async {
             let pool = setup_pool().await;
             _test_batch_does_not_inject_default_system(pool).await
-        })
-    }
-
-    #[test]
-    fn run_test_batch_thread_updated_at_override() -> Result<()> {
-        use infra_utils::infra::test::TEST_RUNTIME;
-        TEST_RUNTIME.block_on(async {
-            let pool = setup_pool().await;
-            _test_batch_thread_updated_at_override(pool).await
         })
     }
 

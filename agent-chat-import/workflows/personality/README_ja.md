@@ -76,8 +76,8 @@ personalityのthread作成者は入力`user_id`であり、出力thread／memory
 |---|---|---|
 | `thread_ids` | — | 指定時のみ対象スレッドを絞り込み |
 | `labels_filter` | — | 指定時のみ該当ラベルを持つスレッドを処理 |
-| `updated_within_hours` | — | 直近 N 時間以内に更新されたスレッドのみ |
-| `updated_after_ms` | — | 絶対 epoch ms 下限 (`updated_within_hours` より優先) |
+| `updated_within_hours` | — | 最新メッセージが直近 N 時間以内のスレッドのみ |
+| `updated_after_ms` | — | 最新メッセージ時刻の絶対 epoch ms 下限 (`updated_within_hours` より優先) |
 | `output_language` | `ja` | single / merge に伝搬する出力言語 (`ja` / `en`) |
 | `merge_enabled` | `false` | true なら1層後に言語別 `user-personality-merge` worker を呼ぶ |
 

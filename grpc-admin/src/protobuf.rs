@@ -56,6 +56,7 @@ pub mod llm_memory {
         // shim; the handler imports them directly from `protobuf::*`.
     }
     pub mod service {
+        #![allow(clippy::large_enum_variant)]
         tonic::include_proto!("llm_memory.service");
     }
 }

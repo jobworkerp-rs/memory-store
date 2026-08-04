@@ -461,11 +461,9 @@ struct LoadedFile {
     rel: PathBuf,
     /// `None` when the file failed to read or to decode under
     /// `--encoding=utf8-strict`. Such files are dropped from entry
-    /// construction *and* from thread timestamp aggregation, so
-    /// `thread.updated_at` reflects the newest memory actually
-    /// imported (otherwise `--since` / `updated_after_ms` filters
-    /// would surface threads whose latest memory is older than the
-    /// reported updated_at).
+    /// construction and from source-session timestamp aggregation. This
+    /// keeps the source metadata internally consistent; the server derives
+    /// thread message extrema only from accepted memory rows.
     raw_bytes: Option<Vec<u8>>,
     /// Frontmatter-stripped body (when frontmatter parsing applied) or
     /// the full decoded text. `None` mirrors `raw_bytes == None`.
@@ -483,8 +481,8 @@ struct LoadedFile {
 
 impl LoadedFile {
     /// True when this file will become a `CanonicalEntry`. Used to
-    /// gate session-level timestamp aggregation so unreadable files do
-    /// not pull `thread.updated_at` past the newest real memory.
+    /// gate session-level timestamp aggregation so unreadable files do not
+    /// affect source metadata.
     fn is_entry(&self) -> bool {
         self.raw_bytes.is_some() && self.content_body.is_some()
     }
@@ -684,9 +682,8 @@ fn single_basename(canonical_root: &Path) -> String {
 }
 
 /// Aggregate (min created, max updated) across files that will become
-/// real entries. Files that failed to load are excluded so a vault
-/// with broken files does not advance `thread.updated_at` past the
-/// newest memory it actually contains. Empty inputs produce `(0, 0)`
+/// real entries. Files that failed to load are excluded from source
+/// metadata. Empty inputs produce `(0, 0)`
 /// so callers don't need to special-case.
 /// Build a `Skipped` outcome when every file in a per-dir / single
 /// session failed to load. Mirrors the per-file branch so the runner

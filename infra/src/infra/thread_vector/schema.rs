@@ -45,6 +45,9 @@ pub fn thread_arrow_schema(vector_size: usize) -> Arc<Schema> {
         // Appended to permit in-place evolution of legacy LanceDB tables.
         // Writers always provide a value; the startup migration backfills 1.
         Field::new("memory_kind", DataType::Int32, false),
+        // Appended so existing LanceDB tables can evolve in place.
+        Field::new("first_message_at", DataType::Int64, true),
+        Field::new("last_message_at", DataType::Int64, true),
     ];
     Arc::new(Schema::new(fields))
 }

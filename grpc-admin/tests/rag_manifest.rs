@@ -135,6 +135,44 @@ fn manifest_workflow_workers_reference_existing_yaml_files() {
     }
 }
 
+#[test]
+fn find_conversations_uses_explicit_thread_time_filter_names() {
+    let _ = manifest();
+    let expanded =
+        jobworkerp_client::client::yaml_common::expand_env(find_conversations_workflow())
+            .expect("find-conversations workflow env expansion must succeed");
+    let workflow: serde_yaml::Value =
+        serde_yaml::from_str(&expanded).expect("find-conversations workflow YAML must parse");
+    let properties = &workflow["input"]["schema"]["document"]["properties"]["filter"]["properties"];
+
+    for name in [
+        "thread_created_after",
+        "thread_created_before",
+        "thread_updated_after",
+        "thread_updated_before",
+        "first_message_after",
+        "first_message_before",
+        "last_message_after",
+        "last_message_before",
+    ] {
+        assert!(
+            properties.get(name).is_some(),
+            "find-conversations filter must expose {name}"
+        );
+    }
+    for obsolete_name in [
+        "created_after",
+        "created_before",
+        "updated_after",
+        "updated_before",
+    ] {
+        assert!(
+            properties.get(obsolete_name).is_none(),
+            "find-conversations must not expose obsolete {obsolete_name}"
+        );
+    }
+}
+
 /// All RAG workers must be WORKFLOWs. Direct GRPC workers expose
 /// `GrpcArgs` (method / json_body / metadata) to the LLM, which would
 /// silently swallow structured fields like memory_id and fire

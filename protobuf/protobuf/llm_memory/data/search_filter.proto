@@ -15,12 +15,20 @@ message ThreadSearchFilter {
   optional LabelMatchMode label_match_mode = 3;
   // Channel filter
   optional string channel = 4;
-  // Creation time range (milliseconds since epoch)
-  optional int64 created_after = 5;
-  optional int64 created_before = 6;
-  // Update time range (milliseconds since epoch)
-  optional int64 updated_after = 7;
-  optional int64 updated_before = 8;
+  reserved 5, 6, 7, 8;
+  reserved "created_after", "created_before", "updated_after", "updated_before";
   // Memory kinds to match. Empty means all kinds; multiple values use OR.
   repeated MemoryKind memory_kinds = 9;
+  // Thread audit timestamp ranges (milliseconds since epoch).
+  // Both bounds are exclusive for ThreadSearchFilter.
+  optional int64 thread_created_after = 10;
+  optional int64 thread_created_before = 11;
+  optional int64 thread_updated_after = 12;
+  optional int64 thread_updated_before = 13;
+  // Conversation timestamp ranges (milliseconds since epoch).
+  // Both bounds are exclusive for ThreadSearchFilter.
+  optional int64 first_message_after = 14;
+  optional int64 first_message_before = 15;
+  optional int64 last_message_after = 16;
+  optional int64 last_message_before = 17;
 }

@@ -11,7 +11,7 @@ use std::sync::Arc;
 /// Two pre-conditions block dispatch:
 ///
 /// 1. The import reported one or more session-level errors. A
-///    half-imported thread leaves a stale `updated_at` window that
+///    half-imported thread leaves a stale latest-message window that
 ///    would otherwise pull incomplete data into the summary; LLM
 ///    summarization is expensive enough that swallowing partial-failure
 ///    state silently is worse than asking the operator to rerun.
@@ -47,7 +47,7 @@ pub(crate) fn skip_reason(import_errors: usize, memories_imported: usize) -> Opt
 /// the workflow input shape is correct before any import work begins.
 ///
 /// `updated_after_ms` is forwarded as an absolute lower bound for
-/// `updated_at` so the summary window aligns exactly with the imported
+/// the latest message time so the summary window aligns exactly with the imported
 /// set. We deliberately do *not* convert it to `updated_within_hours`:
 /// that path re-anchors the window at workflow execution time, which
 /// drifts past the import boundary whenever there is dispatch / queue
@@ -615,6 +615,30 @@ mod tests {
             assert!(!batch.contains("thread_id: ($thread.id.value | tonumber)"));
             assert!(single.contains("thread_id: { type: string }"));
         }
+    }
+
+    #[test]
+    fn thread_batch_workflows_use_reserved_proto_replacements_for_message_time_windows() {
+        for yaml in [
+            include_str!("../workflows/thread-summary/thread-summary-batch.yaml"),
+            include_str!("../workflows/thread-reflection/thread-reflection-batch.yaml"),
+            include_str!("../workflows/personality/thread-personality-batch.yaml"),
+        ] {
+            assert!(yaml.contains("last_message_after: $updated_after_ms"));
+            assert!(
+                !yaml.contains("updated_after: $updated_after_ms"),
+                "reserved proto field must not be emitted in a gRPC JSON request"
+            );
+            assert!(
+                !yaml.contains("del(.updated_after)"),
+                "reserved proto field must not be removed from a request because it must not be added"
+            );
+        }
+
+        let summary = include_str!("../workflows/thread-summary/thread-summary-batch.yaml");
+        assert!(summary.contains("last_message_before: $updated_before_ms"));
+        assert!(!summary.contains("updated_before: $updated_before_ms"));
+        assert!(!summary.contains("del(.updated_before)"));
     }
 
     #[test]

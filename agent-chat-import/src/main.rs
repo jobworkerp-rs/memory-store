@@ -1,6 +1,7 @@
 mod cli;
 mod client;
 mod common;
+mod events;
 mod generation_workers;
 mod parser;
 #[cfg(feature = "personality-after")]
@@ -14,8 +15,10 @@ use clap::Parser;
 use cli::{Cli, CodexArgs, DEFAULT_PLAIN_SOURCE_NAME, GlobalArgs, PlainArgs, Subcmd};
 use client::{ImportClient, LiveGrpcImportClient, LiveGrpcImportClientConfig, RetryPolicy};
 use common::importer::{
-    CanonicalSessionResult, ChunkLimits, run_all, run_all_with_entry_collector,
+    CanonicalSessionResult, ChunkLimits, run_all_with_entry_collector_and_event_sink,
+    run_all_with_event_sink,
 };
+use events::EventOutput;
 use source::claude_code::ClaudeCodeSource;
 use source::codex::CodexSource;
 use source::plain::PlainSource;
@@ -134,7 +137,7 @@ async fn run_claude_code(
 ) -> Result<()> {
     args.attachment_subtypes_policy()
         .map_err(|e| anyhow::anyhow!("--attachment-subtypes: {e}"))?;
-    run_canonical_source(global, user_id, "claude_code", ClaudeCodeSource::new(args)).await
+    run_canonical_source(global, user_id, "claude-code", ClaudeCodeSource::new(args)).await
 }
 
 #[cfg(feature = "summarize-after")]
@@ -262,7 +265,8 @@ async fn run_plain(global: &GlobalArgs, args: PlainArgs, user_id: i64) -> Result
     let d_external_id: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     let d_path: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::new());
 
-    let results = run_all_with_entry_collector(
+    let event_output = EventOutput::new(global.events_jsonl, "plain", std::io::stdout());
+    let results = run_all_with_entry_collector_and_event_sink(
         &source,
         client.as_deref(),
         since_millis,
@@ -274,6 +278,7 @@ async fn run_plain(global: &GlobalArgs, args: PlainArgs, user_id: i64) -> Result
             d_external_id.borrow_mut().extend(eid);
             d_path.borrow_mut().extend(paths);
         },
+        Some(&event_output),
     )
     .await?;
     print_canonical_summary(&display_label, &results);
@@ -423,7 +428,7 @@ fn print_prune_summary(outcome: &PruneOutcome) {
 async fn run_canonical_source<S>(
     global: &GlobalArgs,
     user_id: i64,
-    label: &str,
+    label: &'static str,
     source: S,
 ) -> Result<()>
 where
@@ -450,7 +455,8 @@ where
     } else {
         label.to_string()
     };
-    let results = run_all(
+    let event_output = EventOutput::new(global.events_jsonl, label, std::io::stdout());
+    let results = run_all_with_event_sink(
         &source,
         client.as_deref(),
         since_millis,
@@ -458,6 +464,7 @@ where
         user_id,
         &extra_labels,
         chunk_limits_from_global(global),
+        Some(&event_output),
     )
     .await?;
     print_canonical_summary(&display_label, &results);

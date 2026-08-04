@@ -58,6 +58,15 @@ impl ThreadVectorAppImpl {
         }
     }
 
+    /// Recreate search indexes after a maintenance table cutover. Scalar
+    /// synchronization runs first because it rewrites vector rows; building
+    /// indexes afterwards leaves the replacement table immediately searchable.
+    pub async fn rebuild_search_indexes(&self) -> Result<()> {
+        self.vector_repo.maintenance_build_fts(false).await?;
+        self.vector_repo.maintenance_build_vector(false).await?;
+        Ok(())
+    }
+
     // ===== Embedding management =====
 
     /// N-row upsert of a thread description embedding. Builds one chunk

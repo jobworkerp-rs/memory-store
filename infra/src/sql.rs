@@ -100,14 +100,14 @@ macro_rules! memory_rating_columns {
 #[cfg(feature = "postgres")]
 macro_rules! thread_columns {
     () => {
-        "id, default_system_memory_id, user_id, description, channel, embedding, embedding_dim, created_at, updated_at, metadata::text AS metadata, memory_kind"
+        "id, default_system_memory_id, user_id, description, channel, embedding, embedding_dim, created_at, updated_at, first_message_at, last_message_at, metadata::text AS metadata, memory_kind"
     };
 }
 
 #[cfg(not(feature = "postgres"))]
 macro_rules! thread_columns {
     () => {
-        "id, default_system_memory_id, user_id, description, channel, embedding, embedding_dim, created_at, updated_at, metadata, memory_kind"
+        "id, default_system_memory_id, user_id, description, channel, embedding, embedding_dim, created_at, updated_at, first_message_at, last_message_at, metadata, memory_kind"
     };
 }
 

@@ -100,22 +100,31 @@ fn build_thread_memory_kind_filter(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_thread_time_filter(
     qualifier: &str,
     created_after: Option<i64>,
     created_before: Option<i64>,
     updated_after: Option<i64>,
     updated_before: Option<i64>,
+    first_message_after: Option<i64>,
+    first_message_before: Option<i64>,
+    last_message_after: Option<i64>,
+    last_message_before: Option<i64>,
     param_offset: usize,
 ) -> ThreadTimeFilter {
     let mut sql = String::new();
     let mut binds: Vec<i64> = Vec::new();
     let mut next = param_offset;
-    let pairs: [(&str, Option<i64>); 4] = [
+    let pairs: [(&str, Option<i64>); 8] = [
         ("created_at >", created_after),
         ("created_at <=", created_before),
         ("updated_at >", updated_after),
         ("updated_at <=", updated_before),
+        ("first_message_at >", first_message_after),
+        ("first_message_at <=", first_message_before),
+        ("last_message_at >", last_message_after),
+        ("last_message_at <=", last_message_before),
     ];
     for (op, v) in pairs {
         if let Some(value) = v {
@@ -321,7 +330,7 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
                  WHERE tl.label IN ({label_placeholders}){user_filter}{} \
                  GROUP BY tl.thread_id \
                  HAVING COUNT(DISTINCT tl.label) = {label_count} \
-                 ORDER BY MAX(t.updated_at) DESC, tl.thread_id DESC \
+                 ORDER BY MAX(t.last_message_at) DESC NULLS LAST, tl.thread_id DESC \
                  LIMIT {} OFFSET {}",
                 memory_kind.sql,
                 build_in_placeholders(1, param_offset),
@@ -333,7 +342,7 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
                  JOIN thread t ON tl.thread_id = t.id \
                  WHERE tl.label IN ({label_placeholders}){user_filter}{} \
                  GROUP BY tl.thread_id \
-                 ORDER BY MAX(t.updated_at) DESC, tl.thread_id DESC \
+                 ORDER BY MAX(t.last_message_at) DESC NULLS LAST, tl.thread_id DESC \
                  LIMIT {} OFFSET {}",
                 memory_kind.sql,
                 build_in_placeholders(1, param_offset),
@@ -378,6 +387,39 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
         updated_before: Option<i64>,
         memory_kinds: &[i32],
     ) -> Result<Vec<LabelWithCountRow>> {
+        self.find_distinct_labels_with_message_times(
+            user_id,
+            limit,
+            offset,
+            created_after,
+            created_before,
+            updated_after,
+            updated_before,
+            None,
+            None,
+            None,
+            None,
+            memory_kinds,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn find_distinct_labels_with_message_times(
+        &self,
+        user_id: Option<i64>,
+        limit: Option<i32>,
+        offset: Option<i64>,
+        created_after: Option<i64>,
+        created_before: Option<i64>,
+        updated_after: Option<i64>,
+        updated_before: Option<i64>,
+        first_message_after: Option<i64>,
+        first_message_before: Option<i64>,
+        last_message_after: Option<i64>,
+        last_message_before: Option<i64>,
+        memory_kinds: &[i32],
+    ) -> Result<Vec<LabelWithCountRow>> {
         let mut next_param: usize = 1;
         let user_filter = if user_id.is_some() {
             let s = format!(" AND t.user_id = {}", dyn_placeholder(next_param));
@@ -392,6 +434,10 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
             created_before,
             updated_after,
             updated_before,
+            first_message_after,
+            first_message_before,
+            last_message_after,
+            last_message_before,
             next_param,
         );
         next_param = time.next_offset;
@@ -452,6 +498,37 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
         updated_after: Option<i64>,
         updated_before: Option<i64>,
     ) -> Result<Vec<LabelWithCountRow>> {
+        self.search_labels_with_message_times(
+            query_str,
+            user_id,
+            limit,
+            created_after,
+            created_before,
+            updated_after,
+            updated_before,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn search_labels_with_message_times(
+        &self,
+        query_str: &str,
+        user_id: Option<i64>,
+        limit: Option<i32>,
+        created_after: Option<i64>,
+        created_before: Option<i64>,
+        updated_after: Option<i64>,
+        updated_before: Option<i64>,
+        first_message_after: Option<i64>,
+        first_message_before: Option<i64>,
+        last_message_after: Option<i64>,
+        last_message_before: Option<i64>,
+    ) -> Result<Vec<LabelWithCountRow>> {
         let escaped = escape_like(query_str);
         let pattern = format!("%{escaped}%");
 
@@ -471,6 +548,10 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
             created_before,
             updated_after,
             updated_before,
+            first_message_after,
+            first_message_before,
+            last_message_after,
+            last_message_before,
             next_param,
         );
         next_param = time.next_offset;
@@ -523,6 +604,41 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
         updated_before: Option<i64>,
         memory_kinds: &[i32],
     ) -> Result<Vec<LabelWithCountRow>> {
+        self.find_co_occurring_labels_with_message_times(
+            labels,
+            user_id,
+            limit,
+            offset,
+            created_after,
+            created_before,
+            updated_after,
+            updated_before,
+            None,
+            None,
+            None,
+            None,
+            memory_kinds,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn find_co_occurring_labels_with_message_times(
+        &self,
+        labels: &[String],
+        user_id: Option<i64>,
+        limit: Option<i32>,
+        offset: Option<i64>,
+        created_after: Option<i64>,
+        created_before: Option<i64>,
+        updated_after: Option<i64>,
+        updated_before: Option<i64>,
+        first_message_after: Option<i64>,
+        first_message_before: Option<i64>,
+        last_message_after: Option<i64>,
+        last_message_before: Option<i64>,
+        memory_kinds: &[i32],
+    ) -> Result<Vec<LabelWithCountRow>> {
         if labels.is_empty() {
             return Ok(vec![]);
         }
@@ -556,6 +672,10 @@ pub trait ThreadLabelRepository: UseRdbPool + Sync + Send {
             created_before,
             updated_after,
             updated_before,
+            first_message_after,
+            first_message_before,
+            last_message_after,
+            last_message_before,
             next_param,
         );
         next_param = time.next_offset;
@@ -671,6 +791,8 @@ mod test {
             embedding_dim: None,
             created_at: 0,
             updated_at: 0,
+            first_message_at: None,
+            last_message_at: None,
             labels: vec![],
             metadata: None,
             memory_kind: 0,
@@ -825,11 +947,16 @@ mod test {
         // "project-a" itself should be excluded
         assert!(!co.iter().any(|r| r.label == "project-a"));
 
-        // Verify sort order: results are ordered by updated_at DESC.
-        // Update t1 to have a newer updated_at so it comes first.
+        // Verify sort order: results are ordered by last_message_at DESC.
+        // Update t1 to have a newer latest-message timestamp so it comes first.
         let mut tx = db.begin().await?;
         thread_repo
             .update_updated_at_tx(&mut *tx, &t1, now + 1000)
+            .await?;
+        sqlx::query("UPDATE thread SET last_message_at = ? WHERE id = ?")
+            .bind(now + 1000)
+            .bind(t1.value)
+            .execute(&mut *tx)
             .await?;
         tx.commit().await?;
 
@@ -842,10 +969,15 @@ mod test {
             "most recently updated thread should come first"
         );
 
-        // Now update t2 to be even newer
+        // Now update t2 to be even newer.
         let mut tx = db.begin().await?;
         thread_repo
             .update_updated_at_tx(&mut *tx, &t2, now + 2000)
+            .await?;
+        sqlx::query("UPDATE thread SET last_message_at = ? WHERE id = ?")
+            .bind(now + 2000)
+            .bind(t2.value)
+            .execute(&mut *tx)
             .await?;
         tx.commit().await?;
 
@@ -854,10 +986,10 @@ mod test {
             .await?;
         assert_eq!(
             ids[0], t2.value,
-            "t2 now has newer updated_at and should come first"
+            "t2 now has the newest message and should come first"
         );
 
-        // Also verify match_all respects updated_at DESC order
+        // Also verify match_all respects latest-message order.
         let ids = label_repo
             .find_thread_ids_by_labels(
                 &["project-a".to_string(), "rust".to_string()],
@@ -941,10 +1073,15 @@ mod test {
         let t3 = thread_repo.create(&mut *tx, &data).await?;
         tx.commit().await?;
 
-        // Set distinct updated_at: t2 newest, t3 middle, t1 oldest
+        // Set distinct latest-message values: t2 newest, t3 middle, t1 oldest.
         for (tid, ts) in [(&t1, now + 1000), (&t3, now + 2000), (&t2, now + 3000)] {
             let mut tx = db.begin().await?;
             thread_repo.update_updated_at_tx(&mut *tx, tid, ts).await?;
+            sqlx::query("UPDATE thread SET last_message_at = ? WHERE id = ?")
+                .bind(ts)
+                .bind(tid.value)
+                .execute(&mut *tx)
+                .await?;
             tx.commit().await?;
         }
 
@@ -955,7 +1092,7 @@ mod test {
                 .await?;
         }
 
-        // Verify updated_at DESC ordering
+        // Verify LAST_MESSAGE_DESC ordering.
         let ids = label_repo
             .find_thread_ids_by_labels(&["shared".to_string()], false, None, None, None)
             .await?;
@@ -1014,10 +1151,8 @@ mod test {
         Ok(())
     }
 
-    /// (P9) Helper to create a thread with a fixed `created_at` and
-    /// optionally bump its `updated_at` afterwards. Bypasses the
-    /// `fill_timestamps` server-side default by supplying a non-zero
-    /// `created_at` directly.
+    /// Helper to seed audit timestamps for range-query tests. Production
+    /// thread creation deliberately ignores client supplied timestamps.
     async fn create_thread_with_timestamps(
         thread_repo: &ThreadRepositoryImpl,
         pool: &'static RdbPool,
@@ -1025,19 +1160,15 @@ mod test {
         created_at: i64,
         updated_at: i64,
     ) -> Result<protobuf::llm_memory::data::ThreadId> {
-        let mut data = create_test_thread_data(user_id);
-        data.created_at = created_at;
-        // updated_at gets overwritten to `now` on insert when 0; pass the
-        // intended value so the initial row is correct, then call
-        // `update_updated_at_tx` afterwards if the test needs to diverge
-        // from `created_at`.
-        data.updated_at = if updated_at == 0 {
-            created_at
-        } else {
-            updated_at
-        };
+        let data = create_test_thread_data(user_id);
         let mut tx = pool.begin().await.context("begin")?;
         let id = thread_repo.create(&mut *tx, &data).await?;
+        sqlx::query("UPDATE thread SET created_at = ?, updated_at = ? WHERE id = ?")
+            .bind(created_at)
+            .bind(updated_at)
+            .bind(id.value)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await.context("commit thread")?;
         Ok(id)
     }
@@ -1093,6 +1224,19 @@ mod test {
                 &["new_only".to_string(), "shared".to_string()],
                 now,
             )
+            .await?;
+
+        sqlx::query("UPDATE thread SET first_message_at = ?, last_message_at = ? WHERE id = ?")
+            .bind(now - 30_000)
+            .bind(now - 30_000)
+            .bind(t_old.value)
+            .execute(pool)
+            .await?;
+        sqlx::query("UPDATE thread SET first_message_at = ?, last_message_at = ? WHERE id = ?")
+            .bind(now - 5_000)
+            .bind(now - 5_000)
+            .bind(t_new.value)
+            .execute(pool)
             .await?;
 
         // No filter — all 4 distinct labels are present.
@@ -1226,6 +1370,19 @@ mod test {
             )
             .await?;
 
+        sqlx::query("UPDATE thread SET first_message_at = ?, last_message_at = ? WHERE id = ?")
+            .bind(now - 30_000)
+            .bind(now - 30_000)
+            .bind(t_old.value)
+            .execute(pool)
+            .await?;
+        sqlx::query("UPDATE thread SET first_message_at = ?, last_message_at = ? WHERE id = ?")
+            .bind(now - 5_000)
+            .bind(now - 5_000)
+            .bind(t_new.value)
+            .execute(pool)
+            .await?;
+
         // Without time filter, both `agent_*` labels show up.
         let all = label_repo
             .search_labels("agent", Some(200), None, None, None, None, None)
@@ -1247,6 +1404,25 @@ mod test {
             )
             .await?;
         let names: Vec<&str> = recent.iter().map(|r| r.label.as_str()).collect();
+        assert!(names.contains(&"agent_new"));
+        assert!(!names.contains(&"agent_old"));
+
+        let recent_message = label_repo
+            .search_labels_with_message_times(
+                "agent",
+                Some(200),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(now - 10_000),
+                None,
+            )
+            .await?;
+        let names: Vec<&str> = recent_message.iter().map(|r| r.label.as_str()).collect();
         assert!(names.contains(&"agent_new"));
         assert!(!names.contains(&"agent_old"));
 
@@ -1292,6 +1468,19 @@ mod test {
             )
             .await?;
 
+        sqlx::query("UPDATE thread SET first_message_at = ?, last_message_at = ? WHERE id = ?")
+            .bind(now - 30_000)
+            .bind(now - 30_000)
+            .bind(t_old.value)
+            .execute(pool)
+            .await?;
+        sqlx::query("UPDATE thread SET first_message_at = ?, last_message_at = ? WHERE id = ?")
+            .bind(now - 5_000)
+            .bind(now - 5_000)
+            .bind(t_new.value)
+            .execute(pool)
+            .await?;
+
         // No time filter: both co_old and co_new appear, query labels excluded.
         let all = label_repo
             .find_co_occurring_labels(
@@ -1314,6 +1503,27 @@ mod test {
             "query labels must be excluded"
         );
         assert!(!names.contains(&"coding_agent"));
+
+        let recent_message = label_repo
+            .find_co_occurring_labels_with_message_times(
+                &["workflow-chat".to_string(), "coding_agent".to_string()],
+                Some(300),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(now - 10_000),
+                None,
+                &[],
+            )
+            .await?;
+        let names: Vec<&str> = recent_message.iter().map(|r| r.label.as_str()).collect();
+        assert!(names.contains(&"co_new"));
+        assert!(!names.contains(&"co_old"));
 
         // updated_after isolates t_new — only co_new should remain.
         let recent = label_repo

@@ -18,6 +18,8 @@ pub struct ThreadRow {
     pub embedding_dim: Option<i32>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub first_message_at: Option<i64>,
+    pub last_message_at: Option<i64>,
     pub metadata: Option<String>,
     pub memory_kind: Option<i32>,
 }
@@ -47,6 +49,8 @@ impl ThreadRow {
                 embedding_dim: self.embedding_dim,
                 created_at: self.created_at,
                 updated_at: self.updated_at,
+                first_message_at: self.first_message_at,
+                last_message_at: self.last_message_at,
                 // Labels are hydrated separately by the app layer
                 labels: vec![],
                 metadata: self.metadata.clone(),

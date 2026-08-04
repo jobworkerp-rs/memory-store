@@ -790,6 +790,8 @@ mod test {
             embedding_dim: None,
             created_at: 100,
             updated_at: 100,
+            first_message_at: None,
+            last_message_at: None,
             labels: vec![],
             metadata: None,
             memory_kind: 0,

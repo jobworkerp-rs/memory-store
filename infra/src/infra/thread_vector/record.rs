@@ -28,6 +28,8 @@ pub struct ThreadVectorRecord {
     pub channel: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub first_message_at: Option<i64>,
+    pub last_message_at: Option<i64>,
     pub indexed_at: i64,
 }
 
@@ -95,6 +97,8 @@ impl ThreadVectorRecord {
             channel: data.channel.clone(),
             created_at: data.created_at,
             updated_at: data.updated_at,
+            first_message_at: data.first_message_at,
+            last_message_at: data.last_message_at,
             indexed_at: command_utils::util::datetime::now_millis(),
         }
     }

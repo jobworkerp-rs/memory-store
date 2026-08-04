@@ -10,7 +10,7 @@ use std::sync::Arc;
 /// should be skipped. Same two-condition gate as `summarize::skip_reason`:
 ///
 /// 1. The import reported one or more session-level errors. A
-///    half-imported thread leaves a stale `updated_at` window that
+///    half-imported thread leaves a stale latest-message window that
 ///    would otherwise pull incomplete data into the extraction;
 ///    personality extraction is expensive enough that swallowing
 ///    partial-failure state silently is worse than asking the operator
@@ -43,7 +43,7 @@ pub(crate) fn skip_reason(import_errors: usize, memories_imported: usize) -> Opt
 /// the workflow input shape is correct before any import work begins.
 ///
 /// `updated_after_ms` is forwarded as an absolute lower bound for
-/// `updated_at` so the extraction window aligns exactly with the
+/// the latest message time so the extraction window aligns exactly with the
 /// imported set. Same rationale as the summary path: a relative
 /// `updated_within_hours` would re-anchor the window at workflow
 /// execution time and drift past the import boundary on dispatch

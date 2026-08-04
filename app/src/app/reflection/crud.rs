@@ -21,7 +21,10 @@ use infra::infra::reflection::few_shot_usage::ReflectionFewShotUsageRepository;
 use infra::infra::reflection::rdb::ThreadReflectionIndexRepository;
 use infra::infra::reflection::tool::ReflectionToolRepository;
 use infra::infra::reflection::tool_outcome::ReflectionToolOutcomeRepository;
+use infra::infra::thread::rdb::ThreadRepository;
 use infra::infra::thread_memory::rdb::ThreadMemoryRepository;
+#[cfg(feature = "postgres")]
+use protobuf::llm_memory::data::ThreadId;
 use protobuf::llm_memory::data::{MemoryId, Reflection, ReflectionId};
 
 use crate::app::reflection::ReflectionAppImpl;
@@ -77,12 +80,29 @@ pub async fn delete(app: &ReflectionAppImpl, id: &ReflectionId) -> Result<()> {
     // this RPC scoped to reflections. The pre-tx lookup is sufficient
     // because reflection ids come from the snowflake generator and
     // cannot collide with an in-flight insert for the same id.
-    if app.index_repo.find_by_memory_id(id.value).await?.is_none() {
-        return Err(LlmMemoryError::NotFound(format!("reflection {} not found", id.value)).into());
-    }
-
+    let _index_row = app
+        .index_repo
+        .find_by_memory_id(id.value)
+        .await?
+        .ok_or_else(|| LlmMemoryError::NotFound(format!("reflection {} not found", id.value)))?;
     let memory_id = id.value;
     let mut tx = app.pool.begin().await?;
+    let mut affected_thread_ids = app
+        .thread_memory_repo
+        .find_all_threads_by_memory_tx(&mut *tx, memory_id)
+        .await?;
+    affected_thread_ids.sort_unstable();
+    affected_thread_ids.dedup();
+
+    // Match finalize's lock order so concurrent membership changes for the
+    // same aggregate thread derive extrema from a serialized state.
+    #[cfg(feature = "postgres")]
+    for thread_id in &affected_thread_ids {
+        app.thread_repo
+            .find_row_for_update_tx(&mut *tx, &ThreadId { value: *thread_id })
+            .await?
+            .ok_or_else(|| LlmMemoryError::NotFound(format!("thread {thread_id} not found")))?;
+    }
 
     // Child tables first (they reference memory_id only, no ordering
     // between them is required, but we issue them in spec §3.2 order
@@ -117,6 +137,10 @@ pub async fn delete(app: &ReflectionAppImpl, id: &ReflectionId) -> Result<()> {
     app.thread_memory_repo
         .delete_by_memory_tx(&mut *tx, memory_id)
         .await?;
+    let now = command_utils::util::datetime::now_millis();
+    app.thread_repo
+        .refresh_message_bounds_for_thread_ids_tx(&mut tx, &affected_thread_ids, now)
+        .await?;
 
     // Memory body last. By this point every dependent row is gone,
     // so a successful commit yields a fully consistent state.
@@ -147,6 +171,16 @@ pub async fn delete(app: &ReflectionAppImpl, id: &ReflectionId) -> Result<()> {
                 "memory cache invalidation failed for deleted reflection {}: {e}",
                 memory_id
             );
+        }
+    }
+
+    if let Some(thread_vector_app) = app.thread_vector_app.as_ref() {
+        for thread_id in affected_thread_ids {
+            if let Err(e) = thread_vector_app.sync_thread_scalars(thread_id).await {
+                tracing::warn!(
+                    "sync_thread_scalars after reflection delete failed for thread {thread_id}: {e}"
+                );
+            }
         }
     }
 

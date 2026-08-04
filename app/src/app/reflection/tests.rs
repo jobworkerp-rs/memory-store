@@ -178,6 +178,8 @@ async fn seed_origin(pool: &'static RdbPool, user_id: i64) -> Result<(i64, i64)>
                 embedding_dim: None,
                 created_at: now,
                 updated_at: now,
+                first_message_at: None,
+                last_message_at: None,
                 metadata: None,
                 labels: vec![],
                 memory_kind: MemoryKind::Raw as i32,
@@ -2057,6 +2059,23 @@ fn run_delete_removes_reflection() -> Result<()> {
             "thread_memory junction must reference the reflection pre-delete"
         );
 
+        let aggregate_thread_id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT thread_id FROM thread_reflection_index WHERE memory_id = {p1}"
+        )))
+        .bind(id.value)
+        .fetch_one(pool)
+        .await?;
+        let bounds_before: (Option<i64>, Option<i64>) = sqlx::query_as(sqlx::AssertSqlSafe(
+            format!("SELECT first_message_at, last_message_at FROM thread WHERE id = {p1}"),
+        ))
+        .bind(aggregate_thread_id)
+        .fetch_one(pool)
+        .await?;
+        assert!(
+            bounds_before.0.is_some() && bounds_before.1.is_some(),
+            "the aggregate thread must expose the reflection message bounds before delete"
+        );
+
         app.delete(&id).await?;
 
         // Post-condition: every owning table is empty for this id.
@@ -2098,6 +2117,13 @@ fn run_delete_removes_reflection() -> Result<()> {
             junction_post, 0,
             "thread_memory junction must be detached after delete"
         );
+        let bounds_after: (Option<i64>, Option<i64>) = sqlx::query_as(sqlx::AssertSqlSafe(
+            format!("SELECT first_message_at, last_message_at FROM thread WHERE id = {p1}"),
+        ))
+        .bind(aggregate_thread_id)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(bounds_after, (None, None));
 
         // Deleting again yields NotFound. The sidecar guard now
         // catches the second call before it ever opens a tx.
@@ -2601,6 +2627,8 @@ async fn seed_container_thread(pool: &'static RdbPool) -> Result<i64> {
                 embedding_dim: None,
                 created_at: now,
                 updated_at: now,
+                first_message_at: None,
+                last_message_at: None,
                 metadata: None,
                 labels: vec![],
                 memory_kind: MemoryKind::Reflection as i32,

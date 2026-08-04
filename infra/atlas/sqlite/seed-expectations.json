@@ -1,0 +1,41 @@
+{
+  "version": "20260803000001",
+  "tables": [
+    {
+      "table": "failure_mode_dictionary",
+      "key_column": "mode",
+      "keys": [
+        "OTHER",
+        "ambiguous_instruction",
+        "conflicting_requirements",
+        "context_overflow",
+        "data_loss",
+        "external_service_failure",
+        "goal_drift_by_user",
+        "hallucination",
+        "loop",
+        "misleading_premise",
+        "missing_context",
+        "permission_issue",
+        "rate_limit",
+        "scope_drift",
+        "tool_misuse",
+        "tool_unavailable"
+      ]
+    },
+    {
+      "table": "failure_signature_indicator_norm",
+      "key_column": "indicator_name",
+      "keys": [
+        "compact_boundary_count",
+        "consecutive_errors",
+        "elapsed_ms_at_detection",
+        "no_state_change_turns",
+        "same_tool_repeated_count",
+        "tool_calls_per_turn_ratio",
+        "turn_count_at_detection",
+        "user_clarification_count"
+      ]
+    }
+  ]
+}

@@ -86,6 +86,22 @@ cargo build --release --features lindera
 The LanceDB vector/FTS stack is a required dependency. The `lindera` feature
 enables morphological tokenization for Japanese and Korean.
 
+### SQLite migration bundle
+
+Developers of a desktop application that owns a local Memories SQLite database
+build a native migration bundle from the same source revision as Memories:
+
+```bash
+CARGO_BUILD_JOBS=1 scripts/build-memories-db-migrate-sqlite.sh /path/to/memories-db-migrate
+```
+
+The build supports Linux/x86_64 and macOS/Apple Silicon. It packages the native
+`memories-db-migrate` binary and the matching, SHA-256-pinned Atlas binary. Run
+the bundle before opening the database, with all database writers stopped and a
+joint SQLite/LanceDB backup available. The application must invoke the bundle's
+`memories-db-migrate` commands rather than applying SQL or running Atlas
+directly.
+
 ## Setup and Run
 
 ```bash

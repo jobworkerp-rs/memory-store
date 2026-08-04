@@ -27,9 +27,9 @@ input:
           type: integer
           minimum: 1
           description: >-
-            When specified, only threads whose `updated_at` is within the
+            When specified, only threads whose latest message is within the
             past N hours **measured from this workflow's execution time**
-            are targeted (server-side `updated_after` filter, strict `>`).
+            are targeted (server-side `last_message_after` filter, strict `>`).
             Omit to process all threads as before. `updated_after_ms`
             takes precedence when both are set, because relative windows
             drift with dispatch latency.
@@ -38,7 +38,7 @@ input:
           minimum: 0
           description: >-
             When specified, an absolute lower bound (epoch ms) for
-            `updated_at`. Takes precedence over `updated_within_hours`.
+            the latest message time. Takes precedence over `updated_within_hours`.
             Use this when the caller already knows the absolute boundary
             (e.g. memories-import passes its `--since` here so the window
             stays exactly aligned with the imported set even if jobworkerp
@@ -48,7 +48,7 @@ input:
           minimum: 0
           description: >-
             When specified, an absolute upper bound (epoch ms, inclusive
-            `<=`) for `updated_at`. Omit for no upper bound. Pairs with
+            `<=`) for the latest message time. Omit for no upper bound. Pairs with
             `updated_after_ms` to bound the targeted window on both ends.
         min_message_count: { type: integer, default: 4 }
         max_context_chars: { type: integer, default: 200000 }
@@ -72,7 +72,7 @@ do:
           title: "summary_user_id is no longer supported"
           detail: "Use user_id and memory_kind instead."
 
-  # Step 0c: Resolve the effective `updated_after` lower bound (epoch ms).
+  # Step 0c: Resolve the effective latest-message lower bound (epoch ms).
   # `updated_after_ms` (absolute) wins when supplied; otherwise fall back
   # to deriving from `updated_within_hours` (relative to *workflow* start).
   # The relative path is kept for backward compatibility but it can drift
@@ -119,11 +119,11 @@ do:
                    match_mode: "LABEL_ALL",
                    user_id: $workflow.input.user_id,
                    memory_kinds: ["MEMORY_KIND_RAW"],
-                   updated_after: $updated_after_ms,
-                   updated_before: $updated_before_ms
+                   last_message_after: $updated_after_ms,
+                   last_message_before: $updated_before_ms
                  }
-                 | if $updated_after_ms == null then del(.updated_after) else . end
-                 | if $updated_before_ms == null then del(.updated_before) else . end
+                 | if $updated_after_ms == null then del(.last_message_after) else . end
+                 | if $updated_before_ms == null then del(.last_message_before) else . end
                  | tojson) }
             as_json: true
       export:
@@ -148,11 +148,11 @@ do:
               ${ ({
                    user_id: { value: $workflow.input.user_id },
                    memory_kinds: ["MEMORY_KIND_RAW"],
-                   updated_after: $updated_after_ms,
-                   updated_before: $updated_before_ms
+                   last_message_after: $updated_after_ms,
+                   last_message_before: $updated_before_ms
                  }
-                 | if $updated_after_ms == null then del(.updated_after) else . end
-                 | if $updated_before_ms == null then del(.updated_before) else . end
+                 | if $updated_after_ms == null then del(.last_message_after) else . end
+                 | if $updated_before_ms == null then del(.last_message_before) else . end
                  | tojson) }
             as_json: true
       export:

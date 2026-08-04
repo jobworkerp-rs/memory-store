@@ -30,7 +30,7 @@ input:
           type: integer
           minimum: 1
           description: >-
-            When specified, only threads whose `updated_at` is within the
+            When specified, only threads whose latest message is within the
             past N hours measured from this workflow's execution time
             are targeted. `updated_after_ms` takes precedence when both
             are set.
@@ -38,7 +38,7 @@ input:
           type: integer
           minimum: 0
           description: >-
-            Absolute lower bound (epoch ms) for `updated_at`. Takes
+            Absolute lower bound (epoch ms) for the latest message time. Takes
             precedence over `updated_within_hours`. memories-import
             forwards `--since` here so the window stays exactly aligned
             with the imported set.
@@ -86,7 +86,7 @@ do:
         # so a `try/catch` swallow of merge failure surfaces as merged=false.
         merge_invoked: "${ false }"
 
-  # Resolve effective `updated_after` lower bound (epoch ms): absolute
+  # Resolve effective latest-message lower bound (epoch ms): absolute
   # wins over relative, null clears the field so the server applies
   # no lower bound. Same shape as thread-summary-batch.
   - resolveUpdatedAfter:
@@ -119,9 +119,9 @@ do:
                    match_mode: "LABEL_ALL",
                    user_id: $workflow.input.user_id,
                    memory_kinds: ["MEMORY_KIND_RAW"],
-                   updated_after: $updated_after_ms
+                   last_message_after: $updated_after_ms
                  }
-                 | if $updated_after_ms == null then del(.updated_after) else . end
+                 | if $updated_after_ms == null then del(.last_message_after) else . end
                  | tojson) }
             as_json: true
       export:
@@ -145,9 +145,9 @@ do:
               ${ ({
                    user_id: { value: $workflow.input.user_id },
                    memory_kinds: ["MEMORY_KIND_RAW"],
-                   updated_after: $updated_after_ms
+                   last_message_after: $updated_after_ms
                  }
-                 | if $updated_after_ms == null then del(.updated_after) else . end
+                 | if $updated_after_ms == null then del(.last_message_after) else . end
                  | tojson) }
             as_json: true
       export:

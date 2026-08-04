@@ -47,10 +47,14 @@ input:
             channel:
               type: string
               description: "Thread channel name."
-            created_after:    { type: integer }
-            created_before:   { type: integer }
-            updated_after:    { type: integer }
-            updated_before:   { type: integer }
+            thread_created_after:  { type: integer }
+            thread_created_before: { type: integer }
+            thread_updated_after:  { type: integer }
+            thread_updated_before: { type: integer }
+            first_message_after:   { type: integer }
+            first_message_before:  { type: integer }
+            last_message_after:    { type: integer }
+            last_message_before:   { type: integer }
         hybrid_strategy:
           type: string
           enum: [RRF, WEIGHTED, VECTOR_THEN_FTS, FTS_THEN_VECTOR]

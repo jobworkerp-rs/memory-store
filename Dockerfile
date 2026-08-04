@@ -12,11 +12,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libssl-dev \
         pkg-config \
         ca-certificates \
+        curl \
+        jq \
         clang \
         cmake \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
+
+# The workspace links LanceDB and DataFusion, so parallel Rust builds can
+# exhaust the memory available to CI builders and local release builders.
+ENV CARGO_BUILD_JOBS=1
 
 # Copy workspace manifest + lockfile first to maximize layer cache reuse.
 COPY Cargo.toml Cargo.lock ./
@@ -29,14 +35,36 @@ COPY infra infra/
 COPY app app/
 COPY grpc-admin grpc-admin/
 COPY agent-chat-import agent-chat-import/
+COPY scripts scripts/
 
 # Workflows are read at runtime by the binary but the build does not need them;
 # they are copied into the runtime image instead.
+
+# Atlas is a fixed release dependency of memories-db-migrate. The lock pins a
+# stable release URL, version, and SHA-256; every mismatch fails closed.
+RUN scripts/fetch-atlas-linux-amd64.sh /build/atlas-bin/atlas
 
 RUN cargo build --release \
         --no-default-features \
         --features summarize-after \
         -p agent-chat-import --bin memories-import
+
+# Exercise the complete local-Memories SQLite migration path in the release
+# build. This deliberately uses a disposable database; user SQLite files are
+# never part of the image build.
+RUN cargo build --release -p grpc-admin --bin memories-db-migrate \
+    && mkdir -p infra/atlas/bin \
+    && cp /build/atlas-bin/atlas infra/atlas/bin/atlas \
+    && export MEMORIES_ATLAS_DATABASE_URL="sqlite:///tmp/memories-db-migrate-e2e.sqlite3?mode=rwc" \
+    && ./target/release/memories-db-migrate schema validate \
+    && ./target/release/memories-db-migrate schema status \
+    && ./target/release/memories-db-migrate schema apply --dry-run \
+    && ./target/release/memories-db-migrate schema apply \
+    && ./target/release/memories-db-migrate post-migrate run --all-required --maintenance-window-ack \
+    && ./target/release/memories-db-migrate schema verify \
+    && ./target/release/memories-db-migrate post-migrate verify \
+    && schema_status="$(./target/release/memories-db-migrate schema status)" \
+    && printf '%s\n' "$schema_status" | grep -Fx 'schema_status status=managed pending_count=0'
 
 # `front` is the server; `migrate-attachment-to-media` and
 # `cleanup-orphan-media` are operational batch jobs run as one-off k8s
@@ -49,7 +77,8 @@ RUN cargo build --release \
         -p grpc-admin \
         --bin front \
         --bin migrate-attachment-to-media \
-        --bin cleanup-orphan-media
+        --bin cleanup-orphan-media \
+        --bin memories-db-migrate
 
 # ---------- Runtime stage ----------
 FROM debian:bookworm-slim AS runtime
@@ -90,8 +119,11 @@ COPY --from=builder --chown=memories:memories /build/target/release/front ./fron
 # Operational batch jobs, run as one-off k8s Pods from this image.
 COPY --from=builder --chown=memories:memories /build/target/release/migrate-attachment-to-media ./migrate-attachment-to-media
 COPY --from=builder --chown=memories:memories /build/target/release/cleanup-orphan-media ./cleanup-orphan-media
+COPY --from=builder --chown=memories:memories /build/target/release/memories-db-migrate ./memories-db-migrate
 COPY --chown=memories:memories workflows ./workflows
 COPY --chown=memories:memories infra/sql/postgres ./sql/postgres
+COPY --chown=memories:memories infra/atlas ./atlas
+COPY --from=builder --chown=memories:memories /build/atlas-bin/atlas ./atlas/bin/atlas
 COPY --chown=memories:memories docker/start.sh ./start.sh
 RUN chmod +x ./start.sh
 

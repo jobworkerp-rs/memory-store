@@ -135,10 +135,14 @@ impl ThreadFilterConfig {
 pub fn has_non_label_filters(f: &ThreadSearchFilter) -> bool {
     f.user_id.is_some()
         || f.channel.is_some()
-        || f.created_after.is_some()
-        || f.created_before.is_some()
-        || f.updated_after.is_some()
-        || f.updated_before.is_some()
+        || f.thread_created_after.is_some()
+        || f.thread_created_before.is_some()
+        || f.thread_updated_after.is_some()
+        || f.thread_updated_before.is_some()
+        || f.first_message_after.is_some()
+        || f.first_message_before.is_some()
+        || f.last_message_after.is_some()
+        || f.last_message_before.is_some()
         || !f.memory_kinds.is_empty()
 }
 
@@ -150,10 +154,14 @@ pub fn has_non_label_filters(f: &ThreadSearchFilter) -> bool {
 /// resolve cleanly.
 pub fn needs_other_route(f: &ThreadSearchFilter) -> bool {
     let other_than_user_id = f.channel.is_some()
-        || f.created_after.is_some()
-        || f.created_before.is_some()
-        || f.updated_after.is_some()
-        || f.updated_before.is_some()
+        || f.thread_created_after.is_some()
+        || f.thread_created_before.is_some()
+        || f.thread_updated_after.is_some()
+        || f.thread_updated_before.is_some()
+        || f.first_message_after.is_some()
+        || f.first_message_before.is_some()
+        || f.last_message_after.is_some()
+        || f.last_message_before.is_some()
         || !f.memory_kinds.is_empty();
     if !f.labels.is_empty() {
         // labels route already AND-applies user_id; only run the other
@@ -233,10 +241,14 @@ pub async fn resolve_memory_ids_from_thread_filter(
             .find_thread_ids_by_filter(
                 filter.user_id,
                 filter.channel.as_deref(),
-                filter.created_after,
-                filter.created_before,
-                filter.updated_after,
-                filter.updated_before,
+                filter.thread_created_after,
+                filter.thread_created_before,
+                filter.thread_updated_after,
+                filter.thread_updated_before,
+                filter.first_message_after,
+                filter.first_message_before,
+                filter.last_message_after,
+                filter.last_message_before,
                 &filter.memory_kinds,
                 cfg.intermediate_hard_limit,
             )
@@ -338,19 +350,19 @@ mod tests {
                 ..Default::default()
             },
             ThreadSearchFilter {
-                created_after: Some(1),
+                thread_created_after: Some(1),
                 ..Default::default()
             },
             ThreadSearchFilter {
-                created_before: Some(1),
+                thread_created_before: Some(1),
                 ..Default::default()
             },
             ThreadSearchFilter {
-                updated_after: Some(1),
+                thread_updated_after: Some(1),
                 ..Default::default()
             },
             ThreadSearchFilter {
-                updated_before: Some(1),
+                thread_updated_before: Some(1),
                 ..Default::default()
             },
             ThreadSearchFilter {
@@ -396,12 +408,12 @@ mod tests {
             },
             ThreadSearchFilter {
                 labels: vec!["rust".into()],
-                created_after: Some(1),
+                thread_created_after: Some(1),
                 ..Default::default()
             },
             ThreadSearchFilter {
                 labels: vec!["rust".into()],
-                updated_before: Some(2),
+                thread_updated_before: Some(2),
                 ..Default::default()
             },
             ThreadSearchFilter {

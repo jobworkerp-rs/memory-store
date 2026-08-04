@@ -38,10 +38,14 @@ fn thread_list_options_from_user_req(
     req: &FindThreadListByUserIdRequest,
 ) -> Result<ThreadListOptions, tonic::Status> {
     Ok(ThreadListOptions {
-        created_after: req.created_after,
-        created_before: req.created_before,
-        updated_after: req.updated_after,
-        updated_before: req.updated_before,
+        created_after: req.thread_created_after,
+        created_before: req.thread_created_before,
+        updated_after: req.thread_updated_after,
+        updated_before: req.thread_updated_before,
+        first_message_after: req.first_message_after,
+        first_message_before: req.first_message_before,
+        last_message_after: req.last_message_after,
+        last_message_before: req.last_message_before,
         sort: req.sort.map(ThreadSort::from).unwrap_or_default(),
         memory_kinds: validated_memory_kinds(&req.memory_kinds)?,
     })
@@ -409,10 +413,14 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
         let match_all = req.match_mode
             == Some(crate::protobuf::llm_memory::data::LabelMatchMode::LabelAll as i32);
         let opts = ThreadListOptions {
-            created_after: req.created_after,
-            created_before: req.created_before,
-            updated_after: req.updated_after,
-            updated_before: req.updated_before,
+            created_after: req.thread_created_after,
+            created_before: req.thread_created_before,
+            updated_after: req.thread_updated_after,
+            updated_before: req.thread_updated_before,
+            first_message_after: req.first_message_after,
+            first_message_before: req.first_message_before,
+            last_message_after: req.last_message_after,
+            last_message_before: req.last_message_before,
             sort: req.sort.map(ThreadSort::from).unwrap_or_default(),
             memory_kinds: validated_memory_kinds(&req.memory_kinds)?,
         };
@@ -451,14 +459,18 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
         let memory_kinds = validated_memory_kinds(&req.memory_kinds)?;
         match self
             .app()
-            .find_distinct_labels(
+            .find_distinct_labels_with_message_times(
                 req.user_id,
                 req.limit,
                 req.offset,
-                req.created_after,
-                req.created_before,
-                req.updated_after,
-                req.updated_before,
+                req.thread_created_after,
+                req.thread_created_before,
+                req.thread_updated_after,
+                req.thread_updated_before,
+                req.first_message_after,
+                req.first_message_before,
+                req.last_message_after,
+                req.last_message_before,
                 &memory_kinds,
             )
             .await
@@ -487,14 +499,18 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
         }
         match self
             .app()
-            .search_labels(
+            .search_labels_with_message_times(
                 &req.query,
                 req.user_id,
                 req.limit,
-                req.created_after,
-                req.created_before,
-                req.updated_after,
-                req.updated_before,
+                req.thread_created_after,
+                req.thread_created_before,
+                req.thread_updated_after,
+                req.thread_updated_before,
+                req.first_message_after,
+                req.first_message_before,
+                req.last_message_after,
+                req.last_message_before,
             )
             .await
         {
@@ -538,7 +554,7 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
                 let thread_data = upsert.thread_data.ok_or_else(|| {
                     tonic::Status::invalid_argument("upsert.thread_data is required")
                 })?;
-                BatchThreadTarget::UpsertByChannel(thread_data)
+                BatchThreadTarget::UpsertByChannel(Box::new(thread_data))
             }
             None => {
                 return Err(tonic::Status::invalid_argument(
@@ -563,7 +579,6 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
             thread_target,
             memories,
             upsert_by_external_id: req.upsert_by_external_id,
-            thread_updated_at_override: req.thread_updated_at_override,
             labels: req.labels,
         };
 
@@ -653,15 +668,19 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
         let memory_kinds = validated_memory_kinds(&req.memory_kinds)?;
         match self
             .app()
-            .find_co_occurring_labels(
+            .find_co_occurring_labels_with_message_times(
                 &req.labels,
                 req.user_id,
                 req.limit,
                 req.offset,
-                req.created_after,
-                req.created_before,
-                req.updated_after,
-                req.updated_before,
+                req.thread_created_after,
+                req.thread_created_before,
+                req.thread_updated_after,
+                req.thread_updated_before,
+                req.first_message_after,
+                req.first_message_before,
+                req.last_message_after,
+                req.last_message_before,
                 &memory_kinds,
             )
             .await

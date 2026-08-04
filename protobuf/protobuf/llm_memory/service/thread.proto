@@ -23,7 +23,7 @@ message OptionalThreadResponse {
 }
 
 // Request to fetch threads owned by a given user.
-// The stream is ordered by `sort` (default: updated_at descending).
+// The stream is ordered by `sort` (default: latest message descending).
 message FindThreadListByUserIdRequest {
     // Target user id (required).
     llm_memory.data.UserId user_id = 1;
@@ -38,18 +38,24 @@ message FindThreadListByUserIdRequest {
     // `ThreadSearchFilter` (used by the LanceDB path) where both bounds
     // are exclusive — the two filter shapes have intentionally distinct
     // semantics tied to their respective backends.
-    optional int64 created_after  = 4;
-    optional int64 created_before = 5;
-    optional int64 updated_after  = 6;
-    optional int64 updated_before = 7;
-    // Sort key. UNSPECIFIED = UPDATED_DESC (default).
+    reserved 4, 5, 6, 7;
+    reserved "created_after", "created_before", "updated_after", "updated_before";
+    // Sort key. UNSPECIFIED = LAST_MESSAGE_DESC (default).
     optional llm_memory.data.ThreadListSort sort = 8;
     // MemoryKind values to include (empty = all kinds, OR logic).
     repeated llm_memory.data.MemoryKind memory_kinds = 9;
+    optional int64 thread_created_after = 10;
+    optional int64 thread_created_before = 11;
+    optional int64 thread_updated_after = 12;
+    optional int64 thread_updated_before = 13;
+    optional int64 first_message_after = 14;
+    optional int64 first_message_before = 15;
+    optional int64 last_message_after = 16;
+    optional int64 last_message_before = 17;
 }
 
 // Request to attach a Memory to a Thread.
-// The Thread's updated_at is bumped as part of the call.
+// The Thread's audit timestamp changes only when its message extrema change.
 message AddMemoryRequest {
     // Target thread id (required).
     llm_memory.data.ThreadId thread_id = 1;
@@ -143,14 +149,20 @@ message FindThreadListByLabelsRequest {
 
     // Time-range filters (epoch ms). Applied on top of the label match.
     // Same convention as FindThreadListByUserIdRequest.
-    optional int64 created_after  = 6;
-    optional int64 created_before = 7;
-    optional int64 updated_after  = 8;
-    optional int64 updated_before = 9;
-    // Sort key. UNSPECIFIED = UPDATED_DESC (default).
+    reserved 6, 7, 8, 9;
+    reserved "created_after", "created_before", "updated_after", "updated_before";
+    // Sort key. UNSPECIFIED = LAST_MESSAGE_DESC (default).
     optional llm_memory.data.ThreadListSort sort = 10;
     // MemoryKind values to include (empty = all kinds, OR logic).
     repeated llm_memory.data.MemoryKind memory_kinds = 11;
+    optional int64 thread_created_after = 12;
+    optional int64 thread_created_before = 13;
+    optional int64 thread_updated_after = 14;
+    optional int64 thread_updated_before = 15;
+    optional int64 first_message_after = 16;
+    optional int64 first_message_before = 17;
+    optional int64 last_message_after = 18;
+    optional int64 last_message_before = 19;
 }
 
 // Distinct label listing
@@ -163,12 +175,18 @@ message FindDistinctLabelsRequest {
     // Applied before label aggregation so the resulting `thread_count`
     // reflects the filtered population. Same convention as
     // FindThreadListByUserIdRequest.
-    optional int64 created_after  = 4;
-    optional int64 created_before = 5;
-    optional int64 updated_after  = 6;
-    optional int64 updated_before = 7;
+    reserved 4, 5, 6, 7;
+    reserved "created_after", "created_before", "updated_after", "updated_before";
     // MemoryKind values to include (empty = all kinds, OR logic).
     repeated llm_memory.data.MemoryKind memory_kinds = 8;
+    optional int64 thread_created_after = 9;
+    optional int64 thread_created_before = 10;
+    optional int64 thread_updated_after = 11;
+    optional int64 thread_updated_before = 12;
+    optional int64 first_message_after = 13;
+    optional int64 first_message_before = 14;
+    optional int64 last_message_after = 15;
+    optional int64 last_message_before = 16;
 }
 
 message FindDistinctLabelsResponse {
@@ -185,10 +203,16 @@ message SearchLabelsRequest {
 
     // Time-range filters (epoch ms) on the underlying threads.
     // Same semantics as FindDistinctLabelsRequest above.
-    optional int64 created_after  = 4;
-    optional int64 created_before = 5;
-    optional int64 updated_after  = 6;
-    optional int64 updated_before = 7;
+    reserved 4, 5, 6, 7;
+    reserved "created_after", "created_before", "updated_after", "updated_before";
+    optional int64 thread_created_after = 8;
+    optional int64 thread_created_before = 9;
+    optional int64 thread_updated_after = 10;
+    optional int64 thread_updated_before = 11;
+    optional int64 first_message_after = 12;
+    optional int64 first_message_before = 13;
+    optional int64 last_message_after = 14;
+    optional int64 last_message_before = 15;
 }
 
 message SearchLabelsResponse {
@@ -208,12 +232,18 @@ message FindCoOccurringLabelsRequest {
     // ANDed with the label match so the co-occurrence aggregation
     // runs only over the time-filtered population.
     // Same convention as FindThreadListByUserIdRequest.
-    optional int64 created_after  = 5;
-    optional int64 created_before = 6;
-    optional int64 updated_after  = 7;
-    optional int64 updated_before = 8;
+    reserved 5, 6, 7, 8;
+    reserved "created_after", "created_before", "updated_after", "updated_before";
     // MemoryKind values to include (empty = all kinds, OR logic).
     repeated llm_memory.data.MemoryKind memory_kinds = 9;
+    optional int64 thread_created_after = 10;
+    optional int64 thread_created_before = 11;
+    optional int64 thread_updated_after = 12;
+    optional int64 thread_updated_before = 13;
+    optional int64 first_message_after = 14;
+    optional int64 first_message_before = 15;
+    optional int64 last_message_after = 16;
+    optional int64 last_message_before = 17;
 }
 
 message FindCoOccurringLabelsResponse {
@@ -255,6 +285,8 @@ message BatchMemoryInput {
 
 // Request for ThreadService.AddMemoriesBatch.
 message AddMemoriesBatchRequest {
+    reserved 5;
+    reserved "thread_updated_at_override";
     // Either reuse an existing thread by id, or upsert by channel.
     oneof thread_target {
         llm_memory.data.ThreadId existing_thread_id = 1;
@@ -268,15 +300,6 @@ message AddMemoriesBatchRequest {
     // collision with AlreadyExists. The "existing memory must already
     // belong to THIS thread" rule applies regardless of this flag.
     bool upsert_by_external_id = 4;
-    // When > 0, the server sets thread.updated_at to
-    // `max(current, this value)` at the end of the batch — the
-    // override only moves updated_at forward, never backwards, so
-    // differential imports and high-watermark consumers
-    // (`updated_after >= ...` filters, summarize-after) cannot drop
-    // the thread when the source's recorded session time is older
-    // than the live row. 0 means no override (updated_at bumps
-    // naturally as memories are appended).
-    int64 thread_updated_at_override = 5;
     // Labels to attach idempotently after the batch commits.
     repeated string labels = 6;
 }

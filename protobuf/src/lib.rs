@@ -4,6 +4,7 @@ pub mod llm_memory {
         tonic::include_proto!("llm_memory.data");
     }
     pub mod service {
+        #![allow(clippy::large_enum_variant)]
         tonic::include_proto!("llm_memory.service");
     }
 }

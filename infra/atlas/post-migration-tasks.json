@@ -1,0 +1,28 @@
+{
+  "tasks": [
+    {
+      "id": "thread-message-times-v1",
+      "generation": 1,
+      "description": "thread の会話時刻を補完し、既存 ThreadVector row の時刻 scalar を同期する",
+      "canonical_definition": {
+        "backends": ["postgres", "sqlite"],
+        "checkpoint_format": "thread-message-times-v1@1/checkpoint-v1",
+        "completion_required_by_schema_version": "20260803000003",
+        "dependencies": [],
+        "id": "thread-message-times-v1",
+        "implementation": "thread_message_times_v1::ThreadMessageTimesV1Task",
+        "introduced_by_schema_version": "20260803000003",
+        "maintenance_window_required": true,
+        "state_contract": "rdb-keyset-and-vector-staging-v1"
+      },
+      "canonical_definition_digest": "d2fe9980cf1048115967a8ab019a53c4422b284f3a8cf185ce2c55988506ed1d",
+      "backends": ["postgres", "sqlite"],
+      "introduced_by_schema_version": "20260803000003",
+      "completion_required_by_schema_version": "20260803000003",
+      "dependencies": [],
+      "maintenance_window_required": true,
+      "implementation": "thread_message_times_v1::ThreadMessageTimesV1Task",
+      "lifecycle": "active"
+    }
+  ]
+}
