@@ -59,10 +59,7 @@ RUN cargo build --release -p grpc-admin --bin memories-db-migrate \
     && ./target/release/memories-db-migrate schema validate \
     && ./target/release/memories-db-migrate schema status \
     && ./target/release/memories-db-migrate schema apply --dry-run \
-    && ./target/release/memories-db-migrate schema apply \
-    && ./target/release/memories-db-migrate post-migrate run --all-required --maintenance-window-ack \
-    && ./target/release/memories-db-migrate schema verify \
-    && ./target/release/memories-db-migrate post-migrate verify \
+    && ./target/release/memories-db-migrate release apply --maintenance-window-ack \
     && schema_status="$(./target/release/memories-db-migrate schema status)" \
     && printf '%s\n' "$schema_status" | grep -Fx 'schema_status status=managed pending_count=0'
 

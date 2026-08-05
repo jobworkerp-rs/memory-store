@@ -72,6 +72,10 @@ enum Command {
         #[command(subcommand)]
         command: PostMigrateCommand,
     },
+    Release {
+        #[command(subcommand)]
+        command: ReleaseCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -100,6 +104,19 @@ enum PostMigrateCommand {
     Status,
     Verify,
     Run(PostMigrateRunArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ReleaseCommand {
+    Plan,
+    Baseline,
+    Apply(ReleaseApplyArgs),
+}
+
+#[derive(Debug, Args)]
+struct ReleaseApplyArgs {
+    #[arg(long)]
+    maintenance_window_ack: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,18 +160,72 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Schema { command } => match command {
-            SchemaCommand::Validate => {
-                run_atlas(&["migrate", "validate"]).await?;
-                println!("schema_validate status=valid");
-                Ok(())
-            }
+            SchemaCommand::Validate => run_schema_validate().await,
             SchemaCommand::Status => run_status().await,
             SchemaCommand::Apply(args) => run_apply(args.dry_run).await,
             SchemaCommand::Verify(verify_args) => run_verify(verify_args.to_version).await,
             SchemaCommand::Baseline => run_baseline().await,
         },
         Command::PostMigrate { command } => run_post_migrate(command).await,
+        Command::Release { command } => run_release(command).await,
     }
+}
+
+async fn run_schema_validate() -> Result<()> {
+    run_atlas(&["migrate", "validate"]).await?;
+    println!("schema_validate status=valid");
+    Ok(())
+}
+
+async fn run_release(command: ReleaseCommand) -> Result<()> {
+    match command {
+        ReleaseCommand::Plan => {
+            run_schema_validate().await?;
+            run_status().await?;
+            run_apply(true).await?;
+            run_post_migrate(PostMigrateCommand::Status).await?;
+            println!("release_plan status=completed");
+        }
+        ReleaseCommand::Baseline => {
+            run_schema_validate().await?;
+            run_status().await?;
+            run_baseline().await?;
+            run_status().await?;
+            run_verify(None).await?;
+            println!("release_baseline status=completed");
+        }
+        ReleaseCommand::Apply(args) => {
+            if !args.maintenance_window_ack {
+                bail!("--maintenance-window-ack is required for release apply");
+            }
+            run_schema_validate().await?;
+            run_status().await?;
+            run_apply(true).await?;
+            run_apply(false).await?;
+            run_post_migrate(PostMigrateCommand::Status).await?;
+            run_post_migrate(PostMigrateCommand::Run(PostMigrateRunArgs {
+                id: None,
+                generation: None,
+                all_required: true,
+                dry_run: true,
+                maintenance_window_ack: false,
+            }))
+            .await?;
+            run_post_migrate(PostMigrateCommand::Run(PostMigrateRunArgs {
+                id: None,
+                generation: None,
+                all_required: true,
+                dry_run: false,
+                maintenance_window_ack: true,
+            }))
+            .await?;
+            run_verify(None).await?;
+            run_post_migrate(PostMigrateCommand::Verify).await?;
+            run_status().await?;
+            println!("release_apply status=completed");
+        }
+    }
+    Ok(())
 }
 
 async fn run_status() -> Result<()> {
@@ -267,7 +338,7 @@ async fn run_uninitialized_dry_run() -> Result<()> {
 async fn cleanup_uninitialized_dry_run_history() -> Result<()> {
     let pool = open_target_pool().await?;
     let has_application_table = table_exists(&pool, "thread").await?;
-    let has_history = table_exists(&pool, "atlas_schema_revisions").await?;
+    let has_history = atlas_history_exists(&pool).await?;
     let has_contract = table_exists(&pool, "memories_schema_contract").await?;
     let has_task_state = table_exists(&pool, "memories_data_migration_task_state").await?;
     if !has_history {
@@ -277,7 +348,7 @@ async fn cleanup_uninitialized_dry_run_history() -> Result<()> {
         bail!("Atlas dry-run changed an uninitialized target beyond its empty revision history");
     }
 
-    let revision_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM atlas_schema_revisions")
+    let revision_count: i64 = sqlx::query_scalar(ATLAS_HISTORY_COUNT_SQL)
         .fetch_one(&pool)
         .await
         .context("checking Atlas dry-run revision history")?;
@@ -286,7 +357,7 @@ async fn cleanup_uninitialized_dry_run_history() -> Result<()> {
     }
     // Atlas creates its revision table before rendering a dry-run plan. An
     // empty table is not migration state, so remove it to preserve dry-run.
-    sqlx::query("DROP TABLE atlas_schema_revisions")
+    sqlx::query(ATLAS_HISTORY_DROP_SQL)
         .execute(&pool)
         .await
         .context("restoring uninitialized target after Atlas dry-run")?;
@@ -536,7 +607,7 @@ async fn post_migration_state_unavailable(pool: &RdbPool) -> Result<bool> {
 
 async fn schema_state(pool: &RdbPool) -> Result<SchemaState> {
     let has_application_table = table_exists(pool, "thread").await?;
-    let has_history = table_exists(pool, "atlas_schema_revisions").await?;
+    let has_history = atlas_history_exists(pool).await?;
     let has_contract = table_exists(pool, "memories_schema_contract").await?;
     let has_task_state = table_exists(pool, "memories_data_migration_task_state").await?;
     if !has_history {
@@ -568,11 +639,10 @@ async fn schema_state(pool: &RdbPool) -> Result<SchemaState> {
 /// Atlas history may stop at a fixed-catalog boundary. Fresh databases start
 /// at v1 with a normal applied revision; adopted schemas require a baseline.
 async fn valid_schema_history_prefix_len(pool: &RdbPool) -> Result<Option<usize>> {
-    let history: Vec<(String, i64)> =
-        sqlx::query_as("SELECT version, type FROM atlas_schema_revisions ORDER BY version ASC")
-            .fetch_all(pool)
-            .await
-            .context("reading Atlas schema revision history")?;
+    let history: Vec<(String, i64)> = sqlx::query_as(ATLAS_HISTORY_SELECT_SQL)
+        .fetch_all(pool)
+        .await
+        .context("reading Atlas schema revision history")?;
     let expected = atlas_migration_versions();
     let Some((first_version, first_type)) = history.first() else {
         return Ok(None);
@@ -597,6 +667,33 @@ async fn valid_schema_history_prefix_len(pool: &RdbPool) -> Result<Option<usize>
         }
     }
     Ok(Some(start_index + history.len()))
+}
+
+#[cfg(feature = "postgres")]
+const ATLAS_HISTORY_COUNT_SQL: &str = "SELECT COUNT(*) FROM atlas_schema_revisions";
+#[cfg(feature = "postgres")]
+const ATLAS_HISTORY_SELECT_SQL: &str =
+    "SELECT version, type FROM atlas_schema_revisions ORDER BY version ASC";
+#[cfg(feature = "postgres")]
+const ATLAS_HISTORY_DROP_SQL: &str = "DROP TABLE atlas_schema_revisions";
+
+#[cfg(not(feature = "postgres"))]
+const ATLAS_HISTORY_COUNT_SQL: &str = "SELECT COUNT(*) FROM atlas_schema_revisions";
+#[cfg(not(feature = "postgres"))]
+const ATLAS_HISTORY_SELECT_SQL: &str =
+    "SELECT version, type FROM atlas_schema_revisions ORDER BY version ASC";
+#[cfg(not(feature = "postgres"))]
+const ATLAS_HISTORY_DROP_SQL: &str = "DROP TABLE atlas_schema_revisions";
+
+async fn atlas_history_exists(pool: &RdbPool) -> Result<bool> {
+    #[cfg(feature = "postgres")]
+    {
+        return table_exists(pool, "atlas_schema_revisions").await;
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        table_exists(pool, "atlas_schema_revisions").await
+    }
 }
 
 /// The contract and common task state are introduced by the third fixed
@@ -816,8 +913,8 @@ async fn run_atlas_capture(
         .arg("--env")
         .arg(backend)
         .args(args)
-        .envs(child_env.iter().map(|(name, value)| (name, value)))
         .env("MEMORIES_ATLAS_DATABASE_URL", database_url)
+        .envs(child_env.iter().map(|(name, value)| (name, value)))
         .stdin(Stdio::null())
         .output()
         .await
@@ -971,24 +1068,19 @@ fn latest_migration_version(artifact_root: &std::path::Path, backend: &str) -> R
 #[cfg(feature = "postgres")]
 async fn run_postgres_verify(args: &[String]) -> Result<String> {
     let pool = open_target_pool().await?;
+    let target_url = migration_database_url()?;
     let schema = format!(
         "memories_atlas_verify_{}_{}",
         std::process::id(),
         command_utils::util::datetime::now_millis()
     );
+    let environment = postgres_verify_environment(&target_url, &schema)?;
     let create = format!("CREATE SCHEMA {}", quote_postgres_identifier(&schema));
     sqlx::query(sqlx::AssertSqlSafe(create))
         .execute(&pool)
         .await
         .context("creating temporary PostgreSQL schema for Atlas verification")?;
-    let target_url = migration_database_url()?;
-    let dev_url = atlas_database_url(&postgres_schema_url(&target_url, &schema)?)?;
-    let result = run_atlas_capture(
-        args,
-        "verify.hcl",
-        &[("MEMORIES_ATLAS_INTERNAL_DEV_URL".to_string(), dev_url)],
-    )
-    .await;
+    let result = run_atlas_capture(args, "verify.hcl", &environment).await;
     let drop = format!("DROP SCHEMA {} CASCADE", quote_postgres_identifier(&schema));
     let cleanup = sqlx::query(sqlx::AssertSqlSafe(drop))
         .execute(&pool)
@@ -1002,6 +1094,51 @@ async fn run_postgres_verify(args: &[String]) -> Result<String> {
             "Atlas verification also failed to remove its temporary schema: {cleanup_error:#}"
         ))),
     }
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_verify_environment(
+    target_url: &str,
+    dev_schema: &str,
+) -> Result<Vec<(String, String)>> {
+    let source_schema = postgres_target_schema(target_url)?;
+    Ok(vec![
+        (
+            "MEMORIES_ATLAS_DATABASE_URL".to_string(),
+            atlas_database_url(&postgres_schema_url(target_url, &source_schema)?)?,
+        ),
+        (
+            "MEMORIES_ATLAS_INTERNAL_DEV_URL".to_string(),
+            atlas_database_url(&postgres_schema_url(target_url, dev_schema)?)?,
+        ),
+    ])
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_target_schema(target_url: &str) -> Result<String> {
+    let url = Url::parse(target_url).context("parsing PostgreSQL target URL")?;
+    if url.scheme() != "postgres" && url.scheme() != "postgresql" {
+        bail!("PostgreSQL verification requires a PostgreSQL target URL");
+    }
+    let pairs = url.query_pairs().collect::<Vec<_>>();
+    let search_path = pairs
+        .iter()
+        .find_map(|(key, value)| (*key == "search_path").then(|| value.to_string()));
+    let sqlx_search_path = pairs
+        .iter()
+        .find_map(|(key, value)| (*key == "options[search_path]").then(|| value.to_string()));
+    if let (Some(search_path), Some(sqlx_search_path)) = (&search_path, &sqlx_search_path)
+        && search_path != sqlx_search_path
+    {
+        bail!("conflicting PostgreSQL search_path options are not supported");
+    }
+    let schema = search_path
+        .or(sqlx_search_path)
+        .unwrap_or_else(|| "public".to_string());
+    // Reuse the URL builder's identifier validation before the schema reaches
+    // a process boundary or dynamic SQL.
+    postgres_schema_url(target_url, &schema)?;
+    Ok(schema)
 }
 
 #[cfg(not(feature = "postgres"))]
@@ -1212,8 +1349,10 @@ fn target_backend_for_url(url: &str) -> Result<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::atlas_database_url;
+    #[cfg(feature = "postgres")]
+    use super::postgres_verify_environment;
     use super::{
-        ADOPTION_BASELINE_VERSION, adoption_baseline_versions, atlas_artifact_root,
+        ADOPTION_BASELINE_VERSION, Cli, adoption_baseline_versions, atlas_artifact_root,
         atlas_config_path, atlas_migration_versions, atlas_platform_name, load_atlas_tool_lock,
         load_seed_expectations, pending_count_for_schema_state,
         remaining_migration_count_after_baseline, schema_diff_args,
@@ -1227,8 +1366,12 @@ mod tests {
         verify_seed_expectations,
     };
     #[cfg(feature = "postgres")]
-    use super::{SchemaState, postgres_schema_url, quote_postgres_identifier, schema_state};
+    use super::{
+        ATLAS_HISTORY_COUNT_SQL, ATLAS_HISTORY_DROP_SQL, ATLAS_HISTORY_SELECT_SQL, SchemaState,
+        postgres_schema_url, quote_postgres_identifier, schema_state,
+    };
     use anyhow::{Context, Result, bail};
+    use clap::Parser;
     use infra_utils::infra::rdb::{Rdb, RdbPool};
     use std::process::Stdio;
     use std::time::Duration;
@@ -1246,6 +1389,17 @@ mod tests {
         "THREAD_VECTOR_INDEX_MIN_ROWS",
         "THREAD_VECTOR_INDEX_NPROBES",
     ];
+
+    #[test]
+    fn release_apply_command_accepts_maintenance_acknowledgement() {
+        Cli::try_parse_from([
+            "memories-db-migrate",
+            "release",
+            "apply",
+            "--maintenance-window-ack",
+        ])
+        .expect("release apply command must parse");
+    }
 
     const E2E_FIXED_SEARCH_ENVIRONMENT: [(&str, &str); 5] = [
         ("MEMORY_FTS_TOKENIZER", "simple"),
@@ -1735,15 +1889,14 @@ mod tests {
     }
 
     #[test]
-    fn docker_smoke_migration_uses_public_schema_subcommands() {
+    fn docker_smoke_migration_uses_release_coordinator() {
         const DOCKERFILE: &str = include_str!("../../../Dockerfile");
 
         for command in [
             "schema validate",
             "schema status",
             "schema apply --dry-run",
-            "schema apply",
-            "schema verify",
+            "release apply --maintenance-window-ack",
         ] {
             assert!(
                 DOCKERFILE.contains(&format!("memories-db-migrate {command}")),
@@ -1757,18 +1910,16 @@ mod tests {
             );
         }
 
-        let post_migrate_verify = DOCKERFILE
-            .find("memories-db-migrate post-migrate verify")
-            .expect("Docker smoke migration must verify post-migration tasks");
-        let final_status = DOCKERFILE[post_migrate_verify..]
+        let release_apply = DOCKERFILE
+            .find("memories-db-migrate release apply --maintenance-window-ack")
+            .expect("Docker smoke migration must use the release coordinator");
+        let final_status = DOCKERFILE[release_apply..]
             .find("memories-db-migrate schema status")
-            .map(|offset| post_migrate_verify + offset)
-            .expect(
-                "Docker smoke migration must check schema status after post-migrate verification",
-            );
+            .map(|offset| release_apply + offset)
+            .expect("Docker smoke migration must check schema status after release apply");
         assert!(
-            final_status > post_migrate_verify,
-            "the managed schema status check must follow post-migrate verification"
+            final_status > release_apply,
+            "the managed schema status check must follow release apply"
         );
         assert!(
             DOCKERFILE[final_status..]
@@ -1776,7 +1927,7 @@ mod tests {
             "Docker smoke migration must reject a final schema status other than managed with no pending migrations"
         );
         assert!(
-            DOCKERFILE[post_migrate_verify..].contains(
+            DOCKERFILE[release_apply..].contains(
                 "schema_status=\"$(./target/release/memories-db-migrate schema status)\""
             ),
             "Docker smoke migration must preserve schema status failures while checking its structured output"
@@ -1929,6 +2080,93 @@ mod tests {
         assert!(
             !query.iter().any(|(key, _)| key == "options[search_path]"),
             "Atlas/libpq must not receive SQLx-only URL parameters"
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_uses_target_schema_for_atlas_revision_history() {
+        assert_eq!(
+            ATLAS_HISTORY_COUNT_SQL,
+            "SELECT COUNT(*) FROM atlas_schema_revisions"
+        );
+        assert_eq!(
+            ATLAS_HISTORY_SELECT_SQL,
+            "SELECT version, type FROM atlas_schema_revisions ORDER BY version ASC"
+        );
+        assert_eq!(ATLAS_HISTORY_DROP_SQL, "DROP TABLE atlas_schema_revisions");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_verify_environment_scopes_source_and_dev_to_schemas() {
+        let environment = postgres_verify_environment(
+            "postgres://user:secret@example.invalid/memories?sslmode=disable",
+            "memories_atlas_verify_123",
+        )
+        .unwrap();
+
+        assert_eq!(
+            environment,
+            vec![
+                (
+                    "MEMORIES_ATLAS_DATABASE_URL".to_string(),
+                    "postgres://user:secret@example.invalid/memories?sslmode=disable&search_path=public"
+                        .to_string(),
+                ),
+                (
+                    "MEMORIES_ATLAS_INTERNAL_DEV_URL".to_string(),
+                    "postgres://user:secret@example.invalid/memories?sslmode=disable&search_path=memories_atlas_verify_123"
+                        .to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_verify_environment_preserves_the_target_schema() {
+        let environment = postgres_verify_environment(
+            "postgres://user:secret@example.invalid/memories?sslmode=disable&search_path=tenant_a&options%5Bsearch_path%5D=tenant_a",
+            "memories_atlas_verify_123",
+        )
+        .unwrap();
+
+        assert_eq!(
+            environment[0],
+            (
+                "MEMORIES_ATLAS_DATABASE_URL".to_string(),
+                "postgres://user:secret@example.invalid/memories?sslmode=disable&search_path=tenant_a"
+                    .to_string(),
+            )
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_verify_environment_uses_sqlx_only_target_schema_option() {
+        let environment = postgres_verify_environment(
+            "postgres://user:secret@example.invalid/memories?sslmode=disable&options%5Bsearch_path%5D=tenant_a",
+            "memories_atlas_verify_123",
+        )
+        .unwrap();
+
+        assert!(environment[0].1.ends_with("search_path=tenant_a"));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_verify_environment_rejects_conflicting_schema_options() {
+        let error = postgres_verify_environment(
+            "postgres://user:secret@example.invalid/memories?search_path=tenant_a&options%5Bsearch_path%5D=tenant_b",
+            "memories_atlas_verify_123",
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting PostgreSQL search_path")
         );
     }
 

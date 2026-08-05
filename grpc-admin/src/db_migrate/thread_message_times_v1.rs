@@ -14,7 +14,7 @@ use infra::infra::thread_vector::{
 };
 use infra_utils::infra::rdb::RdbPool;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::cmp::Ordering;
 
 const CHECKPOINT_FORMAT: &str = "thread-message-times-v1@1/checkpoint-v1";
 const DEFAULT_BATCH_SIZE: i64 = 500;
@@ -612,16 +612,23 @@ impl ThreadMessageTimesV1Task {
                     else {
                         continue;
                     };
-                    let records = source
-                        .find_records_by_thread_id(*thread_id)
-                        .await?
-                        .into_iter()
-                        .map(|mut record| {
-                            record.first_message_at = first;
-                            record.last_message_at = last;
-                            record
-                        })
-                        .collect();
+                    let (records, discarded_duplicates) = normalize_vector_records(
+                        source
+                            .find_records_by_thread_id(*thread_id)
+                            .await?
+                            .into_iter()
+                            .map(|mut record| {
+                                record.first_message_at = first;
+                                record.last_message_at = last;
+                                record
+                            })
+                            .collect(),
+                    )?;
+                    if discarded_duplicates != 0 {
+                        eprintln!(
+                            "thread_vector_duplicate_rows_discarded thread_id={thread_id} count={discarded_duplicates}"
+                        );
+                    }
                     staging.batch_upsert(records).await?;
                     self.renew_lease(lease).await?;
                 }
@@ -803,8 +810,15 @@ impl ThreadMessageTimesV1Task {
         let canonical_ids = unique_thread_ids(canonical.get_all_thread_ids().await?);
         let staging_ids = unique_thread_ids(staging.get_all_thread_ids().await?);
         for thread_id in canonical_ids {
-            let source = sorted_records(canonical.find_records_by_thread_id(thread_id).await?)?;
-            let target = sorted_records(staging.find_records_by_thread_id(thread_id).await?)?;
+            let (source, _) =
+                normalize_vector_records(canonical.find_records_by_thread_id(thread_id).await?)?;
+            let (target, target_duplicates) =
+                normalize_vector_records(staging.find_records_by_thread_id(thread_id).await?)?;
+            if target_duplicates != 0 {
+                bail!(
+                    "staging ThreadVector retained duplicate row identifiers for thread_id={thread_id}"
+                );
+            }
             if message_bounds_for_existing_thread(&self.pool, thread_id)
                 .await?
                 .is_none()
@@ -850,10 +864,15 @@ impl ThreadMessageTimesV1Task {
             bail!("ThreadVector thread key set verification failed after cutover");
         }
         for thread_id in expected_ids {
-            let expected_records =
-                sorted_records(expected.find_records_by_thread_id(thread_id).await?)?;
-            let actual_records =
-                sorted_records(actual.find_records_by_thread_id(thread_id).await?)?;
+            let (expected_records, expected_duplicates) =
+                normalize_vector_records(expected.find_records_by_thread_id(thread_id).await?)?;
+            let (actual_records, actual_duplicates) =
+                normalize_vector_records(actual.find_records_by_thread_id(thread_id).await?)?;
+            if expected_duplicates != 0 || actual_duplicates != 0 {
+                bail!(
+                    "ThreadVector equivalence verification found duplicate row identifiers for thread_id={thread_id}"
+                );
+            }
             verify_matching_vector_records(thread_id, &expected_records, &actual_records, true)?;
         }
         Ok(())
@@ -867,7 +886,13 @@ impl ThreadMessageTimesV1Task {
             let (first, last) = message_bounds_for_existing_thread(&self.pool, thread_id)
                 .await?
                 .context("ThreadVector contains a thread absent from RDB")?;
-            let records = sorted_records(repository.find_records_by_thread_id(thread_id).await?)?;
+            let (records, discarded_duplicates) =
+                normalize_vector_records(repository.find_records_by_thread_id(thread_id).await?)?;
+            if discarded_duplicates != 0 {
+                bail!(
+                    "ThreadVector verification found duplicate row identifiers for thread_id={thread_id}"
+                );
+            }
             if records.is_empty() {
                 bail!("ThreadVector thread key has no records for thread_id={thread_id}");
             }
@@ -994,7 +1019,9 @@ fn unique_thread_ids(mut ids: Vec<i64>) -> Vec<i64> {
     ids
 }
 
-fn sorted_records(mut records: Vec<ThreadVectorRecord>) -> Result<Vec<ThreadVectorRecord>> {
+fn normalize_vector_records(
+    mut records: Vec<ThreadVectorRecord>,
+) -> Result<(Vec<ThreadVectorRecord>, usize)> {
     records.sort_by(|left, right| {
         (left.thread_id, &left.vector_kind, left.chunk_index).cmp(&(
             right.thread_id,
@@ -1002,22 +1029,61 @@ fn sorted_records(mut records: Vec<ThreadVectorRecord>) -> Result<Vec<ThreadVect
             right.chunk_index,
         ))
     });
-    let mut seen = BTreeSet::new();
-    for record in &records {
-        if !seen.insert((
-            record.thread_id,
-            record.vector_kind.clone(),
-            record.chunk_index,
-        )) {
-            bail!(
-                "ThreadVector has duplicate row identifier thread_id={} vector_kind={} chunk_index={}",
-                record.thread_id,
-                record.vector_kind,
-                record.chunk_index
-            );
+    let mut normalized = Vec::with_capacity(records.len());
+    let mut discarded = 0;
+    let mut group_start = 0;
+    while group_start < records.len() {
+        let key = (
+            records[group_start].thread_id,
+            records[group_start].vector_kind.as_str(),
+            records[group_start].chunk_index,
+        );
+        let mut group_end = group_start + 1;
+        while group_end < records.len()
+            && (
+                records[group_end].thread_id,
+                records[group_end].vector_kind.as_str(),
+                records[group_end].chunk_index,
+            ) == key
+        {
+            group_end += 1;
         }
+        let winner = records[group_start..group_end]
+            .iter()
+            .max_by(|left, right| compare_duplicate_vector_records(left, right))
+            .expect("non-empty duplicate group");
+        discarded += group_end - group_start - 1;
+        normalized.push(winner.clone());
+        group_start = group_end;
     }
-    Ok(records)
+    Ok((normalized, discarded))
+}
+
+fn compare_duplicate_vector_records(
+    left: &ThreadVectorRecord,
+    right: &ThreadVectorRecord,
+) -> Ordering {
+    left.indexed_at
+        .cmp(&right.indexed_at)
+        .then_with(|| left.updated_at.cmp(&right.updated_at))
+        .then_with(|| left.created_at.cmp(&right.created_at))
+        .then_with(|| left.begin_position.cmp(&right.begin_position))
+        .then_with(|| left.end_position.cmp(&right.end_position))
+        .then_with(|| left.user_id.cmp(&right.user_id))
+        .then_with(|| left.memory_kind.cmp(&right.memory_kind))
+        .then_with(|| left.content.cmp(&right.content))
+        .then_with(|| left.description.cmp(&right.description))
+        .then_with(|| left.labels.cmp(&right.labels))
+        .then_with(|| left.embedding_model.cmp(&right.embedding_model))
+        .then_with(|| left.channel.cmp(&right.channel))
+        .then_with(|| left.first_message_at.cmp(&right.first_message_at))
+        .then_with(|| left.last_message_at.cmp(&right.last_message_at))
+        .then_with(|| {
+            left.embedding
+                .iter()
+                .map(|value| value.to_bits())
+                .cmp(right.embedding.iter().map(|value| value.to_bits()))
+        })
 }
 
 fn verify_matching_vector_records(
@@ -1207,15 +1273,18 @@ async fn update_message_bounds_preserving_audit(
 mod tests {
     #[cfg(not(feature = "postgres"))]
     use super::ThreadMessageTimesV1Task;
-    use super::{Checkpoint, IndexOutcome, IndexOutcomes, RdbPhase, VectorPhase, fetch_thread_ids};
+    use super::{
+        Checkpoint, IndexOutcome, IndexOutcomes, RdbPhase, VectorPhase, fetch_thread_ids,
+        normalize_vector_records,
+    };
     #[cfg(not(feature = "postgres"))]
     use crate::db_migrate::{catalog, state};
     #[cfg(not(feature = "postgres"))]
     use infra::infra::memory_vector::config::{DistanceType, FtsConfig, VectorIndexConfig};
+    use infra::infra::thread_vector::record::ThreadVectorRecord;
     #[cfg(not(feature = "postgres"))]
     use infra::infra::thread_vector::{
-        config::ThreadVectorDBConfig, record::ThreadVectorRecord,
-        repository::ThreadVectorRepositoryImpl,
+        config::ThreadVectorDBConfig, repository::ThreadVectorRepositoryImpl,
     };
 
     #[cfg(not(feature = "postgres"))]
@@ -1303,6 +1372,81 @@ mod tests {
             ..Checkpoint::default()
         };
         assert!(checkpoint.validate().is_err());
+    }
+
+    #[test]
+    fn normalizes_identical_duplicate_vector_rows_by_latest_indexed_at() {
+        let record = |content: &str, indexed_at: i64| ThreadVectorRecord {
+            thread_id: 1,
+            vector_kind: "text".to_string(),
+            chunk_index: 0,
+            begin_position: 0,
+            end_position: 3,
+            user_id: 7,
+            memory_kind: 1,
+            content: content.to_string(),
+            description: Some(content.to_string()),
+            labels: vec!["keep".to_string()],
+            embedding: vec![0.1, 0.2, 0.3, 0.4],
+            embedding_model: Some("test-model".to_string()),
+            channel: None,
+            created_at: 10,
+            updated_at: 20,
+            first_message_at: None,
+            last_message_at: None,
+            indexed_at,
+        };
+
+        let mut older = record("same", 30);
+        older.first_message_at = Some(100);
+        older.last_message_at = Some(200);
+        let (records, discarded) = normalize_vector_records(vec![
+            older,
+            record("same", 40),
+            ThreadVectorRecord {
+                thread_id: 2,
+                ..record("other", 50)
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(discarded, 1);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].thread_id, 1);
+        assert_eq!(records[0].content, "same");
+        assert_eq!(records[0].indexed_at, 40);
+        assert_eq!(records[1].thread_id, 2);
+    }
+
+    #[test]
+    fn normalizes_conflicting_duplicate_vector_rows_by_latest_indexed_at() {
+        let record = |content: &str, indexed_at: i64| ThreadVectorRecord {
+            thread_id: 1,
+            vector_kind: "text".to_string(),
+            chunk_index: 0,
+            begin_position: 0,
+            end_position: 3,
+            user_id: 7,
+            memory_kind: 1,
+            content: content.to_string(),
+            description: Some(content.to_string()),
+            labels: vec!["keep".to_string()],
+            embedding: vec![0.1, 0.2, 0.3, 0.4],
+            embedding_model: Some("test-model".to_string()),
+            channel: None,
+            created_at: 10,
+            updated_at: 20,
+            first_message_at: Some(100),
+            last_message_at: Some(200),
+            indexed_at,
+        };
+
+        let (records, discarded) =
+            normalize_vector_records(vec![record("old", 30), record("new", 40)]).unwrap();
+        assert_eq!(discarded, 1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].content, "new");
+        assert_eq!(records[0].indexed_at, 40);
     }
 
     #[cfg(not(feature = "postgres"))]
