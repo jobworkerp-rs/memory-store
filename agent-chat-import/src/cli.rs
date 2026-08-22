@@ -309,9 +309,10 @@ pub struct UpsertGenerationWorkersArgs {
     #[arg(long, default_value = "all", value_name = "LANG")]
     pub language: String,
 
-    /// Channel assigned to the generated WORKFLOW workers.
-    #[arg(long, default_value = "workflow_lang", value_name = "CHANNEL")]
-    pub channel: String,
+    /// Optional channel assigned to the generated WORKFLOW workers. When
+    /// omitted, jobworkerp uses its default channel.
+    #[arg(long, value_name = "CHANNEL")]
+    pub channel: Option<String>,
 
     /// jobworkerp connection timeout in seconds.
     #[arg(long, default_value_t = 30, value_name = "SECONDS")]
@@ -903,7 +904,18 @@ mod tests {
             Subcmd::UpsertGenerationWorkers(args) => {
                 assert_eq!(args.feature, "all");
                 assert_eq!(args.language, "all");
-                assert_eq!(args.channel, "workflow_lang");
+                assert_eq!(args.channel, None);
+            }
+            other => panic!("expected UpsertGenerationWorkers, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upsert_generation_workers_accepts_explicit_channel() {
+        let cli = parse(&["upsert-generation-workers", "--channel", "workflow_lang"]).unwrap();
+        match cli.command {
+            Subcmd::UpsertGenerationWorkers(args) => {
+                assert_eq!(args.channel.as_deref(), Some("workflow_lang"));
             }
             other => panic!("expected UpsertGenerationWorkers, got {other:?}"),
         }

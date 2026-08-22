@@ -141,9 +141,11 @@ changing prompts.
 JOBWORKERP_ADDR=http://localhost:9000 \
 memories-import upsert-generation-workers \
   --feature all \
-  --language all \
-  --channel workflow_lang
+  --language all
 ```
+
+If `--channel` is omitted, the workers use jobworkerp's default channel. Pass
+`--channel <CHANNEL>` only when a specific channel is required.
 
 This subcommand does not import data and does not require `--user-id`.
 

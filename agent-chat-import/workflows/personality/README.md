@@ -29,9 +29,11 @@ The batch calls language-specific workers by name. Register them first:
 memories-import upsert-generation-workers \
   --feature personality \
   --language all \
-  --channel workflow_lang \
   --repo-root /abs/path/to/memories/agent-chat-import
 ```
+
+Omit `--channel` to use jobworkerp's default channel; specify it only when a
+custom channel is required.
 
 ## Invariants
 

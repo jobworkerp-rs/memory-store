@@ -24,9 +24,11 @@ memories のチャットスレッドから LLM reflection を生成する genera
 memories-import upsert-generation-workers \
   --feature reflection \
   --language all \
-  --channel workflow_lang \
   --repo-root /abs/path/to/memories/agent-chat-import
 ```
+
+`--channel` を省略すると jobworkerp のデフォルト channel が使われる。特定の
+channel が必要な場合だけ指定する。
 
 prompt を変更した場合は、`upsert-generation-workers` を再実行して worker settings を更新します。
 

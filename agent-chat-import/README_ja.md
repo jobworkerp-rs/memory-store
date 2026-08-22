@@ -134,9 +134,11 @@ python3 へ依存しない。prompt を変更した場合は再登録する。
 JOBWORKERP_ADDR=http://localhost:9000 \
 memories-import upsert-generation-workers \
   --feature all \
-  --language all \
-  --channel workflow_lang
+  --language all
 ```
+
+`--channel` を省略した場合は jobworkerp のデフォルト channel を使用する。
+特定の channel が必要な場合だけ `--channel <CHANNEL>` を指定する。
 
 登録される worker 名は `memories-thread-reflection-single-ja/en`,
 `memories-thread-summary-single-ja/en`, `memories-daily-work-summary-single-ja/en`,
@@ -340,8 +342,9 @@ personality の prompt は、言語別 worker 登録時に
 
 batch→single / merge の fan-out は言語別 worker (`memories-*-<lang>`) を `workerName` で呼ぶため、
 bare なテンプレートでも prompt context は不要。事前に
-`memories-import upsert-generation-workers --feature all --language all --channel workflow_lang`
-などで言語別 worker を登録しておく。
+`memories-import upsert-generation-workers --feature all --language all`
+などで言語別 worker を登録しておく。`--channel <CHANNEL>` を省略すると
+jobworkerp のデフォルト channel が使われる。
 
 ## `codex` サブコマンド
 

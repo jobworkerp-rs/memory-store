@@ -883,7 +883,7 @@ impl EmbeddingDispatcherCore {
                 metadata,
                 &worker_data,
                 args_bytes,
-                self.config.timeout_sec,
+                u64::from(self.config.timeout_sec),
                 None,
                 Some(jobworkerp_client::jobworkerp::data::Priority::High),
                 Some(using),

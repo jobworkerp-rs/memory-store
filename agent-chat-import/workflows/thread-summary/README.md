@@ -30,9 +30,11 @@ the batch.
 memories-import upsert-generation-workers \
   --feature thread-summary \
   --language all \
-  --channel workflow_lang \
   --repo-root /abs/path/to/memories/agent-chat-import
 ```
+
+Omit `--channel` to use jobworkerp's default channel; specify it only when a
+custom channel is required.
 
 Re-run registration after changing prompts.
 

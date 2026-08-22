@@ -29,9 +29,11 @@ documented in [../../../workflows/thread-reflection/README.md](../../../workflow
 memories-import upsert-generation-workers \
   --feature reflection \
   --language all \
-  --channel workflow_lang \
   --repo-root /abs/path/to/memories/agent-chat-import
 ```
+
+Omit `--channel` to use jobworkerp's default channel; specify it only when a
+custom channel is required.
 
 Re-run this after prompt changes.
 

@@ -390,11 +390,10 @@ do:
                         settings:
                           workflow_url: "${ $workflow.input.thread_summary_batch_yaml }"
                         # Batch parent → `llm_batch` (≥2). Its child
-                        # single workers run on the channel baked into
-                        # their registered worker definition (MG6: the
-                        # batch fans out via `workerName`, default
-                        # `workflow_lang`). Putting the parent on the same
-                        # channel as its children deadlocks — the only slot
+                        # single workers run on an explicitly registered
+                        # channel, or jobworkerp's default when omitted (MG6:
+                        # the batch fans out via `workerName`). Putting the parent on
+                        # the same channel as its children deadlocks — the only slot
                         # is held by the parent waiting for child jobs that
                         # can never start.
                         options:

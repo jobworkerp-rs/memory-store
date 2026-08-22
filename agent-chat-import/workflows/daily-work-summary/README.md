@@ -28,6 +28,20 @@ The batch dispatches `memories-daily-work-summary-single-ja/en` based on
 `output_language`. Register workers with `memories-import
 upsert-generation-workers` before running.
 
+## Register Generation Workers
+
+Register the language-specific single workers before running the batch:
+
+```bash
+memories-import upsert-generation-workers \
+  --feature daily-work-summary \
+  --language all \
+  --repo-root /absolute/path/to/memories/agent-chat-import
+```
+
+Omit `--channel` to use jobworkerp's default channel. Specify a channel only
+when a custom channel is required.
+
 ## Prerequisites
 
 - Thread summaries exist under the requested `user_id` with kind `THREAD_SUMMARY`.

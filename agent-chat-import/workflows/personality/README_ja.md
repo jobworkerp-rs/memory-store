@@ -107,9 +107,11 @@ prompt は `memories-import upsert-generation-workers` が `agent-chat-import/wo
 JOBWORKERP_ADDR=http://localhost:9000 \
 memories-import upsert-generation-workers \
   --feature personality \
-  --language all \
-  --channel workflow_lang
+  --language all
 ```
+
+`--channel` を省略すると jobworkerp のデフォルト channel が使われる。特定の
+channel が必要な場合だけ指定する。
 
 登録される worker は `memories-thread-personality-single-ja/en` と `memories-user-personality-merge-ja/en`。prompt を変更したら再登録する。
 `thread-personality-batch.yaml` は `output_language` に応じてこれらの言語別 worker を `workerName` で呼ぶため、

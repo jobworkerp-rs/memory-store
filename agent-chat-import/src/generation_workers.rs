@@ -136,7 +136,7 @@ struct GenerationWorkerRegistration {
 #[derive(Debug, Clone)]
 pub(crate) struct UpsertGenerationWorkersArgs {
     pub repo_root: PathBuf,
-    pub channel: String,
+    pub channel: Option<String>,
     pub timeout_sec: u32,
     pub features: Vec<GenerationWorkerFeature>,
     pub languages: Vec<String>,
@@ -201,7 +201,7 @@ fn worker_name_for_feature(feature: GenerationWorkerFeature, lang: &str) -> Resu
 
 fn build_generation_worker_registrations(
     repo_root: &Path,
-    channel: &str,
+    channel: Option<&str>,
     features: &[GenerationWorkerFeature],
     languages: &[String],
 ) -> Result<Vec<GenerationWorkerRegistration>> {
@@ -216,7 +216,7 @@ fn build_generation_worker_registrations(
 
 fn build_registration(
     repo_root: &Path,
-    channel: &str,
+    channel: Option<&str>,
     feature: GenerationWorkerFeature,
     lang: &str,
 ) -> Result<GenerationWorkerRegistration> {
@@ -247,7 +247,7 @@ fn build_registration(
         runner_id: None,
         runner_settings: Vec::new(),
         periodic_interval: 0,
-        channel: Some(channel.to_string()),
+        channel: channel.map(str::to_string),
         queue_type: QueueType::Normal as i32,
         response_type: ResponseType::Direct as i32,
         store_success: false,
@@ -283,7 +283,7 @@ pub(crate) async fn upsert_generation_workers(
 ) -> Result<Vec<String>> {
     let registrations = build_generation_worker_registrations(
         &args.repo_root,
-        &args.channel,
+        args.channel.as_deref(),
         &args.features,
         &args.languages,
     )?;
@@ -341,7 +341,7 @@ mod tests {
     fn builds_reflection_registration_with_prompt_context() {
         let regs = build_generation_worker_registrations(
             &resolve_repo_root(),
-            "workflow_lang",
+            None,
             &[GenerationWorkerFeature::Reflection],
             &["ja".to_string()],
         )
@@ -349,7 +349,7 @@ mod tests {
         assert_eq!(regs.len(), 1);
         let reg = &regs[0];
         assert_eq!(reg.worker_name, "memories-thread-reflection-single-ja");
-        assert_eq!(reg.worker_data.channel.as_deref(), Some("workflow_lang"));
+        assert_eq!(reg.worker_data.channel, None);
         let context = reg.settings["workflow_context"].as_str().unwrap();
         assert!(context.contains("\"prompt_source\":\"embedded_context\""));
         assert!(context.contains("reflection_system_prompt"));
@@ -361,7 +361,7 @@ mod tests {
     fn builds_all_summary_registrations() {
         let regs = build_generation_worker_registrations(
             &resolve_repo_root(),
-            "workflow_lang",
+            Some("workflow_lang"),
             &[
                 GenerationWorkerFeature::ThreadSummary,
                 GenerationWorkerFeature::DailyWorkSummary,
@@ -382,6 +382,7 @@ mod tests {
             ]
         );
         for reg in regs {
+            assert_eq!(reg.worker_data.channel.as_deref(), Some("workflow_lang"));
             let context = reg.settings["workflow_context"].as_str().unwrap();
             assert!(context.contains("_system_prompt"));
             assert!(context.contains("_user_tail"));
@@ -404,7 +405,7 @@ mod tests {
     fn builds_personality_registrations_with_prompt_context() {
         let regs = build_generation_worker_registrations(
             &resolve_repo_root(),
-            "workflow_lang",
+            Some("workflow_lang"),
             &[
                 GenerationWorkerFeature::ThreadPersonality,
                 GenerationWorkerFeature::UserPersonalityMerge,

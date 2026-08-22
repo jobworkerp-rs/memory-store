@@ -31,9 +31,11 @@ batch を動かす前に、対象言語の worker を登録しておく:
 memories-import upsert-generation-workers \
   --feature thread-summary \
   --language all \
-  --channel workflow_lang \
   --repo-root /abs/path/to/memories/agent-chat-import
 ```
+
+`--channel` を省略すると jobworkerp のデフォルト channel が使われる。特定の
+channel が必要な場合だけ指定する。
 
 ### 単一スレッド要約
 
@@ -182,7 +184,7 @@ batch 経由で `workerName` 指定の言語別 worker に渡る）:
 
 batch は `output_language` に応じて `memories-thread-summary-single-ja` /
 `memories-thread-summary-single-en` を `workerName` で呼ぶ。事前に
-`memories-import upsert-generation-workers --feature thread-summary --language all --channel workflow_lang`
+`memories-import upsert-generation-workers --feature thread-summary --language all`
 などで言語別 single worker を登録しておく。
 
 ## 差分実行の仕組み
