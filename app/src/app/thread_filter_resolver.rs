@@ -133,6 +133,9 @@ impl ThreadFilterConfig {
 /// the `find_thread_ids_by_filter` route is skipped entirely when this
 /// returns false, which keeps the labels-only fast path on a single SQL.
 pub fn has_non_label_filters(f: &ThreadSearchFilter) -> bool {
+    // `thread_id` is resolved by its own point route (Route 3), never by
+    // the broad `find_thread_ids_by_filter` scan: a point filter must not
+    // read every thread or fail on the intermediate limit.
     f.user_id.is_some()
         || f.channel.is_some()
         || f.thread_created_after.is_some()
@@ -153,6 +156,8 @@ pub fn has_non_label_filters(f: &ThreadSearchFilter) -> bool {
 /// users who own a lot of threads even though the labels route would
 /// resolve cleanly.
 pub fn needs_other_route(f: &ThreadSearchFilter) -> bool {
+    // `thread_id` / `thread_group_id` have dedicated routes, so they do
+    // not enable the broad non-label scan.
     let other_than_user_id = f.channel.is_some()
         || f.thread_created_after.is_some()
         || f.thread_created_before.is_some()
@@ -266,13 +271,43 @@ pub async fn resolve_memory_ids_from_thread_filter(
         None
     };
 
-    // Intersect / take whichever is populated. Two unset routes means
+    // Route 3: explicit Thread id / ThreadGroup expansion. Independent of the other
+    // routes so a group-only filter does not trigger the broad
+    // non-label scan.
+    let thread_set: Option<HashSet<i64>> = filter.thread_id.map(|thread_id| [thread_id].into());
+
+    let group_set: Option<HashSet<i64>> = if let Some(group_id) = filter.thread_group_id {
+        let ids = thread_repo
+            .find_thread_ids_by_group_id(group_id, cfg.intermediate_hard_limit + 1)
+            .await?;
+        if ids.len() as i64 > cfg.intermediate_hard_limit {
+            return Err(LlmMemoryError::FailedPrecondition(format!(
+                "thread_filter.thread_group_id {group_id} has more than {} current members \
+                 (intermediate hard limit).",
+                cfg.intermediate_hard_limit
+            ))
+            .into());
+        }
+        Some(ids.into_iter().collect())
+    } else {
+        None
+    };
+
+    // Intersect / take whichever is populated. No populated route means
     // an empty `ThreadSearchFilter` was provided, which the caller
     // should treat as "no thread-side narrowing".
-    let resolved: HashSet<i64> = match (labels_set, other_set) {
-        (Some(a), Some(b)) => a.intersection(&b).copied().collect(),
-        (Some(s), None) | (None, Some(s)) => s,
-        (None, None) => return Ok(None),
+    let mut resolved: Option<HashSet<i64>> = None;
+    for set in [labels_set, other_set, thread_set, group_set]
+        .into_iter()
+        .flatten()
+    {
+        resolved = Some(match resolved {
+            Some(acc) => acc.intersection(&set).copied().collect(),
+            None => set,
+        });
+    }
+    let Some(resolved) = resolved else {
+        return Ok(None);
     };
 
     if resolved.len() as i64 > cfg.max_thread_ids {
@@ -376,6 +411,66 @@ mod tests {
                 f
             );
         }
+    }
+
+    /// A `thread_id`-only filter is a point lookup and must not enable
+    /// the broad non-label route (which would read every thread and could
+    /// trip `intermediate_hard_limit`).
+    #[test]
+    fn thread_id_only_filter_does_not_enable_broad_route() {
+        let point = ThreadSearchFilter {
+            thread_id: Some(42),
+            ..Default::default()
+        };
+        assert!(!has_non_label_filters(&point));
+        assert!(!needs_other_route(&point));
+
+        // Combined with a real broad condition it still enables Route 2.
+        let mixed = ThreadSearchFilter {
+            thread_id: Some(42),
+            channel: Some("c".into()),
+            ..Default::default()
+        };
+        assert!(has_non_label_filters(&mixed));
+        assert!(needs_other_route(&mixed));
+    }
+
+    /// Point-route regression: with a tiny intermediate limit and more
+    /// threads than the limit, a `thread_id`-only filter still resolves
+    /// without invoking (and failing on) the broad Route 2 scan.
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn thread_id_only_filter_survives_a_tiny_intermediate_limit() {
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = infra::infra::thread_group::test_support::setup_thread_group_pool().await;
+            for id in [26_001, 26_002, 26_003] {
+                infra::infra::thread_group::test_support::insert_thread(pool, id, None).await;
+            }
+            let cfg = ThreadFilterConfig {
+                intermediate_hard_limit: 1,
+                ..ThreadFilterConfig::from_env()
+            };
+            let filter = ThreadSearchFilter {
+                thread_id: Some(26_001),
+                ..Default::default()
+            };
+            let resolved = resolve_memory_ids_from_thread_filter(
+                &cfg,
+                &ThreadLabelRepositoryImpl::new(pool),
+                &ThreadRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool),
+                &ThreadMemoryRepositoryImpl::new(pool),
+                &filter,
+                None,
+            )
+            .await
+            .expect("thread_id-only filter must not fail the broad-route limit");
+            assert_eq!(
+                resolved,
+                Some(Vec::new()),
+                "point filter resolves its thread with no memories"
+            );
+        });
     }
 
     /// `needs_other_route` decides whether the non-label SQL route runs

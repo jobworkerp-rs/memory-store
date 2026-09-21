@@ -25,7 +25,7 @@ pub const DEFAULT_PLAIN_SOURCE_NAME: &str = "plain";
 #[derive(Parser, Debug)]
 #[command(
     name = "memories-import",
-    about = "Import agent chat history (Claude Code, Codex CLI, plain text trees) into memories",
+    about = "Import agent chat history (Claude Code, Codex CLI, OpenCode SQLite, plain text trees) into memories",
     subcommand_required = true,
     arg_required_else_help = true
 )]
@@ -41,7 +41,7 @@ impl Cli {
     pub fn requires_user_id(&self) -> bool {
         matches!(
             self.command,
-            Subcmd::ClaudeCode(_) | Subcmd::Codex(_) | Subcmd::Plain(_)
+            Subcmd::ClaudeCode(_) | Subcmd::Codex(_) | Subcmd::OpenCode(_) | Subcmd::Plain(_)
         )
     }
 
@@ -110,6 +110,18 @@ pub struct GlobalArgs {
     /// Dry run (no actual import)
     #[arg(short = 'n', long, global = true)]
     pub dry_run: bool,
+
+    /// Connect to `--server-url` and report the current ThreadGroup
+    /// reconciliation state without importing or writing anything. This
+    /// is the connected dry-run form; it requires `--server-url`.
+    #[arg(long, global = true)]
+    pub dry_run_connect: bool,
+
+    /// Per-run emergency gate: skip ThreadGroup observation /
+    /// reconciliation writes. The design 8.2 suppression check still
+    /// runs, so a forbidden identity is never imported.
+    #[arg(long, global = true)]
+    pub no_thread_group_writes: bool,
 
     /// Emit versioned machine-readable import lifecycle events as JSONL.
     #[arg(long, global = true)]
@@ -295,6 +307,9 @@ pub enum Subcmd {
     ClaudeCode(ClaudeCodeArgs),
     /// Import OpenAI Codex CLI rollout JSONL.
     Codex(CodexArgs),
+    /// Import OpenCode SQLite sessions.
+    #[command(name = "opencode")]
+    OpenCode(OpenCodeArgs),
     /// Import a directory tree of `.md` / `.txt` files.
     Plain(PlainArgs),
 }
@@ -471,6 +486,71 @@ pub struct CodexArgs {
     #[arg(long, action = ArgAction::SetTrue, overrides_with = "link_tool_calls")]
     #[allow(dead_code)] // Resolved via effective_link_tool_calls()
     pub no_link_tool_calls: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(group(clap::ArgGroup::new("opencode_input").required(true).multiple(false)))]
+pub struct OpenCodeArgs {
+    /// Single OpenCode session identifier.
+    #[arg(long, group = "opencode_input", conflicts_with = "all_sessions")]
+    pub session_id: Option<String>,
+
+    /// Import all sessions present in the database.
+    #[arg(long, group = "opencode_input", conflicts_with = "session_id")]
+    pub all_sessions: bool,
+
+    /// OpenCode SQLite database path.
+    #[arg(long, value_name = "PATH")]
+    pub opencode_db: Option<PathBuf>,
+
+    /// Entry kinds to import.
+    #[arg(
+        short = 't',
+        long,
+        default_value = "user,assistant,tool_call,tool_output,system,reasoning,attachment"
+    )]
+    pub include_types: String,
+
+    /// Base paths to strip from generated path/dir labels.
+    #[arg(short = 'P', long, value_name = "PATHS")]
+    pub strip_path_prefix: Option<String>,
+
+    /// Include sessions with a non-null time_archived.
+    #[arg(long)]
+    pub include_archived: bool,
+}
+
+impl OpenCodeArgs {
+    pub fn include_types_set(&self) -> std::collections::HashSet<String> {
+        self.include_types
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    pub fn path_prefixes(&self) -> Vec<String> {
+        self.strip_path_prefix
+            .as_deref()
+            .map(|s| {
+                s.split(',')
+                    .map(|p| p.trim().trim_end_matches('/').to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn resolved_db(&self) -> PathBuf {
+        if let Some(path) = &self.opencode_db {
+            return expand_tilde(path);
+        }
+        let base = std::env::var_os("XDG_DATA_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| expand_tilde(std::path::Path::new("~/.local/share")));
+        base.join("opencode").join("opencode.db")
+    }
 }
 
 impl CodexArgs {
@@ -1025,6 +1105,49 @@ mod tests {
     }
 
     #[test]
+    fn opencode_input_required_and_exclusive() {
+        let missing = parse(&["-u", "1", "opencode"]).unwrap_err();
+        assert_eq!(
+            missing.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        let both = parse(&[
+            "-u",
+            "1",
+            "opencode",
+            "--all-sessions",
+            "--session-id",
+            "ses-1",
+        ])
+        .unwrap_err();
+        assert_eq!(both.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn opencode_defaults_and_options_are_parsed() {
+        let cli = parse(&[
+            "opencode",
+            "--session-id",
+            "ses-1",
+            "-u",
+            "7",
+            "--include-types",
+            "user,tool_output",
+            "--include-archived",
+        ])
+        .unwrap();
+        match cli.command {
+            Subcmd::OpenCode(args) => {
+                assert_eq!(args.session_id.as_deref(), Some("ses-1"));
+                assert!(!args.all_sessions);
+                assert_eq!(args.include_types_set().len(), 2);
+                assert!(args.include_archived);
+            }
+            other => panic!("expected OpenCode, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn subcommand_required() {
         let err = parse(&["-u", "1"]).unwrap_err();
         // clap returns DisplayHelpOnMissingArgumentOrSubcommand for missing subcommand
@@ -1148,6 +1271,24 @@ mod tests {
         let cli = parse(&["-u", "1", "--dry-run", "claude-code", "--all-projects"]).unwrap();
         assert!(cli.global.dry_run);
         assert_eq!(cli.global.user_id, Some(1));
+    }
+
+    #[test]
+    fn connected_dry_run_and_write_gate_flags_parse() {
+        let cli = parse(&[
+            "-u",
+            "1",
+            "--dry-run-connect",
+            "--no-thread-group-writes",
+            "--server-url",
+            "http://localhost:9010",
+            "claude-code",
+            "--all-projects",
+        ])
+        .unwrap();
+        assert!(cli.global.dry_run_connect);
+        assert!(cli.global.no_thread_group_writes);
+        assert!(!cli.global.dry_run);
     }
 
     #[test]

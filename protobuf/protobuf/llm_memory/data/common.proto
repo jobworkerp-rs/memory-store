@@ -51,6 +51,8 @@ enum MemoryKind {
   MEMORY_KIND_MONTHLY_SUMMARY = 5;
   MEMORY_KIND_PERSONALITY = 6;
   MEMORY_KIND_REFLECTION = 7;
+  // Group-scoped summary generated from the current ThreadGroup membership.
+  MEMORY_KIND_THREAD_GROUP_SUMMARY = 8;
 }
 
 // Label match mode for thread label filtering

@@ -6,6 +6,7 @@
 
 - `claude-code` — Claude Code JSONL transcript (`~/.claude/projects/<hash>/<session>.jsonl`)
 - `codex` — OpenAI Codex CLI rollout (`~/.codex/sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl`)
+- `opencode` — OpenCode SQLite session (`$XDG_DATA_HOME/opencode/opencode.db`)
 - `plain` — Obsidian vault などのプレーンテキストツリー (`.md` / `.txt`)
 
 ## Canonical schema
@@ -112,6 +113,20 @@ memories-import --user-id 1 claude-code \
 
 例: `cwd=/home/me/work/foo` → ラベルは `path:work/foo`。
 `dir:` ラベルや `metadata.project_path` は変化しない (絶対パスのまま)。
+
+セッションのディレクトリが Git 管理下にある場合は、`repo:<host>/<組織>/<repository>`
+形式の repository identity ラベルも付与する。
+最近傍の祖先リポジトリを採用するため、`$HOME` 配下のリポジトリよりサブディレクトリ内の
+リポジトリが優先される。リモートは `origin` を優先し、なければ設定ファイル順で最初の
+リモートを使う。各リモートでは `url`、なければ `fetchurl` を使う。`http` / `https` /
+`ssh` / `git` URL と scp-like SSH 形式を解析し、scheme、userinfo、末尾の `/` と `.git`
+suffix を除去する。scheme URL の query と fragment も除去する。host は小文字化し、非標準
+port は保持する。したがって
+`https://git.example.com/org/repo.git`、`ssh://git@git.example.com/org/repo.git`、
+`git@git.example.com:org/repo.git` はすべて `repo:git.example.com/org/repo` になる。解析不能な
+形式や repository path を持たない remote は、誤った同一視を避けるためラベルを静かに省略する。
+scp-like 形式で userinfo と path の境界を一意に解析できない remote も省略する。
+Git 管理下でない場合やリモートを解決できない場合（Git がない環境を含む）も同様に省略する。
 
 ### dry-run (DB 接続なしで件数だけ確認)
 
@@ -399,6 +414,27 @@ memories-import --user-id 1 codex --all-sessions --no-link-tool-calls
 | `--include-encrypted-reasoning` | — | `false` | `reasoning.encrypted_content` の本文を metadata に保存。**既定では保存しない**(sensitive blob が DB / dump / backup に残らないように)。本文の代わりに `encrypted_content_sha256` と `encrypted_content_size` は常に保存される |
 | `--link-tool-calls` / `--no-link-tool-calls` | — | `true` | tool_call ↔ output の親子リンクを張るか |
 
+## `opencode` サブコマンド
+
+OpenCode のローカル SQLite (`session` / `message` / `part`) を read-only で読み取り、1 session を 1 Thread として取り込む。既定 DB は `$XDG_DATA_HOME/opencode/opencode.db`（未設定時は `~/.local/share/opencode/opencode.db`）で、`--opencode-db` で変更できる。
+
+```bash
+# 全セッションを dry-run
+memories-import --user-id 1 --dry-run opencode --all-sessions
+
+# 1 session を実際に取り込む
+memories-import --user-id 1 --server-url http://localhost:9010 opencode \
+  --session-id ses_... --opencode-db ~/.local/share/opencode/opencode.db
+```
+
+`--session-id` と `--all-sessions` は排他必須。`-t, --include-types`（既定: `user,assistant,tool_call,tool_output,system,reasoning,attachment`）、`-P, --strip-path-prefix`、`--include-archived` を指定できる。`--since` は session/message/part の更新時刻で候補を再評価し、既存 Memory の本文や metadata は重複再実行で上書きしない。参照添付は media RPC に送らず、秘密情報を含む URL は redacted reference として保存する。取り込み時の動作メモ:
+
+- **重複再実行で安全**: `--since` は session/message/part の更新時刻で候補を再評価するが、既存 Memory の本文や metadata は上書きしない。未完了 message / tool (`pending` / `running`) は defer され、次回実行時に再評価される
+- **親 session の補完**: `--since` で更新対象になった session は、`parent_id` を持つ場合に未更新の祖先も親から順に取り込む。subagent だけが取り込まれて lineage 上の root になることを防ぐためであり、祖先も通常の重複排除を通る
+- **elide 済み tool output**: `state.time.compacted` を持つ completed tool は、OpenCode による compaction で output が消去されているため、call (input) のみを取り込み、output / 内部 attachment は生成しない。`error` status の tool は compacted でも `state.error` を tool output として常に保存する
+- **参照添付**: media RPC に送らず、秘密情報を含む URL は redacted reference として保存する。metadata には原 MIME と filename のみ保存する
+- **usage の重複除去**: message 単位の usage は同一 message の複数 part に繰り返されるため、`message_id` 単位で重複を除いた最初の part にだけ `metadata.opencode.usage` を保存する
+
 ## `plain` サブコマンド
 
 Obsidian vault などのプレーンテキストツリー (`.md` / `.txt`) を取り込む。`.gitignore` 尊重 walker (`ignore` crate) + glob exclude (`globset`) + frontmatter パース (`serde_yaml`) を備える。
@@ -531,7 +567,7 @@ channel / `external_id` / `agent:<source-name>` ラベルすべての prefix に
 | `--personality-workflow` | personality 時 ○ | — | thread-personality-batch.yaml の絶対パス |
 | `--personality-channel` | — | (なし) | jobworkerp チャンネル名 |
 | `--personality-timeout-sec` | — | `86400` (24h) | personality job の timeout (秒)。理由は summarize 側と同じ |
-| `--server-retry-max` | — | `3` | 1 RPC あたりの最大試行回数 (初回含む)。 retry 対象は `Unavailable` / `DeadlineExceeded` / `ResourceExhausted` および PostgreSQL `40001` / `40P01` SQLSTATE。`--server-retry-max 1` または `--no-retry` で完全に無効化できる |
+| `--server-retry-max` | — | `3` | 1 RPC あたりの最大試行回数 (初回含む)。 retry 対象は `Unavailable` / `DeadlineExceeded` / `ResourceExhausted` / `Cancelled` および PostgreSQL `40001` / `40P01` SQLSTATE。`--server-retry-max 1` または `--no-retry` で完全に無効化できる |
 
 | `--server-retry-base-ms` | — | `1000` | 指数バックオフの基底 ms (試行 N の待機は `min(base * 2^(N-1), cap)` を jitter 倍したもの) |
 | `--server-retry-cap-ms` | — | `30000` | バックオフの上限 ms |
@@ -553,16 +589,25 @@ channel / `external_id` / `agent:<source-name>` ラベルすべての prefix に
 `--source-name`を含む。`session_completed.imported_count`は、その試行で新規作成または
 重複upsertとして存在を確認した累積件数である。既存threadへの成功した再試行も
 `thread_id`付きの完了eventを出力する。thread IDを得る前にparse skipまたは入力エラーに
-なったセッションはeventを出力しない。creation event後に後続chunkが失敗した場合は、
-同じkeyとIDの`success=false` completionを出力する。eventの書込みに失敗したimportは
-非成功として扱う。
+なったセッションは既存のライフサイクルeventを出力しない。creation event後に後続chunkが
+失敗した場合は、同じkeyとIDの`success=false` completionを出力する。eventの書込みに
+失敗したimportは非成功として扱う。
+
+import全体の終了前には、`import_completed`を1件出力する。plain では任意の prune RPC より前に
+出力するため、prune 失敗でもこの event は抑制されない。このeventには全セッションの
+最終集計と`sessions`配列が含まれ、parse errorなどsession keyを確定できない失敗では
+`session_key: null`を使用する。詳細なフィールド定義は
+[`docs/memories-import-event-spec_ja.md`](../docs/memories-import-event-spec_ja.md)を参照。
+既存の`thread_created`と`session_completed`のJSON形状は変更しない。現時点のexit codeは
+従来どおりsession error（plainでは既存のprune判定も含む）がある場合に1であり、将来
+`import_completed`を主な判定経路へ移行する予定である。
 
 ### Back-pressure と再試行
 
 memories サーバ側 (cnpg PostgreSQL) で `AddMemoriesBatch` の INSERT が遅延する場合、 client はチャンクごとの逐次 `await` で待機するため自然に律速されます。さらに以下の挙動が組み合わさります:
 
 1. **チャンクサイズ縮小**: 既定 200 件 / 4 MiB に絞ることで 1 transaction を数秒程度に抑え、 cnpg の lock contention が解消する余地を与えます。
-2. **指数バックオフ + リトライ**: 上記 SQLSTATE か gRPC `Unavailable` / `DeadlineExceeded` / `ResourceExhausted` が返った場合、 max 3 回まで指数バックオフで再送します。`AddMemoriesBatch` は server 側で `upsert_by_external_id=true` 固定により冪等で、`UpdateMemoryParents` も同じ memory_id への再送は `rewired: false` の no-op になるため、リトライ起因の二重作成は起きません。
+2. **指数バックオフ + リトライ**: 上記 SQLSTATE か gRPC `Unavailable` / `DeadlineExceeded` / `ResourceExhausted` / `Cancelled` が返った場合、 max 3 回まで指数バックオフで再送します。`AddMemoriesBatch` は server 側で `upsert_by_external_id=true` 固定により冪等で、`UpdateMemoryParents` も同じ memory_id への再送は `rewired: false` の no-op になるため、リトライ起因の二重作成は起きません。
 
 ### external_id
 

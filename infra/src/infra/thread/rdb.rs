@@ -793,6 +793,29 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
     /// `(user_id, channel)` shape, while this method is a generic resolver
     /// that returns ids only.
     #[allow(clippy::too_many_arguments)]
+    /// Current members of a ThreadGroup (active + deleted placeholder),
+    /// used by the explicit `thread_group_id` search filter. The
+    /// ThreadGroup member table is owned by the ThreadGroup repository;
+    /// this read helper keeps the search resolver free of a second
+    /// repository dependency. `max` is an overfetch limit.
+    async fn find_thread_ids_by_group_id(&self, group_id: i64, max: i64) -> Result<Vec<i64>> {
+        use crate::sql::p;
+        let sql = format!(
+            "SELECT thread_id FROM thread_group_member \
+             WHERE group_id = {} AND thread_id IS NOT NULL \
+             AND state IN ('active','deleted') ORDER BY thread_id LIMIT {}",
+            p!(1),
+            p!(2)
+        );
+        Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+            .bind(group_id)
+            .bind(max)
+            .fetch_all(self.db_pool())
+            .await
+            .map_err(LlmMemoryError::DBError)?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn find_thread_ids_by_filter(
         &self,
         user_id: Option<i64>,
@@ -1090,6 +1113,14 @@ pub trait UseThreadRepository {
 }
 
 impl ThreadRepositoryImpl {
+    /// The `&'static` pool handle this repository was built with. Used by
+    /// app-layer code that must construct another pool-backed repository
+    /// (e.g. the ThreadGroup import gate) without threading the module's
+    /// pool through every signature.
+    pub fn static_pool(&self) -> &'static RdbPool {
+        self.pool
+    }
+
     pub fn new(id_generator: IdGeneratorWrapper, pool: &'static RdbPool) -> Self {
         Self { id_generator, pool }
     }

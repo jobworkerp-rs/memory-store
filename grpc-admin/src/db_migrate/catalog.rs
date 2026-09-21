@@ -7,6 +7,10 @@ pub const THREAD_MESSAGE_TIMES_V1_ID: &str = "thread-message-times-v1";
 pub const THREAD_MESSAGE_TIMES_V1_GENERATION: u32 = 1;
 pub const THREAD_MESSAGE_TIMES_V1_IDENTITY: &str = "thread-message-times-v1@1";
 
+pub const THREAD_GROUPS_CANONICAL_KEYS_V1_ID: &str = "thread-groups-canonical-keys-v1";
+pub const THREAD_GROUPS_CANONICAL_KEYS_V1_GENERATION: u32 = 1;
+pub const THREAD_GROUPS_CANONICAL_KEYS_V1_IDENTITY: &str = "thread-groups-canonical-keys-v1@1";
+
 const CATALOG_JSON: &str = include_str!("../../../infra/atlas/post-migration-tasks.json");
 const HISTORY_JSON: &str = include_str!("../../../infra/atlas/post-migration-task-history.json");
 
@@ -34,7 +38,7 @@ pub struct TaskCatalogEntry {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct TaskHistory {
     entries: Vec<TaskHistoryEntry>,
-    lifecycle_transitions: Vec<serde_json::Value>,
+    lifecycle_transitions: Vec<TaskHistoryTransition>,
     previous_history_digest: Option<String>,
     history_digest: String,
 }
@@ -43,6 +47,20 @@ struct TaskHistory {
 struct TaskHistoryEntry {
     identity: String,
     canonical_definition_digest: String,
+}
+
+/// One append-only ledger event. A `registered` transition adds exactly one
+/// catalog entry; a `retired` transition only changes the entry's lifecycle.
+/// `previous_history_digest` anchors the transition to the ledger state it
+/// was appended to, so every prior ledger state can be re-derived and
+/// re-hashed from the file alone (rewrites, removals, and non-prefix
+/// updates therefore fail the digest chain).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct TaskHistoryTransition {
+    identity: String,
+    canonical_definition_digest: String,
+    kind: String,
+    previous_history_digest: String,
 }
 
 impl TaskCatalogEntry {
@@ -255,9 +273,6 @@ fn visit_selected_task(
 fn validate_history(catalog: &TaskCatalog) -> Result<()> {
     let history: TaskHistory =
         serde_json::from_str(HISTORY_JSON).context("parsing post-migration task history")?;
-    if history.previous_history_digest.is_some() {
-        bail!("initial task history must not declare a previous digest");
-    }
     let canonical = serde_json::json!({
         "entries": history.entries.clone(),
         "lifecycle_transitions": history.lifecycle_transitions.clone(),
@@ -278,7 +293,78 @@ fn validate_history(catalog: &TaskCatalog) -> Result<()> {
             );
         }
     }
+    validate_history_chain(&history)?;
     Ok(())
+}
+
+/// Re-derive every prior ledger state from the file and verify its digest
+/// against the chain anchor of the transition that consumed it. This keeps
+/// the ledger append-only: rewriting an entry, dropping an entry, or
+/// injecting a non-prefix update breaks one of the re-derived digests.
+fn validate_history_chain(history: &TaskHistory) -> Result<()> {
+    if history.lifecycle_transitions.is_empty() {
+        if history.previous_history_digest.is_some() {
+            bail!("initial task history must not declare a previous digest");
+        }
+        return Ok(());
+    }
+    // The current state's link must be the one its last transition consumed.
+    let last_transition = history.lifecycle_transitions.last().expect("non-empty");
+    if history.previous_history_digest.as_deref()
+        != Some(last_transition.previous_history_digest.as_str())
+    {
+        bail!("task history previous digest does not match the last lifecycle transition");
+    }
+    let mut entries = history.entries.clone();
+    let mut transitions = history.lifecycle_transitions.clone();
+    while let Some(transition) = transitions.pop() {
+        if transition.kind == "registered" {
+            let registered = entries.pop().with_context(|| {
+                format!(
+                    "task history transition for {} has no matching entry",
+                    transition.identity
+                )
+            })?;
+            if registered.identity != transition.identity
+                || registered.canonical_definition_digest != transition.canonical_definition_digest
+            {
+                bail!(
+                    "task history transition for {} does not match its registered entry",
+                    transition.identity
+                );
+            }
+        } else if transition.kind != "retired" {
+            bail!("unknown task history transition kind: {}", transition.kind);
+        }
+        let predecessor = serde_json::json!({
+            "entries": entries,
+            "lifecycle_transitions": transitions,
+            "previous_history_digest":
+                transitions.last().map(|t| t.previous_history_digest.clone()),
+        });
+        if canonical_definition_digest(&predecessor)? != transition.previous_history_digest {
+            bail!(
+                "task history chain digest mismatch at the transition for {}",
+                transition.identity
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn thread_groups_canonical_keys_v1() -> Result<TaskCatalogEntry> {
+    let task = load_catalog()?
+        .tasks
+        .into_iter()
+        .find(|task| {
+            task.id == THREAD_GROUPS_CANONICAL_KEYS_V1_ID
+                && task.generation == THREAD_GROUPS_CANONICAL_KEYS_V1_GENERATION
+        })
+        .context("thread-groups-canonical-keys-v1@1 is missing from task catalog")?;
+    if task.identity() != THREAD_GROUPS_CANONICAL_KEYS_V1_IDENTITY {
+        bail!("thread-groups-canonical-keys-v1 catalog identity is invalid");
+    }
+    Ok(task)
 }
 
 pub fn thread_message_times_v1() -> Result<TaskCatalogEntry> {
@@ -345,20 +431,57 @@ fn validate_schema_version(version: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        TaskCatalog, TaskCatalogEntry, canonical_definition_digest, load_catalog,
-        select_tasks_for_schema_version, thread_message_times_v1, validate_fixed_catalog_entry,
+        HISTORY_JSON, TaskCatalog, TaskCatalogEntry, TaskHistory, canonical_definition_digest,
+        load_catalog, select_tasks_for_schema_version, thread_groups_canonical_keys_v1,
+        thread_message_times_v1, validate_fixed_catalog_entry, validate_history_chain,
     };
     use crate::db_migrate::has_registered_implementation;
     use serde_json::json;
 
     #[test]
-    fn catalog_is_valid_and_contains_the_required_task() {
+    fn catalog_is_valid_and_contains_the_required_tasks() {
         let catalog = load_catalog().expect("catalog must be valid");
-        assert_eq!(catalog.tasks.len(), 1);
+        assert_eq!(catalog.tasks.len(), 2);
         assert_eq!(
             thread_message_times_v1().unwrap().identity(),
             "thread-message-times-v1@1"
         );
+        assert_eq!(
+            thread_groups_canonical_keys_v1().unwrap().identity(),
+            "thread-groups-canonical-keys-v1@1"
+        );
+    }
+
+    #[test]
+    fn new_task_is_selected_for_both_backends_at_its_schema_version() {
+        let catalog = load_catalog().unwrap();
+        for backend in ["sqlite", "postgres"] {
+            let selected =
+                select_tasks_for_schema_version(&catalog, "20260920000001", backend).unwrap();
+            assert_eq!(
+                selected
+                    .iter()
+                    .map(TaskCatalogEntry::identity)
+                    .collect::<Vec<_>>(),
+                vec![
+                    "thread-groups-canonical-keys-v1@1",
+                    "thread-message-times-v1@1"
+                ]
+            );
+        }
+        // The task is introduced by the ThreadGroup schema version, so
+        // earlier schema versions must not select it.
+        for backend in ["sqlite", "postgres"] {
+            let selected =
+                select_tasks_for_schema_version(&catalog, "20260803000003", backend).unwrap();
+            assert_eq!(
+                selected
+                    .iter()
+                    .map(TaskCatalogEntry::identity)
+                    .collect::<Vec<_>>(),
+                vec!["thread-message-times-v1@1"]
+            );
+        }
     }
 
     #[test]
@@ -430,8 +553,73 @@ mod tests {
     }
 
     #[test]
+    fn committed_task_history_chain_is_valid() {
+        let history: TaskHistory =
+            serde_json::from_str(HISTORY_JSON).expect("committed task history must parse");
+        validate_history_chain(&history).unwrap();
+    }
+
+    #[test]
+    fn history_chain_rejects_rewrites_and_non_prefix_updates() {
+        use super::{TaskHistory, TaskHistoryEntry, TaskHistoryTransition};
+
+        let entry = |identity: &str, digest: &str| TaskHistoryEntry {
+            identity: identity.to_string(),
+            canonical_definition_digest: digest.to_string(),
+        };
+        let digest_of = |entries: &[TaskHistoryEntry],
+                         transitions: &[TaskHistoryTransition],
+                         previous: Option<String>| {
+            canonical_definition_digest(&json!({
+                "entries": entries,
+                "lifecycle_transitions": transitions,
+                "previous_history_digest": previous,
+            }))
+            .unwrap()
+        };
+
+        let first = entry("a@1", "digest-a");
+        let second = entry("b@1", "digest-b");
+        let genesis_digest = digest_of(std::slice::from_ref(&first), &[], None);
+        let transition = TaskHistoryTransition {
+            identity: "b@1".to_string(),
+            canonical_definition_digest: "digest-b".to_string(),
+            kind: "registered".to_string(),
+            previous_history_digest: genesis_digest.clone(),
+        };
+        let valid = TaskHistory {
+            entries: vec![first.clone(), second.clone()],
+            lifecycle_transitions: vec![transition.clone()],
+            previous_history_digest: Some(genesis_digest.clone()),
+            history_digest: digest_of(
+                &[first.clone(), second],
+                std::slice::from_ref(&transition),
+                Some(genesis_digest.clone()),
+            ),
+        };
+        validate_history_chain(&valid).unwrap();
+
+        // Rewriting the registered entry's digest breaks the chain.
+        let mut rewritten = valid.clone();
+        rewritten.entries[1].canonical_definition_digest = "forged".to_string();
+        assert!(validate_history_chain(&rewritten).is_err());
+
+        // Dropping an entry (non-prefix update) breaks the chain.
+        let mut shortened = valid.clone();
+        shortened.entries.remove(0);
+        assert!(validate_history_chain(&shortened).is_err());
+
+        // A transition anchored to the wrong predecessor digest is rejected.
+        let mut wrong_link = valid;
+        wrong_link.lifecycle_transitions[0].previous_history_digest = "0".repeat(64);
+        assert!(validate_history_chain(&wrong_link).is_err());
+    }
+
+    #[test]
     fn fixed_catalog_validation_rejects_a_self_consistent_forged_entry() {
         let entry = thread_message_times_v1().unwrap();
+        validate_fixed_catalog_entry(&entry).unwrap();
+        let entry = thread_groups_canonical_keys_v1().unwrap();
         validate_fixed_catalog_entry(&entry).unwrap();
 
         let mut forged = entry.clone();

@@ -13,6 +13,7 @@
 
 use crate::cli::ClaudeCodeArgs;
 use crate::common::canonical;
+use crate::common::git::resolve_repo_label;
 use crate::common::ids::{
     ID_SHA256_THRESHOLD, sha1_hex_prefix, sha256_hex_prefix, truncate_id_for_external,
 };
@@ -22,8 +23,10 @@ use crate::parser::{
     self as raw_parser, RawEntry, SessionInfo, parse_jsonl_file, parse_timestamp_millis,
 };
 use crate::source::{
-    CanonicalAddons, CanonicalEntry, CanonicalSession, ChatSource, ReadSessionOutcome, StreamItem,
-    mtime_skip_outcome,
+    CLAUDE_CODE_ADAPTER_VERSION, CanonicalAddons, CanonicalEntry, CanonicalSession, ChatSource,
+    ReadSessionOutcome, StreamItem, ThreadGroupConfidence, ThreadGroupEvidenceKind,
+    ThreadGroupIdentityScope, ThreadGroupObservation, ThreadGroupPolarity,
+    ThreadGroupSourceIdentity, mtime_skip_outcome,
 };
 use anyhow::{Context, Result};
 use protobuf::llm_memory::data::{ContentType, MessageRole};
@@ -244,7 +247,8 @@ impl ChatSource for ClaudeCodeSource {
             }
         };
 
-        let session = build_canonical_session(&info, &self.args);
+        let mut session = build_canonical_session(&info, &self.args);
+        session.thread_group_observations = main_session_observations(&info, &entries);
         let include_types = self.args.include_types_set();
         let strip_prefixes = self.args.path_prefixes();
 
@@ -273,6 +277,7 @@ impl ChatSource for ClaudeCodeSource {
             session,
             entries: crate::source::CanonicalEntryStream::new(iter),
             source_filtered_count_initial: 0,
+            diagnostics: Default::default(),
         })
     }
 }
@@ -1545,6 +1550,7 @@ fn build_canonical_session(info: &SessionInfo, args: &ClaudeCodeArgs) -> Canonic
             labels.push(truncate_label_keep_tail("dir:", dir_name));
         }
     }
+    labels.extend(resolve_repo_label(info.cwd.as_deref().map(Path::new)));
     if let Some(ref branch) = info.git_branch {
         labels.push(truncate_label_keep_head("branch:", branch));
     }
@@ -1581,7 +1587,153 @@ fn build_canonical_session(info: &SessionInfo, args: &ClaudeCodeArgs) -> Canonic
         updated_at_ms: info.updated_at,
         source_labels: labels,
         source_metadata: serde_json::Value::Object(session_meta),
+        thread_metadata: None,
+        thread_group_observations: Vec::new(),
     }
+}
+
+/// Identity scope for a Claude Code session is the encoded working
+/// directory (the `projects/<projectKey>` directory name). A transcript
+/// whose project cannot be determined keeps `unknown` so it is not
+/// silently merged with a known scope (design 4.2.1).
+fn claude_identity_scope(project_key: Option<&str>) -> ThreadGroupIdentityScope {
+    match project_key.filter(|k| !k.is_empty()) {
+        Some(key) => ThreadGroupIdentityScope::Known(key.to_string()),
+        None => ThreadGroupIdentityScope::Unknown,
+    }
+}
+
+fn claude_identity(
+    project_key: Option<&str>,
+    native_kind: &'static str,
+    native_id: String,
+) -> ThreadGroupSourceIdentity {
+    ThreadGroupSourceIdentity {
+        source: SOURCE_ID.into(),
+        native_kind,
+        owner_scope: None,
+        identity_scope: claude_identity_scope(project_key),
+        native_id,
+    }
+}
+
+/// Map main-transcript entries to the adapter observation contract.
+///
+/// Only the forward-compatible `/fork` metadata (v2.1.212+:
+/// `forkParentSessionId` plus `forkBoundaryAt` / `interactiveLineage`) is
+/// interpreted. Inline `isSidechain` records and `parent_tool_use_id`
+/// are invocation evidence, not session parents, so they never produce a
+/// relation or a fabricated child identity (design 10.1.3).
+fn main_session_observations(
+    info: &SessionInfo,
+    entries: &[RawEntry],
+) -> Vec<ThreadGroupObservation> {
+    let fork_parent = entries
+        .iter()
+        .find_map(|entry| non_empty_extra(entry, "forkParentSessionId"));
+    let Some(fork_parent) = fork_parent else {
+        return Vec::new();
+    };
+
+    let subject = claude_identity(
+        info.project_hash.as_deref(),
+        "session",
+        info.session_id.clone(),
+    );
+    let candidate_parent = claude_identity(info.project_hash.as_deref(), "session", fork_parent);
+    let corroborated = entries
+        .iter()
+        .any(|entry| entry.extra("forkBoundaryAt").is_some())
+        || entries
+            .iter()
+            .any(|entry| entry.extra("interactiveLineage").is_some());
+    // Without the boundary / lineage corroboration the fork metadata is
+    // incomplete: keep it as unsupported rather than promoting it.
+    let confidence = if corroborated {
+        ThreadGroupConfidence::Exact
+    } else {
+        ThreadGroupConfidence::Unsupported
+    };
+    vec![ThreadGroupObservation {
+        subject,
+        candidate_parent: Some(candidate_parent),
+        relation_kind: Some("fork".into()),
+        evidence_kind: ThreadGroupEvidenceKind::SourceField,
+        polarity: ThreadGroupPolarity::Supports,
+        confidence,
+        source_record_ref: "claude_code:session.fork_metadata".into(),
+        adapter_version: CLAUDE_CODE_ADAPTER_VERSION,
+    }]
+}
+
+/// Observation for a dedicated `subagents/agent-<agentId>.jsonl`
+/// transcript. `exact` delegated requires the `.meta.json.toolUseId` to
+/// match an `Agent` tool_use id in the parent transcript; otherwise the
+/// observation stays `unsupported` with the structural parent session as
+/// a candidate only (design 10.1.3). The composite `native_id` is
+/// `<parentSessionId>/subagents/agent-<agentId>`.
+pub(crate) fn subagent_observations(
+    project_key: Option<&str>,
+    parent_session_id: &str,
+    agent_id: &str,
+    tool_use_id: Option<&str>,
+    parent_agent_tool_use_ids: &HashSet<String>,
+) -> Vec<ThreadGroupObservation> {
+    let native_id = format!("{parent_session_id}/subagents/agent-{agent_id}");
+    let matched = tool_use_id.is_some_and(|id| parent_agent_tool_use_ids.contains(id));
+    vec![ThreadGroupObservation {
+        subject: claude_identity(project_key, "subagent_transcript", native_id),
+        candidate_parent: Some(claude_identity(
+            project_key,
+            "session",
+            parent_session_id.to_string(),
+        )),
+        relation_kind: Some("delegated".into()),
+        evidence_kind: ThreadGroupEvidenceKind::SourceField,
+        polarity: ThreadGroupPolarity::Supports,
+        confidence: if matched {
+            ThreadGroupConfidence::Exact
+        } else {
+            ThreadGroupConfidence::Unsupported
+        },
+        source_record_ref: "claude_code:subagents/agent.meta.json".into(),
+        adapter_version: CLAUDE_CODE_ADAPTER_VERSION,
+    }]
+}
+
+/// Collect the `tool_use` ids of `Agent` invocations from a parent
+/// transcript. Only the explicit `name: "Agent"` tool is considered;
+/// proximity, `agentId`, and sidechain flags are not substitutes.
+pub(crate) fn agent_tool_use_ids(entries: &[RawEntry]) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for entry in entries {
+        let Some(content) = entry
+            .message
+            .as_ref()
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        else {
+            continue;
+        };
+        for block in content {
+            if block.get("type").and_then(|v| v.as_str()) == Some("tool_use")
+                && block.get("name").and_then(|v| v.as_str()) == Some("Agent")
+                && let Some(id) = block.get("id").and_then(|v| v.as_str())
+                && !id.is_empty()
+            {
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    ids
+}
+
+fn non_empty_extra(entry: &RawEntry, key: &str) -> Option<String> {
+    entry
+        .extra(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
 fn collect_jsonl_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -1599,6 +1751,7 @@ fn collect_jsonl_files(dir: &Path) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::git::git_fixture::{origin_config, repo_fixture};
     use crate::source::test_support::{entries_from_outcome, unpack_outcome};
     use std::io::Write;
 
@@ -1631,6 +1784,173 @@ mod tests {
         let src = ClaudeCodeSource::new(args_with_file(path.clone()));
         let inputs = src.discover().unwrap();
         assert_eq!(inputs, vec![path]);
+    }
+
+    #[test]
+    fn canonical_session_adds_repository_label_for_git_cwd() {
+        let (_temp, repo) = repo_fixture(&origin_config("https://example.com/claude.git"));
+        let info = SessionInfo {
+            session_id: "session".to_string(),
+            cwd: Some(repo.to_string_lossy().to_string()),
+            git_branch: Some("main".to_string()),
+            custom_title: None,
+            project_hash: None,
+            slug: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let session = build_canonical_session(&info, &args_with_file(PathBuf::from("/dev/null")));
+
+        assert!(
+            session
+                .source_labels
+                .iter()
+                .any(|label| label == "repo:example.com/claude")
+        );
+    }
+
+    fn entry(json: &str) -> RawEntry {
+        raw_parser::parse_raw_entry_str(json).unwrap()
+    }
+
+    fn session_info(project_hash: Option<&str>) -> SessionInfo {
+        SessionInfo {
+            session_id: "sess-1".to_string(),
+            cwd: None,
+            git_branch: None,
+            custom_title: None,
+            project_hash: project_hash.map(String::from),
+            slug: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn claude_fork_metadata_with_corroboration_is_exact() {
+        let info = session_info(Some("proj-key"));
+        let entries = vec![entry(
+            r#"{"type":"system","timestamp":"2026-04-17T10:00:00.000Z","sessionId":"sess-1","forkParentSessionId":"parent-sess","forkBoundaryAt":123,"interactiveLineage":true}"#,
+        )];
+        let obs = main_session_observations(&info, &entries);
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].confidence, ThreadGroupConfidence::Exact);
+        assert_eq!(obs[0].relation_kind.as_deref(), Some("fork"));
+        assert_eq!(
+            obs[0].subject.identity_scope,
+            ThreadGroupIdentityScope::Known("proj-key".into())
+        );
+        assert_eq!(obs[0].subject.native_id, "sess-1");
+        assert_eq!(
+            obs[0]
+                .candidate_parent
+                .as_ref()
+                .map(|p| p.native_id.as_str()),
+            Some("parent-sess")
+        );
+        assert_eq!(obs[0].adapter_version, CLAUDE_CODE_ADAPTER_VERSION);
+        assert_eq!(
+            obs[0].source_record_ref,
+            "claude_code:session.fork_metadata"
+        );
+    }
+
+    #[test]
+    fn claude_fork_metadata_without_corroboration_is_unsupported() {
+        let info = session_info(Some("proj-key"));
+        let entries = vec![entry(
+            r#"{"type":"system","timestamp":"2026-04-17T10:00:00.000Z","sessionId":"sess-1","forkParentSessionId":"parent-sess"}"#,
+        )];
+        let obs = main_session_observations(&info, &entries);
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].confidence, ThreadGroupConfidence::Unsupported);
+    }
+
+    #[test]
+    fn claude_inline_sidechain_and_parent_tool_use_id_emit_no_observation() {
+        // Inline `isSidechain` and `parent_tool_use_id` are invocation
+        // evidence only; they must not fabricate a session relation or a
+        // child identity (design 10.1.3).
+        let info = session_info(Some("proj-key"));
+        let entries = vec![
+            entry(
+                r#"{"type":"assistant","timestamp":"2026-04-17T10:00:00.000Z","sessionId":"sess-1","isSidechain":true,"parentToolUseID":"toolu_1","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#,
+            ),
+            entry(
+                r#"{"type":"assistant","timestamp":"2026-04-17T10:00:01.000Z","sessionId":"sess-1","parent_tool_use_id":"toolu_1","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#,
+            ),
+        ];
+        assert!(main_session_observations(&info, &entries).is_empty());
+    }
+
+    #[test]
+    fn claude_unknown_project_scope_stays_unknown() {
+        let info = session_info(None);
+        let entries = vec![entry(
+            r#"{"type":"system","timestamp":"2026-04-17T10:00:00.000Z","sessionId":"sess-1","forkParentSessionId":"parent-sess","forkBoundaryAt":1}"#,
+        )];
+        let obs = main_session_observations(&info, &entries);
+        assert_eq!(
+            obs[0].subject.identity_scope,
+            ThreadGroupIdentityScope::Unknown
+        );
+    }
+
+    #[test]
+    fn claude_agent_tool_use_ids_match_only_agent_invocations() {
+        let entries = vec![entry(
+            r#"{"type":"assistant","timestamp":"2026-04-17T10:00:00.000Z","sessionId":"sess-1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Agent","id":"toolu_agent"},{"type":"tool_use","name":"Bash","id":"toolu_bash"}]}}"#,
+        )];
+        let ids = agent_tool_use_ids(&entries);
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains("toolu_agent"));
+    }
+
+    #[test]
+    fn claude_subagent_with_matching_tool_use_id_is_exact_delegated() {
+        let parent_ids = HashSet::from(["toolu_agent".to_string()]);
+        let obs = subagent_observations(
+            Some("proj-key"),
+            "sess-1",
+            "abc123",
+            Some("toolu_agent"),
+            &parent_ids,
+        );
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].confidence, ThreadGroupConfidence::Exact);
+        assert_eq!(obs[0].relation_kind.as_deref(), Some("delegated"));
+        assert_eq!(obs[0].subject.native_id, "sess-1/subagents/agent-abc123");
+        assert_eq!(obs[0].subject.native_kind, "subagent_transcript");
+        assert_eq!(
+            obs[0]
+                .candidate_parent
+                .as_ref()
+                .map(|p| p.native_id.as_str()),
+            Some("sess-1")
+        );
+        assert_eq!(
+            obs[0].subject.identity_scope,
+            ThreadGroupIdentityScope::Known("proj-key".into())
+        );
+    }
+
+    #[test]
+    fn claude_subagent_without_tool_use_match_is_unsupported() {
+        let parent_ids = HashSet::from(["toolu_agent".to_string()]);
+        let unmatched = subagent_observations(
+            Some("proj-key"),
+            "sess-1",
+            "abc123",
+            Some("toolu_other"),
+            &parent_ids,
+        );
+        assert_eq!(unmatched[0].confidence, ThreadGroupConfidence::Unsupported);
+
+        let missing =
+            subagent_observations(Some("proj-key"), "sess-1", "abc123", None, &parent_ids);
+        assert_eq!(missing[0].confidence, ThreadGroupConfidence::Unsupported);
+        assert!(missing[0].candidate_parent.is_some());
     }
 
     #[test]

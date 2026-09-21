@@ -169,6 +169,9 @@ impl ThreadSafeFilter {
             });
         };
 
+        if let Some(thread_id) = filter.thread_id {
+            combine_and(Self::thread_id(thread_id));
+        }
         if let Some(uid) = filter.user_id {
             combine_and(Self::user_id(uid));
         }

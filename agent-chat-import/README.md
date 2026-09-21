@@ -10,6 +10,8 @@ Supported source subcommands:
   `~/.claude/projects/<hash>/<session>.jsonl`.
 - `codex`: OpenAI Codex CLI rollout JSONL under
   `~/.codex/sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl`.
+- `opencode`: OpenCode local SQLite sessions
+  (`$XDG_DATA_HOME/opencode/opencode.db`).
 - `plain`: plain-text trees such as Obsidian vaults (`.md` / `.txt`).
 
 ## Canonical Schema
@@ -120,6 +122,22 @@ memories-import --user-id 1 claude-code \
 
 `cwd=/home/me/work/foo` becomes `path:work/foo`. `dir:` labels and
 `metadata.project_path` remain absolute.
+
+When a session directory is under Git control, importers also attach a
+`repo:<host>/<organization>/<repository>` repository-identity label. The nearest ancestor repository wins, so a repository
+in a subdirectory takes precedence over one at `$HOME`. The `origin` remote is
+preferred; otherwise the first remote in config-file order is used. Within a
+remote, `url` is preferred over `fetchurl`. `http`, `https`, `ssh`, and `git`
+URLs plus scp-like SSH remotes are normalized by removing the scheme, userinfo,
+trailing `/`, and `.git` suffix. Query strings and fragments are also removed
+from scheme URLs. Hosts are lowercased and non-default ports are retained.
+Therefore `https://git.example.com/org/repo.git`,
+`ssh://git@git.example.com/org/repo.git`, and
+`git@git.example.com:org/repo.git` all produce
+`repo:git.example.com/org/repo`. Unparseable remotes and remotes without a
+repository path are silently omitted to avoid false identity matches, as are
+scp-like remotes whose userinfo/path boundary cannot be parsed unambiguously,
+non-repositories, and unresolved remotes (including git-less environments).
 
 Dry-run counts inputs without connecting to the server:
 
@@ -319,7 +337,11 @@ the ordinary human-readable output. Event objects use
 `thread_created` is emitted immediately after the first `AddMemoriesBatch`
 response reports that a new thread was created. `session_completed` is emitted
 when that real session finishes. A `thread_id` is always a decimal string, so
-IDs larger than JavaScript's safe integer range remain exact.
+IDs larger than JavaScript's safe integer range remain exact. `import_completed`
+is emitted once before the import command exits and contains the final aggregate
+and per-session results. For `plain`, it is emitted before the optional prune
+RPC, so a prune failure does not suppress the event. Its contract is documented in
+[`docs/memories-import-event-spec_ja.md`](../docs/memories-import-event-spec_ja.md).
 
 `source` is the CLI subcommand name: `claude-code`, `codex`, or `plain`.
 `session_key` is the stable canonical channel used across retries; for `plain`,
@@ -330,9 +352,12 @@ Successful retries into an existing thread also emit a completion event with
 its `thread_id`, but do not emit a creation event.
 
 Sessions skipped before obtaining a thread ID, including parse skips and input
-errors, emit no lifecycle event. If a later chunk fails after a creation event,
-the importer emits a matching completion with `success=false`. Failure to write
-an event makes the import unsuccessful.
+errors, emit no legacy lifecycle event. They are included in `import_completed`;
+when parsing cannot determine a session key, its `session_key` is `null`. If a
+later chunk fails after a creation event, the importer emits a matching
+completion with `success=false`. Failure to write an event makes the import
+unsuccessful. The existing exit-code behavior is unchanged for now; a future
+change is expected to make `import_completed` the primary decision path.
 
 | Option | Default | Description |
 |---|---|---|
@@ -349,7 +374,7 @@ an event makes the import unsuccessful.
 | `--summarize-workflow` | none | Absolute path to `thread-summary-batch.yaml` |
 | `--extract-personality-after-file` / `--extract-personality-after-json` | none | Mutually exclusive; requires `--personality-workflow` |
 | `--personality-workflow` | none | Absolute path to `thread-personality-batch.yaml` |
-| `--server-retry-max` | `3` | Max RPC attempts including the first |
+| `--server-retry-max` | `3` | Max RPC attempts including the first; retries `Unavailable`, `DeadlineExceeded`, `ResourceExhausted`, and `Cancelled` |
 | `--server-retry-base-ms` | `1000` | Exponential backoff base |
 | `--server-retry-cap-ms` | `30000` | Backoff cap |
 | `--server-retry-jitter-ratio` | `0.25` | Jitter ratio |
@@ -359,7 +384,8 @@ an event makes the import unsuccessful.
 
 The client naturally applies back-pressure by awaiting each chunk. Retryable
 gRPC errors and PostgreSQL serialization/deadlock SQLSTATEs are retried with
-exponential backoff. `AddMemoriesBatch` is idempotent by external ID, so retries
+exponential backoff. This includes `Cancelled`, which can be reported for an
+in-flight RPC after an h2 `GOAWAY`. `AddMemoriesBatch` is idempotent by external ID, so retries
 do not create duplicates.
 
 ## External IDs

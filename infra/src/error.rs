@@ -30,6 +30,10 @@ pub enum LlmMemoryError {
     /// `FAILED_PRECONDITION` (which means "fix state before retrying").
     #[error("Aborted({0})")]
     Aborted(String),
+    /// A keyset cursor refers to a read-model snapshot that no longer exists.
+    /// Mapped to gRPC `ABORTED`; callers should restart the search.
+    #[error("snapshot_changed({0})")]
+    SnapshotChanged(String),
     /// Caller request was rejected because the requested mode is reserved
     /// but not yet implemented in this build (e.g. CountSearchMode::VECTOR
     /// in Phase 5-1). Mapped to gRPC `UNIMPLEMENTED` (code 12) by

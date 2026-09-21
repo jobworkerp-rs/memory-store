@@ -16,12 +16,14 @@
 
 use crate::cli::CodexArgs;
 use crate::common::canonical;
+use crate::common::git::resolve_repo_label;
 use crate::common::ids::{sha1_hex_prefix, sha256_hex_prefix};
 use crate::common::path::apply_path_prefix;
 use crate::parser::parse_timestamp_millis;
 use crate::source::{
-    CanonicalAddons, CanonicalEntry, CanonicalSession, ChatSource, ReadSessionOutcome,
-    mtime_skip_outcome,
+    CODEX_ADAPTER_VERSION, CanonicalAddons, CanonicalEntry, CanonicalSession, ChatSource,
+    ReadSessionOutcome, ThreadGroupConfidence, ThreadGroupEvidenceKind, ThreadGroupIdentityScope,
+    ThreadGroupObservation, ThreadGroupPolarity, ThreadGroupSourceIdentity, mtime_skip_outcome,
 };
 use anyhow::{Context, Result};
 use protobuf::llm_memory::data::{ContentType, MessageRole};
@@ -324,6 +326,7 @@ impl ChatSource for CodexSource {
             session: canonical_session,
             entries: crate::source::CanonicalEntryStream::from_vec(entries),
             source_filtered_count_initial: source_filtered,
+            diagnostics: Default::default(),
         })
     }
 }
@@ -411,6 +414,7 @@ fn build_canonical_session(
             ));
         }
     }
+    labels.extend(resolve_repo_label(cwd.as_deref().map(Path::new)));
     if let Some(ref branch) = git_branch {
         labels.push(crate::common::labels::truncate_label_keep_head(
             "branch:", branch,
@@ -469,7 +473,105 @@ fn build_canonical_session(
         updated_at_ms: timestamp_ms,
         source_labels: labels,
         source_metadata: serde_json::Value::Object(session_meta),
+        thread_metadata: None,
+        thread_group_observations: observations_from_session_meta(session_id, payload),
     }
+}
+
+/// Map the Codex `session_meta.payload` fields to the adapter observation
+/// contract (design 10.1.1 / 10.1.3).
+///
+/// Only explicit source fields are interpreted:
+/// - `thread_source: "subagent"` plus a `parent_thread_id` (top-level, or
+///   the corroborating `source.subagent.thread_spawn.parent_thread_id`)
+///   is `delegated` `exact`.
+/// - `thread_source: "user"` plus `forked_from_id` with a null/absent
+///   `parent_thread_id` is `fork` `exact`.
+/// - A subagent meta that is missing its parent identity is reported as
+///   `unsupported` so it is never promoted to a canonical relation.
+/// - Plain resume / compaction reuses the same native session and emits
+///   no relation; `forked_from_id` on a subagent meta is not a fork.
+fn observations_from_session_meta(
+    native_id: &str,
+    payload: &serde_json::Value,
+) -> Vec<ThreadGroupObservation> {
+    let subject = codex_identity(native_id);
+    let thread_source = payload.get("thread_source").and_then(|v| v.as_str());
+    let parent_thread_id = non_empty_str(payload.get("parent_thread_id"));
+    let forked_from_id = non_empty_str(payload.get("forked_from_id"));
+
+    if thread_source == Some("subagent") {
+        let parent = parent_thread_id.or_else(|| nested_thread_spawn_parent(payload));
+        return vec![match parent {
+            Some(parent_id) => ThreadGroupObservation {
+                subject,
+                candidate_parent: Some(codex_identity(&parent_id)),
+                relation_kind: Some("delegated".into()),
+                evidence_kind: ThreadGroupEvidenceKind::SourceField,
+                polarity: ThreadGroupPolarity::Supports,
+                confidence: ThreadGroupConfidence::Exact,
+                source_record_ref: "codex:session_meta:subagent".into(),
+                adapter_version: CODEX_ADAPTER_VERSION,
+            },
+            None => ThreadGroupObservation {
+                subject,
+                candidate_parent: None,
+                relation_kind: Some("delegated".into()),
+                evidence_kind: ThreadGroupEvidenceKind::SourceField,
+                polarity: ThreadGroupPolarity::Supports,
+                confidence: ThreadGroupConfidence::Unsupported,
+                source_record_ref: "codex:session_meta:subagent".into(),
+                adapter_version: CODEX_ADAPTER_VERSION,
+            },
+        }];
+    }
+
+    if thread_source == Some("user")
+        && parent_thread_id.is_none()
+        && let Some(parent_id) = forked_from_id
+    {
+        return vec![ThreadGroupObservation {
+            subject,
+            candidate_parent: Some(codex_identity(&parent_id)),
+            relation_kind: Some("fork".into()),
+            evidence_kind: ThreadGroupEvidenceKind::SourceField,
+            polarity: ThreadGroupPolarity::Supports,
+            confidence: ThreadGroupConfidence::Exact,
+            source_record_ref: "codex:session_meta:fork".into(),
+            adapter_version: CODEX_ADAPTER_VERSION,
+        }];
+    }
+
+    Vec::new()
+}
+
+fn codex_identity(native_id: &str) -> ThreadGroupSourceIdentity {
+    ThreadGroupSourceIdentity {
+        source: SOURCE_ID.into(),
+        native_kind: "session",
+        owner_scope: None,
+        // Codex native IDs carry no extra project scope (design 4.2.1).
+        identity_scope: ThreadGroupIdentityScope::Known(String::new()),
+        native_id: native_id.to_string(),
+    }
+}
+
+fn non_empty_str(value: Option<&serde_json::Value>) -> Option<String> {
+    value
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+fn nested_thread_spawn_parent(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("source")
+        .and_then(|s| s.get("subagent"))
+        .and_then(|s| s.get("thread_spawn"))
+        .and_then(|s| s.get("parent_thread_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
 fn build_session_meta_entry(
@@ -1583,7 +1685,8 @@ fn filename_stem(p: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::test_support::{entries_from_outcome, unpack_outcome};
+    use crate::common::git::git_fixture::{origin_config, repo_fixture};
+    use crate::source::test_support::{entries_from_outcome, session_from_outcome, unpack_outcome};
     use std::io::Write;
 
     fn args(file: PathBuf) -> CodexArgs {
@@ -1722,6 +1825,7 @@ mod tests {
         );
         assert!(session.source_labels.iter().any(|l| l == "agent:codex"));
         assert!(session.source_labels.iter().any(|l| l.starts_with("path:")));
+        assert!(!session.source_labels.iter().any(|l| l.starts_with("repo:")));
         assert!(session.source_labels.iter().any(|l| l == "branch:main"));
         assert!(session.source_labels.iter().any(|l| l == "provider:openai"));
 
@@ -1730,6 +1834,136 @@ mod tests {
         assert_eq!(entries[0].role, MessageRole::RoleMeta);
         assert_eq!(entries[0].content, "system prompt body");
         assert_eq!(filtered, 0);
+    }
+
+    fn session_from_meta(meta: &str) -> CanonicalSession {
+        let (_d, p) = write_lines(&[meta]);
+        let s = CodexSource::new(args(p.clone()));
+        session_from_outcome(s.read_session(&p, None).unwrap())
+    }
+
+    #[test]
+    fn codex_subagent_meta_emits_exact_delegated_observation() {
+        let session = session_from_meta(
+            r#"{"type":"session_meta","payload":{"id":"child-1","session_id":"parent-1","thread_source":"subagent","parent_thread_id":"parent-1","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-1","depth":1}}}}}"#,
+        );
+        assert_eq!(session.thread_group_observations.len(), 1);
+        let obs = &session.thread_group_observations[0];
+        assert_eq!(obs.confidence, ThreadGroupConfidence::Exact);
+        assert_eq!(obs.evidence_kind, ThreadGroupEvidenceKind::SourceField);
+        assert_eq!(obs.polarity, ThreadGroupPolarity::Supports);
+        assert_eq!(obs.adapter_version, CODEX_ADAPTER_VERSION);
+        assert_eq!(obs.relation_kind.as_deref(), Some("delegated"));
+        assert_eq!(obs.subject.native_id, "child-1");
+        assert_eq!(
+            obs.candidate_parent.as_ref().map(|p| p.native_id.as_str()),
+            Some("parent-1")
+        );
+        assert_eq!(
+            obs.subject.identity_scope,
+            ThreadGroupIdentityScope::Known(String::new())
+        );
+        assert_eq!(obs.source_record_ref, "codex:session_meta:subagent");
+    }
+
+    #[test]
+    fn codex_subagent_without_top_level_parent_uses_nested_thread_spawn() {
+        // Legacy / partial rollouts may only carry the parent id inside
+        // `source.subagent.thread_spawn`. It is still an explicit field.
+        let session = session_from_meta(
+            r#"{"type":"session_meta","payload":{"id":"child-2","thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-2"}}}}}"#,
+        );
+        let obs = &session.thread_group_observations[0];
+        assert_eq!(obs.confidence, ThreadGroupConfidence::Exact);
+        assert_eq!(
+            obs.candidate_parent.as_ref().map(|p| p.native_id.as_str()),
+            Some("parent-2")
+        );
+    }
+
+    #[test]
+    fn codex_subagent_missing_parent_is_unsupported_not_exact() {
+        let session = session_from_meta(
+            r#"{"type":"session_meta","payload":{"id":"child-3","thread_source":"subagent","source":{"subagent":{"thread_spawn":{}}}}}"#,
+        );
+        assert_eq!(session.thread_group_observations.len(), 1);
+        let obs = &session.thread_group_observations[0];
+        assert_eq!(obs.confidence, ThreadGroupConfidence::Unsupported);
+        assert!(obs.candidate_parent.is_none());
+        assert_eq!(obs.relation_kind.as_deref(), Some("delegated"));
+    }
+
+    #[test]
+    fn codex_user_fork_meta_emits_exact_fork_observation() {
+        let session = session_from_meta(
+            r#"{"type":"session_meta","payload":{"id":"fork-1","thread_source":"user","parent_thread_id":null,"forked_from_id":"base-1","forked_from_ordinal_exclusive":914,"history_base":{"thread_id":"base-1"},"source":"cli"}}"#,
+        );
+        assert_eq!(session.thread_group_observations.len(), 1);
+        let obs = &session.thread_group_observations[0];
+        assert_eq!(obs.confidence, ThreadGroupConfidence::Exact);
+        assert_eq!(obs.relation_kind.as_deref(), Some("fork"));
+        assert_eq!(
+            obs.candidate_parent.as_ref().map(|p| p.native_id.as_str()),
+            Some("base-1")
+        );
+        assert_eq!(obs.source_record_ref, "codex:session_meta:fork");
+    }
+
+    #[test]
+    fn codex_subagent_forked_from_is_not_a_fork() {
+        // `forked_from_id` on a subagent meta describes the spawn parent,
+        // not a user fork (design 10.1.1).
+        let session = session_from_meta(
+            r#"{"type":"session_meta","payload":{"id":"child-4","thread_source":"subagent","parent_thread_id":"parent-4","forked_from_id":"parent-4","source":{"subagent":"review"}}}"#,
+        );
+        assert_eq!(session.thread_group_observations.len(), 1);
+        let obs = &session.thread_group_observations[0];
+        assert_eq!(obs.relation_kind.as_deref(), Some("delegated"));
+        assert_eq!(obs.confidence, ThreadGroupConfidence::Exact);
+    }
+
+    #[test]
+    fn codex_plain_resume_emits_no_observation() {
+        // Same native session resumed: no new Thread and no relation.
+        let session = session_from_meta(
+            r#"{"type":"session_meta","payload":{"id":"resume-1","thread_source":"user","source":"cli"}}"#,
+        );
+        assert!(session.thread_group_observations.is_empty());
+    }
+
+    #[test]
+    fn codex_session_meta_multiplicity_does_not_fabricate_relation() {
+        // Two session_meta records (subagent child + user history_base).
+        // Multiplicity alone must not invent a fork relation; only the
+        // first meta's explicit subagent evidence is interpreted.
+        let (_d, p) = write_lines(&[
+            r#"{"type":"session_meta","payload":{"id":"child-5","thread_source":"subagent","parent_thread_id":"parent-5","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-5"}}}}}"#,
+            r#"{"type":"session_meta","payload":{"id":"child-5","thread_source":"user","parent_thread_id":null,"forked_from_id":"parent-5","source":"cli"}}"#,
+        ]);
+        let s = CodexSource::new(args(p.clone()));
+        let session = session_from_outcome(s.read_session(&p, None).unwrap());
+        assert_eq!(session.thread_group_observations.len(), 1);
+        assert_eq!(
+            session.thread_group_observations[0]
+                .relation_kind
+                .as_deref(),
+            Some("delegated")
+        );
+    }
+
+    #[test]
+    fn canonical_session_adds_repository_label_for_git_cwd() {
+        let (_temp, repo) = repo_fixture(&origin_config("https://example.com/codex.git"));
+        let payload = serde_json::json!({"cwd": repo, "git": {"branch": "main"}});
+
+        let session = build_canonical_session("session", &payload, &[]);
+
+        assert!(
+            session
+                .source_labels
+                .iter()
+                .any(|label| label == "repo:example.com/codex")
+        );
     }
 
     #[test]

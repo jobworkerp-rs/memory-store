@@ -10,6 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "../protobuf/protobuf/llm_memory/service/memory.proto",
                 "../protobuf/protobuf/llm_memory/service/media.proto",
                 "../protobuf/protobuf/llm_memory/service/thread.proto",
+                "../protobuf/protobuf/llm_memory/service/thread_group.proto",
                 "../protobuf/protobuf/llm_memory/service/memory_rating.proto",
                 "../protobuf/protobuf/llm_memory/service/memory_vector.proto",
                 "../protobuf/protobuf/llm_memory/service/thread_vector.proto",

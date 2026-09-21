@@ -126,6 +126,14 @@ pub fn tool_category(source_id: &str, name: &str) -> Option<&'static str> {
         ("claude_code", "Grep") | ("claude_code", "Glob") => Some("file_search"),
         ("claude_code", "WebSearch") => Some("web_search"),
         ("claude_code", "WebFetch") => Some("web_fetch"),
+        ("opencode", "bash") => Some("shell_exec"),
+        ("opencode", "read") => Some("file_read"),
+        ("opencode", "write") | ("opencode", "edit") | ("opencode", "apply_patch") => {
+            Some("file_write")
+        }
+        ("opencode", "grep") | ("opencode", "glob") => Some("file_search"),
+        ("opencode", "websearch") => Some("web_search"),
+        ("opencode", "webfetch") => Some("web_fetch"),
         _ => None,
     }
 }
@@ -442,6 +450,8 @@ pub enum AttachmentStorage {
     InlineBase64,
     Url,
     Ref,
+    /// A URI reference whose original value must not be persisted.
+    RedactedRef,
     /// Set automatically by `build_attachment` when inline base64
     /// data exceeds `MEMORY_ATTACHMENT_INLINE_MAX_BYTES`.
     Elided,
@@ -461,6 +471,7 @@ impl AttachmentStorage {
             AttachmentStorage::InlineBase64 => "inline_base64",
             AttachmentStorage::Url => "url",
             AttachmentStorage::Ref => "ref",
+            AttachmentStorage::RedactedRef => "redacted_ref",
             AttachmentStorage::Elided => "elided",
             AttachmentStorage::Invalid { .. } => "invalid",
         }
@@ -501,6 +512,80 @@ pub fn build_attachment(
         alt,
         size_config(),
     )
+}
+
+/// Build a redacted reference without accepting the source URI as a value.
+/// The caller supplies only its digest, which prevents accidental leakage in
+/// metadata, content previews, or later media resolution.
+pub fn build_redacted_ref_attachment(
+    kind: AttachmentKind,
+    media_type: Option<&str>,
+    url_sha256: &str,
+    alt: Option<&str>,
+) -> BuildAttachmentResult {
+    let content_type = kind.content_type();
+    let attachment = json!({
+        "kind": kind.as_str(),
+        "storage": "redacted_ref",
+        "invalid_reason": Value::Null,
+        "media_type": media_type,
+        "data": Value::Null,
+        "url": Value::Null,
+        "url_sha256": url_sha256,
+        "url_redacted": true,
+        "size_bytes": Value::Null,
+        "width": Value::Null,
+        "height": Value::Null,
+        "data_truncated": Value::Null,
+        "data_sha256": Value::Null,
+        "alt": alt,
+    });
+    let mt = media_type.unwrap_or("");
+    let content = format!("[{} {} url redacted]", kind.as_str(), mt).replace("  ", " ");
+    BuildAttachmentResult {
+        attachment,
+        content,
+        content_type,
+    }
+}
+
+/// Build an elided attachment from a precomputed digest/size (used for data
+/// URLs that are not safe or useful to keep inline).
+pub fn build_elided_attachment(
+    kind: AttachmentKind,
+    media_type: Option<&str>,
+    size_bytes: u64,
+    data_sha256: &str,
+    alt: Option<&str>,
+) -> BuildAttachmentResult {
+    let content_type = kind.content_type();
+    let attachment = json!({
+        "kind": kind.as_str(),
+        "storage": "elided",
+        "invalid_reason": Value::Null,
+        "media_type": media_type,
+        "data": Value::Null,
+        "url": Value::Null,
+        "size_bytes": size_bytes,
+        "width": Value::Null,
+        "height": Value::Null,
+        "data_truncated": true,
+        "data_sha256": data_sha256,
+        "alt": alt,
+    });
+    let mt = media_type.unwrap_or("");
+    let content = format!(
+        "[{} {} {} bytes (data elided)]",
+        kind.as_str(),
+        mt,
+        size_bytes
+    )
+    .replace("  ", " ");
+    BuildAttachmentResult {
+        attachment,
+        content,
+        content_type,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -646,6 +731,10 @@ fn format_attachment_content(
         AttachmentStorage::Ref => {
             let url_str = url.unwrap_or("");
             format!("[{kind_str} {url_str}]")
+        }
+        AttachmentStorage::RedactedRef => {
+            let mt = media_type.unwrap_or("");
+            format!("[{kind_str} {mt} url redacted]").replace("  ", " ")
         }
         AttachmentStorage::Elided => {
             let mt = media_type.unwrap_or("");
@@ -984,15 +1073,34 @@ fn attachment_u32(att: &Value, key: &str) -> Option<u32> {
     att.get(key).and_then(|v| v.as_u64()).map(|n| n as u32)
 }
 
+fn media_type_essence(value: &str) -> String {
+    value
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
 /// Classify one `metadata.attachment` object for the import path. Pure —
 /// the importer performs the gRPC I/O the variant describes. A
 /// missing/blank required field downgrades to `KeepAsIs` so a malformed
 /// attachment never aborts the batch (parity with the offline migration
 /// which downgrades the same shapes to `Skip`).
 pub fn classify_attachment_for_import(att: &Value) -> AttachmentImportAction {
+    classify_attachment_for_source("", att)
+}
+
+/// Source-aware attachment classification. OpenCode's arbitrary references
+/// are already canonical metadata and must never be sent to
+/// `MediaService.Register`; its normalized safe media URLs still use the
+/// existing URL registration path. Legacy sources retain their historical
+/// `ref` registration behaviour.
+pub fn classify_attachment_for_source(source_id: &str, att: &Value) -> AttachmentImportAction {
     let storage = att.get("storage").and_then(|s| s.as_str()).unwrap_or("");
     let media_type =
         attachment_str(att, "media_type").unwrap_or_else(|| "application/octet-stream".to_string());
+    let normalized_media_type = media_type_essence(&media_type);
     let width = attachment_u32(att, "width");
     let height = attachment_u32(att, "height");
     let alt = attachment_str(att, "alt");
@@ -1020,15 +1128,36 @@ pub fn classify_attachment_for_import(att: &Value) -> AttachmentImportAction {
             },
             _ => AttachmentImportAction::KeepAsIs,
         },
+        // OpenCode's normalized `url` storage is reserved for a safe
+        // HTTP(S) media URL and should use the existing media registration
+        // path. Its `ref` storage is an arbitrary/local reference and must
+        // remain metadata-only. Legacy sources retain their historical
+        // registration behaviour for both forms.
+        "ref" if source_id == "opencode" => AttachmentImportAction::KeepAsIs,
+        "redacted_ref" => AttachmentImportAction::KeepAsIs,
         "url" | "ref" => match attachment_str(att, "url") {
-            Some(url) if !url.is_empty() => AttachmentImportAction::RegisterUrl {
-                kind,
-                media_type,
-                url,
-                width,
-                height,
-                alt,
-            },
+            Some(url) if !url.is_empty() => {
+                if source_id == "opencode" {
+                    let safe_media_url = url::Url::parse(&url).is_ok_and(|parsed| {
+                        matches!(parsed.scheme(), "http" | "https")
+                            && parsed.host_str().is_some()
+                            && (normalized_media_type.starts_with("image/")
+                                || normalized_media_type.starts_with("audio/")
+                                || normalized_media_type.starts_with("video/"))
+                    });
+                    if !safe_media_url {
+                        return AttachmentImportAction::KeepAsIs;
+                    }
+                }
+                AttachmentImportAction::RegisterUrl {
+                    kind,
+                    media_type,
+                    url,
+                    width,
+                    height,
+                    alt,
+                }
+            }
             _ => AttachmentImportAction::KeepAsIs,
         },
         // elided / invalid / unknown: no gRPC media_object path.
@@ -1704,6 +1833,74 @@ mod tests {
             classify_attachment_for_import(&att),
             AttachmentImportAction::KeepAsIs
         );
+    }
+
+    #[test]
+    fn redacted_reference_never_contains_original_url() {
+        let result = build_redacted_ref_attachment(
+            AttachmentKind::Ref,
+            Some("text/plain"),
+            "deadbeef",
+            Some("secret.txt"),
+        );
+        let text = result.attachment.to_string();
+        assert!(!text.contains("https://"));
+        assert_eq!(result.attachment["storage"], "redacted_ref");
+        assert_eq!(
+            classify_attachment_for_source("opencode", &result.attachment),
+            AttachmentImportAction::KeepAsIs
+        );
+    }
+
+    #[test]
+    fn opencode_safe_media_url_registers_but_reference_does_not() {
+        let url = json!({
+            "storage": "url",
+            "kind": "image",
+            "media_type": "image/png",
+            "url": "https://example.com/a.png"
+        });
+        assert!(matches!(
+            classify_attachment_for_source("opencode", &url),
+            AttachmentImportAction::RegisterUrl { .. }
+        ));
+        let unsafe_url = json!({
+            "storage": "url",
+            "kind": "image",
+            "media_type": "image/png",
+            "url": "file:///tmp/a.png"
+        });
+        assert_eq!(
+            classify_attachment_for_source("opencode", &unsafe_url),
+            AttachmentImportAction::KeepAsIs
+        );
+
+        let reference = json!({
+            "storage": "ref",
+            "kind": "image",
+            "media_type": "image/png",
+            "url": "file:///tmp/a.png"
+        });
+        assert_eq!(
+            classify_attachment_for_source("opencode", &reference),
+            AttachmentImportAction::KeepAsIs
+        );
+    }
+
+    #[test]
+    fn opencode_safe_media_url_uses_normalized_media_type() {
+        let attachment = json!({
+            "storage": "url",
+            "kind": "image",
+            "media_type": " IMAGE/PNG ; charset=utf-8 ",
+            "url": "https://example.com/a.png"
+        });
+        match classify_attachment_for_source("opencode", &attachment) {
+            AttachmentImportAction::RegisterUrl { media_type, .. } => {
+                assert_eq!(media_type, " IMAGE/PNG ; charset=utf-8 ");
+            }
+            other => panic!("expected safe media URL registration, got {other:?}"),
+        }
     }
 
     #[test]

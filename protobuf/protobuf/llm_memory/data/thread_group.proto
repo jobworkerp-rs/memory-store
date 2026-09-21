@@ -1,0 +1,261 @@
+syntax = "proto3";
+
+package llm_memory.data;
+
+// ThreadGroup read model and the adapter observation contract.
+//
+// The wire enum values are frozen; readers must treat unknown values as
+// unspecified. `optional` is used only where proto3 scalar presence is
+// semantically required (nullable ids / timestamps / confidence).
+
+message ThreadGroupId {
+    int64 value = 1;
+}
+
+enum ThreadGroupStatus {
+    THREAD_GROUP_STATUS_UNSPECIFIED = 0;
+    THREAD_GROUP_STATUS_ACTIVE = 1;
+    THREAD_GROUP_STATUS_REDIRECTED = 2;
+    THREAD_GROUP_STATUS_SPLIT = 3;
+}
+
+enum ThreadGroupingAuthority {
+    THREAD_GROUPING_AUTHORITY_UNSPECIFIED = 0;
+    THREAD_GROUPING_AUTHORITY_RECONCILER = 1;
+    THREAD_GROUPING_AUTHORITY_OPERATOR = 2;
+}
+
+enum ThreadGroupMemberRole {
+    THREAD_GROUP_MEMBER_ROLE_UNSPECIFIED = 0;
+    THREAD_GROUP_MEMBER_ROLE_ROOT = 1;
+    THREAD_GROUP_MEMBER_ROLE_MEMBER = 2;
+}
+
+enum ThreadGroupMemberState {
+    THREAD_GROUP_MEMBER_STATE_UNSPECIFIED = 0;
+    THREAD_GROUP_MEMBER_STATE_ACTIVE = 1;
+    THREAD_GROUP_MEMBER_STATE_DELETED = 2;
+    THREAD_GROUP_MEMBER_STATE_REDIRECTED = 3;
+}
+
+enum ThreadRelationType {
+    THREAD_RELATION_TYPE_UNSPECIFIED = 0;
+    THREAD_RELATION_TYPE_DELEGATED = 1;
+    THREAD_RELATION_TYPE_FORK = 2;
+    THREAD_RELATION_TYPE_CONTINUATION = 3;
+}
+
+enum ThreadRelationState {
+    THREAD_RELATION_STATE_UNSPECIFIED = 0;
+    THREAD_RELATION_STATE_ACTIVE = 1;
+    THREAD_RELATION_STATE_RETRACTED = 2;
+    THREAD_RELATION_STATE_SUPERSEDED = 3;
+}
+
+enum ThreadSelectionBasis {
+    THREAD_SELECTION_BASIS_UNSPECIFIED = 0;
+    THREAD_SELECTION_BASIS_SOURCE_EXACT = 1;
+    THREAD_SELECTION_BASIS_SOURCE_STRONG = 2;
+    THREAD_SELECTION_BASIS_OPERATOR_CONFIRMATION = 3;
+}
+
+enum ThreadEvidenceConfidence {
+    THREAD_EVIDENCE_CONFIDENCE_UNSPECIFIED = 0;
+    THREAD_EVIDENCE_CONFIDENCE_EXACT = 1;
+    THREAD_EVIDENCE_CONFIDENCE_STRONG = 2;
+    THREAD_EVIDENCE_CONFIDENCE_HEURISTIC = 3;
+    THREAD_EVIDENCE_CONFIDENCE_UNSUPPORTED = 4;
+}
+
+enum ThreadEvidenceKind {
+    THREAD_EVIDENCE_KIND_UNSPECIFIED = 0;
+    THREAD_EVIDENCE_KIND_SOURCE_EVENT = 1;
+    THREAD_EVIDENCE_KIND_SOURCE_FIELD = 2;
+    THREAD_EVIDENCE_KIND_NEGATIVE_OR_CONFLICT = 3;
+    THREAD_EVIDENCE_KIND_DERIVED_REJECTION = 4;
+    THREAD_EVIDENCE_KIND_DERIVED_CONFLICT = 5;
+}
+
+enum ThreadObservationPolarity {
+    THREAD_OBSERVATION_POLARITY_UNSPECIFIED = 0;
+    THREAD_OBSERVATION_POLARITY_SUPPORTS = 1;
+    THREAD_OBSERVATION_POLARITY_NEGATES = 2;
+    THREAD_OBSERVATION_POLARITY_CONFLICTS = 3;
+}
+
+enum ThreadObservationState {
+    THREAD_OBSERVATION_STATE_UNSPECIFIED = 0;
+    THREAD_OBSERVATION_STATE_PENDING = 1;
+    THREAD_OBSERVATION_STATE_CANDIDATE = 2;
+    THREAD_OBSERVATION_STATE_SELECTED = 3;
+    THREAD_OBSERVATION_STATE_CONFLICT = 4;
+    THREAD_OBSERVATION_STATE_SUPERSEDED = 5;
+    THREAD_OBSERVATION_STATE_UNSUPPORTED = 6;
+}
+
+enum ThreadCandidateState {
+    THREAD_CANDIDATE_STATE_UNSPECIFIED = 0;
+    THREAD_CANDIDATE_STATE_PENDING = 1;
+    THREAD_CANDIDATE_STATE_CANDIDATE = 2;
+    THREAD_CANDIDATE_STATE_AMBIGUOUS = 3;
+    THREAD_CANDIDATE_STATE_CONFLICT = 4;
+    THREAD_CANDIDATE_STATE_UNSUPPORTED = 5;
+    THREAD_CANDIDATE_STATE_SUPERSEDED = 6;
+}
+
+// Display-only projection of a Thread. Deleted placeholders retain their
+// canonical key and deletion timestamp but have no live Thread fields.
+message ThreadGroupThreadDisplay {
+    optional int64 thread_id = 1;
+    string thread_canonical_key = 2;
+    optional string description = 3;
+    optional string source = 4;
+    optional int64 created_at = 5;
+    optional int64 last_message_at = 6;
+    optional int64 deleted_at = 7;
+}
+
+message ThreadGroup {
+    ThreadGroupId id = 1;
+    string group_canonical_key = 2;
+    optional string title = 3;
+    ThreadGroupStatus status = 4;
+    ThreadGroupingAuthority grouping_authority = 5;
+    optional int64 redirect_to_group_id = 6;
+    // Max conversation timestamp of live Threads in the current
+    // membership. Unset when no live Thread has one; default list sorts
+    // unset last.
+    optional int64 latest_activity_at = 7;
+    // Display root of the group: a current member with no active parent
+    // inside the group (placeholder members included).
+    optional int64 root_thread_id = 8;
+    optional string root_thread_canonical_key = 9;
+    optional ThreadGroupThreadDisplay root_display = 10;
+    int64 active_member_count = 11;
+    int64 deleted_member_count = 12;
+    int64 unresolved_count = 13;
+    string membership_snapshot_digest = 14;
+}
+
+message ThreadGroupMember {
+    int64 group_id = 1;
+    optional int64 thread_id = 2;
+    string thread_canonical_key = 3;
+    string owner_scope = 4;
+    optional string source = 5;
+    optional string identity_scope = 6;
+    optional string native_id = 7;
+    ThreadGroupMemberRole role = 8;
+    ThreadGroupMemberState state = 9;
+    ThreadGroupingAuthority provenance = 10;
+    optional int64 deleted_at = 11;
+    optional ThreadGroupThreadDisplay display = 12;
+}
+
+message ThreadRelation {
+    int64 id = 1;
+    optional int64 parent_thread_id = 2;
+    optional int64 child_thread_id = 3;
+    string parent_thread_canonical_key = 4;
+    string child_thread_canonical_key = 5;
+    ThreadRelationType relation_type = 6;
+    ThreadRelationState state = 7;
+    ThreadSelectionBasis selection_basis = 8;
+    optional ThreadEvidenceConfidence source_confidence = 9;
+    optional int64 selected_observation_id = 10;
+    optional int64 selected_operator_decision_id = 11;
+    // Resolved in one batch for lineage displays, including relations whose
+    // other endpoint belongs to a different active group.
+    optional int64 parent_group_id = 12;
+    optional int64 child_group_id = 13;
+    optional ThreadGroupThreadDisplay parent_display = 14;
+    optional ThreadGroupThreadDisplay child_display = 15;
+}
+
+message ThreadObservation {
+    int64 id = 1;
+    string subject_source = 2;
+    bool subject_identity_scope_known = 3;
+    string subject_identity_scope_value = 4;
+    string subject_owner_scope = 5;
+    string subject_native_id = 6;
+    bool candidate_parent_present = 7;
+    optional string candidate_parent_source = 8;
+    bool candidate_parent_identity_scope_known = 9;
+    optional string candidate_parent_identity_scope_value = 10;
+    optional string candidate_parent_owner_scope = 11;
+    optional string candidate_parent_native_id = 12;
+    optional string relation_kind = 13;
+    ThreadEvidenceKind evidence_kind = 14;
+    ThreadObservationPolarity polarity = 15;
+    optional ThreadEvidenceConfidence source_confidence = 16;
+    ThreadObservationState state = 17;
+    string adapter_version = 18;
+    string source_record_ref = 19;
+    int64 observed_at = 20;
+}
+
+message ThreadGroupCandidateAssociation {
+    int64 id = 1;
+    optional int64 subject_thread_id = 2;
+    string subject_source = 3;
+    bool subject_identity_scope_known = 4;
+    string subject_identity_scope_value = 5;
+    string subject_owner_scope = 6;
+    string subject_native_id = 7;
+    optional int64 candidate_group_id = 8;
+    optional int64 candidate_parent_thread_id = 9;
+    ThreadCandidateState state = 10;
+    optional int64 selected_observation_id = 11;
+}
+
+// Owner-local source identity endpoint as produced by the adapter. The
+// importer leaves `owner_scope` unset; the trusted caller may supply it.
+message ThreadGroupEndpoint {
+    string source = 1;
+    bool identity_scope_known = 2;
+    string identity_scope = 3;
+    string owner_scope = 4;
+    string native_id = 5;
+}
+
+message ThreadGroupObservationInput {
+    ThreadGroupEndpoint subject = 1;
+    optional ThreadGroupEndpoint candidate_parent = 2;
+    optional string relation_kind = 3;
+    ThreadEvidenceKind evidence_kind = 4;
+    ThreadObservationPolarity polarity = 5;
+    optional ThreadEvidenceConfidence source_confidence = 6;
+    string adapter_version = 7;
+    string source_record_ref = 8;
+    optional int64 observed_at = 9;
+}
+
+// Owner-scoped manual collection reference set. Separate from primary
+// lineage: it never affects parent / child relations or root choice.
+message ManualCollection {
+    int64 id = 1;
+    string owner_scope = 2;
+    string title = 3;
+    int64 created_at = 4;
+    int64 updated_at = 5;
+}
+
+message ManualCollectionMember {
+    int64 collection_id = 1;
+    int64 thread_id = 2;
+    string owner_scope = 3;
+}
+
+// Lineage read model: current memberships (active + deleted placeholder)
+// and canonical relations, plus unresolved candidate associations.
+message ThreadGroupLineage {
+    ThreadGroup group = 1;
+    repeated ThreadGroupMember members = 2;
+    repeated ThreadRelation relations = 3;
+    repeated ThreadGroupCandidateAssociation unresolved = 4;
+    // Evidence visibility: observations recorded for the group's member
+    // identities (canonical relations are adopted from a subset of
+    // these).
+    repeated ThreadObservation observations = 5;
+}

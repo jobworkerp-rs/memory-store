@@ -18,16 +18,21 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use futures::StreamExt;
-use protobuf::llm_memory::data::{ContentType, MemoryId, ThreadId};
+use protobuf::llm_memory::data::{ContentType, MemoryId, ThreadId, UserId};
 use protobuf::llm_memory::service::media_service_client::MediaServiceClient;
 use protobuf::llm_memory::service::memory_service_client::MemoryServiceClient;
+use protobuf::llm_memory::service::thread_group_service_client::ThreadGroupServiceClient;
 use protobuf::llm_memory::service::thread_service_client::ThreadServiceClient;
 use protobuf::llm_memory::service::upload_request::Payload as UploadPayload;
 use protobuf::llm_memory::service::{
-    AddMemoriesBatchRequest, AddMemoriesBatchResponse, FindMemoryListRequest, MemoryCountCondition,
-    MemoryListEntry, RegisterRequest, UpdateMemoryParentsRequest, UpdateMemoryParentsResponse,
+    AddLabelsRequest, AddMemoriesBatchRequest, AddMemoriesBatchResponse, FindMemoryListRequest,
+    FindThreadListByUserIdRequest, MemoryCountCondition, MemoryListEntry,
+    PreviewThreadGroupImportRequest, PreviewThreadGroupImportResponse,
+    RecordThreadGroupObservationsRequest, RecordThreadGroupObservationsResponse, RegisterRequest,
+    ThreadGroupReconciliationReport, UpdateMemoryParentsRequest, UpdateMemoryParentsResponse,
     UploadHeader, UploadRequest,
 };
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::Status;
@@ -65,6 +70,8 @@ pub trait ImportClient: Send + Sync {
         request: AddMemoriesBatchRequest,
     ) -> Result<AddMemoriesBatchResponse>;
 
+    async fn add_labels(&self, request: AddLabelsRequest) -> Result<()>;
+
     /// Stream bytes to `MediaService.Upload` (reservation→copy→confirm,
     /// sha256 dedup, b-1..b-5 conflict handling all server-side). Returns
     /// the resulting `media_object_id`.
@@ -97,11 +104,54 @@ pub trait ImportClient: Send + Sync {
         external_id: String,
     ) -> Result<Option<MemoryListEntry>>;
 
+    /// Resolve the unique thread for a user/channel pair. `None` means that
+    /// no thread exists; multiple matching threads are reported as an error
+    /// so callers never guess which thread should receive imported data.
+    async fn find_thread_by_channel_and_user_id(
+        &self,
+        channel: String,
+        user_id: i64,
+    ) -> Result<Option<ThreadId>>;
+
+    /// Snapshot every `channel -> thread_id` pair for a user with one
+    /// thread-list scan. Importers that resolve a thread per session
+    /// (e.g. OpenCode `--all-sessions`) use this once per run instead
+    /// of re-streaming all user threads per session. The returned map
+    /// may be empty; callers fall back to the per-channel lookup for
+    /// misses. Channels backed by multiple threads are omitted so the
+    /// per-channel lookup reports the ambiguity.
+    async fn find_thread_channels_by_user_id(
+        &self,
+        user_id: i64,
+    ) -> Result<HashMap<String, ThreadId>> {
+        let _ = user_id;
+        Ok(HashMap::new())
+    }
+
     async fn delete_memory(&self, memory_id: MemoryId) -> Result<()>;
 
     async fn delete_thread(&self, thread_id: ThreadId) -> Result<()>;
 
     async fn count_memories_in_thread(&self, thread_id: ThreadId) -> Result<i64>;
+
+    /// Record ThreadGroup adapter observations for an imported subject
+    /// thread. Default no-op so lightweight / test clients need not
+    /// implement the additive ThreadGroup RPC.
+    async fn record_thread_group_observations(
+        &self,
+        request: RecordThreadGroupObservationsRequest,
+    ) -> Result<RecordThreadGroupObservationsResponse> {
+        let _ = request;
+        Ok(RecordThreadGroupObservationsResponse::default())
+    }
+
+    /// Read-only ThreadGroup reconciliation snapshot for the connected
+    /// dry-run. Default no-op so lightweight clients stay compatible.
+    async fn find_thread_group_reconciliation_report(
+        &self,
+    ) -> Result<protobuf::llm_memory::service::ThreadGroupReconciliationReport> {
+        Ok(Default::default())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +166,33 @@ pub struct LiveGrpcImportClientConfig {
     /// PostgreSQL room to recover from transient lock waits or
     /// connection-pool exhaustion without failing the session.
     pub retry: RetryPolicy,
+    /// Connected dry-run: route the write RPCs to read-only previews /
+    /// no-ops and accumulate a planned report instead of importing.
+    pub preview_only: bool,
+}
+
+/// Planned-report accumulator for `--dry-run-connect`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThreadGroupImportPreviewReport {
+    pub sessions: u64,
+    pub planned_memories: u64,
+    pub planned_observations: u64,
+    pub planned_relations: u64,
+    pub pending: u64,
+    pub suppressed_sessions: u64,
+    pub conflict_sessions: u64,
+}
+
+/// Process-wide preview client so the runner can print the accumulated
+/// connected dry-run report after the import path completes.
+static PREVIEW_CLIENT: std::sync::OnceLock<Arc<LiveGrpcImportClient>> = std::sync::OnceLock::new();
+
+pub fn set_preview_client(client: Arc<LiveGrpcImportClient>) {
+    let _ = PREVIEW_CLIENT.set(client);
+}
+
+pub fn preview_report() -> Option<ThreadGroupImportPreviewReport> {
+    PREVIEW_CLIENT.get().map(|client| client.preview_report())
 }
 
 /// Bounded retry-with-backoff policy applied to every RPC issued by
@@ -157,6 +234,14 @@ pub struct LiveGrpcImportClient {
     channel: Channel,
     auth_token: Option<Arc<String>>,
     retry: RetryPolicy,
+    /// One-shot snapshot cache of `channel -> thread_id` for a single
+    /// user, filled by the first OpenCode thread resolution so
+    /// `--all-sessions` does not re-scan all user threads per session.
+    thread_channel_cache: tokio::sync::Mutex<Option<(i64, HashMap<String, ThreadId>)>>,
+    /// Connected dry-run mode; see `LiveGrpcImportClientConfig`.
+    preview_only: bool,
+    preview: std::sync::Mutex<ThreadGroupImportPreviewReport>,
+    preview_media_counter: std::sync::atomic::AtomicI64,
 }
 
 const MAX_DECODING_MESSAGE_SIZE: usize = 16 * 1024 * 1024 - 1;
@@ -192,7 +277,16 @@ impl LiveGrpcImportClient {
             channel,
             auth_token: config.auth_token.map(Arc::new),
             retry: config.retry,
+            thread_channel_cache: tokio::sync::Mutex::new(None),
+            preview_only: config.preview_only,
+            preview: std::sync::Mutex::new(ThreadGroupImportPreviewReport::default()),
+            preview_media_counter: std::sync::atomic::AtomicI64::new(0),
         })
+    }
+
+    /// Snapshot of the accumulated connected dry-run report.
+    pub fn preview_report(&self) -> ThreadGroupImportPreviewReport {
+        self.preview.lock().unwrap().clone()
     }
 
     fn build_client(&self) -> ThreadServiceClient<Channel> {
@@ -213,6 +307,32 @@ impl LiveGrpcImportClient {
             .max_encoding_message_size(MAX_DECODING_MESSAGE_SIZE)
     }
 
+    fn build_thread_group_client(&self) -> ThreadGroupServiceClient<Channel> {
+        ThreadGroupServiceClient::new(self.channel.clone())
+            .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_DECODING_MESSAGE_SIZE)
+    }
+
+    /// Read-only planned-import RPC used by the connected dry-run.
+    async fn preview_thread_group_import_rpc(
+        &self,
+        request: &RecordThreadGroupObservationsRequest,
+    ) -> Result<PreviewThreadGroupImportResponse> {
+        let preview_request = PreviewThreadGroupImportRequest {
+            subject: request.subject.clone(),
+            observations: request.observations.clone(),
+            explicit_override: false,
+        };
+        let response = retry_status(&self.retry, "preview_thread_group_import", || {
+            let mut client = self.build_thread_group_client();
+            let req = self.attach_auth(tonic::Request::new(preview_request.clone()));
+            async move { client.preview_thread_group_import(req).await }
+        })
+        .await
+        .map_err(map_status)?;
+        Ok(response.into_inner())
+    }
+
     fn attach_auth<T>(&self, mut req: tonic::Request<T>) -> tonic::Request<T> {
         if let Some(token) = &self.auth_token {
             let value = format!("Bearer {token}");
@@ -230,9 +350,35 @@ impl ImportClient for LiveGrpcImportClient {
         &self,
         request: AddMemoriesBatchRequest,
     ) -> Result<AddMemoriesBatchResponse> {
-        // `upsert_by_external_id = true` is set unconditionally by the
-        // importer, so re-sending the same batch is idempotent on the
-        // server side (existing memories are reused, never duplicated).
+        if self.preview_only {
+            let mut preview = self.preview.lock().unwrap();
+            preview.planned_memories += request.memories.len() as u64;
+            let outcomes = request
+                .memories
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, _)| protobuf::llm_memory::service::AddMemoryOutcome {
+                        memory_id: Some(protobuf::llm_memory::data::MemoryId {
+                            value: index as i64 + 1,
+                        }),
+                        created: true,
+                        position: index as i32,
+                        existing_parent_ids_empty: false,
+                        resolved_parent_ids: Vec::new(),
+                    },
+                )
+                .collect();
+            return Ok(AddMemoriesBatchResponse {
+                thread_id: Some(ThreadId { value: 0 }),
+                thread_created: false,
+                outcomes,
+                suppressed: false,
+            });
+        }
+        // The caller selects the external-id policy per source: legacy
+        // sources use upsert=true, while OpenCode pre-filters duplicates and
+        // sends upsert=false so existing content is never overwritten.
         let response = retry_status(&self.retry, "add_memories_batch", || {
             let mut client = self.build_client();
             let req = self.attach_auth(tonic::Request::new(request.clone()));
@@ -243,7 +389,32 @@ impl ImportClient for LiveGrpcImportClient {
         Ok(response.into_inner())
     }
 
+    async fn add_labels(&self, request: AddLabelsRequest) -> Result<()> {
+        if self.preview_only || request.labels.is_empty() {
+            return Ok(());
+        }
+        let response = retry_status(&self.retry, "add_labels", || {
+            let mut client = self.build_client();
+            let req = self.attach_auth(tonic::Request::new(request.clone()));
+            async move { client.add_labels(req).await }
+        })
+        .await
+        .map_err(map_status)?
+        .into_inner();
+        if !response.is_success {
+            return Err(anyhow!("ThreadService.AddLabels returned is_success=false"));
+        }
+        Ok(())
+    }
+
     async fn upload_media(&self, header: UploadMediaHeader, bytes: Vec<u8>) -> Result<i64> {
+        if self.preview_only {
+            let _ = (header, bytes);
+            return Ok(self
+                .preview_media_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1);
+        }
         let mut client = self.build_media_client();
         // First message = header; subsequent messages = chunks. Splitting
         // into bounded chunks keeps a single huge image off one frame
@@ -282,6 +453,13 @@ impl ImportClient for LiveGrpcImportClient {
     }
 
     async fn register_media_url(&self, params: RegisterMediaUrl) -> Result<i64> {
+        if self.preview_only {
+            let _ = params;
+            return Ok(self
+                .preview_media_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1);
+        }
         let mut client = self.build_media_client();
         let req = RegisterRequest {
             kind: params.kind as i32,
@@ -308,6 +486,10 @@ impl ImportClient for LiveGrpcImportClient {
         &self,
         request: UpdateMemoryParentsRequest,
     ) -> Result<UpdateMemoryParentsResponse> {
+        if self.preview_only {
+            let _ = request;
+            return Ok(UpdateMemoryParentsResponse::default());
+        }
         // Re-sending an UpdateMemoryParents that already succeeded gets
         // `rewired: false` back on the second attempt (the server-side
         // guard sees the parents are already set); the importer only
@@ -368,13 +550,129 @@ impl ImportClient for LiveGrpcImportClient {
         .await
         .map_err(map_status)?;
         let mut stream = stream.into_inner();
-        match stream.next().await {
-            Some(entry) => Ok(Some(entry.map_err(map_status)?)),
-            None => Ok(None),
+        let mut first_entry = None;
+        while let Some(entry) = stream.next().await {
+            match entry {
+                Ok(entry) if first_entry.is_none() => first_entry = Some(entry),
+                Ok(_) => {}
+                Err(status) if first_entry.is_some() => {
+                    tracing::warn!(
+                        code = ?status.code(),
+                        message = status.message(),
+                        "exact memory lookup stream failed after the result was received"
+                    );
+                }
+                Err(status) => return Err(map_status(status)),
+            }
         }
+        Ok(first_entry)
+    }
+
+    async fn find_thread_by_channel_and_user_id(
+        &self,
+        channel: String,
+        user_id: i64,
+    ) -> Result<Option<ThreadId>> {
+        // Only the initial RPC dispatch is retried. Once the stream is being
+        // consumed, restarting it would repeat an unbounded user-thread scan.
+        let stream = retry_status(&self.retry, "find_thread_by_channel_and_user_id", || {
+            let mut client = self.build_client();
+            let request = FindThreadListByUserIdRequest {
+                user_id: Some(UserId { value: user_id }),
+                ..Default::default()
+            };
+            let auth_request = self.attach_auth(tonic::Request::new(request));
+            async move { client.find_thread_list_by_user_id(auth_request).await }
+        })
+        .await
+        .map_err(map_status)?;
+
+        let mut stream = stream.into_inner();
+        let mut matching_thread: Option<ThreadId> = None;
+        while let Some(thread) = stream.next().await {
+            let thread = thread.map_err(map_status)?;
+            let Some(data) = thread.data else {
+                continue;
+            };
+            if data.user_id.as_ref().map(|id| id.value) != Some(user_id)
+                || data.channel.as_deref() != Some(channel.as_str())
+            {
+                continue;
+            }
+            let thread_id = thread
+                .id
+                .ok_or_else(|| anyhow!("thread list returned a matching thread without id"))?;
+            if matching_thread.is_some() {
+                return Err(anyhow!(
+                    "multiple threads match channel {channel:?} for user {user_id}"
+                ));
+            }
+            matching_thread = Some(thread_id);
+        }
+        Ok(matching_thread)
+    }
+
+    async fn find_thread_channels_by_user_id(
+        &self,
+        user_id: i64,
+    ) -> Result<HashMap<String, ThreadId>> {
+        // Reuse the one-shot snapshot for the same user across sessions.
+        if let Some((cached_user, cache)) = self.thread_channel_cache.lock().await.as_ref()
+            && *cached_user == user_id
+        {
+            return Ok(cache.clone());
+        }
+        // Only the initial RPC dispatch is retried, same policy as the
+        // per-channel lookup: a mid-stream failure must not restart the
+        // full user-thread scan.
+        let stream = retry_status(&self.retry, "find_thread_channels_by_user_id", || {
+            let mut client = self.build_client();
+            let request = FindThreadListByUserIdRequest {
+                user_id: Some(UserId { value: user_id }),
+                ..Default::default()
+            };
+            let auth_request = self.attach_auth(tonic::Request::new(request));
+            async move { client.find_thread_list_by_user_id(auth_request).await }
+        })
+        .await
+        .map_err(map_status)?;
+
+        let mut stream = stream.into_inner();
+        let mut resolved: HashMap<String, ThreadId> = HashMap::new();
+        let mut ambiguous: HashSet<String> = HashSet::new();
+        while let Some(thread) = stream.next().await {
+            let thread = thread.map_err(map_status)?;
+            let Some(data) = thread.data else {
+                continue;
+            };
+            if data.user_id.as_ref().map(|id| id.value) != Some(user_id) {
+                continue;
+            }
+            let Some(channel) = data.channel.filter(|c| !c.is_empty()) else {
+                continue;
+            };
+            let thread_id = thread
+                .id
+                .ok_or_else(|| anyhow!("thread list returned a thread without id"))?;
+            // A channel with two or more threads is ambiguous; omit it
+            // from the snapshot so the per-channel lookup reports the
+            // ambiguity instead of silently picking one winner.
+            if resolved.remove(&channel).is_some() {
+                ambiguous.insert(channel);
+            } else if !ambiguous.contains(&channel) {
+                resolved.insert(channel, thread_id);
+            }
+        }
+        let map = resolved;
+        *self.thread_channel_cache.lock().await = Some((user_id, map.clone()));
+        Ok(map)
     }
 
     async fn delete_memory(&self, memory_id: MemoryId) -> Result<()> {
+        if self.preview_only {
+            let _ = memory_id;
+            return Ok(());
+        }
         let mut client = self.build_memory_client();
         client
             .delete(self.attach_auth(tonic::Request::new(memory_id)))
@@ -384,6 +682,10 @@ impl ImportClient for LiveGrpcImportClient {
     }
 
     async fn delete_thread(&self, thread_id: ThreadId) -> Result<()> {
+        if self.preview_only {
+            let _ = thread_id;
+            return Ok(());
+        }
         let mut client = self.build_client();
         client
             .delete(self.attach_auth(tonic::Request::new(thread_id)))
@@ -403,6 +705,54 @@ impl ImportClient for LiveGrpcImportClient {
             .await
             .map_err(map_status)?;
         Ok(response.into_inner().total)
+    }
+
+    async fn record_thread_group_observations(
+        &self,
+        request: RecordThreadGroupObservationsRequest,
+    ) -> Result<RecordThreadGroupObservationsResponse> {
+        if self.preview_only {
+            let preview = self.preview_thread_group_import_rpc(&request).await?;
+            let mut report = self.preview.lock().unwrap();
+            report.sessions += 1;
+            report.planned_observations += preview.planned_observations.max(0) as u64;
+            report.planned_relations += preview.planned_relations.max(0) as u64;
+            report.pending += preview.pending.max(0) as u64;
+            if preview.suppressed {
+                report.suppressed_sessions += 1;
+            }
+            if preview.conflict {
+                report.conflict_sessions += 1;
+            }
+            return Ok(RecordThreadGroupObservationsResponse::default());
+        }
+        let response = retry_status(&self.retry, "record_thread_group_observations", || {
+            let mut client = self.build_thread_group_client();
+            let req = self.attach_auth(tonic::Request::new(request.clone()));
+            async move { client.record_thread_group_observations(req).await }
+        })
+        .await
+        .map_err(map_status)?;
+        Ok(response.into_inner())
+    }
+
+    async fn find_thread_group_reconciliation_report(
+        &self,
+    ) -> Result<ThreadGroupReconciliationReport> {
+        let response = retry_status(
+            &self.retry,
+            "find_thread_group_reconciliation_report",
+            || {
+                let mut client = self.build_thread_group_client();
+                let req = self.attach_auth(tonic::Request::new(
+                    protobuf::llm_memory::service::FindThreadGroupReconciliationReportRequest {},
+                ));
+                async move { client.find_thread_group_reconciliation_report(req).await }
+            },
+        )
+        .await
+        .map_err(map_status)?;
+        Ok(response.into_inner())
     }
 }
 
@@ -429,13 +779,17 @@ const PG_SQLSTATE_DEADLOCK_DETECTED: &str = "40P01";
 ///   * `DeadlineExceeded` — RPC deadline hit; usually means the next
 ///     attempt will succeed if the upstream caught up.
 ///   * `ResourceExhausted` — connection pool / quota / rate limit.
+///   * `Cancelled` — an in-flight RPC can become cancelled after an h2
+///     `GOAWAY`, so retrying lets the session recover. Ctrl+C also produces
+///     `Cancelled`; retrying it up to `max_attempts` is acceptable because
+///     the backoff is short and the practical impact is limited.
 ///   * `Internal` with a PostgreSQL serialization-failure or
 ///     deadlock-detected SQLSTATE in the message text.
 fn is_retryable_status(status: &Status) -> bool {
     use tonic::Code;
     if matches!(
         status.code(),
-        Code::Unavailable | Code::DeadlineExceeded | Code::ResourceExhausted
+        Code::Unavailable | Code::DeadlineExceeded | Code::ResourceExhausted | Code::Cancelled
     ) {
         return true;
     }
@@ -522,6 +876,7 @@ mod tests {
         assert!(is_retryable_status(&Status::unavailable("x")));
         assert!(is_retryable_status(&Status::deadline_exceeded("x")));
         assert!(is_retryable_status(&Status::resource_exhausted("x")));
+        assert!(is_retryable_status(&Status::cancelled("x")));
         assert!(!is_retryable_status(&Status::invalid_argument("x")));
         assert!(!is_retryable_status(&Status::not_found("x")));
         assert!(!is_retryable_status(&Status::failed_precondition("x")));
@@ -579,10 +934,10 @@ mod tests {
                 *g
             };
             async move {
-                if n < 3 {
-                    Err(Status::unavailable("transient"))
-                } else {
-                    Ok(n)
+                match n {
+                    1 => Err(Status::unavailable("transient")),
+                    2 => Err(Status::cancelled("transient after GOAWAY")),
+                    _ => Ok(n),
                 }
             }
         })
@@ -623,5 +978,247 @@ mod tests {
             1,
             "non-retryable status must surface on first attempt"
         );
+    }
+
+    struct OneMemoryPerLookup {
+        eof_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        post_entry_error: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl protobuf::llm_memory::service::memory_service_server::MemoryService for OneMemoryPerLookup {
+        type FindListStream = std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<protobuf::llm_memory::data::Memory, Status>>
+                    + Send,
+            >,
+        >;
+        type FindRecentListByUserIdStream = std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<protobuf::llm_memory::data::Memory, Status>>
+                    + Send,
+            >,
+        >;
+        type FindListByConditionStream = std::pin::Pin<
+            Box<
+                dyn futures::Stream<
+                        Item = Result<protobuf::llm_memory::service::MemoryListEntry, Status>,
+                    > + Send,
+            >,
+        >;
+
+        async fn create(
+            &self,
+            _request: tonic::Request<protobuf::llm_memory::data::MemoryData>,
+        ) -> Result<tonic::Response<protobuf::llm_memory::service::CreateMemoryResponse>, Status>
+        {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
+        async fn update(
+            &self,
+            _request: tonic::Request<protobuf::llm_memory::data::Memory>,
+        ) -> Result<tonic::Response<protobuf::llm_memory::service::SuccessResponse>, Status>
+        {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
+        async fn delete(
+            &self,
+            _request: tonic::Request<protobuf::llm_memory::data::MemoryId>,
+        ) -> Result<tonic::Response<protobuf::llm_memory::service::SuccessResponse>, Status>
+        {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
+        async fn find(
+            &self,
+            _request: tonic::Request<protobuf::llm_memory::data::MemoryId>,
+        ) -> Result<tonic::Response<protobuf::llm_memory::service::OptionalMemoryResponse>, Status>
+        {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
+        async fn find_list(
+            &self,
+            _request: tonic::Request<protobuf::llm_memory::service::FindListRequest>,
+        ) -> Result<tonic::Response<Self::FindListStream>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
+        async fn find_recent_list_by_user_id(
+            &self,
+            _request: tonic::Request<protobuf::llm_memory::service::FindRecentListByUserIdRequest>,
+        ) -> Result<tonic::Response<Self::FindRecentListByUserIdStream>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
+        async fn count(
+            &self,
+            _request: tonic::Request<protobuf::llm_memory::service::FindCondition>,
+        ) -> Result<tonic::Response<protobuf::llm_memory::service::CountResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
+        async fn find_list_by_condition(
+            &self,
+            request: tonic::Request<protobuf::llm_memory::service::FindMemoryListRequest>,
+        ) -> Result<tonic::Response<Self::FindListByConditionStream>, Status> {
+            let request = request.into_inner();
+            assert_eq!(request.limit, Some(1));
+            let entry = protobuf::llm_memory::service::MemoryListEntry {
+                memory: Some(protobuf::llm_memory::data::Memory {
+                    data: Some(protobuf::llm_memory::data::MemoryData {
+                        external_id: request.external_id,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let eof_count = std::sync::Arc::clone(&self.eof_count);
+            let post_entry_error = self.post_entry_error;
+            let stream = futures::stream::unfold(
+                (Some(entry), post_entry_error),
+                move |(entry, emit_error)| {
+                    let eof_count = std::sync::Arc::clone(&eof_count);
+                    async move {
+                        match (entry, emit_error) {
+                            (Some(entry), true) => Some((Ok(entry), (None, true))),
+                            (None, true) => Some((
+                                Err(Status::internal("stream failed after first result")),
+                                (None, false),
+                            )),
+                            (Some(entry), false) => Some((Ok(entry), (None, false))),
+                            (None, false) => {
+                                for _ in 0..2 {
+                                    tokio::task::yield_now().await;
+                                }
+                                eof_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                None
+                            }
+                        }
+                    }
+                },
+            );
+            Ok(tonic::Response::new(Box::pin(stream)))
+        }
+
+        async fn count_by_condition(
+            &self,
+            _request: tonic::Request<protobuf::llm_memory::service::MemoryCountCondition>,
+        ) -> Result<tonic::Response<protobuf::llm_memory::service::CountResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
+        async fn update_content_no_dispatch(
+            &self,
+            _request: tonic::Request<protobuf::llm_memory::service::UpdateContentNoDispatchRequest>,
+        ) -> Result<tonic::Response<protobuf::llm_memory::service::SuccessResponse>, Status>
+        {
+            Err(Status::unimplemented("not used by this test"))
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_lookup_drains_each_server_stream_to_eof() {
+        let eof_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let incoming = futures::stream::unfold(listener, |listener| async {
+            match listener.accept().await {
+                Ok((stream, _)) => Some((Ok::<_, std::io::Error>(stream), listener)),
+                Err(_) => None,
+            }
+        });
+        let server = tonic::transport::Server::builder()
+            .add_service(
+                protobuf::llm_memory::service::memory_service_server::MemoryServiceServer::new(
+                    OneMemoryPerLookup {
+                        eof_count: std::sync::Arc::clone(&eof_count),
+                        post_entry_error: false,
+                    },
+                ),
+            )
+            .serve_with_incoming(incoming);
+        let server_task = tokio::spawn(server);
+
+        let client = LiveGrpcImportClient::connect(LiveGrpcImportClientConfig {
+            server_url: format!("http://{address}"),
+            timeout: Duration::from_secs(5),
+            tls_ca_path: None,
+            auth_token: None,
+            retry: RetryPolicy::no_retry(),
+            preview_only: false,
+        })
+        .await
+        .unwrap();
+
+        for lookup in 0..1100 {
+            let result = client
+                .find_memory_by_external_id(format!("memory-{lookup}"))
+                .await;
+            assert!(result.is_ok(), "lookup {lookup} failed: {result:?}");
+        }
+        assert_eq!(
+            eof_count.load(std::sync::atomic::Ordering::SeqCst),
+            1100,
+            "every server stream must be consumed through EOF"
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn exact_lookup_keeps_first_entry_after_post_entry_stream_error() {
+        let eof_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let incoming = futures::stream::unfold(listener, |listener| async {
+            match listener.accept().await {
+                Ok((stream, _)) => Some((Ok::<_, std::io::Error>(stream), listener)),
+                Err(_) => None,
+            }
+        });
+        let server = tonic::transport::Server::builder()
+            .add_service(
+                protobuf::llm_memory::service::memory_service_server::MemoryServiceServer::new(
+                    OneMemoryPerLookup {
+                        eof_count: std::sync::Arc::clone(&eof_count),
+                        post_entry_error: true,
+                    },
+                ),
+            )
+            .serve_with_incoming(incoming);
+        let server_task = tokio::spawn(server);
+
+        let client = LiveGrpcImportClient::connect(LiveGrpcImportClientConfig {
+            server_url: format!("http://{address}"),
+            timeout: Duration::from_secs(5),
+            tls_ca_path: None,
+            auth_token: None,
+            retry: RetryPolicy::no_retry(),
+            preview_only: false,
+        })
+        .await
+        .unwrap();
+
+        let result = client
+            .find_memory_by_external_id("memory-after-error".to_string())
+            .await
+            .unwrap();
+        let external_id = result
+            .and_then(|entry| entry.memory)
+            .and_then(|memory| memory.data)
+            .and_then(|data| data.external_id);
+        assert_eq!(external_id.as_deref(), Some("memory-after-error"));
+
+        server_task.abort();
+        let _ = server_task.await;
     }
 }

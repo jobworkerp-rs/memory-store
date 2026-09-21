@@ -63,6 +63,9 @@ jobworkerp-client = { path = "../modules/jobworkerp-client" }
 # Needed by rag_tools to inline `$file:` workflow includes with nested
 # env-var expansion before handing the manifest to jobworkerp-client.
 serde_yaml = { version = "0.9" }
+# thread-groups-canonical-keys-v1@1: manual / non-source threads get a
+# random immutable key, stored once in `thread_canonical_key`.
+rand = { workspace = true }
 
 
 anyhow = { workspace = true }

@@ -29,6 +29,29 @@ use crate::app::memory_kind::{
     normalize_memory_for_create, normalize_thread_for_create, preserve_thread_kind_for_update,
     validate_memory_kind_matches_thread,
 };
+use crate::app::thread_group::{
+    SourceIdentityInput, SuppressionDecision, decide_suppression, new_manual_thread_canonical_key,
+};
+use infra::infra::thread_group::canonical_key::{
+    ThreadCanonicalKeyRepository, ThreadCanonicalKeyRepositoryImpl,
+};
+use infra::infra::thread_group::collection::{
+    ManualCollectionRepository, ManualCollectionRepositoryImpl,
+};
+use infra::infra::thread_group::deletion_marker::{
+    ThreadDeletionMarkerRepository, ThreadDeletionMarkerRepositoryImpl,
+};
+use infra::infra::thread_group::lock::{ThreadGroupLockRepository, ThreadGroupLockRepositoryImpl};
+use infra::infra::thread_group::member::{
+    ThreadGroupMemberRepository, ThreadGroupMemberRepositoryImpl,
+};
+use infra::infra::thread_group::relation::{
+    ThreadRelationRepository, ThreadRelationRepositoryImpl,
+};
+use infra::infra::thread_group::rows::{NewThreadDeletionMarker, SourceIdentityKey, values};
+use infra::infra::thread_group::source_identity::{
+    SourceThreadIdentityRepository, SourceThreadIdentityRepositoryImpl,
+};
 
 /// Common time-range, sort, and memory-kind options for the thread list endpoints
 /// (`find_thread_list_by_user_id`, `find_threads_by_labels`).
@@ -288,6 +311,14 @@ pub struct AddMemoriesBatchInput {
     pub memories: Vec<BatchMemoryInput>,
     pub upsert_by_external_id: bool,
     pub labels: Vec<String>,
+    /// Owner-local source identity of the session being imported. When
+    /// present, the design 8.2 suppression gate runs inside the import
+    /// transaction before any content write, and a permitted re-import
+    /// consumes the marker and revives the current placeholder.
+    pub source_identity: Option<SourceIdentityInput>,
+    /// Explicit operator override that may consume a
+    /// `forbid_reimport=true` marker.
+    pub explicit_override: bool,
 }
 
 /// `Some((media_object.kind, storage_backend))` of the row-locked,
@@ -312,6 +343,31 @@ pub struct AddMemoriesBatchOutput {
     /// `upsert_by_external_id`. Used by the gRPC layer to fire embedding
     /// dispatches after commit.
     pub new_memories_for_embedding: Vec<NewMemoryForEmbedding>,
+    /// True when a `forbid_reimport=true` deletion marker suppressed the
+    /// import. No content was written; `outcomes` is empty.
+    pub suppressed: bool,
+}
+
+/// DB writes performed by `delete_thread_in_tx`, plus the post-commit
+/// work the caller runs after a successful commit.
+pub struct DeleteThreadTxOutcome {
+    pub deleted: bool,
+    pub exclusive_ids: Vec<i64>,
+    pub all_memory_ids: Vec<MemoryId>,
+    pub post_delete: Vec<(i64, infra::infra::media_object::rdb::MediaObjectRow)>,
+}
+
+/// Result of a policy-aware delete across a (possibly recursive) thread
+/// set.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeleteThreadPolicyOutcome {
+    /// Internal id of every thread whose content delete ran, root first.
+    pub deleted_thread_ids: Vec<i64>,
+    /// Memory ids that became orphaned and were removed; callers cascade
+    /// to external vector stores.
+    pub exclusive_memory_ids: Vec<i64>,
+    /// Whether the root thread row actually existed and was deleted.
+    pub root_deleted: bool,
 }
 
 /// Result of walking back the `parent_ids` chain from a starting memory.
@@ -381,6 +437,27 @@ pub trait ThreadApp:
             .thread_repository()
             .create(&mut *tx, &to_insert)
             .await?;
+
+        // Every Thread gets an immutable canonical key at creation
+        // (design 3.1.1). A manually created / non-source Thread gets a
+        // random `creation_uuid` key persisted in the same transaction;
+        // source-backed imports assign their deterministic key later.
+        {
+            let now = command_utils::util::datetime::now_millis();
+            let canonical_keys =
+                ThreadCanonicalKeyRepositoryImpl::new(self.thread_repository().static_pool());
+            let owner_scope = format!("user:{}", to_insert.user_id.map(|u| u.value).unwrap_or(0));
+            canonical_keys
+                .assign_tx(
+                    &mut *tx,
+                    id.value,
+                    &owner_scope,
+                    &new_manual_thread_canonical_key(),
+                    values::canonical_key_origin::CREATION_UUID,
+                    now,
+                )
+                .await?;
+        }
 
         // Anchor the default system memory in the junction so that
         // delete_thread's orphan check (NOT EXISTS thread_memory) does
@@ -587,9 +664,23 @@ pub trait ThreadApp:
     /// Delete a thread and its exclusive memories.
     /// Returns `(deleted, exclusive_memory_ids)` so callers can cascade to external stores.
     async fn delete_thread(&self, id: &ThreadId) -> Result<(bool, Vec<i64>)> {
-        let pool = self.thread_repository().db_pool();
+        let pool = self.thread_repository().static_pool();
         let mut tx = pool.begin().await.map_err(LlmMemoryError::DBError)?;
+        let outcome = self.delete_thread_in_tx(&mut tx, id).await?;
+        tx.commit().await.map_err(LlmMemoryError::DBError)?;
+        self.finish_delete_post_commit(&outcome, id).await;
+        Ok((outcome.deleted, outcome.exclusive_ids))
+    }
 
+    /// DB-write half of `delete_thread`, callable inside a caller-owned
+    /// transaction. The ThreadGroup policy delete reuses this so content
+    /// removal and marker / placeholder bookkeeping commit together
+    /// under the shared identity lock.
+    async fn delete_thread_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, infra_utils::infra::rdb::Rdb>,
+        id: &ThreadId,
+    ) -> Result<DeleteThreadTxOutcome> {
         // 0. Lock the thread row first. On PostgreSQL this is a row-level
         //    FOR UPDATE lock that blocks concurrent add_memory from
         //    reading and inserting into a thread that is about to be
@@ -597,13 +688,13 @@ pub trait ThreadApp:
         //    semantics already serialise writes).
         let _thread = self
             .thread_repository()
-            .find_row_for_update_tx(&mut *tx, id)
+            .find_row_for_update_tx(&mut **tx, id)
             .await?;
 
         // 1. Get all memory IDs for this thread from thread_memory
         let all_memory_ids = self
             .thread_memory_repository()
-            .find_memory_ids_by_thread_tx(&mut *tx, id.value)
+            .find_memory_ids_by_thread_tx(&mut **tx, id.value)
             .await?;
 
         // 2. Lock the current member memories before removing the junction
@@ -614,12 +705,8 @@ pub trait ThreadApp:
         let candidate_ids: Vec<i64> = all_memory_ids.iter().map(|mid| mid.value).collect();
         let locked_candidates = self
             .memory_repository()
-            .find_by_ids_for_update_tx(&mut tx, &candidate_ids)
+            .find_by_ids_for_update_tx(&mut *tx, &candidate_ids)
             .await?;
-        // memory_id -> media_object_id from the row-locked pre-delete
-        // rows, used after the orphan delete to decrement only the media
-        // of memories that were actually deleted (a shared memory keeps
-        // its media reference).
         let media_by_memory: std::collections::HashMap<i64, i64> = locked_candidates
             .iter()
             .filter_map(|m| {
@@ -631,7 +718,7 @@ pub trait ThreadApp:
 
         // 3. Delete thread_memory junction entries first (safe for future FK constraints)
         self.thread_memory_repository()
-            .delete_by_thread_tx(&mut *tx, id.value)
+            .delete_by_thread_tx(&mut **tx, id.value)
             .await?;
 
         // 4. Delete only those candidate memories that are still orphaned
@@ -640,11 +727,11 @@ pub trait ThreadApp:
         //    memory through `thread_memory`.
         let exclusive_ids = self
             .memory_repository()
-            .delete_orphaned_by_ids_tx(&mut tx, &candidate_ids)
+            .delete_orphaned_by_ids_tx(&mut *tx, &candidate_ids)
             .await?;
         for mid in &exclusive_ids {
             self.memory_rating_repository()
-                .delete_by_memory_id_tx(&mut *tx, *mid)
+                .delete_by_memory_id_tx(&mut **tx, *mid)
                 .await?;
         }
 
@@ -664,10 +751,10 @@ pub trait ThreadApp:
                 };
                 media
                     .repository()
-                    .find_by_id_for_update_tx(&mut tx, moid)
+                    .find_by_id_for_update_tx(&mut *tx, moid)
                     .await?;
                 if let Some(job) =
-                    super::memory::decr_and_maybe_claim(media.repository(), &mut tx, moid).await?
+                    super::memory::decr_and_maybe_claim(media.repository(), &mut *tx, moid).await?
                 {
                     post_delete.push(job);
                 }
@@ -676,34 +763,51 @@ pub trait ThreadApp:
 
         // 4b. Delete thread_label junction entries.
         self.thread_label_repository()
-            .delete_by_thread_tx(&mut *tx, id.value)
+            .delete_by_thread_tx(&mut **tx, id.value)
             .await?;
 
         // 5. Delete the thread row itself.
-        let result = self.thread_repository().delete_tx(&mut *tx, id).await?;
+        let deleted = self.thread_repository().delete_tx(&mut **tx, id).await?;
 
-        tx.commit().await.map_err(LlmMemoryError::DBError)?;
+        // 5a. Null the live endpoints of canonical relations that
+        //     reference this thread. The endpoint canonical key is
+        //     retained, so a later revival reconnects by identity
+        //     (design 5.3). Runs for both the legacy and policy paths.
+        let now = now_millis();
+        let relations = ThreadRelationRepositoryImpl::new(
+            infra::infra::IdGeneratorWrapper::new(),
+            self.thread_repository().static_pool(),
+        );
+        relations
+            .detach_parent_thread_id_tx(&mut **tx, id.value, now)
+            .await?;
+        relations
+            .detach_child_thread_id_tx(&mut **tx, id.value, now)
+            .await?;
 
-        // Post-commit: the claim winner runs the storage+row delete for
-        // each media_object whose ref_count reached 0 (best-effort;
-        // finish_delete marks deleted-failed on error and the GC retries).
+        Ok(DeleteThreadTxOutcome {
+            deleted,
+            exclusive_ids,
+            all_memory_ids,
+            post_delete,
+        })
+    }
+
+    /// Post-commit side effects of `delete_thread_in_tx`: media storage
+    /// finalization, cache invalidation, and the best-effort thread
+    /// vector delete.
+    async fn finish_delete_post_commit(&self, outcome: &DeleteThreadTxOutcome, id: &ThreadId) {
         if let Some(media) = self.media_subsystem() {
-            for (moid, row) in post_delete {
-                let _ = media.finalizer().finish_delete(moid, &row).await;
+            for (moid, row) in &outcome.post_delete {
+                let _ = media.finalizer().finish_delete(*moid, row).await;
             }
         }
-
-        // 6. Clear memory caches (both exclusive and shared - shared might have stale thread refs)
-        for mid in &all_memory_ids {
+        for mid in &outcome.all_memory_ids {
             let k = Arc::new(memory_cache_key(&mid.value));
             let _ = self.delete_memory_cache(&k).await;
         }
-
-        // 7. Clear thread cache
         let k = Arc::new(Self::find_cache_key(&id.value));
         let _ = self.delete_cache(&k).await;
-
-        // 8. Best-effort delete thread vector from LanceDB
         if let Some(tva) = self.thread_vector_app()
             && let Err(e) = tva.delete_thread_vector(id.value).await
         {
@@ -712,8 +816,6 @@ pub trait ThreadApp:
                 id.value
             );
         }
-
-        Ok((result, exclusive_ids))
     }
 
     fn find_cache_key(id: &i64) -> String {
@@ -2142,6 +2244,8 @@ impl ThreadApp for ThreadAppImpl {
             memories,
             upsert_by_external_id,
             labels,
+            source_identity,
+            explicit_override,
         } = input;
 
         if memories.is_empty() {
@@ -2183,8 +2287,51 @@ impl ThreadApp for ThreadAppImpl {
         }
 
         // ----- Phase 1: transaction begin + thread resolution -----
-        let pool = self.thread_repository().db_pool();
+        let pool = self.thread_repository().static_pool();
         let mut tx = pool.begin().await.map_err(LlmMemoryError::DBError)?;
+
+        // ----- Phase 1 (cont.): design 8.2 suppression gate. Runs in the
+        // same transaction as the content write, before any row is
+        // created, so a `forbid_reimport=true` marker blocks the import
+        // without side effects. An explicit override consumes the marker
+        // in the same section. An unreadable identity scope skips the
+        // gate (no marker can exist for it).
+        let marker_key = source_identity.as_ref().and_then(|identity| identity.key());
+        if let Some(key) = &marker_key {
+            let lock_repo = ThreadGroupLockRepositoryImpl::new(pool);
+            lock_repo.lock_source_identity_tx(&mut *tx, key).await?;
+            let marker_repo = ThreadDeletionMarkerRepositoryImpl::new(pool);
+            let marker = marker_repo.find_tx(&mut *tx, key).await?;
+            // The emergency write gate cannot consume a marker or revive
+            // a placeholder, so a marked identity fails closed rather
+            // than writing content it cannot reconcile.
+            if marker.is_some() && !crate::app::thread_group::thread_group_writes_enabled() {
+                tx.rollback().await.map_err(LlmMemoryError::DBError)?;
+                return Err(LlmMemoryError::FailedPrecondition(
+                    "ThreadGroup writes are disabled; cannot process a deletion marker".to_string(),
+                )
+                .into());
+            }
+            let decision = decide_suppression(
+                marker.as_ref().map(|row| row.forbid_reimport),
+                explicit_override,
+            );
+            if decision == SuppressionDecision::Suppress {
+                tx.rollback().await.map_err(LlmMemoryError::DBError)?;
+                return Ok(AddMemoriesBatchOutput {
+                    thread_id: ThreadId { value: 0 },
+                    thread_created: false,
+                    outcomes: Vec::new(),
+                    new_memories_for_embedding: Vec::new(),
+                    suppressed: true,
+                });
+            }
+            // A permitted re-import consumes the marker whether it was a
+            // revivable (forbid=false) marker or an explicit override.
+            if marker.is_some() && decision != SuppressionDecision::Suppress {
+                marker_repo.consume_tx(&mut *tx, key).await?;
+            }
+        }
 
         let (thread_id, thread_created, _target_user_id, target_memory_kind) = match thread_target {
             BatchThreadTarget::ExistingThreadId(tid) => {
@@ -2304,6 +2451,40 @@ impl ThreadApp for ThreadAppImpl {
                 }
             }
         };
+
+        // ----- Phase 1 (cont.): revival + resolved mapping. A permitted
+        // re-import attaches the freshly resolved thread to the current
+        // deleted placeholder and records the owner-local mapping, all in
+        // the content transaction. Retracted / superseded relation states
+        // are never revived by this step. -----
+        if crate::app::thread_group::thread_group_writes_enabled()
+            && let Some(identity) = source_identity.as_ref()
+            && let Some(key) = identity.key()
+        {
+            let member_repo = ThreadGroupMemberRepositoryImpl::new(pool);
+            let source_repo = SourceThreadIdentityRepositoryImpl::new(pool);
+            let now = now_millis();
+            if let Some(canonical_key) = identity.canonical_key() {
+                member_repo
+                    .revive_current_tx(&mut *tx, &canonical_key, thread_id.value, now)
+                    .await?;
+                // Reconnect canonical relations whose live endpoint was
+                // nulled by the delete, resolving by identity key.
+                let relations = ThreadRelationRepositoryImpl::new(
+                    infra::infra::IdGeneratorWrapper::new(),
+                    pool,
+                );
+                relations
+                    .reconnect_parent_thread_id_tx(&mut *tx, &canonical_key, thread_id.value, now)
+                    .await?;
+                relations
+                    .reconnect_child_thread_id_tx(&mut *tx, &canonical_key, thread_id.value, now)
+                    .await?;
+            }
+            source_repo
+                .upsert_resolved_tx(&mut *tx, &key, thread_id.value, now)
+                .await?;
+        }
 
         // ----- Phase 1 (cont.): user_id alignment between target thread and each memory -----
         let mut memories = memories;
@@ -2650,6 +2831,262 @@ impl ThreadApp for ThreadAppImpl {
             thread_created,
             outcomes,
             new_memories_for_embedding,
+            suppressed: false,
+        })
+    }
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+impl ThreadAppImpl {
+    /// Delete a Thread (or its active descendant closure when
+    /// `recursive`) while preserving ThreadGroup lineage: a content-free
+    /// deletion marker per source-backed identity, a `deleted`
+    /// placeholder membership, and manual collection link removal.
+    /// `forbid_reimport` blocks a later normal import. Existing
+    /// `Delete(ThreadId)` maps to `(recursive=false, forbid_reimport=false)`.
+    ///
+    /// Content deletion and the ThreadGroup bookkeeping run in a single
+    /// transaction under the shared identity / canonical-key locks.
+    /// Canonical-key and identity state is re-read inside that
+    /// transaction after the locks are held. The operation is
+    /// idempotent, so a retry after a transient failure converges.
+    pub async fn delete_thread_with_policy(
+        &self,
+        root_thread_id: i64,
+        recursive: bool,
+        forbid_reimport: bool,
+        actor_id: &str,
+        reason: &str,
+    ) -> Result<DeleteThreadPolicyOutcome> {
+        let pool = self.thread_repository().static_pool();
+        let id_generator = infra::infra::IdGeneratorWrapper::new();
+        let canonical_keys = ThreadCanonicalKeyRepositoryImpl::new(pool);
+        let relations = ThreadRelationRepositoryImpl::new(id_generator.clone(), pool);
+        let member_repo = ThreadGroupMemberRepositoryImpl::new(pool);
+        let source_repo = SourceThreadIdentityRepositoryImpl::new(pool);
+        let marker_repo = ThreadDeletionMarkerRepositoryImpl::new(pool);
+        let collections = ManualCollectionRepositoryImpl::new(id_generator, pool);
+        let locks = ThreadGroupLockRepositoryImpl::new(pool);
+
+        // Active descendant closure over the canonical relation graph.
+        // Relations retain endpoint canonical keys after a thread is
+        // deleted, so the walk passes through previously deleted
+        // intermediate nodes and still finds their live descendants.
+        // A live thread always has a canonical key; a thread imported but
+        // never reconciled may not. Without a key we can only delete the
+        // named thread's content (no lineage walk).
+        let root_key = canonical_keys
+            .find_by_thread_id(root_thread_id)
+            .await?
+            .map(|row| row.key);
+        let mut target_keys: Vec<String> = Vec::new();
+        let mut targets: Vec<i64> = vec![root_thread_id];
+        if let Some(root_key) = root_key {
+            target_keys.push(root_key.clone());
+            if recursive {
+                let mut seen: HashSet<String> = HashSet::from([root_key.clone()]);
+                let mut queue = vec![root_key];
+                while let Some(parent_key) = queue.pop() {
+                    for relation in relations
+                        .list_by_parent_canonical_key(
+                            &parent_key,
+                            Some(infra::infra::thread_group::rows::values::relation_state::ACTIVE),
+                        )
+                        .await?
+                    {
+                        let child_key = relation.child_thread_canonical_key;
+                        if seen.insert(child_key.clone()) {
+                            target_keys.push(child_key.clone());
+                            queue.push(child_key);
+                        }
+                    }
+                }
+            }
+            // Resolve each canonical key to its live thread id. A
+            // previously deleted intermediate key has no live thread and
+            // contributes no content target, but its descendants are
+            // still in the set.
+            let mut resolved: Vec<i64> = Vec::new();
+            for key in &target_keys {
+                if let Some(row) = canonical_keys.find_by_key(key).await?
+                    && !resolved.contains(&row.thread_id)
+                {
+                    resolved.push(row.thread_id);
+                }
+            }
+            if !resolved.contains(&root_thread_id) {
+                resolved.push(root_thread_id);
+            }
+            targets = resolved;
+        }
+
+        // Pre-read lock candidates on the pool. The authoritative state
+        // is re-read inside the transaction after the locks are held, so
+        // a concurrent import cannot slip an identity or membership
+        // change between the pre-read and the mutation.
+        let mut canonical_key_locks: Vec<String> = Vec::new();
+        let mut initial_identity_tuples: Vec<(String, String, String, String)> = Vec::new();
+        for &thread_id in &targets {
+            if let Some(key) = canonical_keys.find_by_thread_id(thread_id).await? {
+                canonical_key_locks.push(key.key);
+            }
+            for identity in source_repo.list_by_thread_id(thread_id).await? {
+                initial_identity_tuples.push((
+                    identity.owner_scope,
+                    identity.source,
+                    identity.identity_scope,
+                    identity.native_id,
+                ));
+            }
+        }
+        canonical_key_locks.sort();
+        canonical_key_locks.dedup();
+        initial_identity_tuples.sort();
+        initial_identity_tuples.dedup();
+
+        // One transaction for content removal AND ThreadGroup bookkeeping.
+        // The canonical-key and identity locks are taken in stable order
+        // first, so this delete serialises with a concurrent import /
+        // override for the same identities (design 5.2 / 8.2).
+        let mut tx = pool.begin().await.map_err(LlmMemoryError::DBError)?;
+        for key in &canonical_key_locks {
+            locks.lock_thread_canonical_key_tx(&mut *tx, key).await?;
+        }
+        // Lock the pre-read identities, then re-read in-transaction and
+        // lock any identity that appeared between the pre-read and the
+        // lock (bounded; a stable set converges in one extra pass).
+        let mut locked_identities: HashSet<(String, String, String, String)> = HashSet::new();
+        let mut pending = initial_identity_tuples;
+        for _ in 0..3 {
+            if pending.is_empty() {
+                break;
+            }
+            for (owner_scope, source, identity_scope, native_id) in &pending {
+                locks
+                    .lock_source_identity_tx(
+                        &mut *tx,
+                        &SourceIdentityKey {
+                            owner_scope,
+                            source,
+                            identity_scope,
+                            native_id,
+                        },
+                    )
+                    .await?;
+                locked_identities.insert((
+                    owner_scope.clone(),
+                    source.clone(),
+                    identity_scope.clone(),
+                    native_id.clone(),
+                ));
+            }
+            pending.clear();
+            for &thread_id in &targets {
+                for identity in source_repo
+                    .list_by_thread_id_tx(&mut *tx, thread_id)
+                    .await?
+                {
+                    let tuple = (
+                        identity.owner_scope,
+                        identity.source,
+                        identity.identity_scope,
+                        identity.native_id,
+                    );
+                    if !locked_identities.contains(&tuple) {
+                        pending.push(tuple);
+                    }
+                }
+            }
+            pending.sort();
+            pending.dedup();
+        }
+
+        // Authoritative in-transaction state, read only after the locks
+        // are held.
+        let mut keys_by_thread: std::collections::HashMap<i64, String> =
+            std::collections::HashMap::new();
+        let mut identities_by_thread: std::collections::HashMap<i64, Vec<_>> =
+            std::collections::HashMap::new();
+        for &thread_id in &targets {
+            if let Some(key) = canonical_keys
+                .find_by_thread_id_tx(&mut *tx, thread_id)
+                .await?
+            {
+                keys_by_thread.insert(thread_id, key.key);
+            }
+            identities_by_thread.insert(
+                thread_id,
+                source_repo
+                    .list_by_thread_id_tx(&mut *tx, thread_id)
+                    .await?,
+            );
+        }
+
+        let now = now_millis();
+        let mut outcomes = Vec::with_capacity(targets.len());
+        for &thread_id in &targets {
+            let outcome = self
+                .delete_thread_in_tx(&mut tx, &ThreadId { value: thread_id })
+                .await?;
+            outcomes.push((thread_id, outcome));
+
+            if let Some(canonical_key) = keys_by_thread.get(&thread_id) {
+                collections
+                    .detach_all_by_thread_tx(&mut *tx, thread_id)
+                    .await?;
+                member_repo
+                    .mark_current_deleted_tx(&mut *tx, canonical_key, now, now)
+                    .await?;
+            }
+            if let Some(identities) = identities_by_thread.get(&thread_id) {
+                for identity in identities {
+                    let key = SourceIdentityKey {
+                        owner_scope: &identity.owner_scope,
+                        source: &identity.source,
+                        identity_scope: &identity.identity_scope,
+                        native_id: &identity.native_id,
+                    };
+                    marker_repo
+                        .put_tx(
+                            &mut *tx,
+                            &NewThreadDeletionMarker {
+                                identity: key,
+                                forbid_reimport,
+                                recursive,
+                                actor_id: actor_id.to_string(),
+                                reason: Some(reason.to_string()),
+                                deleted_at: now,
+                            },
+                        )
+                        .await?;
+                    source_repo.delete_tx(&mut *tx, &key).await?;
+                }
+            }
+            canonical_keys.delete_tx(&mut *tx, thread_id).await?;
+        }
+        tx.commit().await.map_err(LlmMemoryError::DBError)?;
+
+        // Post-commit side effects run only after the single commit.
+        let mut exclusive_memory_ids = Vec::new();
+        let mut root_deleted = false;
+        for (thread_id, outcome) in &outcomes {
+            if *thread_id == root_thread_id {
+                root_deleted = outcome.deleted;
+            }
+            self.finish_delete_post_commit(outcome, &ThreadId { value: *thread_id })
+                .await;
+            exclusive_memory_ids.extend(outcome.exclusive_ids.iter().copied());
+        }
+        Ok(DeleteThreadPolicyOutcome {
+            deleted_thread_ids: targets,
+            exclusive_memory_ids,
+            root_deleted,
         })
     }
 }
@@ -5244,6 +5681,8 @@ mod test {
             memories,
             upsert_by_external_id,
             labels: vec![],
+            source_identity: None,
+            explicit_override: false,
         }
     }
 
@@ -5730,6 +6169,8 @@ mod test {
             memories: vec![batch_memory_input("nr-2", user_id, "b", 0, vec![])],
             upsert_by_external_id: true,
             labels: vec![],
+            source_identity: None,
+            explicit_override: false,
         })
         .await?;
         let after = app
@@ -5964,6 +6405,8 @@ mod test {
             )],
             upsert_by_external_id: true,
             labels: vec![],
+            source_identity: None,
+            explicit_override: false,
         };
 
         let out = app.add_memories_batch(input).await?;
@@ -6769,6 +7212,686 @@ mod test {
         TEST_RUNTIME.block_on(async {
             let pool = setup_pool().await;
             _test_find_memories_by_thread_id_unresolvable_no_panic(pool).await
+        })
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn run_test_batch_import_suppression_gate_and_override() -> Result<()> {
+        use common::thread_group_key::IdentityScope;
+        use infra::infra::thread_group::rows::{NewThreadDeletionMarker, SourceIdentityKey};
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = infra::infra::thread_group::test_support::setup_thread_group_pool().await;
+            let app = build_app(pool);
+            let identity = SourceIdentityInput {
+                owner_scope: "user:1".to_string(),
+                source: "codex".to_string(),
+                identity_scope: IdentityScope::known(String::new()),
+                native_id: "suppress-native-1".to_string(),
+            };
+            let input = |explicit_override: bool| AddMemoriesBatchInput {
+                thread_target: BatchThreadTarget::UpsertByChannel(Box::new(ThreadData {
+                    user_id: Some(UserId { value: 1 }),
+                    channel: Some("import:test:suppress".to_string()),
+                    memory_kind: MemoryKind::Raw as i32,
+                    ..Default::default()
+                })),
+                memories: vec![batch_memory_input(
+                    "eid-suppress-1",
+                    1,
+                    "hello",
+                    1_000,
+                    vec![],
+                )],
+                upsert_by_external_id: true,
+                labels: vec![],
+                source_identity: Some(identity.clone()),
+                explicit_override,
+            };
+
+            let first = app.add_memories_batch(input(false)).await?;
+            assert!(!first.suppressed);
+            assert_eq!(first.outcomes.len(), 1);
+
+            let marker_repo = ThreadDeletionMarkerRepositoryImpl::new(pool);
+            let key = SourceIdentityKey {
+                owner_scope: "user:1",
+                source: "codex",
+                identity_scope: "",
+                native_id: "suppress-native-1",
+            };
+            marker_repo
+                .put_tx(
+                    pool,
+                    &NewThreadDeletionMarker {
+                        identity: key,
+                        forbid_reimport: true,
+                        recursive: false,
+                        actor_id: "operator".to_string(),
+                        reason: Some("privacy".to_string()),
+                        deleted_at: 2_000,
+                    },
+                )
+                .await?;
+
+            // Normal re-import is suppressed with no content written.
+            let suppressed = app.add_memories_batch(input(false)).await?;
+            assert!(suppressed.suppressed);
+            assert!(suppressed.outcomes.is_empty());
+
+            // Explicit override consumes the marker and imports.
+            let overridden = app.add_memories_batch(input(true)).await?;
+            assert!(!overridden.suppressed);
+            assert!(
+                marker_repo.find(&key).await?.is_none(),
+                "explicit override must consume the marker"
+            );
+            Ok(())
+        })
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn run_test_delete_with_policy_placeholder_marker_and_revival() -> Result<()> {
+        use crate::app::thread_group::{ObservedEndpoint, ThreadGroupReconciliationService};
+        use common::thread_group_key::IdentityScope;
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = infra::infra::thread_group::test_support::setup_thread_group_pool().await;
+            let app = build_app(pool);
+            let identity = SourceIdentityInput {
+                owner_scope: "user:1".to_string(),
+                source: "codex".to_string(),
+                identity_scope: IdentityScope::known(String::new()),
+                native_id: "del-native".to_string(),
+            };
+            let batch = |explicit_override: bool| AddMemoriesBatchInput {
+                thread_target: BatchThreadTarget::UpsertByChannel(Box::new(ThreadData {
+                    user_id: Some(UserId { value: 1 }),
+                    channel: Some("import:test:del".to_string()),
+                    memory_kind: MemoryKind::Raw as i32,
+                    ..Default::default()
+                })),
+                memories: vec![batch_memory_input("eid-del-1", 1, "hi", 1_000, vec![])],
+                upsert_by_external_id: true,
+                labels: vec![],
+                source_identity: Some(identity.clone()),
+                explicit_override,
+            };
+
+            let first = app.add_memories_batch(batch(false)).await?;
+            let thread_id = first.thread_id.value;
+            let subject = ObservedEndpoint {
+                source: "codex".to_string(),
+                identity_scope: IdentityScope::known(String::new()),
+                owner_scope: "user:1".to_string(),
+                native_id: "del-native".to_string(),
+            };
+            ThreadGroupReconciliationService::new(pool)
+                .reconcile_subject(thread_id, &subject, &[], "op", 1_000)
+                .await?;
+
+            let key = identity.canonical_key().expect("source-backed key");
+            let outcome = app
+                .delete_thread_with_policy(thread_id, false, true, "operator", "privacy")
+                .await?;
+            assert_eq!(outcome.deleted_thread_ids, vec![thread_id]);
+            assert!(outcome.root_deleted);
+
+            let member_repo = ThreadGroupMemberRepositoryImpl::new(pool);
+            let placeholder = member_repo
+                .find_current_by_thread_canonical_key(&key)
+                .await?
+                .expect("placeholder membership");
+            assert_eq!(
+                placeholder.state,
+                infra::infra::thread_group::rows::values::member_state::DELETED
+            );
+            assert!(placeholder.thread_id.is_none());
+
+            let marker_repo = ThreadDeletionMarkerRepositoryImpl::new(pool);
+            let marker_key = identity.key().expect("known scope key");
+            assert!(
+                marker_repo
+                    .find(&marker_key)
+                    .await?
+                    .expect("marker")
+                    .forbid_reimport
+            );
+
+            // Normal re-import is suppressed.
+            assert!(app.add_memories_batch(batch(false)).await?.suppressed);
+
+            // Explicit override revives the placeholder and consumes the marker.
+            let revived = app.add_memories_batch(batch(true)).await?;
+            assert!(!revived.suppressed);
+            let revived_member = member_repo
+                .find_current_by_thread_canonical_key(&key)
+                .await?
+                .expect("revived membership");
+            assert_eq!(
+                revived_member.state,
+                infra::infra::thread_group::rows::values::member_state::ACTIVE
+            );
+            assert!(revived_member.thread_id.is_some());
+            assert!(marker_repo.find(&marker_key).await?.is_none());
+            Ok(())
+        })
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn run_test_delete_with_policy_recursive_closure_is_revivable() -> Result<()> {
+        use crate::app::thread_group::{
+            ObservationInput, ObservedEndpoint, ThreadGroupReconciliationService,
+        };
+        use common::thread_group_key::IdentityScope;
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = infra::infra::thread_group::test_support::setup_thread_group_pool().await;
+            let app = build_app(pool);
+            let identity = |native: &str| SourceIdentityInput {
+                owner_scope: "user:1".to_string(),
+                source: "codex".to_string(),
+                identity_scope: IdentityScope::known(String::new()),
+                native_id: native.to_string(),
+            };
+            let endpoint = |native: &str| ObservedEndpoint {
+                source: "codex".to_string(),
+                identity_scope: IdentityScope::known(String::new()),
+                owner_scope: "user:1".to_string(),
+                native_id: native.to_string(),
+            };
+            let observation = |child: &str, parent: &str| ObservationInput {
+                subject: endpoint(child),
+                candidate_parent: Some(endpoint(parent)),
+                relation_kind: Some("delegated".to_string()),
+                evidence_kind: "source_field".to_string(),
+                polarity: "supports".to_string(),
+                source_confidence: Some("exact".to_string()),
+                adapter_version: "codex-adapter@1".to_string(),
+                source_record_ref: "test:fixture".to_string(),
+                import_run_id: None,
+                observed_at: 1_000,
+            };
+            async fn import_one(
+                app: &ThreadAppImpl,
+                identity: &SourceIdentityInput,
+                channel: &str,
+                eid: &str,
+            ) -> Result<i64> {
+                let out = app
+                    .add_memories_batch(AddMemoriesBatchInput {
+                        thread_target: BatchThreadTarget::UpsertByChannel(Box::new(ThreadData {
+                            user_id: Some(UserId { value: 1 }),
+                            channel: Some(channel.to_string()),
+                            memory_kind: MemoryKind::Raw as i32,
+                            ..Default::default()
+                        })),
+                        memories: vec![batch_memory_input(eid, 1, "hi", 1_000, vec![])],
+                        upsert_by_external_id: true,
+                        labels: vec![],
+                        source_identity: Some(identity.clone()),
+                        explicit_override: false,
+                    })
+                    .await?;
+                Ok(out.thread_id.value)
+            }
+
+            let a = import_one(&app, &identity("rec-a"), "del-rec:a", "eid-rec-a").await?;
+            let b = import_one(&app, &identity("rec-b"), "del-rec:b", "eid-rec-b").await?;
+            let c = import_one(&app, &identity("rec-c"), "del-rec:c", "eid-rec-c").await?;
+            let reconcile = ThreadGroupReconciliationService::new(pool);
+            reconcile
+                .reconcile_subject(a, &endpoint("rec-a"), &[], "op", 1_000)
+                .await?;
+            reconcile
+                .reconcile_subject(
+                    b,
+                    &endpoint("rec-b"),
+                    &[observation("rec-b", "rec-a")],
+                    "op",
+                    1_001,
+                )
+                .await?;
+            reconcile
+                .reconcile_subject(
+                    c,
+                    &endpoint("rec-c"),
+                    &[observation("rec-c", "rec-b")],
+                    "op",
+                    1_002,
+                )
+                .await?;
+
+            let outcome = app
+                .delete_thread_with_policy(a, true, false, "operator", "cleanup")
+                .await?;
+            assert_eq!(outcome.deleted_thread_ids.len(), 3);
+            assert!(outcome.root_deleted);
+
+            let marker_repo = ThreadDeletionMarkerRepositoryImpl::new(pool);
+            let member_repo = ThreadGroupMemberRepositoryImpl::new(pool);
+            for native in ["rec-a", "rec-b", "rec-c"] {
+                let input = identity(native);
+                let key = input.key().expect("key");
+                assert!(
+                    !marker_repo
+                        .find(&key)
+                        .await?
+                        .expect("marker")
+                        .forbid_reimport
+                );
+                let canonical = input.canonical_key().expect("canonical");
+                let placeholder = member_repo
+                    .find_current_by_thread_canonical_key(&canonical)
+                    .await?
+                    .expect("placeholder");
+                assert_eq!(placeholder.state, values::member_state::DELETED);
+            }
+
+            // A non-forbidding marker allows normal re-import, which
+            // revives the placeholder.
+            let b_input = identity("rec-b");
+            let _b2 = import_one(&app, &b_input, "del-rec:b:2", "eid-rec-b-2").await?;
+            let b_key = b_input.key().expect("key");
+            assert!(marker_repo.find(&b_key).await?.is_none());
+            let revived = member_repo
+                .find_current_by_thread_canonical_key(&b_input.canonical_key().expect("canonical"))
+                .await?
+                .expect("revived");
+            assert_eq!(revived.state, values::member_state::ACTIVE);
+            Ok(())
+        })
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn run_test_recursive_delete_traverses_deleted_intermediate() -> Result<()> {
+        use crate::app::thread_group::{
+            ObservationInput, ObservedEndpoint, ThreadGroupReconciliationService,
+        };
+        use common::thread_group_key::IdentityScope;
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = infra::infra::thread_group::test_support::setup_thread_group_pool().await;
+            let app = build_app(pool);
+            let reconcile = ThreadGroupReconciliationService::new(pool);
+            let endpoint = |native: &str| ObservedEndpoint {
+                source: "codex".to_string(),
+                identity_scope: IdentityScope::known(String::new()),
+                owner_scope: "user:1".to_string(),
+                native_id: native.to_string(),
+            };
+            let identity = |native: &str| SourceIdentityInput {
+                owner_scope: "user:1".to_string(),
+                source: "codex".to_string(),
+                identity_scope: IdentityScope::known(String::new()),
+                native_id: native.to_string(),
+            };
+            let observation = |child: &str, parent: &str| ObservationInput {
+                subject: endpoint(child),
+                candidate_parent: Some(endpoint(parent)),
+                relation_kind: Some("delegated".to_string()),
+                evidence_kind: "source_field".to_string(),
+                polarity: "supports".to_string(),
+                source_confidence: Some("exact".to_string()),
+                adapter_version: "codex-adapter@1".to_string(),
+                source_record_ref: "test:fixture".to_string(),
+                import_run_id: None,
+                observed_at: 1_000,
+            };
+            async fn import_one(
+                app: &ThreadAppImpl,
+                identity: &SourceIdentityInput,
+                channel: &str,
+                eid: &str,
+            ) -> Result<i64> {
+                let out = app
+                    .add_memories_batch(AddMemoriesBatchInput {
+                        thread_target: BatchThreadTarget::UpsertByChannel(Box::new(ThreadData {
+                            user_id: Some(UserId { value: 1 }),
+                            channel: Some(channel.to_string()),
+                            memory_kind: MemoryKind::Raw as i32,
+                            ..Default::default()
+                        })),
+                        memories: vec![batch_memory_input(eid, 1, "hi", 1_000, vec![])],
+                        upsert_by_external_id: true,
+                        labels: vec![],
+                        source_identity: Some(identity.clone()),
+                        explicit_override: false,
+                    })
+                    .await?;
+                Ok(out.thread_id.value)
+            }
+
+            let a = import_one(&app, &identity("td-a"), "td:a", "eid-td-a").await?;
+            let b = import_one(&app, &identity("td-b"), "td:b", "eid-td-b").await?;
+            let c = import_one(&app, &identity("td-c"), "td:c", "eid-td-c").await?;
+            reconcile
+                .reconcile_subject(a, &endpoint("td-a"), &[], "op", 1_000)
+                .await?;
+            reconcile
+                .reconcile_subject(
+                    b,
+                    &endpoint("td-b"),
+                    &[observation("td-b", "td-a")],
+                    "op",
+                    1_001,
+                )
+                .await?;
+            reconcile
+                .reconcile_subject(
+                    c,
+                    &endpoint("td-c"),
+                    &[observation("td-c", "td-b")],
+                    "op",
+                    1_002,
+                )
+                .await?;
+
+            // Delete the intermediate B first; its relation endpoints are
+            // nulled but the canonical keys survive.
+            app.delete_thread_with_policy(b, false, false, "operator", "remove B")
+                .await?;
+            // Recursive delete of A must still reach C through the
+            // deleted intermediate B.
+            let outcome = app
+                .delete_thread_with_policy(a, true, false, "operator", "remove chain")
+                .await?;
+            assert!(
+                outcome.deleted_thread_ids.contains(&c),
+                "C must be reached through the deleted intermediate B"
+            );
+            let thread_repo =
+                ThreadRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+            assert!(
+                thread_repo.find(&ThreadId { value: c }).await?.is_none(),
+                "C content must be removed"
+            );
+            let c_member = ThreadGroupMemberRepositoryImpl::new(pool)
+                .find_current_by_thread_canonical_key(
+                    &identity("td-c").canonical_key().expect("key"),
+                )
+                .await?
+                .expect("placeholder");
+            assert_eq!(
+                c_member.state,
+                infra::infra::thread_group::rows::values::member_state::DELETED
+            );
+            Ok(())
+        })
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn run_test_delete_nulls_endpoints_and_reimport_reconnects() -> Result<()> {
+        use crate::app::thread_group::{
+            ObservationInput, ObservedEndpoint, ThreadGroupReconciliationService,
+        };
+        use common::thread_group_key::IdentityScope;
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = infra::infra::thread_group::test_support::setup_thread_group_pool().await;
+            let app = build_app(pool);
+            let reconcile = ThreadGroupReconciliationService::new(pool);
+            let relations =
+                ThreadRelationRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+            let endpoint = |native: &str| ObservedEndpoint {
+                source: "codex".to_string(),
+                identity_scope: IdentityScope::known(String::new()),
+                owner_scope: "user:1".to_string(),
+                native_id: native.to_string(),
+            };
+            let identity = |native: &str| SourceIdentityInput {
+                owner_scope: "user:1".to_string(),
+                source: "codex".to_string(),
+                identity_scope: IdentityScope::known(String::new()),
+                native_id: native.to_string(),
+            };
+            let observation = |child: &str, parent: &str| ObservationInput {
+                subject: endpoint(child),
+                candidate_parent: Some(endpoint(parent)),
+                relation_kind: Some("delegated".to_string()),
+                evidence_kind: "source_field".to_string(),
+                polarity: "supports".to_string(),
+                source_confidence: Some("exact".to_string()),
+                adapter_version: "codex-adapter@1".to_string(),
+                source_record_ref: "test:fixture".to_string(),
+                import_run_id: None,
+                observed_at: 1_000,
+            };
+            async fn import_one(
+                app: &ThreadAppImpl,
+                identity: &SourceIdentityInput,
+                channel: &str,
+                eid: &str,
+            ) -> Result<i64> {
+                let out = app
+                    .add_memories_batch(AddMemoriesBatchInput {
+                        thread_target: BatchThreadTarget::UpsertByChannel(Box::new(ThreadData {
+                            user_id: Some(UserId { value: 1 }),
+                            channel: Some(channel.to_string()),
+                            memory_kind: MemoryKind::Raw as i32,
+                            ..Default::default()
+                        })),
+                        memories: vec![batch_memory_input(eid, 1, "hi", 1_000, vec![])],
+                        upsert_by_external_id: true,
+                        labels: vec![],
+                        source_identity: Some(identity.clone()),
+                        explicit_override: false,
+                    })
+                    .await?;
+                Ok(out.thread_id.value)
+            }
+
+            let a = import_one(&app, &identity("rr-a"), "rr:a", "eid-rr-a").await?;
+            let b = import_one(&app, &identity("rr-b"), "rr:b", "eid-rr-b").await?;
+            reconcile
+                .reconcile_subject(a, &endpoint("rr-a"), &[], "op", 1_000)
+                .await?;
+            reconcile
+                .reconcile_subject(
+                    b,
+                    &endpoint("rr-b"),
+                    &[observation("rr-b", "rr-a")],
+                    "op",
+                    1_001,
+                )
+                .await?;
+
+            let b_key = identity("rr-b").canonical_key().expect("key");
+            let relation_id = relations
+                .find_active_by_child_canonical_key(&b_key)
+                .await?
+                .expect("relation")
+                .id;
+            assert_eq!(
+                relations
+                    .find_by_id(relation_id)
+                    .await?
+                    .expect("relation")
+                    .child_thread_id,
+                Some(b)
+            );
+
+            // Delete B: the child endpoint is nulled, the key retained.
+            app.delete_thread_with_policy(b, false, false, "operator", "remove B")
+                .await?;
+            let detached = relations.find_by_id(relation_id).await?.expect("relation");
+            assert!(
+                detached.child_thread_id.is_none(),
+                "child endpoint must be nulled on delete"
+            );
+            assert_eq!(detached.child_thread_canonical_key, b_key);
+
+            // Reimport B revives the placeholder and reconnects by key.
+            let b2 = import_one(&app, &identity("rr-b"), "rr:b:2", "eid-rr-b-2").await?;
+            let reconnected = relations.find_by_id(relation_id).await?.expect("relation");
+            assert_eq!(reconnected.child_thread_id, Some(b2));
+            assert_eq!(
+                reconnected.state,
+                infra::infra::thread_group::rows::values::relation_state::ACTIVE
+            );
+            Ok(())
+        })
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn run_test_create_thread_assigns_creation_uuid_canonical_key() -> Result<()> {
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = infra::infra::thread_group::test_support::setup_thread_group_pool().await;
+            let app = build_app(pool);
+            let thread_id = app
+                .create_thread(&ThreadData {
+                    user_id: Some(UserId { value: 1 }),
+                    memory_kind: MemoryKind::Raw as i32,
+                    ..Default::default()
+                })
+                .await?;
+            let repo = ThreadCanonicalKeyRepositoryImpl::new(pool);
+            let row = repo
+                .find_by_thread_id(thread_id.value)
+                .await?
+                .expect("manual key assigned at creation");
+            assert_eq!(row.origin, values::canonical_key_origin::CREATION_UUID);
+            assert_eq!(row.owner_scope, "user:1");
+            assert_eq!(row.key.len(), 64);
+
+            // `ensure_thread_canonical_key` is stable and generates only
+            // when missing (a legacy thread row inserted without a key).
+            let reconcile = crate::app::thread_group::ThreadGroupReconciliationService::new(pool);
+            let first = reconcile
+                .ensure_thread_canonical_key(thread_id.value, "user:1", 1_000)
+                .await?;
+            assert_eq!(first, row.key);
+            infra::infra::thread_group::test_support::insert_thread(pool, 31_001, None).await;
+            let generated = reconcile
+                .ensure_thread_canonical_key(31_001, "user:1", 1_000)
+                .await?;
+            assert_eq!(generated.len(), 64);
+            let again = reconcile
+                .ensure_thread_canonical_key(31_001, "user:1", 1_001)
+                .await?;
+            assert_eq!(generated, again, "key must be stable after generation");
+            Ok(())
+        })
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn run_test_concurrent_delete_and_import_has_no_marker_bypass() -> Result<()> {
+        use crate::app::thread_group::{ObservedEndpoint, ThreadGroupReconciliationService};
+        use common::thread_group_key::IdentityScope;
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = infra::infra::thread_group::test_support::setup_thread_group_pool().await;
+            let app = build_app(pool);
+            let reconcile = ThreadGroupReconciliationService::new(pool);
+            let marker_repo = ThreadDeletionMarkerRepositoryImpl::new(pool);
+            let member_repo = ThreadGroupMemberRepositoryImpl::new(pool);
+            let thread_repo =
+                ThreadRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+
+            for iteration in 0..5i64 {
+                let native = format!("race-native-{iteration}");
+                let channel = format!("race:chan:{iteration}");
+                let identity = SourceIdentityInput {
+                    owner_scope: "user:1".to_string(),
+                    source: "codex".to_string(),
+                    identity_scope: IdentityScope::known(String::new()),
+                    native_id: native.clone(),
+                };
+                let batch = |eid: &str, explicit_override: bool| AddMemoriesBatchInput {
+                    thread_target: BatchThreadTarget::UpsertByChannel(Box::new(ThreadData {
+                        user_id: Some(UserId { value: 1 }),
+                        channel: Some(channel.clone()),
+                        memory_kind: MemoryKind::Raw as i32,
+                        ..Default::default()
+                    })),
+                    memories: vec![batch_memory_input(eid, 1, "hi", 1_000, vec![])],
+                    upsert_by_external_id: true,
+                    labels: vec![],
+                    source_identity: Some(identity.clone()),
+                    explicit_override,
+                };
+
+                let first = app
+                    .add_memories_batch(batch(&format!("race-eid-{iteration}-a"), false))
+                    .await?;
+                let thread_id = first.thread_id.value;
+                reconcile
+                    .reconcile_subject(
+                        thread_id,
+                        &ObservedEndpoint {
+                            source: "codex".to_string(),
+                            identity_scope: IdentityScope::known(String::new()),
+                            owner_scope: "user:1".to_string(),
+                            native_id: native.clone(),
+                        },
+                        &[],
+                        "op",
+                        1_000,
+                    )
+                    .await?;
+
+                // Delete (forbid) and a normal re-import race for the same
+                // identity. Either may lose to SQLite write serialization;
+                // the post-conditions must hold regardless.
+                let delete_fut =
+                    app.delete_thread_with_policy(thread_id, false, true, "operator", "race");
+                let import_fut =
+                    app.add_memories_batch(batch(&format!("race-eid-{iteration}-b"), false));
+                let (_delete_result, _import_result) = tokio::join!(delete_fut, import_fut);
+
+                let key = identity.canonical_key().expect("key");
+                let marker = marker_repo
+                    .find(&identity.key().expect("identity key"))
+                    .await?;
+                let member = member_repo
+                    .find_current_by_thread_canonical_key(&key)
+                    .await?;
+
+                if marker.is_some() {
+                    // A forbidden marker must never coexist with surviving
+                    // content or an active membership (marker bypass).
+                    assert!(
+                        thread_repo
+                            .find(&ThreadId { value: thread_id })
+                            .await?
+                            .is_none(),
+                        "iteration {iteration}: marker present but thread content survived"
+                    );
+                    if let Some(member) = &member {
+                        assert_eq!(
+                            member.state,
+                            infra::infra::thread_group::rows::values::member_state::DELETED,
+                            "iteration {iteration}: marker present but membership still active"
+                        );
+                    }
+                }
+
+                // No dangling active membership: an active membership must
+                // point at a live thread row.
+                if let Some(member) = &member
+                    && member.state
+                        == infra::infra::thread_group::rows::values::member_state::ACTIVE
+                {
+                    let live = member.thread_id.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "iteration {iteration}: active membership without a thread id"
+                        )
+                    })?;
+                    assert!(
+                        thread_repo.find(&ThreadId { value: live }).await?.is_some(),
+                        "iteration {iteration}: active membership points at a missing thread"
+                    );
+                }
+            }
+            Ok(())
         })
     }
 }

@@ -1,5 +1,5 @@
 .claude/
-.codex/
+.codex
 .env
 # Image-memory e2e integration env (minio keys / jobworkerp addr / DB).
 # Carries credentials, so it is ignored like .env; the runbook
@@ -30,4 +30,5 @@ docker-compose-test.yml
 CLAUDE.md
 __pycache__/
 /lancedb-maintenance/
+/.serena/
 

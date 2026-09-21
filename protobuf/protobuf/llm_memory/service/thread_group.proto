@@ -1,0 +1,354 @@
+syntax = "proto3";
+
+package llm_memory.service;
+
+import "llm_memory/data/common.proto";
+import "llm_memory/data/memory.proto";
+import "llm_memory/data/memory_vector.proto";
+import "llm_memory/data/search_filter.proto";
+import "llm_memory/data/thread.proto";
+import "llm_memory/data/thread_group.proto";
+import "llm_memory/service/common.proto";
+
+// ThreadGroup backend service.
+//
+// Additive to ThreadService: existing thread/memory contracts are
+// unchanged. A generic primary ThreadGroup create RPC is deliberately
+// absent (spec 3.1); operator-created groups come only from split.
+service ThreadGroupService {
+    // Read model: active groups ordered by
+    // `latest_activity_at DESC, group_canonical_key ASC` by default.
+    rpc FindThreadGroupList(FindThreadGroupListRequest) returns (stream llm_memory.data.ThreadGroup);
+    // Search raw Thread / Memory members and return matching groups. Paging is
+    // keyset-based: clients must send the opaque next_page_token returned by
+    // this RPC and must restart when the server reports snapshot_changed.
+    rpc SearchThreadGroups(SearchThreadGroupsRequest) returns (SearchThreadGroupsResponse);
+    // Read model: one group's current memberships, canonical relations,
+    // and unresolved candidate associations.
+    rpc FindThreadGroupLineage(llm_memory.data.ThreadGroupId) returns (llm_memory.data.ThreadGroupLineage);
+    // Lookup the durable group summary by its group-scoped external id and
+    // dedicated memory kind. Missing summaries return an empty response.
+    rpc FindThreadGroupSummary(FindThreadGroupSummaryRequest) returns (ThreadGroupSummaryResponse);
+    // Count summaries belonging to active groups that still have live members.
+    rpc CountThreadGroupSummaries(CountThreadGroupSummariesRequest) returns (CountThreadGroupSummariesResponse);
+    // Import path: record adapter observations for an imported subject
+    // thread and reconcile its canonical parent / membership.
+    rpc RecordThreadGroupObservations(RecordThreadGroupObservationsRequest) returns (RecordThreadGroupObservationsResponse);
+    // jobworkerp worker path: process one outbox state-transition event
+    // idempotently by `event_id` alone.
+    rpc ProcessThreadGroupEvent(ProcessThreadGroupEventRequest) returns (ProcessThreadGroupEventResponse);
+    // Connected dry-run: plan a session import against current DB state
+    // without writing. Returns suppression / revival / planned counts.
+    rpc PreviewThreadGroupImport(PreviewThreadGroupImportRequest) returns (PreviewThreadGroupImportResponse);
+
+    // ===== Operator commands (trusted internal caller) =====
+
+    // Merge two active groups into the target, preserving member state
+    // and redirecting the source. Idempotent per source group.
+    rpc MergeThreadGroups(MergeThreadGroupsRequest) returns (MergeThreadGroupsResponse);
+    // Split an active group by canonical-key partition. Identical retry
+    // returns the recorded successors; a different partition is rejected.
+    rpc SplitThreadGroup(SplitThreadGroupRequest) returns (SplitThreadGroupResponse);
+    // Attach a Thread to an existing active group as an operator-fixed
+    // membership. There is no primary-membership detach: use split.
+    rpc AttachThreadGroupMember(AttachThreadGroupMemberRequest) returns (SuccessResponse);
+
+    // Record and apply an explicit operator confirmation / rejection /
+    // retraction on a candidate association. Separate provenance from
+    // source confidence.
+    rpc RecordThreadGroupOperatorDecision(RecordThreadGroupOperatorDecisionRequest) returns (RecordThreadGroupOperatorDecisionResponse);
+
+    // ===== Owner-scoped manual collections =====
+
+    rpc CreateManualCollection(CreateManualCollectionRequest) returns (CreateManualCollectionResponse);
+    rpc FindManualCollectionList(FindManualCollectionListRequest) returns (stream llm_memory.data.ManualCollection);
+    rpc RenameManualCollection(RenameManualCollectionRequest) returns (SuccessResponse);
+    rpc DeleteManualCollection(DeleteManualCollectionRequest) returns (SuccessResponse);
+    rpc AttachManualCollectionMember(AttachManualCollectionMemberRequest) returns (SuccessResponse);
+    rpc DetachManualCollectionMember(DetachManualCollectionMemberRequest) returns (SuccessResponse);
+    rpc FindManualCollectionMembers(FindManualCollectionMembersRequest) returns (stream llm_memory.data.ManualCollectionMember);
+
+    // ===== Operations =====
+
+    // Snapshot of reconciliation / unresolved counts for monitoring.
+    rpc FindThreadGroupReconciliationReport(FindThreadGroupReconciliationReportRequest) returns (ThreadGroupReconciliationReport);
+    // Inactive-history purge: read-only manifest.
+    rpc PreviewThreadGroupPurge(llm_memory.data.ThreadGroupId) returns (ThreadGroupPurgePreview);
+    // Inactive-history purge: execute a previewed manifest.
+    rpc DeleteThreadGroupInactiveHistory(DeleteThreadGroupInactiveHistoryRequest) returns (DeleteThreadGroupInactiveHistoryResponse);
+}
+
+message ThreadGroupPurgePreview {
+    int64 group_id = 1;
+    string group_status = 2;
+    int64 inactive_memberships = 3;
+    int64 active_memberships = 4;
+    int64 inactive_relations = 5;
+    int64 active_relations = 6;
+    int64 audit_rows = 7;
+    int64 retained_deletion_markers = 8;
+    string digest = 9;
+    // Markers referenced only by this group's placeholders (purged).
+    int64 purgeable_deletion_markers = 10;
+    // Groups whose redirect points at this group.
+    int64 dangling_redirects = 11;
+}
+
+message DeleteThreadGroupInactiveHistoryRequest {
+    int64 group_id = 1;
+    // Digest returned by PreviewThreadGroupPurge; a mismatch is a
+    // conflict requiring a fresh preview.
+    string expected_digest = 2;
+    string actor_id = 3;
+    string reason = 4;
+}
+
+message DeleteThreadGroupInactiveHistoryResponse {
+    int64 deleted_memberships = 1;
+    int64 deleted_relations = 2;
+    int64 deleted_audit_rows = 3;
+    bool group_deleted = 4;
+    int64 deleted_deletion_markers = 5;
+    int64 repointed_redirects = 6;
+}
+
+message FindThreadGroupReconciliationReportRequest {}
+
+message ThreadGroupReconciliationReport {
+    int64 active_groups = 1;
+    int64 redirected_groups = 2;
+    int64 split_groups = 3;
+    int64 pending_candidates = 4;
+    int64 ambiguous_candidates = 5;
+    int64 conflict_candidates = 6;
+    int64 unsupported_observations = 7;
+}
+
+message FindThreadGroupListRequest {
+    // Upper bound on the returned rows (all rows when unset).
+    optional int32 limit = 1;
+    // Number of records to skip from the start.
+    optional int64 offset = 2;
+    // Include redirected / split history. Default false = active only.
+    bool include_inactive = 3;
+}
+
+enum ThreadGroupSearchTarget {
+    THREAD_GROUP_SEARCH_TARGET_UNSPECIFIED = 0;
+    THREAD_GROUP_SEARCH_TARGET_THREAD = 1;
+    THREAD_GROUP_SEARCH_TARGET_MEMORY = 2;
+}
+
+enum ThreadGroupSearchMode {
+    THREAD_GROUP_SEARCH_MODE_UNSPECIFIED = 0;
+    THREAD_GROUP_SEARCH_MODE_KEYWORD = 1;
+    THREAD_GROUP_SEARCH_MODE_SEMANTIC = 2;
+    THREAD_GROUP_SEARCH_MODE_HYBRID = 3;
+}
+
+// One raw-member predicate. Multiple predicates are ANDed. Unless
+// allow_cross_member is true on SearchThreadGroupsRequest, every predicate
+// must match the same current member Thread.
+message ThreadGroupMemberSearchQuery {
+    ThreadGroupSearchTarget target = 1;
+    ThreadGroupSearchMode mode = 2;
+    string query_text = 3;
+    repeated llm_memory.data.EmbeddingVector query_vectors = 4;
+    optional llm_memory.data.ThreadSearchFilter thread_filter = 5;
+    optional llm_memory.data.MemorySearchFilter memory_filter = 6;
+    optional llm_memory.data.HybridSearchOptions hybrid_options = 7;
+}
+
+message SearchThreadGroupsRequest {
+    repeated ThreadGroupMemberSearchQuery predicates = 1;
+    // False (the default) requires all predicates to match one member.
+    bool allow_cross_member = 2;
+    optional int32 page_size = 3;
+    // Opaque keyset cursor. Offset pagination is not supported.
+    optional string page_token = 4;
+    // Empty predicates turn this RPC into cursor-paged group browse. The
+    // filter is evaluated against current members and supports date/label
+    // narrowing without requiring a text query.
+    optional llm_memory.data.ThreadSearchFilter browse_filter = 5;
+}
+
+message ThreadGroupSearchWitness {
+    int32 predicate_index = 1;
+    ThreadGroupSearchTarget target = 2;
+    int64 thread_id = 3;
+    string thread_canonical_key = 4;
+    float score = 5;
+    optional llm_memory.data.ThreadGroupThreadDisplay member = 6;
+}
+
+message ThreadGroupSearchResult {
+    llm_memory.data.ThreadGroup group = 1;
+    float relevance_score = 2;
+    repeated ThreadGroupSearchWitness witnesses = 3;
+    // These fields are repeated here so a search result is self-contained for
+    // list UIs; they mirror the current read-model group projection.
+    optional llm_memory.data.ThreadGroupThreadDisplay root_member = 4;
+    int64 current_member_count = 5;
+    int64 active_member_count = 6;
+    int64 deleted_member_count = 7;
+}
+
+message SearchThreadGroupsResponse {
+    repeated ThreadGroupSearchResult results = 1;
+    // Unset when this page is the last page. The value is opaque to clients.
+    optional string next_page_token = 2;
+}
+
+message FindThreadGroupSummaryRequest {
+    int64 group_id = 1;
+}
+
+message ThreadGroupSummaryResponse {
+    optional llm_memory.data.Memory summary = 1;
+}
+
+message CountThreadGroupSummariesRequest {}
+
+message CountThreadGroupSummariesResponse {
+    int64 count = 1;
+}
+
+message RecordThreadGroupObservationsRequest {
+    // Live thread id the subject observations belong to.
+    int64 subject_thread_id = 1;
+    llm_memory.data.ThreadGroupEndpoint subject = 2;
+    repeated llm_memory.data.ThreadGroupObservationInput observations = 3;
+    // Import-run correlation id. Distinct from the event id.
+    optional string operation_id = 4;
+}
+
+message RecordThreadGroupObservationsResponse {
+    repeated int64 observation_ids = 1;
+    // Internal id of the adopted canonical relation, when selected.
+    optional int64 relation_selected = 2;
+    // Group the subject membership landed in, when attached.
+    optional int64 group_id = 3;
+    // True when equal-ranked parents left the child without a parent.
+    bool conflict = 4;
+    // Parent candidates still unresolved (late discovery).
+    int32 pending = 5;
+}
+
+message ProcessThreadGroupEventRequest {
+    // Non-empty outbox event id. The handler is idempotent per id.
+    string event_id = 1;
+}
+
+message ProcessThreadGroupEventResponse {
+    // True when the event had already been processed by an earlier
+    // delivery; the domain no-op is the same either way.
+    bool already_processed = 1;
+    // The immutable event type that was processed.
+    string event_type = 2;
+}
+
+message PreviewThreadGroupImportRequest {
+    llm_memory.data.ThreadGroupEndpoint subject = 1;
+    repeated llm_memory.data.ThreadGroupObservationInput observations = 2;
+    bool explicit_override = 3;
+}
+
+message PreviewThreadGroupImportResponse {
+    bool suppressed = 1;
+    bool would_revive = 2;
+    int64 planned_observations = 3;
+    int64 planned_relations = 4;
+    int64 pending = 5;
+    bool conflict = 6;
+}
+
+message RecordThreadGroupOperatorDecisionRequest {
+    int64 candidate_association_id = 1;
+    // "confirm" | "reject" | "retract".
+    string decision = 2;
+    string actor_id = 3;
+    string reason = 4;
+}
+
+message RecordThreadGroupOperatorDecisionResponse {
+    int64 decision_id = 1;
+    optional int64 relation_id = 2;
+    string state = 3;
+}
+
+message MergeThreadGroupsRequest {
+    int64 source_group_id = 1;
+    int64 target_group_id = 2;
+    string actor_id = 3;
+    string reason = 4;
+}
+
+message MergeThreadGroupsResponse {
+    int64 target_group_id = 1;
+    int32 moved_members = 2;
+    bool already_merged = 3;
+}
+
+message ThreadGroupPartition {
+    repeated string thread_canonical_keys = 1;
+}
+
+message SplitThreadGroupRequest {
+    int64 source_group_id = 1;
+    repeated ThreadGroupPartition partitions = 2;
+    string actor_id = 3;
+    string reason = 4;
+}
+
+message SplitThreadGroupResponse {
+    repeated int64 successor_group_ids = 1;
+}
+
+message AttachThreadGroupMemberRequest {
+    int64 group_id = 1;
+    int64 thread_id = 2;
+    // Resolved by the caller from the lineage read model; the server
+    // does not infer identity from thread_id.
+    string thread_canonical_key = 3;
+    string actor_id = 4;
+    string reason = 5;
+}
+
+message CreateManualCollectionRequest {
+    string owner_scope = 1;
+    string title = 2;
+}
+
+message CreateManualCollectionResponse {
+    int64 id = 1;
+}
+
+message FindManualCollectionListRequest {
+    string owner_scope = 1;
+    optional int32 limit = 2;
+    optional int64 offset = 3;
+}
+
+message RenameManualCollectionRequest {
+    int64 collection_id = 1;
+    string title = 2;
+}
+
+message DeleteManualCollectionRequest {
+    int64 collection_id = 1;
+}
+
+message AttachManualCollectionMemberRequest {
+    int64 collection_id = 1;
+    int64 thread_id = 2;
+    string owner_scope = 3;
+}
+
+message DetachManualCollectionMemberRequest {
+    int64 collection_id = 1;
+    int64 thread_id = 2;
+}
+
+message FindManualCollectionMembersRequest {
+    int64 collection_id = 1;
+}

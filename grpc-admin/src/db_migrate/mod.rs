@@ -10,6 +10,7 @@ use infra_utils::infra::rdb::RdbPool;
 
 pub mod catalog;
 pub mod state;
+pub mod thread_groups_canonical_keys_v1;
 pub mod thread_message_times_v1;
 
 /// Fixed-registry contract for a release-bound post-schema migration task.
@@ -33,6 +34,7 @@ pub fn has_registered_implementation(implementation: &str) -> bool {
     matches!(
         implementation,
         "thread_message_times_v1::ThreadMessageTimesV1Task"
+            | "thread_groups_canonical_keys_v1::ThreadGroupsCanonicalKeysV1Task"
     )
 }
 
@@ -45,6 +47,9 @@ pub fn task_from_catalog(
     match entry.implementation.as_str() {
         "thread_message_times_v1::ThreadMessageTimesV1Task" => Ok(Box::new(
             thread_message_times_v1::ThreadMessageTimesV1Task::new(pool, entry)?,
+        )),
+        "thread_groups_canonical_keys_v1::ThreadGroupsCanonicalKeysV1Task" => Ok(Box::new(
+            thread_groups_canonical_keys_v1::ThreadGroupsCanonicalKeysV1Task::new(pool, entry)?,
         )),
         _ => unreachable!("TaskCatalogEntry::validate rejects unregistered implementations"),
     }

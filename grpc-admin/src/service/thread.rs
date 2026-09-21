@@ -6,8 +6,9 @@ use crate::protobuf::llm_memory::service::thread_service_server::ThreadService;
 use crate::protobuf::llm_memory::service::{
     AddLabelsRequest, AddMemoriesBatchRequest, AddMemoriesBatchResponse,
     AddMemoryOutcome as AddMemoryOutcomeProto, AddMemoryRequest, AddMemoryResponse, CountResponse,
-    CreateThreadResponse, FindCoOccurringLabelsRequest, FindCoOccurringLabelsResponse,
-    FindCondition, FindDistinctLabelsRequest, FindDistinctLabelsResponse, FindListRequest,
+    CreateThreadResponse, DeleteThreadWithPolicyRequest, DeleteThreadWithPolicyResponse,
+    FindCoOccurringLabelsRequest, FindCoOccurringLabelsResponse, FindCondition,
+    FindDistinctLabelsRequest, FindDistinctLabelsResponse, FindListRequest,
     FindMemoriesByThreadIdRequest, FindThreadListByLabelsRequest, FindThreadListByUserIdRequest,
     MemoryWithPosition as MemoryWithPositionProto, OptionalThreadResponse, RemoveLabelsRequest,
     ResolveAncestorClosureRequest, ResolveAncestorClosureResponse, SearchLabelsRequest,
@@ -22,8 +23,10 @@ use app::app::thread::{
     BatchThreadTarget, MemoryWithPosition, ThreadApp, ThreadAppImpl, ThreadListOptions,
     UpdateMemoryParentsOutcome, UpdateParentsSkipReason,
 };
+use app::app::thread_group::SourceIdentityInput;
 use async_stream::stream;
 use command_utils::trace::Tracing;
+use common::thread_group_key::IdentityScope;
 use futures::stream::BoxStream;
 use infra::infra::thread::rdb::ThreadSort;
 use tonic::Response;
@@ -152,27 +155,79 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
     ) -> Result<tonic::Response<SuccessResponse>, tonic::Status> {
         let _s = Self::trace_request("thread", "delete", &request);
         let req = request.get_ref();
-        match self.app().delete_thread(req).await {
-            #[allow(unused_variables)]
-            Ok((r, exclusive_memory_ids)) => {
+        // Legacy Delete maps to the policy path with the documented
+        // defaults (recursive=false, forbid_reimport=false), so it now
+        // performs the same ThreadGroup placeholder / marker bookkeeping
+        // as DeleteWithPolicy without blocking re-import.
+        match self
+            .app()
+            .delete_thread_with_policy(req.value, false, false, "", "legacy Delete(ThreadId)")
+            .await
+        {
+            Ok(outcome) => {
                 // Cascade delete vector entries for exclusive memories (failure is logged only).
                 // Intentional ordering: RDB first, then LanceDB. RDB is the source of truth;
                 // orphaned LanceDB records are cleaned up by rebuild_index.
                 if let Some(va) = self.vector_app()
-                    && !exclusive_memory_ids.is_empty()
-                    && let Err(e) = va.delete_vectors_by_memory_ids(&exclusive_memory_ids).await
+                    && !outcome.exclusive_memory_ids.is_empty()
+                    && let Err(e) = va
+                        .delete_vectors_by_memory_ids(&outcome.exclusive_memory_ids)
+                        .await
                 {
                     tracing::error!(
                         "LanceDB cascade delete failed for thread_id={}: {e}",
                         req.value
                     );
                 }
-                // Thread vector deletion is handled by ThreadApp::delete_thread
-                Ok(Response::new(SuccessResponse { is_success: r }))
+                // Thread vector deletion is handled by finish_delete_post_commit.
+                Ok(Response::new(SuccessResponse {
+                    is_success: outcome.root_deleted,
+                }))
             }
             Err(e) => Err(handle_error(&e)),
         }
     }
+
+    #[tracing::instrument]
+    async fn delete_with_policy(
+        &self,
+        request: tonic::Request<DeleteThreadWithPolicyRequest>,
+    ) -> Result<Response<DeleteThreadWithPolicyResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let thread_id = req
+            .thread_id
+            .ok_or_else(|| tonic::Status::invalid_argument("thread_id is required"))?
+            .value;
+        if req.reason.trim().is_empty() {
+            return Err(tonic::Status::invalid_argument("reason must not be empty"));
+        }
+        let outcome = self
+            .app()
+            .delete_thread_with_policy(
+                thread_id,
+                req.recursive,
+                req.forbid_reimport,
+                &req.actor_id,
+                &req.reason,
+            )
+            .await
+            .map_err(|e| handle_error(&e))?;
+        if let Some(va) = self.vector_app()
+            && !outcome.exclusive_memory_ids.is_empty()
+            && let Err(e) = va
+                .delete_vectors_by_memory_ids(&outcome.exclusive_memory_ids)
+                .await
+        {
+            tracing::error!(
+                "LanceDB cascade delete failed for thread_id={}: {e}",
+                thread_id
+            );
+        }
+        Ok(Response::new(DeleteThreadWithPolicyResponse {
+            deleted_thread_ids: outcome.deleted_thread_ids,
+        }))
+    }
+
     #[tracing::instrument]
     async fn find(
         &self,
@@ -575,11 +630,27 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
             })
             .collect();
 
+        let source_identity = req
+            .source_identity
+            .as_ref()
+            .map(|endpoint| SourceIdentityInput {
+                owner_scope: endpoint.owner_scope.clone(),
+                source: endpoint.source.clone(),
+                identity_scope: if endpoint.identity_scope_known {
+                    IdentityScope::known(endpoint.identity_scope.clone())
+                } else {
+                    IdentityScope::unknown()
+                },
+                native_id: endpoint.native_id.clone(),
+            });
+
         let input = AddMemoriesBatchInput {
             thread_target,
             memories,
             upsert_by_external_id: req.upsert_by_external_id,
             labels: req.labels,
+            source_identity,
+            explicit_override: req.explicit_override,
         };
 
         match self.app().add_memories_batch(input).await {
@@ -587,7 +658,8 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
                 // Fire-and-forget embedding dispatch for memories that need
                 // (re-)embedding: newly inserted ones and those whose
                 // content was overwritten via `upsert_by_external_id`.
-                // Mirrors the AddMemory single-shot semantics.
+                // Mirrors the AddMemory single-shot semantics. A suppressed
+                // import has no outcomes to dispatch.
                 {
                     let app_ref = self.app();
                     for (mid, mem, media) in &out.new_memories_for_embedding {
@@ -598,6 +670,7 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
                     thread_id: Some(out.thread_id),
                     thread_created: out.thread_created,
                     outcomes: out.outcomes.into_iter().map(to_proto_outcome).collect(),
+                    suppressed: out.suppressed,
                 };
                 Ok(Response::new(resp))
             }

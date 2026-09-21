@@ -64,10 +64,17 @@ pub struct AppModule {
     pub reflection_app: ReflectionAppImpl,
     pub memory_vector_app: Option<crate::app::memory_vector::MemoryVectorAppImpl>,
     pub thread_vector_app: Option<Arc<crate::app::thread_vector::ThreadVectorAppImpl>>,
+    pub thread_group_read_app: crate::app::thread_group::ThreadGroupReadService,
+    pub thread_group_reconcile_app: crate::app::thread_group::ThreadGroupReconciliationService,
+    pub thread_group_event_app: crate::app::thread_group::ThreadGroupObservationService,
 }
 
 impl AppModule {
     pub async fn new_by_env(mut repositories: RepositoryModule) -> Self {
+        // `&'static` pool handle, snapshot before any repository field is
+        // moved out. ThreadGroup services are pool-only and hold no
+        // LanceDB state.
+        let thread_group_pool = repositories.pool();
         let mc_config = envy::prefixed("MEMORY_CACHE_")
             .from_env::<memory_utils::cache::stretto::MemoryCacheConfig>()
             .unwrap_or_else(|e| {
@@ -449,6 +456,14 @@ impl AppModule {
             reflection_app,
             memory_vector_app,
             thread_vector_app: thread_vector_app_arc,
+            thread_group_read_app: crate::app::thread_group::ThreadGroupReadService::new(
+                thread_group_pool,
+            ),
+            thread_group_reconcile_app:
+                crate::app::thread_group::ThreadGroupReconciliationService::new(thread_group_pool),
+            thread_group_event_app: crate::app::thread_group::ThreadGroupObservationService::new(
+                thread_group_pool,
+            ),
         }
     }
 }

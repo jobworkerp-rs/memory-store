@@ -4,19 +4,43 @@
 //! is the single source of truth for parent links.
 
 use crate::client::ImportClient;
+use crate::common::canonical::{strip_nul_bytes, strip_nul_bytes_in_value};
 use crate::events::ImportEventSink;
-use crate::source::{CanonicalEntry, CanonicalSession, ChatSource, ReadSessionOutcome, StreamItem};
+use crate::source::{
+    CanonicalEntry, CanonicalEntryStream, CanonicalSession, ChatSource, ReadSessionOutcome,
+    SourceDiagnostics, StreamItem, ThreadGroupConfidence, ThreadGroupEvidenceKind,
+    ThreadGroupIdentityScope, ThreadGroupPolarity, ThreadGroupSourceIdentity,
+};
 use anyhow::Result;
 use common::external_id::{EXTERNAL_ID_MAX_BYTES, namespace_for_external_id, owner_scoped};
 use futures::stream::{StreamExt, TryStreamExt};
 use prost::Message;
-use protobuf::llm_memory::data::{MemoryData, MemoryId, MemoryKind, ThreadData, ThreadId, UserId};
+use protobuf::llm_memory::data::{
+    MemoryData, MemoryId, MemoryKind, ThreadData, ThreadEvidenceConfidence, ThreadEvidenceKind,
+    ThreadGroupEndpoint, ThreadGroupObservationInput, ThreadId, ThreadObservationPolarity, UserId,
+};
 use protobuf::llm_memory::service::add_memories_batch_request::ThreadTarget as PbThreadTarget;
 use protobuf::llm_memory::service::{
-    AddMemoriesBatchRequest, BatchMemoryInput as PbBatchMemoryInput, ThreadUpsertByChannel,
-    UpdateMemoryParentsRequest, UpdateMemoryParentsResponse,
-    UpdateMemoryParentsSkipReason as SkipReason,
+    AddLabelsRequest, AddMemoriesBatchRequest, BatchMemoryInput as PbBatchMemoryInput,
+    RecordThreadGroupObservationsRequest, ThreadUpsertByChannel, UpdateMemoryParentsRequest,
+    UpdateMemoryParentsResponse, UpdateMemoryParentsSkipReason as SkipReason,
 };
+use std::collections::{HashMap, HashSet};
+
+/// Per-run ThreadGroup write gate. `--no-thread-group-writes` disables
+/// observation / reconciliation writes for the process without disabling
+/// the suppression check (the source identity is still sent on the batch
+/// request). Default enabled.
+static THREAD_GROUP_WRITES_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_thread_group_writes_enabled(enabled: bool) {
+    THREAD_GROUP_WRITES_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn thread_group_writes_enabled() -> bool {
+    THREAD_GROUP_WRITES_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Maximum entries packed into a single AddMemoriesBatch call. Spec §3.2.9.
 const CHUNK_MAX_ENTRIES: usize = 500;
@@ -35,6 +59,185 @@ struct RewireJob {
     external_id: String,
     memory_id: MemoryId,
     request: UpdateMemoryParentsRequest,
+}
+
+#[derive(Debug, Clone)]
+struct ExistingMemory {
+    memory_id: MemoryId,
+    parent_ids_empty: bool,
+    thread_ids: Vec<ThreadId>,
+}
+
+async fn lookup_opencode_memories(
+    client: &dyn ImportClient,
+    entries: &[CanonicalEntry],
+    user_id: i64,
+    target_thread_id: Option<ThreadId>,
+) -> Result<(
+    Vec<CanonicalEntry>,
+    HashMap<String, ExistingMemory>,
+    Option<ThreadId>,
+)> {
+    let mut new_entries = Vec::with_capacity(entries.len());
+    let mut existing = HashMap::new();
+    for entry in entries {
+        let Some(found) = client
+            .find_memory_by_external_id(entry.external_id.clone())
+            .await?
+        else {
+            new_entries.push(entry.clone());
+            continue;
+        };
+        let memory = found
+            .memory
+            .ok_or_else(|| anyhow::anyhow!("exact lookup returned no memory"))?;
+        let data = memory
+            .data
+            .ok_or_else(|| anyhow::anyhow!("exact lookup returned no memory data"))?;
+        if data.external_id.as_deref() != Some(entry.external_id.as_str()) {
+            return Err(anyhow::anyhow!(
+                "exact lookup returned a different external_id"
+            ));
+        }
+        let owner = data
+            .user_id
+            .ok_or_else(|| anyhow::anyhow!("exact lookup returned no memory user_id"))?;
+        if owner.value != user_id {
+            return Err(anyhow::anyhow!(
+                "external_id collision belongs to user {}",
+                owner.value
+            ));
+        }
+        if data.thread_ids.is_empty() {
+            return Err(anyhow::anyhow!(
+                "exact lookup returned no thread membership for {}",
+                entry.external_id
+            ));
+        }
+        let Some(target_thread_id) = target_thread_id else {
+            return Err(anyhow::anyhow!(
+                "external_id collision has no matching OpenCode thread: {}",
+                entry.external_id
+            ));
+        };
+        if !data
+            .thread_ids
+            .iter()
+            .any(|thread_id| thread_id.value == target_thread_id.value)
+        {
+            return Err(anyhow::anyhow!(
+                "external_id collision belongs to a different thread: {}",
+                entry.external_id
+            ));
+        }
+        let memory_id = memory
+            .id
+            .ok_or_else(|| anyhow::anyhow!("exact lookup returned no memory id"))?;
+        existing.insert(
+            entry.external_id.clone(),
+            ExistingMemory {
+                memory_id,
+                parent_ids_empty: data.parent_ids.is_empty(),
+                thread_ids: data.thread_ids,
+            },
+        );
+    }
+    Ok((new_entries, existing, target_thread_id))
+}
+
+/// Idempotently apply the session labels to an already-existing OpenCode
+/// thread. Returns `Err` with the caller-facing error string on failure.
+async fn apply_opencode_labels(
+    client: &dyn ImportClient,
+    thread_id: ThreadId,
+    labels: &[String],
+) -> Result<(), String> {
+    if labels.is_empty() {
+        return Ok(());
+    }
+    client
+        .add_labels(AddLabelsRequest {
+            thread_id: Some(thread_id),
+            labels: labels.to_vec(),
+        })
+        .await
+        .map_err(|error| format!("ThreadService.AddLabels failed: {error}"))
+}
+
+async fn rewire_opencode_duplicates(
+    client: &dyn ImportClient,
+    duplicates: &[(CanonicalEntry, ExistingMemory)],
+    thread_id: ThreadId,
+    user_id: i64,
+    result: &mut CanonicalSessionResult,
+) -> Result<(), String> {
+    for (entry, existing) in duplicates {
+        // A shared memory must not be rewritten from one session's view.
+        if !existing.parent_ids_empty || existing.thread_ids.len() != 1 {
+            continue;
+        }
+        if entry.parent_external_ids.is_empty() {
+            continue;
+        }
+        let mut parent_ids = Vec::new();
+        let mut seen = HashSet::new();
+        for external_id in &entry.parent_external_ids {
+            let Some(found) = client
+                .find_memory_by_external_id(external_id.clone())
+                .await
+                .map_err(|e| format!("OpenCode parent lookup failed: {e}"))?
+            else {
+                continue;
+            };
+            let memory = found
+                .memory
+                .ok_or_else(|| "exact parent lookup returned no memory".to_string())?;
+            let data = memory
+                .data
+                .ok_or_else(|| "exact parent lookup returned no memory data".to_string())?;
+            if data.external_id.as_deref() != Some(external_id.as_str()) {
+                return Err(format!(
+                    "exact parent lookup returned a different external_id for {external_id}"
+                ));
+            }
+            if data.user_id.map(|id| id.value) != Some(user_id) {
+                return Err(format!(
+                    "OpenCode parent collision belongs to another user for {external_id}"
+                ));
+            }
+            if !data.thread_ids.iter().any(|id| id.value == thread_id.value) {
+                continue;
+            }
+            let Some(parent_id) = memory.id else {
+                return Err("exact parent lookup returned no memory id".to_string());
+            };
+            if seen.insert(parent_id.value) {
+                parent_ids.push(parent_id);
+            }
+        }
+        if parent_ids.is_empty() {
+            continue;
+        }
+        let response = client
+            .update_memory_parents(UpdateMemoryParentsRequest {
+                thread_id: Some(thread_id),
+                memory_id: Some(existing.memory_id),
+                parent_ids,
+                force_overwrite_when_shared: false,
+                force_overwrite_when_non_empty: false,
+            })
+            .await
+            .map_err(|e| {
+                format!(
+                    "UpdateMemoryParents for OpenCode duplicate {} failed: {e}",
+                    entry.external_id
+                )
+            })?;
+        if response.rewired {
+            result.memories_rewired += 1;
+        }
+    }
+    Ok(())
 }
 
 /// Shared by `run_import` and `flush_chunk`: for every non-created outcome
@@ -154,6 +357,12 @@ pub struct CanonicalSessionResult {
     pub memories_imported: usize,
     pub memories_skipped_duplicate: usize,
     pub memories_skipped_filtered: usize,
+    pub memories_deferred: usize,
+    pub memories_skipped_ignored: usize,
+    pub memories_skipped_warning: usize,
+    pub ignored_by_reason: std::collections::BTreeMap<String, usize>,
+    pub warning_exclusions_by_reason: std::collections::BTreeMap<String, usize>,
+    pub warnings_by_reason: std::collections::BTreeMap<String, usize>,
     pub memories_rewired: usize,
     /// Attachments turned into `media_object` references via
     /// `MediaService`. Counts Upload + Register successes.
@@ -166,11 +375,40 @@ pub struct CanonicalSessionResult {
 }
 
 impl CanonicalSessionResult {
+    fn bump_reason(&mut self, reason: &str, count: usize) {
+        *self
+            .warnings_by_reason
+            .entry(reason.to_string())
+            .or_default() += count;
+    }
+
+    fn warnings_by_reason_entry(&mut self, reason: &str) {
+        self.bump_reason(reason, 1);
+    }
+
     /// Entries confirmed present by this logical session attempt. Duplicate
     /// upserts count because a retry may be completing a thread created by a
     /// previous partial attempt.
     pub fn cumulative_imported_count(&self) -> usize {
         self.memories_imported + self.memories_skipped_duplicate
+    }
+}
+
+fn apply_source_diagnostics(result: &mut CanonicalSessionResult, diagnostics: SourceDiagnostics) {
+    result.memories_deferred += diagnostics.deferred;
+    for (reason, count) in diagnostics.ignored_by_reason {
+        result.memories_skipped_ignored += count;
+        *result.ignored_by_reason.entry(reason).or_default() += count;
+    }
+    for (reason, count) in diagnostics.warning_exclusions_by_reason {
+        result.memories_skipped_warning += count;
+        *result
+            .warning_exclusions_by_reason
+            .entry(reason)
+            .or_default() += count;
+    }
+    for (reason, count) in diagnostics.warnings_by_reason {
+        result.bump_reason(&reason, count);
     }
 }
 
@@ -204,6 +442,19 @@ pub async fn run_import(
     user_id: i64,
     extra_labels: &[String],
 ) -> CanonicalSessionResult {
+    if session.source_id == "opencode" {
+        return run_import_streaming(
+            client,
+            session,
+            CanonicalEntryStream::from_vec(entries),
+            source_filtered_count,
+            since_millis,
+            user_id,
+            extra_labels,
+            ChunkLimits::default(),
+        )
+        .await;
+    }
     run_import_with_event_sink(
         client,
         session,
@@ -293,7 +544,7 @@ async fn run_import_with_event_sink(
     // imported with `metadata.attachment` left intact (the offline
     // attachment migration can still convert it later).
     let (media_ids, media_ok, media_failed) =
-        resolve_media_objects(client, &importable, &already_imported).await;
+        resolve_media_objects(client, &importable, &already_imported, &session.source_id).await;
     result.media_objects_linked += media_ok;
     result.media_link_failures += media_failed;
 
@@ -313,6 +564,14 @@ async fn run_import_with_event_sink(
 
     let mut current_thread_id: Option<ThreadId> = None;
 
+    // Owner-local source identity for the suppression gate / revival.
+    // Empty for plain / non-source sessions (no adapter observation).
+    let owner_scope = format!("user:{user_id}");
+    let source_identity = session
+        .thread_group_observations
+        .first()
+        .map(|observation| endpoint_to_proto(&observation.subject, &owner_scope));
+
     for (chunk_idx0, range) in chunks.iter().enumerate() {
         let chunk_idx = chunk_idx0 + 1;
         let is_last = chunk_idx == total_chunks;
@@ -331,6 +590,8 @@ async fn run_import_with_event_sink(
             memories: pb_memories,
             upsert_by_external_id: true,
             labels: if is_last { labels.clone() } else { Vec::new() },
+            source_identity: source_identity.clone(),
+            explicit_override: false,
         };
 
         let response = match client.add_memories_batch(request).await {
@@ -342,6 +603,13 @@ async fn run_import_with_event_sink(
                 return result;
             }
         };
+
+        // A forbidden deletion marker suppressed the session: report it
+        // without counting a created thread.
+        if response.suppressed {
+            result.skip_reason = Some("suppressed_by_deletion_marker".to_string());
+            return result;
+        }
 
         let Some(batch_thread_id) = response.thread_id else {
             result.error = Some("AddMemoriesBatch response missing thread_id".to_string());
@@ -383,7 +651,124 @@ async fn run_import_with_event_sink(
         }
     }
 
+    finalize_thread_group_observations(client, session, user_id, &mut result).await;
+
     result
+}
+
+/// ThreadGroup observation ingestion (design 8.2). Runs after the
+/// canonical content write so a forbidden/suppressed session never
+/// reaches it. Best-effort relative to the memory import: an RPC failure
+/// is surfaced but the memories stay imported (the next run is
+/// idempotent and retries the observation). Skipped entirely by the
+/// per-run `--no-thread-group-writes` gate.
+async fn finalize_thread_group_observations(
+    client: &dyn ImportClient,
+    session: &CanonicalSession,
+    user_id: i64,
+    result: &mut CanonicalSessionResult,
+) {
+    if !thread_group_writes_enabled() {
+        return;
+    }
+    let Some(thread_id) = result.thread_id else {
+        return;
+    };
+    if session.thread_group_observations.is_empty() {
+        return;
+    }
+    if let Err(error) = record_thread_group_observations(client, session, user_id, thread_id).await
+        && result.error.is_none()
+    {
+        result.error = Some(error);
+    }
+}
+
+/// Map the adapter's source-independent observations to the gRPC import
+/// contract. `owner_scope` is assigned here as `user:{user_id}` (design
+/// 4.2.1); the adapter deliberately leaves it unset.
+async fn record_thread_group_observations(
+    client: &dyn ImportClient,
+    session: &CanonicalSession,
+    user_id: i64,
+    thread_id: i64,
+) -> std::result::Result<(), String> {
+    let owner_scope = format!("user:{user_id}");
+    let Some(subject) = session.thread_group_observations.first() else {
+        return Ok(());
+    };
+    let subject_proto = endpoint_to_proto(&subject.subject, &owner_scope);
+    let observations = session
+        .thread_group_observations
+        .iter()
+        .map(|observation| ThreadGroupObservationInput {
+            subject: Some(endpoint_to_proto(&observation.subject, &owner_scope)),
+            candidate_parent: observation
+                .candidate_parent
+                .as_ref()
+                .map(|parent| endpoint_to_proto(parent, &owner_scope)),
+            relation_kind: observation.relation_kind.clone(),
+            evidence_kind: evidence_kind_to_proto(observation.evidence_kind),
+            polarity: polarity_to_proto(observation.polarity),
+            source_confidence: Some(confidence_to_proto(observation.confidence)),
+            adapter_version: observation.adapter_version.to_string(),
+            source_record_ref: observation.source_record_ref.clone(),
+            observed_at: None,
+        })
+        .collect();
+    let request = RecordThreadGroupObservationsRequest {
+        subject_thread_id: thread_id,
+        subject: Some(subject_proto),
+        observations,
+        operation_id: None,
+    };
+    client
+        .record_thread_group_observations(request)
+        .await
+        .map_err(|e| format!("RecordThreadGroupObservations failed: {e}"))?;
+    Ok(())
+}
+
+fn endpoint_to_proto(
+    identity: &ThreadGroupSourceIdentity,
+    owner_scope: &str,
+) -> ThreadGroupEndpoint {
+    let (identity_scope_known, identity_scope) = match &identity.identity_scope {
+        ThreadGroupIdentityScope::Known(value) => (true, value.clone()),
+        ThreadGroupIdentityScope::Unknown => (false, String::new()),
+    };
+    ThreadGroupEndpoint {
+        source: identity.source.clone(),
+        identity_scope_known,
+        identity_scope,
+        owner_scope: owner_scope.to_string(),
+        native_id: identity.native_id.clone(),
+    }
+}
+
+fn evidence_kind_to_proto(kind: ThreadGroupEvidenceKind) -> i32 {
+    (match kind {
+        ThreadGroupEvidenceKind::SourceEvent => ThreadEvidenceKind::SourceEvent,
+        ThreadGroupEvidenceKind::SourceField => ThreadEvidenceKind::SourceField,
+        ThreadGroupEvidenceKind::NegativeOrConflict => ThreadEvidenceKind::NegativeOrConflict,
+    }) as i32
+}
+
+fn polarity_to_proto(polarity: ThreadGroupPolarity) -> i32 {
+    (match polarity {
+        ThreadGroupPolarity::Supports => ThreadObservationPolarity::Supports,
+        ThreadGroupPolarity::Negates => ThreadObservationPolarity::Negates,
+        ThreadGroupPolarity::Conflicts => ThreadObservationPolarity::Conflicts,
+    }) as i32
+}
+
+fn confidence_to_proto(confidence: ThreadGroupConfidence) -> i32 {
+    (match confidence {
+        ThreadGroupConfidence::Exact => ThreadEvidenceConfidence::Exact,
+        ThreadGroupConfidence::Strong => ThreadEvidenceConfidence::Strong,
+        ThreadGroupConfidence::Heuristic => ThreadEvidenceConfidence::Heuristic,
+        ThreadGroupConfidence::Unsupported => ThreadEvidenceConfidence::Unsupported,
+    }) as i32
 }
 
 /// Split a sequence of pre-built `BatchMemoryInput`s into ranges that
@@ -417,10 +802,15 @@ fn split_chunks(entries: &[PbBatchMemoryInput]) -> Vec<std::ops::Range<usize>> {
 }
 
 fn build_labels(session: &CanonicalSession, extra: &[String]) -> Vec<String> {
-    let mut labels: Vec<String> = session.source_labels.clone();
+    let mut labels: Vec<String> = session
+        .source_labels
+        .iter()
+        .map(|label| strip_nul_bytes(label))
+        .collect();
     for l in extra {
-        if !labels.contains(l) {
-            labels.push(l.clone());
+        let label = strip_nul_bytes(l);
+        if !labels.contains(&label) {
+            labels.push(label);
         }
     }
     labels.retain(|l| !l.is_empty());
@@ -431,16 +821,22 @@ fn build_thread_data(session: &CanonicalSession, user_id: i64) -> ThreadData {
     ThreadData {
         default_system_memory_id: None,
         user_id: Some(UserId { value: user_id }),
-        description: session.description.clone(),
+        description: session.description.as_deref().map(strip_nul_bytes),
         channel: Some(session.channel.clone()),
         embedding: None,
         embedding_dim: None,
-        created_at: session.created_at_ms,
-        updated_at: session.created_at_ms,
+        // Thread audit timestamps are assigned by the server. Source
+        // history timestamps remain on the session metadata and memories.
+        created_at: 0,
+        updated_at: 0,
         first_message_at: None,
         last_message_at: None,
         labels: Vec::new(),
-        metadata: None,
+        metadata: session.thread_metadata.as_ref().map(|value| {
+            let mut value = value.clone();
+            strip_nul_bytes_in_value(&mut value);
+            serde_json::to_string(&value).expect("thread metadata is JSON")
+        }),
         memory_kind: MemoryKind::Raw as i32,
     }
 }
@@ -464,8 +860,9 @@ async fn resolve_media_objects(
     client: &dyn ImportClient,
     importable: &[CanonicalEntry],
     already_imported: &std::collections::HashSet<String>,
+    source_id: &str,
 ) -> (std::collections::HashMap<String, i64>, usize, usize) {
-    use crate::common::canonical::{AttachmentImportAction, classify_attachment_for_import};
+    use crate::common::canonical::{AttachmentImportAction, classify_attachment_for_source};
 
     // Base64 is kept ENCODED until the worker picks the job up so at
     // most MEDIA_CONCURRENCY decoded images are resident at once, not the
@@ -493,7 +890,7 @@ async fn resolve_media_objects(
         let Some(att) = entry.canonical.attachment.as_ref() else {
             continue;
         };
-        match classify_attachment_for_import(att) {
+        match classify_attachment_for_source(source_id, att) {
             AttachmentImportAction::Upload {
                 kind,
                 media_type,
@@ -782,19 +1179,41 @@ pub async fn run_all_with_event_sink<S: ChatSource>(
     chunk_limits: ChunkLimits,
     event_sink: Option<&dyn ImportEventSink>,
 ) -> Result<Vec<CanonicalSessionResult>> {
+    // OpenCode resolves a thread per session by channel. Snapshot the
+    // user's `channel -> thread_id` map once per run so `--all-sessions`
+    // does not re-stream every user thread per session. The snapshot is
+    // advisory: misses fall back to the per-channel lookup, so a thread
+    // created mid-run by this same import is still resolved correctly.
+    let thread_channel_snapshot = match client {
+        Some(c) => match c.find_thread_channels_by_user_id(user_id).await {
+            Ok(map) => map,
+            // Snapshot failure must not abort the run; the per-channel
+            // lookup remains the authoritative fallback.
+            Err(error) => {
+                tracing::warn!(
+                    user_id,
+                    "thread channel snapshot failed, falling back to per-session lookups: {error}"
+                );
+                HashMap::new()
+            }
+        },
+        None => HashMap::new(),
+    };
     let inputs = source.discover()?;
+    let entry_since = source.entry_since(since_millis);
     let mut results = Vec::with_capacity(inputs.len());
     for input in &inputs {
         let mut res = run_session_dispatch(
             source,
             input,
             client,
-            since_millis,
+            entry_since,
             since_millis_with_margin,
             user_id,
             extra_labels,
             chunk_limits,
             event_sink,
+            &thread_channel_snapshot,
         )
         .await;
         emit_session_completion(&mut res, event_sink);
@@ -852,13 +1271,14 @@ pub async fn run_all_with_entry_collector_and_event_sink<'a, S: ChatSource>(
     // (`--prune-missing`) use case is interactive and unlikely to hit
     // cnpg INSERT contention the way the auto-cron path does.
     let inputs = source.discover()?;
+    let entry_since = source.entry_since(since_millis);
     let mut results = Vec::with_capacity(inputs.len());
     for input in &inputs {
         let mut res = run_session_with_collector(
             source,
             input,
             client,
-            since_millis,
+            entry_since,
             since_millis_with_margin,
             user_id,
             extra_labels,
@@ -881,11 +1301,12 @@ async fn run_session<S: ChatSource>(
     user_id: i64,
     extra_labels: &[String],
 ) -> CanonicalSessionResult {
+    let entry_since = source.entry_since(since_millis);
     run_session_with_collector(
         source,
         input,
         client,
-        since_millis,
+        entry_since,
         since_millis_with_margin,
         user_id,
         extra_labels,
@@ -901,6 +1322,47 @@ async fn run_session<S: ChatSource>(
 /// `Vec<CanonicalEntry>`. Sources still on the `Import` Vec variant
 /// are wrapped via `CanonicalEntryStream::from_vec` so the downstream
 /// importer code path is the same for both.
+/// Shared finish for `Import` / `ImportStream` outcomes: route to the
+/// live importer or the matching dry-run counter, then fold the source
+/// diagnostics into the session result. `run_import_streaming_with_event_sink`
+/// itself routes OpenCode sessions through the duplicate-safe path, so both
+/// outcome variants share this single tail.
+#[allow(clippy::too_many_arguments)]
+async fn finish_session_import(
+    client: Option<&dyn ImportClient>,
+    session: CanonicalSession,
+    entries: crate::source::CanonicalEntryStream,
+    source_filtered_count: usize,
+    since_millis: Option<i64>,
+    user_id: i64,
+    extra_labels: &[String],
+    chunk_limits: ChunkLimits,
+    event_sink: Option<&dyn ImportEventSink>,
+    thread_channel_snapshot: &HashMap<String, ThreadId>,
+    diagnostics: SourceDiagnostics,
+) -> CanonicalSessionResult {
+    let mut result = match client {
+        Some(c) => {
+            run_import_streaming_with_event_sink(
+                c,
+                &session,
+                entries,
+                source_filtered_count,
+                since_millis,
+                user_id,
+                extra_labels,
+                chunk_limits,
+                event_sink,
+                thread_channel_snapshot,
+            )
+            .await
+        }
+        None => dry_run_streaming(&session, entries, source_filtered_count, since_millis),
+    };
+    apply_source_diagnostics(&mut result, diagnostics);
+    result
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_session_dispatch<S: ChatSource>(
     source: &S,
@@ -912,6 +1374,7 @@ async fn run_session_dispatch<S: ChatSource>(
     extra_labels: &[String],
     chunk_limits: ChunkLimits,
     event_sink: Option<&dyn ImportEventSink>,
+    thread_channel_snapshot: &HashMap<String, ThreadId>,
 ) -> CanonicalSessionResult {
     let outcome = match source.read_session(input, since_millis_with_margin) {
         Ok(o) => o,
@@ -938,49 +1401,46 @@ async fn run_session_dispatch<S: ChatSource>(
             session,
             entries,
             source_filtered_count,
-        } => match client {
-            Some(c) => {
-                run_import_streaming_with_event_sink(
-                    c,
-                    &session,
-                    crate::source::CanonicalEntryStream::from_vec(entries),
-                    source_filtered_count,
-                    since_millis,
-                    user_id,
-                    extra_labels,
-                    chunk_limits,
-                    event_sink,
-                )
-                .await
-            }
-            None => dry_run_session_result(session, entries, source_filtered_count, since_millis),
-        },
+            diagnostics,
+        } => {
+            // Route through the shared tail so the live/dry-run split and
+            // diagnostics folding cannot drift between the two variants.
+            finish_session_import(
+                client,
+                session,
+                crate::source::CanonicalEntryStream::from_vec(entries),
+                source_filtered_count,
+                since_millis,
+                user_id,
+                extra_labels,
+                chunk_limits,
+                event_sink,
+                thread_channel_snapshot,
+                diagnostics,
+            )
+            .await
+        }
         ReadSessionOutcome::ImportStream {
             session,
             entries: stream,
             source_filtered_count_initial,
-        } => match client {
-            Some(c) => {
-                run_import_streaming_with_event_sink(
-                    c,
-                    &session,
-                    stream,
-                    source_filtered_count_initial,
-                    since_millis,
-                    user_id,
-                    extra_labels,
-                    chunk_limits,
-                    event_sink,
-                )
-                .await
-            }
-            None => dry_run_streaming(
-                &session,
+            diagnostics,
+        } => {
+            finish_session_import(
+                client,
+                session,
                 stream,
                 source_filtered_count_initial,
                 since_millis,
-            ),
-        },
+                user_id,
+                extra_labels,
+                chunk_limits,
+                event_sink,
+                thread_channel_snapshot,
+                diagnostics,
+            )
+            .await
+        }
     }
 }
 
@@ -1040,11 +1500,13 @@ async fn run_session_with_collector<S: ChatSource>(
             session,
             entries,
             source_filtered_count,
+            diagnostics,
         } => {
             run_import_for_vec(
                 session,
                 entries,
                 source_filtered_count,
+                diagnostics,
                 client,
                 since_millis,
                 user_id,
@@ -1058,6 +1520,7 @@ async fn run_session_with_collector<S: ChatSource>(
             session,
             entries: stream,
             source_filtered_count_initial,
+            diagnostics,
         } => {
             // Collector contract needs `&[CanonicalEntry]`, so the
             // streaming source has to be drained first. Only this
@@ -1082,6 +1545,7 @@ async fn run_session_with_collector<S: ChatSource>(
                 session,
                 entries,
                 source_filtered_count,
+                diagnostics,
                 client,
                 since_millis,
                 user_id,
@@ -1113,12 +1577,13 @@ async fn run_import_for_vec(
     session: CanonicalSession,
     entries: Vec<CanonicalEntry>,
     source_filtered_count: usize,
+    diagnostics: SourceDiagnostics,
     client: Option<&dyn ImportClient>,
     since_millis: Option<i64>,
     user_id: i64,
     extra_labels: &[String],
     collect: &mut dyn FnMut(&[CanonicalEntry]),
-    event_sink: Option<&dyn ImportEventSink>,
+    _event_sink: Option<&dyn ImportEventSink>,
 ) -> CanonicalSessionResult {
     // Collector must only see entries that are actually going to be
     // sent to AddMemoriesBatch. plain's `--prune-missing` keys off
@@ -1139,9 +1604,13 @@ async fn run_import_for_vec(
             collect(&importable);
         }
     }
-    match client {
+    // The OpenCode-vs-legacy routing lives in `run_import` so the two
+    // entry points cannot drift apart. OpenCode sessions never reach the
+    // collector path (plain --prune-missing only), so an empty thread
+    // snapshot keeps the per-channel fallback authoritative here.
+    let mut result = match client {
         Some(c) => {
-            run_import_with_event_sink(
+            run_import(
                 c,
                 &session,
                 entries,
@@ -1149,12 +1618,13 @@ async fn run_import_for_vec(
                 since_millis,
                 user_id,
                 extra_labels,
-                event_sink,
             )
             .await
         }
         None => dry_run_session_result(session, entries, source_filtered_count, since_millis),
-    }
+    };
+    apply_source_diagnostics(&mut result, diagnostics);
+    result
 }
 
 /// Dry-run accounting: count import-eligible entries against the
@@ -1294,6 +1764,7 @@ pub async fn run_import_streaming(
         extra_labels,
         chunk_limits,
         None,
+        &HashMap::new(),
     )
     .await
 }
@@ -1309,6 +1780,7 @@ async fn run_import_streaming_with_event_sink(
     extra_labels: &[String],
     chunk_limits: ChunkLimits,
     event_sink: Option<&dyn ImportEventSink>,
+    thread_channel_snapshot: &HashMap<String, ThreadId>,
 ) -> CanonicalSessionResult {
     let mut result = CanonicalSessionResult {
         session_id: session.session_id.clone(),
@@ -1319,6 +1791,72 @@ async fn run_import_streaming_with_event_sink(
 
     let labels = build_labels(session, extra_labels);
 
+    // OpenCode is append-only from the importer's perspective. Resolve every
+    // external ID before media registration or batch insertion so a replay
+    // cannot overwrite an existing memory or re-register its attachment.
+    let (entries_stream, opencode_duplicates, opencode_thread) = if session.source_id == "opencode"
+    {
+        let collected = entries_stream.collect::<Vec<_>>();
+        let mut entries = Vec::with_capacity(collected.len());
+        for item in collected {
+            if let StreamItem::Entry(entry) = item {
+                entries.push(entry);
+            }
+        }
+        let mut namespaced = entries;
+        for entry in &mut namespaced {
+            namespace_entry_external_ids(entry, &session.source_id, user_id);
+        }
+        let target_thread = if namespaced.is_empty() {
+            None
+        } else {
+            // Snapshot first (one scan per run); fall back to the
+            // authoritative per-channel lookup on miss so threads created
+            // after the snapshot was taken are still resolved. An
+            // ambiguous channel is never in the snapshot, so the lookup
+            // surfaces the ambiguity error.
+            match thread_channel_snapshot.get(&session.channel) {
+                Some(thread_id) => Some(*thread_id),
+                None => match client
+                    .find_thread_by_channel_and_user_id(session.channel.clone(), user_id)
+                    .await
+                {
+                    Ok(thread_id) => thread_id,
+                    Err(error) => {
+                        result.error =
+                            Some(format!("OpenCode target thread lookup failed: {error}"));
+                        return result;
+                    }
+                },
+            }
+        };
+        match lookup_opencode_memories(client, &namespaced, user_id, target_thread).await {
+            Ok((new_entries, existing, target)) => {
+                let duplicates = namespaced
+                    .iter()
+                    .filter_map(|entry| {
+                        existing
+                            .get(&entry.external_id)
+                            .cloned()
+                            .map(|memory| (entry.clone(), memory))
+                    })
+                    .collect();
+                result.memories_skipped_duplicate += namespaced.len() - new_entries.len();
+                (
+                    CanonicalEntryStream::from_vec(new_entries),
+                    duplicates,
+                    target,
+                )
+            }
+            Err(error) => {
+                result.error = Some(format!("OpenCode duplicate lookup failed: {error}"));
+                return result;
+            }
+        }
+    } else {
+        (entries_stream, Vec::new(), None)
+    };
+
     // Lazy attachment context: attachment-free transcripts never issue an
     // external-ID lookup. Attachment-bearing entries use exact lookups so a
     // re-import never scans another session's hashed overflow IDs.
@@ -1326,7 +1864,19 @@ async fn run_import_streaming_with_event_sink(
 
     // Streaming state.
     let mut builder = ChunkBuilder::new(chunk_limits);
-    let mut current_thread_id: Option<ThreadId> = None;
+    let mut current_thread_id: Option<ThreadId> = opencode_thread;
+    let mut opencode_labels_applied = false;
+    if let Some(thread_id) = current_thread_id {
+        result.thread_id = Some(thread_id.value);
+        result.thread_created = false;
+        if session.source_id == "opencode"
+            && let Err(error) = apply_opencode_labels(client, thread_id, &labels).await
+        {
+            result.error = Some(error);
+            return result;
+        }
+        opencode_labels_applied = true;
+    }
 
     // Source-side warnings are accumulated to `memories_skipped_filtered`
     // — same accounting as `Filtered`, plus a tracing line so operators
@@ -1349,7 +1899,9 @@ async fn run_import_streaming_with_event_sink(
         };
 
         let mut entry = entry;
-        namespace_entry_external_ids(&mut entry, &session.source_id, user_id);
+        if session.source_id != "opencode" {
+            namespace_entry_external_ids(&mut entry, &session.source_id, user_id);
+        }
 
         if !is_entry_importable(&entry, since_millis) {
             result.memories_skipped_filtered += 1;
@@ -1361,17 +1913,28 @@ async fn run_import_streaming_with_event_sink(
         // `metadata.attachment` blob attached only when resolution
         // failed.
         let media_id_for_entry: Option<i64> = if entry.canonical.attachment.is_some() {
-            let ctx = attachment_ctx.get_or_insert_default();
-            if ctx.is_already_imported(client, &entry.external_id).await {
+            // OpenCode already performed exact lookup for every entry above;
+            // repeat lookups would add latency and could turn a transient
+            // duplicate-lookup failure into an attachment side effect.
+            let already_imported = if session.source_id == "opencode" {
+                false
+            } else {
+                let ctx = attachment_ctx.get_or_insert_default();
+                ctx.is_already_imported(client, &entry.external_id).await
+            };
+            if already_imported {
                 None
             } else {
-                match resolve_one_media(client, &entry).await {
+                match resolve_one_media(client, &entry, &session.source_id).await {
                     Some(Ok(id)) => {
                         result.media_objects_linked += 1;
                         Some(id)
                     }
                     Some(Err(e)) => {
                         result.media_link_failures += 1;
+                        if session.source_id == "opencode" {
+                            result.warnings_by_reason_entry("media_registration_failed");
+                        }
                         tracing::warn!(
                             external_id = entry.external_id.as_str(),
                             "MediaService resolution failed, keeping metadata.attachment: {e}"
@@ -1410,7 +1973,7 @@ async fn run_import_streaming_with_event_sink(
                 &mut result,
                 /*is_last=*/ false,
                 0,
-                &[],
+                &labels,
                 event_sink,
             )
             .await
@@ -1422,7 +1985,33 @@ async fn run_import_streaming_with_event_sink(
         builder.push(entry, pb, size);
     }
 
+    // Shared finish: labels for duplicate-only runs, then parent rewiring
+    // for duplicates — both run once regardless of whether any new entries
+    // were flushed.
+    if builder.is_empty()
+        && session.source_id == "opencode"
+        && result.memories_skipped_duplicate > 0
+        && let Some(thread_id) = current_thread_id
+        && !opencode_labels_applied
+        && let Err(error) = apply_opencode_labels(client, thread_id, &labels).await
+    {
+        result.error = Some(error);
+    }
     if builder.is_empty() {
+        if session.source_id == "opencode"
+            && let Some(thread_id) = current_thread_id
+            && let Err(error) = rewire_opencode_duplicates(
+                client,
+                &opencode_duplicates,
+                thread_id,
+                user_id,
+                &mut result,
+            )
+            .await
+        {
+            result.error = Some(error);
+        }
+        finalize_thread_group_observations(client, session, user_id, &mut result).await;
         return result;
     }
 
@@ -1443,7 +2032,22 @@ async fn run_import_streaming_with_event_sink(
     .await
     {
         result.error = Some(err);
+        return result;
     }
+    if session.source_id == "opencode"
+        && let Some(thread_id) = current_thread_id
+        && let Err(error) = rewire_opencode_duplicates(
+            client,
+            &opencode_duplicates,
+            thread_id,
+            user_id,
+            &mut result,
+        )
+        .await
+    {
+        result.error = Some(error);
+    }
+    finalize_thread_group_observations(client, session, user_id, &mut result).await;
     result
 }
 
@@ -1481,10 +2085,11 @@ impl AttachmentContext {
 async fn resolve_one_media(
     client: &dyn ImportClient,
     entry: &CanonicalEntry,
+    source_id: &str,
 ) -> Option<anyhow::Result<i64>> {
-    use crate::common::canonical::{AttachmentImportAction, classify_attachment_for_import};
+    use crate::common::canonical::{AttachmentImportAction, classify_attachment_for_source};
     let att = entry.canonical.attachment.as_ref()?;
-    match classify_attachment_for_import(att) {
+    match classify_attachment_for_source(source_id, att) {
         AttachmentImportAction::Upload {
             kind,
             media_type,
@@ -1573,17 +2178,33 @@ async fn flush_chunk(
         }),
     };
 
+    let owner_scope = format!("user:{user_id}");
+    let source_identity = session
+        .thread_group_observations
+        .first()
+        .map(|observation| endpoint_to_proto(&observation.subject, &owner_scope));
     let request = AddMemoriesBatchRequest {
         thread_target: Some(thread_target),
         memories: pb_sorted,
-        upsert_by_external_id: true,
-        labels: if is_last { labels.to_vec() } else { Vec::new() },
+        upsert_by_external_id: session.source_id != "opencode",
+        labels: if is_last || (session.source_id == "opencode" && current_thread_id.is_none()) {
+            labels.to_vec()
+        } else {
+            Vec::new()
+        },
+        source_identity,
+        explicit_override: false,
     };
 
     let response = client
         .add_memories_batch(request)
         .await
         .map_err(|e| format!("AddMemoriesBatch failed: {e}"))?;
+
+    if response.suppressed {
+        result.skip_reason = Some("suppressed_by_deletion_marker".to_string());
+        return Ok(());
+    }
 
     let batch_thread_id = response
         .thread_id
@@ -1667,7 +2288,42 @@ mod tests {
             updated_at_ms: 0,
             source_labels: Vec::new(),
             source_metadata: serde_json::json!({"scope": "test"}),
+            thread_metadata: None,
+            thread_group_observations: Vec::new(),
         }
+    }
+
+    #[test]
+    fn build_thread_data_leaves_audit_timestamps_to_the_server() {
+        let mut session = make_session();
+        session.source_id = "opencode".to_string();
+        session.created_at_ms = 1_700_000_000_000;
+        session.updated_at_ms = 1_700_000_001_000;
+
+        let thread = build_thread_data(&session, 42);
+
+        assert_eq!(thread.created_at, 0);
+        assert_eq!(thread.updated_at, 0);
+    }
+
+    #[test]
+    fn build_thread_data_strips_nul_from_metadata_values_and_keys() {
+        let mut session = make_session();
+        session.description = Some("title\u{0000}suffix".to_string());
+        session.thread_metadata = Some(serde_json::json!({
+            "session": {
+                "title\u{0000}suffix": "value\u{0000}suffix",
+                "nested": ["a\u{0000}b"]
+            }
+        }));
+
+        let thread = build_thread_data(&session, 42);
+        assert_eq!(thread.description.as_deref(), Some("titlesuffix"));
+        let metadata = thread.metadata.expect("thread metadata is set");
+        assert!(!metadata.contains('\u{0000}'));
+        let value: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(value["session"]["titlesuffix"], "valuesuffix");
+        assert_eq!(value["session"]["nested"][0], "ab");
     }
 
     fn parse_meta(md: &MemoryData) -> serde_json::Map<String, serde_json::Value> {
@@ -1940,11 +2596,15 @@ mod tests {
 
     use crate::source::CanonicalSession;
     use async_trait::async_trait;
-    use protobuf::llm_memory::data::{MemoryId as PbMemoryId, ThreadId as PbThreadId};
+    use protobuf::llm_memory::data::{
+        Memory as PbMemory, MemoryData as PbMemoryData, MemoryId as PbMemoryId,
+        ThreadId as PbThreadId, UserId as PbUserId,
+    };
     use protobuf::llm_memory::service::{
-        AddMemoriesBatchRequest, AddMemoriesBatchResponse, AddMemoryOutcome,
+        AddMemoriesBatchRequest, AddMemoriesBatchResponse, AddMemoryOutcome, MemoryListEntry,
         UpdateMemoryParentsRequest, UpdateMemoryParentsResponse,
     };
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -1971,6 +2631,8 @@ mod tests {
         existing_external_ids: Mutex<Vec<String>>,
         fail_prefix_query: Mutex<bool>,
         exact_external_id_queries: Mutex<Vec<String>>,
+        exact_memories: Mutex<HashMap<String, MemoryListEntry>>,
+        opencode_thread: Mutex<Option<PbThreadId>>,
         prefix_queries: Mutex<Vec<String>>,
         fail_batch_call: Mutex<Option<usize>>,
     }
@@ -2023,10 +2685,23 @@ mod tests {
         fn fail_batch_call(&self, call: usize) {
             *self.fail_batch_call.lock().unwrap() = Some(call);
         }
+        fn set_opencode_thread(&self, thread_id: Option<i64>) {
+            *self.opencode_thread.lock().unwrap() = thread_id.map(|value| PbThreadId { value });
+        }
+        fn set_exact_memory(&self, external_id: &str, entry: MemoryListEntry) {
+            self.exact_memories
+                .lock()
+                .unwrap()
+                .insert(external_id.to_string(), entry);
+        }
     }
 
     #[async_trait]
     impl crate::client::ImportClient for FakeImportClient {
+        async fn add_labels(&self, _request: AddLabelsRequest) -> anyhow::Result<()> {
+            Ok(())
+        }
+
         async fn add_memories_batch(
             &self,
             request: AddMemoriesBatchRequest,
@@ -2058,6 +2733,7 @@ mod tests {
             Ok(AddMemoriesBatchResponse {
                 thread_id: Some(PbThreadId { value: 9_000 }),
                 thread_created: true,
+                suppressed: false,
                 outcomes,
             })
         }
@@ -2144,6 +2820,15 @@ mod tests {
                 .push(external_id.clone());
             use protobuf::llm_memory::data::{Memory, MemoryData};
             use protobuf::llm_memory::service::MemoryListEntry;
+            if let Some(entry) = self
+                .exact_memories
+                .lock()
+                .unwrap()
+                .get(&external_id)
+                .cloned()
+            {
+                return Ok(Some(entry));
+            }
             Ok(self
                 .existing_external_ids
                 .lock()
@@ -2159,6 +2844,13 @@ mod tests {
                     }),
                     ..Default::default()
                 }))
+        }
+        async fn find_thread_by_channel_and_user_id(
+            &self,
+            _channel: String,
+            _user_id: i64,
+        ) -> anyhow::Result<Option<PbThreadId>> {
+            Ok(*self.opencode_thread.lock().unwrap())
         }
         async fn delete_memory(&self, _memory_id: PbMemoryId) -> anyhow::Result<()> {
             unimplemented!("FakeImportClient (importer tests) does not stub prune RPCs")
@@ -2176,8 +2868,7 @@ mod tests {
     /// end-to-end without touching the filesystem.
     struct FakeSource {
         id: &'static str,
-        session: CanonicalSession,
-        entries: Vec<CanonicalEntry>,
+        sessions: Vec<(CanonicalSession, Vec<CanonicalEntry>)>,
         /// When true, return the new `ImportStream` variant instead of
         /// the legacy `Import` variant. Lets one test fixture cover
         /// both code paths.
@@ -2188,8 +2879,17 @@ mod tests {
         fn new(id: &'static str, session: CanonicalSession, entries: Vec<CanonicalEntry>) -> Self {
             Self {
                 id,
-                session,
-                entries,
+                sessions: vec![(session, entries)],
+                use_stream: false,
+            }
+        }
+        fn with_sessions(
+            id: &'static str,
+            sessions: Vec<(CanonicalSession, Vec<CanonicalEntry>)>,
+        ) -> Self {
+            Self {
+                id,
+                sessions,
                 use_stream: false,
             }
         }
@@ -2200,33 +2900,36 @@ mod tests {
     }
 
     impl crate::source::ChatSource for FakeSource {
-        type SessionInput = ();
+        type SessionInput = usize;
 
         fn id(&self) -> &str {
             self.id
         }
-        fn input_label(&self, _input: &Self::SessionInput) -> String {
-            self.session.session_id.clone()
+        fn input_label(&self, input: &Self::SessionInput) -> String {
+            self.sessions[*input].0.session_id.clone()
         }
         fn discover(&self) -> anyhow::Result<Vec<Self::SessionInput>> {
-            Ok(vec![()])
+            Ok((0..self.sessions.len()).collect())
         }
         fn read_session(
             &self,
-            _input: &Self::SessionInput,
+            input: &Self::SessionInput,
             _since_millis_with_margin: Option<i64>,
         ) -> anyhow::Result<ReadSessionOutcome> {
+            let (session, entries) = &self.sessions[*input];
             if self.use_stream {
                 Ok(ReadSessionOutcome::ImportStream {
-                    session: self.session.clone(),
-                    entries: crate::source::CanonicalEntryStream::from_vec(self.entries.clone()),
+                    session: session.clone(),
+                    entries: crate::source::CanonicalEntryStream::from_vec(entries.clone()),
                     source_filtered_count_initial: 0,
+                    diagnostics: Default::default(),
                 })
             } else {
                 Ok(ReadSessionOutcome::Import {
-                    session: self.session.clone(),
-                    entries: self.entries.clone(),
+                    session: session.clone(),
+                    entries: entries.clone(),
                     source_filtered_count: 0,
+                    diagnostics: Default::default(),
                 })
             }
         }
@@ -2329,6 +3032,41 @@ mod tests {
         assert!(results[0].error.is_none(), "{:?}", results[0].error);
     }
 
+    #[tokio::test]
+    async fn failed_session_does_not_stop_following_sessions() {
+        let mut second_session = fake_session();
+        second_session.session_id = "second".into();
+        second_session.channel = "codex:second".into();
+        let source = FakeSource::with_sessions(
+            "fake",
+            vec![
+                (fake_session(), vec![entry_with("first", 100, vec![])]),
+                (second_session, vec![entry_with("second", 200, vec![])]),
+            ],
+        );
+        let fake = FakeImportClient::default();
+        fake.fail_batch_call(1);
+
+        let results = run_all_with_event_sink(
+            &source,
+            Some(&fake),
+            None,
+            None,
+            1,
+            &[],
+            ChunkLimits::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results[0].error.is_some());
+        assert!(results[1].error.is_none(), "{:?}", results[1].error);
+        assert_eq!(results[1].memories_imported, 1);
+        assert_eq!(fake.batches().len(), 2);
+    }
+
     fn fake_session() -> CanonicalSession {
         CanonicalSession {
             source_id: "codex".to_string(),
@@ -2341,6 +3079,8 @@ mod tests {
             updated_at_ms: 2_000,
             source_labels: Vec::new(),
             source_metadata: serde_json::json!({}),
+            thread_metadata: None,
+            thread_group_observations: Vec::new(),
         }
     }
 
@@ -2359,6 +3099,91 @@ mod tests {
         }
     }
 
+    fn opencode_session() -> CanonicalSession {
+        let mut session = fake_session();
+        session.source_id = "opencode".to_string();
+        session.session_id = "sopencode".to_string();
+        session.channel = "opencode:sopencode".to_string();
+        session
+    }
+
+    fn exact_memory_entry(external_id: &str, user_id: i64, thread_ids: &[i64]) -> MemoryListEntry {
+        MemoryListEntry {
+            memory: Some(PbMemory {
+                id: Some(PbMemoryId { value: 123 }),
+                data: Some(PbMemoryData {
+                    external_id: Some(external_id.to_string()),
+                    user_id: Some(PbUserId { value: user_id }),
+                    thread_ids: thread_ids
+                        .iter()
+                        .copied()
+                        .map(|value| PbThreadId { value })
+                        .collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn opencode_duplicate_in_another_thread_is_rejected_before_write() {
+        let session = opencode_session();
+        let entry = entry_with("duplicate", 100, vec![]);
+        let scoped_id = namespace_external_id("opencode", 1, &entry.external_id);
+        let fake = FakeImportClient::default();
+        fake.set_opencode_thread(Some(10));
+        fake.set_exact_memory(&scoped_id, exact_memory_entry(&scoped_id, 1, &[20]));
+
+        let result = run_import_streaming(
+            &fake,
+            &session,
+            stream_of(vec![entry]),
+            0,
+            None,
+            1,
+            &[],
+            ChunkLimits::default(),
+        )
+        .await;
+
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("different thread"))
+        );
+        assert!(fake.batches().is_empty());
+    }
+
+    #[tokio::test]
+    async fn opencode_duplicate_in_target_thread_is_reused() {
+        let session = opencode_session();
+        let entry = entry_with("duplicate", 100, vec![]);
+        let scoped_id = namespace_external_id("opencode", 1, &entry.external_id);
+        let fake = FakeImportClient::default();
+        fake.set_opencode_thread(Some(10));
+        fake.set_exact_memory(&scoped_id, exact_memory_entry(&scoped_id, 1, &[10]));
+
+        let result = run_import_streaming(
+            &fake,
+            &session,
+            stream_of(vec![entry]),
+            0,
+            None,
+            1,
+            &[],
+            ChunkLimits::default(),
+        )
+        .await;
+
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(result.thread_id, Some(10));
+        assert_eq!(result.memories_skipped_duplicate, 1);
+        assert!(fake.batches().is_empty());
+    }
+
     #[tokio::test]
     async fn run_import_counts_created_and_dispatches_no_rewire_when_empty_resolved() {
         let session = fake_session();
@@ -2369,6 +3194,7 @@ mod tests {
         fake.push_batch(AddMemoriesBatchResponse {
             thread_id: Some(PbThreadId { value: 1 }),
             thread_created: false,
+            suppressed: false,
             outcomes: vec![
                 AddMemoryOutcome {
                     memory_id: Some(PbMemoryId { value: 11 }),
@@ -2412,6 +3238,7 @@ mod tests {
         fake.push_batch(AddMemoriesBatchResponse {
             thread_id: Some(PbThreadId { value: 1 }),
             thread_created: false,
+            suppressed: false,
             outcomes: vec![
                 AddMemoryOutcome {
                     memory_id: Some(PbMemoryId { value: 21 }),
@@ -2459,6 +3286,7 @@ mod tests {
         fake.push_batch(AddMemoriesBatchResponse {
             thread_id: Some(PbThreadId { value: 1 }),
             thread_created: false,
+            suppressed: false,
             outcomes: vec![
                 AddMemoryOutcome {
                     memory_id: Some(PbMemoryId { value: 31 }),
@@ -2963,6 +3791,7 @@ mod tests {
                 value: 9_007_199_254_740_993,
             }),
             thread_created: true,
+            suppressed: false,
             outcomes: vec![AddMemoryOutcome {
                 memory_id: Some(PbMemoryId { value: 1 }),
                 created: true,
@@ -2990,6 +3819,7 @@ mod tests {
                 max_bytes: usize::MAX,
             },
             Some(&sink),
+            &HashMap::new(),
         )
         .await;
 
@@ -3036,6 +3866,7 @@ mod tests {
             &[],
             ChunkLimits::default(),
             Some(&FailingEventSink),
+            &HashMap::new(),
         )
         .await;
 
@@ -3106,6 +3937,7 @@ mod tests {
         fake.push_batch(AddMemoriesBatchResponse {
             thread_id: Some(PbThreadId { value: 42 }),
             thread_created: true,
+            suppressed: false,
             outcomes: vec![
                 AddMemoryOutcome {
                     memory_id: Some(PbMemoryId { value: 1 }),
@@ -3169,6 +4001,7 @@ mod tests {
             fake.push_batch(AddMemoriesBatchResponse {
                 thread_id: Some(PbThreadId { value: 7 }),
                 thread_created: false,
+                suppressed: false,
                 outcomes: (0..chunk_size)
                     .map(|j| AddMemoryOutcome {
                         memory_id: Some(PbMemoryId {
@@ -3212,6 +4045,7 @@ mod tests {
         fake.push_batch(AddMemoriesBatchResponse {
             thread_id: Some(PbThreadId { value: 1 }),
             thread_created: true,
+            suppressed: false,
             outcomes: vec![AddMemoryOutcome {
                 memory_id: Some(PbMemoryId { value: 1 }),
                 created: true,
@@ -3260,6 +4094,7 @@ mod tests {
         fake.push_batch(AddMemoriesBatchResponse {
             thread_id: Some(PbThreadId { value: 9 }),
             thread_created: true,
+            suppressed: false,
             outcomes: vec![AddMemoryOutcome {
                 memory_id: Some(PbMemoryId { value: 1 }),
                 created: true,
@@ -3283,5 +4118,52 @@ mod tests {
         assert!(res.error.is_none(), "{:?}", res.error);
         assert_eq!(res.memories_imported, 1);
         assert_eq!(res.memories_skipped_filtered, 1);
+    }
+
+    #[test]
+    fn thread_group_endpoint_maps_known_and_unknown_scope() {
+        let known = ThreadGroupSourceIdentity {
+            source: "codex".into(),
+            native_kind: "session",
+            owner_scope: None,
+            identity_scope: ThreadGroupIdentityScope::Known(String::new()),
+            native_id: "s1".into(),
+        };
+        let proto = endpoint_to_proto(&known, "user:7");
+        assert!(proto.identity_scope_known);
+        assert_eq!(proto.identity_scope, "");
+        assert_eq!(proto.owner_scope, "user:7");
+        assert_eq!(proto.native_id, "s1");
+
+        let unknown = ThreadGroupSourceIdentity {
+            identity_scope: ThreadGroupIdentityScope::Unknown,
+            ..known
+        };
+        let proto = endpoint_to_proto(&unknown, "user:7");
+        assert!(!proto.identity_scope_known);
+    }
+
+    #[test]
+    fn thread_group_evidence_mappers_cover_all_variants() {
+        assert_eq!(
+            evidence_kind_to_proto(ThreadGroupEvidenceKind::SourceEvent),
+            ThreadEvidenceKind::SourceEvent as i32
+        );
+        assert_eq!(
+            evidence_kind_to_proto(ThreadGroupEvidenceKind::NegativeOrConflict),
+            ThreadEvidenceKind::NegativeOrConflict as i32
+        );
+        assert_eq!(
+            polarity_to_proto(ThreadGroupPolarity::Conflicts),
+            ThreadObservationPolarity::Conflicts as i32
+        );
+        assert_eq!(
+            confidence_to_proto(ThreadGroupConfidence::Strong),
+            ThreadEvidenceConfidence::Strong as i32
+        );
+        assert_eq!(
+            confidence_to_proto(ThreadGroupConfidence::Unsupported),
+            ThreadEvidenceConfidence::Unsupported as i32
+        );
     }
 }

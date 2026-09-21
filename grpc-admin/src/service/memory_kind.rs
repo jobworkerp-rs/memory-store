@@ -4,12 +4,11 @@
 use crate::protobuf::llm_memory::data::{MemoryKind, MemorySearchFilter, ThreadSearchFilter};
 
 pub fn normalize_memory_kinds(memory_kinds: &mut Vec<i32>) -> Result<(), tonic::Status> {
-    if memory_kinds
-        .iter()
-        .any(|kind| !(MemoryKind::Raw as i32..=MemoryKind::Reflection as i32).contains(kind))
-    {
+    if memory_kinds.iter().any(|kind| {
+        !(MemoryKind::Raw as i32..=MemoryKind::ThreadGroupSummary as i32).contains(kind)
+    }) {
         return Err(tonic::Status::invalid_argument(
-            "memory_kinds must contain only values 1..=7",
+            "memory_kinds must contain only values 1..=8",
         ));
     }
     memory_kinds.sort_unstable();
@@ -42,12 +41,17 @@ mod tests {
         let mut kinds = vec![
             MemoryKind::Reflection as i32,
             MemoryKind::Raw as i32,
+            MemoryKind::ThreadGroupSummary as i32,
             MemoryKind::Raw as i32,
         ];
         normalize_memory_kinds(&mut kinds).unwrap();
         assert_eq!(
             kinds,
-            vec![MemoryKind::Raw as i32, MemoryKind::Reflection as i32]
+            vec![
+                MemoryKind::Raw as i32,
+                MemoryKind::Reflection as i32,
+                MemoryKind::ThreadGroupSummary as i32,
+            ]
         );
         normalize_memory_kinds(&mut Vec::new()).unwrap();
     }

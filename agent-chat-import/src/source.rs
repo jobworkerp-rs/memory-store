@@ -14,9 +14,76 @@
 
 pub mod claude_code;
 pub mod codex;
+pub mod opencode;
 pub mod plain;
 
 use protobuf::llm_memory::data::{ContentType, MessageRole};
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadGroupIdentityScope {
+    Known(String),
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadGroupSourceIdentity {
+    pub source: String,
+    /// Source-native record kind the identity was read from (e.g.
+    /// `"session"` or `"subagent_transcript"`). Adapter-internal and not
+    /// part of the canonical relation key.
+    pub native_kind: &'static str,
+    /// The adapter cannot know the import creator. The importer assigns
+    /// `user:{thread.user_id}` before persistence.
+    pub owner_scope: Option<String>,
+    pub identity_scope: ThreadGroupIdentityScope,
+    pub native_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadGroupEvidenceKind {
+    SourceEvent,
+    SourceField,
+    NegativeOrConflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadGroupPolarity {
+    Supports,
+    Negates,
+    Conflicts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadGroupConfidence {
+    Exact,
+    Strong,
+    Heuristic,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadGroupObservation {
+    pub subject: ThreadGroupSourceIdentity,
+    pub candidate_parent: Option<ThreadGroupSourceIdentity>,
+    pub relation_kind: Option<String>,
+    pub evidence_kind: ThreadGroupEvidenceKind,
+    pub polarity: ThreadGroupPolarity,
+    pub confidence: ThreadGroupConfidence,
+    /// Stable, redacted locator of the source record the observation was
+    /// read from. Never the raw payload; the fingerprint is added by the
+    /// observation repository.
+    pub source_record_ref: String,
+    /// Versioned adapter contract that produced the observation. A
+    /// parser change bumps this so stored evidence can be re-evaluated.
+    pub adapter_version: &'static str,
+}
+
+/// Adapter contract versions. Bump when the field-to-relation mapping
+/// changes so reconciliation can distinguish evidence generations.
+pub const CODEX_ADAPTER_VERSION: &str = "codex-adapter@1";
+pub const OPENCODE_ADAPTER_VERSION: &str = "opencode-adapter@1";
+pub const CLAUDE_CODE_ADAPTER_VERSION: &str = "claude-code-adapter@1";
 
 /// Per-session metadata produced by a source. Shared by all entries
 /// in the same session and used to build `ThreadData` + the default
@@ -47,6 +114,20 @@ pub struct CanonicalSession {
     /// Source-specific metadata, embedded verbatim under
     /// `metadata.session` per spec §4.2.1.
     pub source_metadata: serde_json::Value,
+    /// Optional initial Thread metadata. Existing sources leave this unset;
+    /// OpenCode uses it for its allow-listed session snapshot.
+    pub thread_metadata: Option<serde_json::Value>,
+    /// Source-independent ThreadGroup adapter output. The current importer
+    /// preserves it until the atomic import boundary consumes it.
+    pub thread_group_observations: Vec<ThreadGroupObservation>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SourceDiagnostics {
+    pub deferred: usize,
+    pub ignored_by_reason: BTreeMap<String, usize>,
+    pub warning_exclusions_by_reason: BTreeMap<String, usize>,
+    pub warnings_by_reason: BTreeMap<String, usize>,
 }
 
 /// A single message-level record produced by a source. The shared
@@ -181,6 +262,7 @@ pub enum ReadSessionOutcome {
         /// since-filter results in the importer to populate
         /// `SessionResult.memories_skipped_filtered`. Spec §4.3.
         source_filtered_count: usize,
+        diagnostics: SourceDiagnostics,
     },
     /// New variant. Sources that can yield entries incrementally use
     /// this so the importer never holds the full session in memory.
@@ -193,6 +275,7 @@ pub enum ReadSessionOutcome {
         session: CanonicalSession,
         entries: CanonicalEntryStream,
         source_filtered_count_initial: usize,
+        diagnostics: SourceDiagnostics,
     },
     /// Skip without error (e.g. codex rollout missing session_meta,
     /// claude session with all-invalid timestamps). Counts as a
@@ -336,11 +419,13 @@ pub(crate) mod test_support {
                 session,
                 entries,
                 source_filtered_count,
+                ..
             } => (session, entries, source_filtered_count),
             ReadSessionOutcome::ImportStream {
                 session,
                 entries,
                 source_filtered_count_initial,
+                ..
             } => {
                 let mut filtered = source_filtered_count_initial;
                 let drained: Vec<CanonicalEntry> = entries
@@ -396,6 +481,14 @@ pub trait ChatSource {
 
     /// Enumerate session inputs for the configured subcommand.
     fn discover(&self) -> anyhow::Result<Vec<Self::SessionInput>>;
+
+    /// Timestamp filter applied by the shared importer. Most sources use the
+    /// requested value unchanged. Sources whose discovery already performs a
+    /// session-level update check (OpenCode) can return `None` so old entries
+    /// are re-evaluated when a session is selected.
+    fn entry_since(&self, requested_since: Option<i64>) -> Option<i64> {
+        requested_since
+    }
 
     /// Parse one session input into canonical form.
     ///

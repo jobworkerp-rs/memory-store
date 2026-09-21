@@ -37,6 +37,14 @@ serde_yaml = "0.9"
 # data: URL の base64 payload デコード (canonical attachment helper, §4.2.2.6.1).
 # transitive dep として既に Cargo.lock に 0.22.x が存在する。
 base64 = "0.22"
+# OpenCode stores sessions in SQLite. The source trait is synchronous, so use
+# rusqlite for short-lived read-only snapshots rather than holding an async
+# connection across importer RPCs.
+rusqlite = { version = "0.37", features = ["bundled"] }
+url = { workspace = true }
+# Read-only remote resolution; granular crates to keep dmg binary small.
+gix-discover = { version = "0.55", features = ["sha1"] }
+gix-config = { version = "0.60", features = ["sha1"] }
 
 [features]
 default = ["summarize-after", "personality-after"]

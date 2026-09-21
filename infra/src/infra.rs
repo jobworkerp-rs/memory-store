@@ -13,6 +13,7 @@ pub(in crate::infra) mod resource;
 pub mod search_index_maintenance;
 pub mod startup_error;
 pub mod thread;
+pub mod thread_group;
 pub mod thread_label;
 pub mod thread_memory;
 pub mod thread_vector;

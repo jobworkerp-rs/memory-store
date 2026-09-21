@@ -30,6 +30,10 @@ pub fn handle_error(err: &anyhow::Error) -> tonic::Status {
             tracing::warn!("aborted (transient conflict, retryable): {}", msg);
             tonic::Status::aborted(msg.clone())
         }
+        Some(LlmMemoryError::SnapshotChanged(msg)) => {
+            tracing::info!("thread-group search snapshot changed: {}", msg);
+            tonic::Status::aborted(format!("snapshot_changed: {msg}"))
+        }
         Some(LlmMemoryError::PermissionDenied(msg)) => {
             tracing::warn!("permission denied: {}", msg);
             tonic::Status::permission_denied(msg.clone())

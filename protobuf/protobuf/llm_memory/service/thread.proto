@@ -5,11 +5,30 @@ package llm_memory.service;
 import "llm_memory/data/common.proto";
 import "llm_memory/data/thread.proto";
 import "llm_memory/data/memory.proto";
+import "llm_memory/data/thread_group.proto";
 import "llm_memory/service/common.proto";
 
 // Response returned on thread creation. Carries the auto-assigned id.
 message CreateThreadResponse {
     llm_memory.data.ThreadId id = 1;
+}
+
+// Additive delete with ThreadGroup policy. The legacy `Delete(ThreadId)`
+// maps to `recursive=false, forbid_reimport=false`.
+message DeleteThreadWithPolicyRequest {
+    llm_memory.data.ThreadId thread_id = 1;
+    // Delete the active descendant closure, not just the named thread.
+    bool recursive = 2;
+    // Block a later normal re-import of the deleted source identities.
+    bool forbid_reimport = 3;
+    // Audit marker; not an authorization proof.
+    string actor_id = 4;
+    string reason = 5;
+}
+
+message DeleteThreadWithPolicyResponse {
+    // Internal thread ids whose content was removed, root first.
+    repeated int64 deleted_thread_ids = 1;
 }
 
 // Response returned when a memory is attached to a thread via AddMemory.
@@ -302,6 +321,14 @@ message AddMemoriesBatchRequest {
     bool upsert_by_external_id = 4;
     // Labels to attach idempotently after the batch commits.
     repeated string labels = 6;
+    // Owner-local source identity of the imported session. When set, the
+    // design 8.2 suppression gate runs inside the import transaction
+    // before any content write, and a permitted re-import revives the
+    // current placeholder / records the identity mapping.
+    optional llm_memory.data.ThreadGroupEndpoint source_identity = 7;
+    // Explicit operator override allowing a `forbid_reimport=true`
+    // marker to be consumed. Default false.
+    bool explicit_override = 8;
 }
 
 // Per-input outcome inside AddMemoriesBatch. Order matches request.
@@ -332,6 +359,9 @@ message AddMemoriesBatchResponse {
     // false means an existing thread (matched by channel) was reused.
     bool thread_created = 2;
     repeated AddMemoryOutcome outcomes = 3;
+    // True when a deletion marker suppressed the import. No content was
+    // written; `outcomes` is empty and `thread_id` is unset.
+    bool suppressed = 4;
 }
 
 // Why an UpdateMemoryParents call was a no-op.
@@ -379,6 +409,9 @@ service ThreadService {
     // Delete the thread with the given id along with every
     // attached Memory.
     rpc Delete(llm_memory.data.ThreadId) returns (SuccessResponse);
+    // Additive delete with recursive / forbid_reimport policy and
+    // ThreadGroup placeholder + deletion-marker bookkeeping.
+    rpc DeleteWithPolicy(DeleteThreadWithPolicyRequest) returns (DeleteThreadWithPolicyResponse);
     // Fetch a single thread by id.
     rpc Find(llm_memory.data.ThreadId) returns (OptionalThreadResponse);
     // Stream threads in id-descending order with pagination.

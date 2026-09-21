@@ -349,6 +349,8 @@ async fn batch_import_image_media_e2e() {
         }],
         upsert_by_external_id: true,
         labels: vec![],
+        source_identity: None,
+        explicit_override: false,
     };
     let resp = threads
         .add_memories_batch(batch)
@@ -614,6 +616,8 @@ async fn find_memories_by_thread_id_returns_media_payload_e2e() {
             }],
             upsert_by_external_id: true,
             labels: vec![],
+            source_identity: None,
+            explicit_override: false,
         })
         .await
         .expect("AddMemoriesBatch")

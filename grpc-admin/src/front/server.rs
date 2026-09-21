@@ -3,6 +3,7 @@ use crate::protobuf::llm_memory::service::memory_rating_service_server::MemoryRa
 use crate::protobuf::llm_memory::service::memory_service_server::MemoryServiceServer;
 use crate::protobuf::llm_memory::service::memory_vector_service_server::MemoryVectorServiceServer;
 use crate::protobuf::llm_memory::service::search_index_maintenance_service_server::SearchIndexMaintenanceServiceServer;
+use crate::protobuf::llm_memory::service::thread_group_service_server::ThreadGroupServiceServer;
 use crate::protobuf::llm_memory::service::thread_service_server::ThreadServiceServer;
 use crate::protobuf::llm_memory::service::thread_vector_service_server::ThreadVectorServiceServer;
 use crate::service::media::MediaGrpcImpl;
@@ -13,6 +14,7 @@ use crate::service::reflection::ReflectionGrpcImpl;
 use crate::service::reflection_vector::ReflectionVectorGrpcImpl;
 use crate::service::search_index_maintenance::SearchIndexMaintenanceGrpcImpl;
 use crate::service::thread::ThreadGrpcImpl;
+use crate::service::thread_group::ThreadGroupGrpcImpl;
 use crate::service::thread_vector::ThreadVectorGrpcImpl;
 // Reflection service stubs live in the shared `protobuf` crate (see
 // `grpc-admin/build.rs` — reflection protos are intentionally not
@@ -175,6 +177,9 @@ pub async fn create_server(
             .expect("maintenance configuration was validated before server construction");
     let repository_module = RepositoryModule::new_by_env().await;
     let maintenance_executor = repository_module.search_index_maintenance_executor.clone();
+    // Snapshot the RDB pool before the module is moved into AppModule;
+    // the ThreadGroup service is RDB-only.
+    let thread_group_pool = repository_module.pool();
     let mut app_module = AppModule::new_by_env(repository_module).await;
     let memory_rating = MemoryRatingGrpcImpl::new(app_module.memory_rating_app);
     // Share the one MediaApp Arc between MediaService and MemoryService
@@ -233,8 +238,17 @@ pub async fn create_server(
             ReflectionServiceServer::new(reflection_service)
                 .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
                 .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE),
+        )
+        .add_service(
+            ThreadGroupServiceServer::new(
+                ThreadGroupGrpcImpl::new(thread_group_pool)
+                    .with_search_apps(vector_app_arc.clone(), thread_vector_app_arc.clone()),
+            )
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE),
         );
     tracing::info!("ReflectionService registered");
+    tracing::info!("ThreadGroupService registered");
 
     if let Some(va) = vector_app_arc {
         // Startup fail-fast (b): embedding dimension probe. Runs in all

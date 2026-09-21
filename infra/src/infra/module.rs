@@ -12,8 +12,20 @@ use super::{
     reflection::stats::ReflectionStatsRepositoryImpl,
     reflection::tool::ReflectionToolRepositoryImpl,
     reflection::tool_outcome::ReflectionToolOutcomeRepositoryImpl, startup_error::StartupError,
-    thread::rdb::ThreadRepositoryImpl, thread_label::rdb::ThreadLabelRepositoryImpl,
-    thread_memory::rdb::ThreadMemoryRepositoryImpl,
+    thread::rdb::ThreadRepositoryImpl, thread_group::audit::ThreadGroupAuditRepositoryImpl,
+    thread_group::candidate::ThreadGroupCandidateAssociationRepositoryImpl,
+    thread_group::canonical_key::ThreadCanonicalKeyRepositoryImpl,
+    thread_group::collection::ManualCollectionRepositoryImpl,
+    thread_group::deletion_marker::ThreadDeletionMarkerRepositoryImpl,
+    thread_group::group::ThreadGroupRepositoryImpl,
+    thread_group::lock::ThreadGroupLockRepositoryImpl,
+    thread_group::member::ThreadGroupMemberRepositoryImpl,
+    thread_group::observation::ThreadObservationRepositoryImpl,
+    thread_group::operator_decision::OperatorDecisionRepositoryImpl,
+    thread_group::outbox::ThreadGroupEventOutboxRepositoryImpl,
+    thread_group::relation::ThreadRelationRepositoryImpl,
+    thread_group::source_identity::SourceThreadIdentityRepositoryImpl,
+    thread_label::rdb::ThreadLabelRepositoryImpl, thread_memory::rdb::ThreadMemoryRepositoryImpl,
 };
 use infra_utils::infra::rdb::RdbPool;
 use std::sync::Arc;
@@ -44,6 +56,23 @@ pub struct RepositoryModule {
     pub thread_repository: ThreadRepositoryImpl,
     pub thread_memory_repository: ThreadMemoryRepositoryImpl,
     pub thread_label_repository: ThreadLabelRepositoryImpl,
+
+    // ThreadGroup RDB repositories (schema 20260920000001, design
+    // section 5). All RDB-only; no LanceDB involvement.
+    pub thread_group_repository: ThreadGroupRepositoryImpl,
+    pub thread_group_member_repository: ThreadGroupMemberRepositoryImpl,
+    pub thread_relation_repository: ThreadRelationRepositoryImpl,
+    pub thread_observation_repository: ThreadObservationRepositoryImpl,
+    pub thread_group_candidate_association_repository:
+        ThreadGroupCandidateAssociationRepositoryImpl,
+    pub operator_decision_repository: OperatorDecisionRepositoryImpl,
+    pub source_thread_identity_repository: SourceThreadIdentityRepositoryImpl,
+    pub thread_canonical_key_repository: ThreadCanonicalKeyRepositoryImpl,
+    pub thread_deletion_marker_repository: ThreadDeletionMarkerRepositoryImpl,
+    pub thread_group_lock_repository: ThreadGroupLockRepositoryImpl,
+    pub manual_collection_repository: ManualCollectionRepositoryImpl,
+    pub thread_group_event_outbox_repository: ThreadGroupEventOutboxRepositoryImpl,
+    pub thread_group_audit_repository: ThreadGroupAuditRepositoryImpl,
 
     // Reflection RDB repositories. Search/aggregate/CRUD do not
     // depend on LanceDB.
@@ -169,6 +198,36 @@ impl RepositoryModule {
             thread_memory_repository: ThreadMemoryRepositoryImpl::new(pool),
             thread_label_repository: ThreadLabelRepositoryImpl::new(pool),
 
+            thread_group_repository: ThreadGroupRepositoryImpl::new(id_generator.clone(), pool),
+            thread_group_member_repository: ThreadGroupMemberRepositoryImpl::new(pool),
+            thread_relation_repository: ThreadRelationRepositoryImpl::new(
+                id_generator.clone(),
+                pool,
+            ),
+            thread_observation_repository: ThreadObservationRepositoryImpl::new(
+                id_generator.clone(),
+                pool,
+            ),
+            thread_group_candidate_association_repository:
+                ThreadGroupCandidateAssociationRepositoryImpl::new(id_generator.clone(), pool),
+            operator_decision_repository: OperatorDecisionRepositoryImpl::new(
+                id_generator.clone(),
+                pool,
+            ),
+            source_thread_identity_repository: SourceThreadIdentityRepositoryImpl::new(pool),
+            thread_canonical_key_repository: ThreadCanonicalKeyRepositoryImpl::new(pool),
+            thread_deletion_marker_repository: ThreadDeletionMarkerRepositoryImpl::new(pool),
+            thread_group_lock_repository: ThreadGroupLockRepositoryImpl::new(pool),
+            manual_collection_repository: ManualCollectionRepositoryImpl::new(
+                id_generator.clone(),
+                pool,
+            ),
+            thread_group_event_outbox_repository: ThreadGroupEventOutboxRepositoryImpl::new(pool),
+            thread_group_audit_repository: ThreadGroupAuditRepositoryImpl::new(
+                id_generator.clone(),
+                pool,
+            ),
+
             reflection_index_repository: ThreadReflectionIndexRepositoryImpl::new(pool),
             reflection_failure_mode_repository: ReflectionFailureModeRepositoryImpl::new(pool),
             reflection_tool_repository: ReflectionToolRepositoryImpl::new(pool),
@@ -221,6 +280,62 @@ impl RepositoryModule {
 
     pub fn create_thread_label_repository(&self) -> ThreadLabelRepositoryImpl {
         ThreadLabelRepositoryImpl::new(self.pool)
+    }
+
+    pub fn create_thread_group_repository(&self) -> ThreadGroupRepositoryImpl {
+        ThreadGroupRepositoryImpl::new(self.id_generator.clone(), self.pool)
+    }
+
+    pub fn create_thread_group_member_repository(&self) -> ThreadGroupMemberRepositoryImpl {
+        ThreadGroupMemberRepositoryImpl::new(self.pool)
+    }
+
+    pub fn create_thread_relation_repository(&self) -> ThreadRelationRepositoryImpl {
+        ThreadRelationRepositoryImpl::new(self.id_generator.clone(), self.pool)
+    }
+
+    pub fn create_thread_observation_repository(&self) -> ThreadObservationRepositoryImpl {
+        ThreadObservationRepositoryImpl::new(self.id_generator.clone(), self.pool)
+    }
+
+    pub fn create_thread_group_candidate_association_repository(
+        &self,
+    ) -> ThreadGroupCandidateAssociationRepositoryImpl {
+        ThreadGroupCandidateAssociationRepositoryImpl::new(self.id_generator.clone(), self.pool)
+    }
+
+    pub fn create_operator_decision_repository(&self) -> OperatorDecisionRepositoryImpl {
+        OperatorDecisionRepositoryImpl::new(self.id_generator.clone(), self.pool)
+    }
+
+    pub fn create_source_thread_identity_repository(&self) -> SourceThreadIdentityRepositoryImpl {
+        SourceThreadIdentityRepositoryImpl::new(self.pool)
+    }
+
+    pub fn create_thread_canonical_key_repository(&self) -> ThreadCanonicalKeyRepositoryImpl {
+        ThreadCanonicalKeyRepositoryImpl::new(self.pool)
+    }
+
+    pub fn create_thread_deletion_marker_repository(&self) -> ThreadDeletionMarkerRepositoryImpl {
+        ThreadDeletionMarkerRepositoryImpl::new(self.pool)
+    }
+
+    pub fn create_thread_group_lock_repository(&self) -> ThreadGroupLockRepositoryImpl {
+        ThreadGroupLockRepositoryImpl::new(self.pool)
+    }
+
+    pub fn create_manual_collection_repository(&self) -> ManualCollectionRepositoryImpl {
+        ManualCollectionRepositoryImpl::new(self.id_generator.clone(), self.pool)
+    }
+
+    pub fn create_thread_group_event_outbox_repository(
+        &self,
+    ) -> ThreadGroupEventOutboxRepositoryImpl {
+        ThreadGroupEventOutboxRepositoryImpl::new(self.pool)
+    }
+
+    pub fn create_thread_group_audit_repository(&self) -> ThreadGroupAuditRepositoryImpl {
+        ThreadGroupAuditRepositoryImpl::new(self.id_generator.clone(), self.pool)
     }
 
     pub fn create_reflection_index_repository(&self) -> ThreadReflectionIndexRepositoryImpl {

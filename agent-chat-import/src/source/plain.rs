@@ -60,6 +60,7 @@
 pub mod prune;
 
 use crate::cli::PlainArgs;
+use crate::common::git::resolve_repo_label;
 use crate::common::ids::sha256_hex_prefix;
 use crate::common::labels::{MAX_LABEL_BYTES, truncate_label_keep_head, truncate_label_keep_tail};
 use crate::common::path::apply_path_prefix;
@@ -345,6 +346,7 @@ impl ChatSource for PlainSource {
                     session,
                     entries: crate::source::CanonicalEntryStream::from_vec(entries),
                     source_filtered_count_initial: dropped,
+                    diagnostics: Default::default(),
                 })
             }
             PlainSessionInput::Dir { rel_dir, files } => {
@@ -362,6 +364,7 @@ impl ChatSource for PlainSource {
                     session,
                     entries: crate::source::CanonicalEntryStream::from_vec(entries),
                     source_filtered_count_initial: dropped,
+                    diagnostics: Default::default(),
                 })
             }
             PlainSessionInput::Single { files, .. } => {
@@ -379,6 +382,7 @@ impl ChatSource for PlainSource {
                     session,
                     entries: crate::source::CanonicalEntryStream::from_vec(entries),
                     source_filtered_count_initial: dropped,
+                    diagnostics: Default::default(),
                 })
             }
         }
@@ -588,6 +592,8 @@ fn build_per_file_session(
             "scope": "per-file",
             "rel_path": rel_str,
         }),
+        thread_metadata: None,
+        thread_group_observations: Vec::new(),
     }
 }
 
@@ -624,6 +630,8 @@ fn build_per_dir_session(
             // so including them here would double-count in audit summaries.
             "file_count": loaded.iter().filter(|l| l.is_entry()).count(),
         }),
+        thread_metadata: None,
+        thread_group_observations: Vec::new(),
     }
 }
 
@@ -658,6 +666,8 @@ fn build_single_session(
             "root_basename": basename,
             "file_count": loaded.iter().filter(|l| l.is_entry()).count(),
         }),
+        thread_metadata: None,
+        thread_group_observations: Vec::new(),
     }
 }
 
@@ -745,6 +755,9 @@ fn build_default_labels(
             })
             .unwrap_or_else(|| PathBuf::from("."));
         labels.push(truncate_label_keep_tail("dir:", &parent.to_string_lossy()));
+    }
+    if let Some(repo_label) = resolve_repo_label(Some(canonical_root)) {
+        labels.push(repo_label);
     }
     labels.retain(|l| !l.is_empty() && l.len() <= MAX_LABEL_BYTES);
     labels
@@ -1097,6 +1110,7 @@ impl std::str::FromStr for EncodingMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::git::git_fixture::{origin_config, repo_fixture};
     use crate::source::test_support::{entries_from_outcome, session_from_outcome, unpack_outcome};
     use std::io::Write;
 
@@ -1983,6 +1997,23 @@ mod tests {
         assert_eq!(
             path_label_abs, path_label_rel,
             "path: label must be canonical-root based, not args.root based"
+        );
+    }
+
+    #[test]
+    fn git_root_gets_repository_label() {
+        let (_parent, vault) = repo_fixture(&origin_config("https://example.com/plain.git"));
+        write(&vault.join("a.md"), "body");
+
+        let source = PlainSource::new(args(vault, ThreadStrategy::PerFile));
+        let input = source.discover().unwrap().remove(0);
+        let session = session_from_outcome(source.read_session(&input, None).unwrap());
+
+        assert!(
+            session
+                .source_labels
+                .iter()
+                .any(|label| label == "repo:example.com/plain")
         );
     }
 

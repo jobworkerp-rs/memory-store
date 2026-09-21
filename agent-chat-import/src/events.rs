@@ -53,8 +53,70 @@ struct ImportEvent<'a> {
     success: Option<bool>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ImportCompletedReport {
+    pub sessions_processed: usize,
+    pub threads_created: usize,
+    pub memories_imported: usize,
+    pub memories_skipped_duplicate: usize,
+    pub memories_skipped_ignored: usize,
+    pub errors_count: usize,
+    pub sessions: Vec<ImportCompletedSession>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportCompletedSession {
+    pub session_key: Option<String>,
+    pub status: String,
+    pub imported_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ImportSessionError>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportSessionError {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    pub message: String,
+}
+
+#[derive(Serialize)]
+struct ImportCompletedEvent<'a> {
+    schema: &'static str,
+    version: u32,
+    event: &'static str,
+    source: &'a str,
+    sessions_processed: usize,
+    threads_created: usize,
+    memories_imported: usize,
+    memories_skipped_duplicate: usize,
+    memories_skipped_ignored: usize,
+    errors_count: usize,
+    success: bool,
+    sessions: &'a [ImportCompletedSession],
+}
+
+impl<'a> ImportCompletedEvent<'a> {
+    fn from_report(source: &'a str, report: &'a ImportCompletedReport) -> Self {
+        Self {
+            schema: EVENT_SCHEMA,
+            version: EVENT_VERSION,
+            event: "import_completed",
+            source,
+            sessions_processed: report.sessions_processed,
+            threads_created: report.threads_created,
+            memories_imported: report.memories_imported,
+            memories_skipped_duplicate: report.memories_skipped_duplicate,
+            memories_skipped_ignored: report.memories_skipped_ignored,
+            errors_count: report.errors_count,
+            success: report.errors_count == 0,
+            sessions: &report.sessions,
+        }
+    }
+}
+
 impl<W: Write> EventOutput<W> {
-    fn write_event(&self, event: &ImportEvent<'_>) -> Result<(), String> {
+    fn write_event<T: Serialize>(&self, event: &T) -> Result<(), String> {
         if !self.enabled {
             return Ok(());
         }
@@ -68,6 +130,10 @@ impl<W: Write> EventOutput<W> {
             .write_all(b"\n")
             .and_then(|()| writer.flush())
             .map_err(|error| format!("failed to write import event: {error}"))
+    }
+
+    pub fn import_completed(&self, report: &ImportCompletedReport) -> Result<(), String> {
+        self.write_event(&ImportCompletedEvent::from_report(self.source, report))
     }
 }
 
@@ -132,14 +198,30 @@ mod tests {
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["schema"], EVENT_SCHEMA);
-        assert_eq!(events[0]["version"], EVENT_VERSION);
-        assert_eq!(events[0]["source"], "claude-code");
-        assert_eq!(events[0]["session_key"], "claude_code:s1");
-        assert_eq!(events[0]["thread_id"], thread_id.to_string());
-        assert_eq!(events[1]["event"], "session_completed");
-        assert_eq!(events[1]["imported_count"], 7);
-        assert_eq!(events[1]["success"], true);
+        assert_eq!(
+            events[0],
+            serde_json::json!({
+                "schema": EVENT_SCHEMA,
+                "version": EVENT_VERSION,
+                "event": "thread_created",
+                "source": "claude-code",
+                "session_key": "claude_code:s1",
+                "thread_id": thread_id.to_string(),
+            })
+        );
+        assert_eq!(
+            events[1],
+            serde_json::json!({
+                "schema": EVENT_SCHEMA,
+                "version": EVENT_VERSION,
+                "event": "session_completed",
+                "source": "claude-code",
+                "session_key": "claude_code:s1",
+                "thread_id": thread_id.to_string(),
+                "imported_count": 7,
+                "success": true,
+            })
+        );
     }
 
     #[test]
@@ -213,6 +295,175 @@ mod tests {
                 "\"codex:second\":\"thread_created\"",
                 "\"codex:second\":\"session_completed\"",
             ]
+        );
+    }
+
+    #[test]
+    fn import_completed_reports_partial_success_counts_and_session_errors() {
+        let output = EventOutput::new(true, "codex", Vec::new());
+        output
+            .import_completed(&ImportCompletedReport {
+                sessions_processed: 3,
+                threads_created: 1,
+                memories_imported: 2,
+                memories_skipped_duplicate: 3,
+                memories_skipped_ignored: 4,
+                errors_count: 1,
+                sessions: vec![
+                    ImportCompletedSession {
+                        session_key: Some("codex:ok".into()),
+                        status: "completed".into(),
+                        imported_count: 5,
+                        error: None,
+                    },
+                    ImportCompletedSession {
+                        session_key: Some("codex:failed".into()),
+                        status: "failed".into(),
+                        imported_count: 0,
+                        error: Some(ImportSessionError {
+                            code: None,
+                            message: "chunk failed".into(),
+                        }),
+                    },
+                    ImportCompletedSession {
+                        session_key: Some("codex:ignored".into()),
+                        status: "completed".into(),
+                        imported_count: 0,
+                        error: None,
+                    },
+                ],
+            })
+            .unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(String::from_utf8(output.into_inner()).unwrap().trim()).unwrap();
+
+        assert_eq!(event["event"], "import_completed");
+        assert_eq!(event["sessions_processed"], 3);
+        assert_eq!(event["threads_created"], 1);
+        assert_eq!(event["memories_imported"], 2);
+        assert_eq!(event["memories_skipped_duplicate"], 3);
+        assert_eq!(event["memories_skipped_ignored"], 4);
+        assert_eq!(event["errors_count"], 1);
+        assert_eq!(event["success"], false);
+        assert_eq!(event["sessions"][1]["status"], "failed");
+        assert_eq!(event["sessions"][1]["imported_count"], 0);
+        assert_eq!(event["sessions"][1]["error"]["message"], "chunk failed");
+        assert!(event["sessions"][1]["error"].get("code").is_none());
+    }
+
+    #[test]
+    fn import_completed_reports_all_failed_sessions_as_unsuccessful() {
+        let output = EventOutput::new(true, "plain", Vec::new());
+        output
+            .import_completed(&ImportCompletedReport {
+                sessions_processed: 2,
+                threads_created: 0,
+                memories_imported: 0,
+                memories_skipped_duplicate: 0,
+                memories_skipped_ignored: 0,
+                errors_count: 2,
+                sessions: vec![
+                    ImportCompletedSession {
+                        session_key: None,
+                        status: "failed".into(),
+                        imported_count: 0,
+                        error: Some(ImportSessionError {
+                            code: Some("parse_error".into()),
+                            message: "invalid JSON".into(),
+                        }),
+                    },
+                    ImportCompletedSession {
+                        session_key: Some("plain:file:b".into()),
+                        status: "failed".into(),
+                        imported_count: 0,
+                        error: Some(ImportSessionError {
+                            code: None,
+                            message: "permission denied".into(),
+                        }),
+                    },
+                ],
+            })
+            .unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(String::from_utf8(output.into_inner()).unwrap().trim()).unwrap();
+
+        assert_eq!(event["success"], false);
+        assert_eq!(event["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(event["sessions"][0]["session_key"], serde_json::Value::Null);
+        assert_eq!(event["sessions"][0]["error"]["code"], "parse_error");
+        assert_eq!(event["sessions"][1]["status"], "failed");
+    }
+
+    #[test]
+    fn import_completed_wire_format_matches_current_json_lines() {
+        let output = EventOutput::new(true, "codex", Vec::new());
+        output
+            .import_completed(&ImportCompletedReport {
+                sessions_processed: 2,
+                threads_created: 1,
+                memories_imported: 3,
+                memories_skipped_duplicate: 1,
+                memories_skipped_ignored: 0,
+                errors_count: 1,
+                sessions: vec![
+                    ImportCompletedSession {
+                        session_key: Some("codex:ok".into()),
+                        status: "completed".into(),
+                        imported_count: 4,
+                        error: None,
+                    },
+                    ImportCompletedSession {
+                        session_key: None,
+                        status: "failed".into(),
+                        imported_count: 0,
+                        error: Some(ImportSessionError {
+                            code: None,
+                            message: "invalid JSON".into(),
+                        }),
+                    },
+                ],
+            })
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8(output.into_inner()).unwrap(),
+            r#"{"schema":"memories-import-event","version":1,"event":"import_completed","source":"codex","sessions_processed":2,"threads_created":1,"memories_imported":3,"memories_skipped_duplicate":1,"memories_skipped_ignored":0,"errors_count":1,"success":false,"sessions":[{"session_key":"codex:ok","status":"completed","imported_count":4},{"session_key":null,"status":"failed","imported_count":0,"error":{"message":"invalid JSON"}}]}
+"#
+        );
+    }
+
+    #[test]
+    fn import_completed_includes_parse_error_even_without_a_session_key() {
+        let output = EventOutput::new(true, "claude-code", Vec::new());
+        output
+            .import_completed(&ImportCompletedReport {
+                sessions_processed: 1,
+                threads_created: 0,
+                memories_imported: 0,
+                memories_skipped_duplicate: 0,
+                memories_skipped_ignored: 0,
+                errors_count: 1,
+                sessions: vec![ImportCompletedSession {
+                    session_key: None,
+                    status: "failed".into(),
+                    imported_count: 0,
+                    error: Some(ImportSessionError {
+                        code: None,
+                        message: "session parse failed".into(),
+                    }),
+                }],
+            })
+            .unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(String::from_utf8(output.into_inner()).unwrap().trim()).unwrap();
+
+        assert_eq!(event["event"], "import_completed");
+        assert_eq!(event["sessions_processed"], 1);
+        assert_eq!(event["sessions"][0]["session_key"], serde_json::Value::Null);
+        assert_eq!(event["sessions"][0]["status"], "failed");
+        assert_eq!(
+            event["sessions"][0]["error"]["message"],
+            "session parse failed"
         );
     }
 

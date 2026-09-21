@@ -5,6 +5,7 @@ pub mod memory_rating;
 pub mod memory_vector;
 pub mod reflection;
 pub mod thread;
+pub mod thread_group;
 // Shared P5 thread_filter resolver. Used by both the RDB list/Count
 // path (`MemoryApp::find_memory_list_by_condition`) and the LanceDB-
 // bound vector/FTS/hybrid paths.

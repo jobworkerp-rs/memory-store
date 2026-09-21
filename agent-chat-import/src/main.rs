@@ -12,15 +12,16 @@ mod summarize;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use cli::{Cli, CodexArgs, DEFAULT_PLAIN_SOURCE_NAME, GlobalArgs, PlainArgs, Subcmd};
+use cli::{Cli, CodexArgs, DEFAULT_PLAIN_SOURCE_NAME, GlobalArgs, OpenCodeArgs, PlainArgs, Subcmd};
 use client::{ImportClient, LiveGrpcImportClient, LiveGrpcImportClientConfig, RetryPolicy};
 use common::importer::{
     CanonicalSessionResult, ChunkLimits, run_all_with_entry_collector_and_event_sink,
     run_all_with_event_sink,
 };
-use events::EventOutput;
+use events::{EventOutput, ImportCompletedReport, ImportCompletedSession, ImportSessionError};
 use source::claude_code::ClaudeCodeSource;
 use source::codex::CodexSource;
+use source::opencode::OpenCodeSource;
 use source::plain::PlainSource;
 use source::plain::prune::{self, PruneConfig, PruneOutcome, PruneSkipReason, PruneSummary};
 use std::cell::RefCell;
@@ -37,6 +38,10 @@ async fn main() -> Result<()> {
     let user_id = cli.validate_user_id().unwrap_or_else(|e| e.exit());
 
     init_tracing(cli.global.verbose).await?;
+    common::importer::set_thread_group_writes_enabled(!cli.global.no_thread_group_writes);
+    if cli.global.dry_run_connect {
+        report_connected_dry_run(&cli.global).await?;
+    }
 
     match cli.command {
         Subcmd::UpsertGenerationWorkers(args) => {
@@ -48,9 +53,28 @@ async fn main() -> Result<()> {
         Subcmd::Codex(args) => {
             run_codex(&cli.global, args, user_id).await?;
         }
+        Subcmd::OpenCode(args) => {
+            run_opencode(&cli.global, args, user_id).await?;
+        }
         Subcmd::Plain(args) => {
             run_plain(&cli.global, args, user_id).await?;
         }
+    }
+
+    if cli.global.dry_run_connect
+        && let Some(report) = client::preview_report()
+    {
+        println!(
+            "[dry-run-connect] planned sessions={} memories={} observations={} relations={} \
+             pending={} suppressed_sessions={} conflict_sessions={}",
+            report.sessions,
+            report.planned_memories,
+            report.planned_observations,
+            report.planned_relations,
+            report.pending,
+            report.suppressed_sessions,
+            report.conflict_sessions,
+        );
     }
 
     Ok(())
@@ -97,10 +121,19 @@ async fn build_import_client(global: &GlobalArgs) -> Result<Option<Arc<dyn Impor
     if global.dry_run {
         return Ok(None);
     }
+    let cfg = live_client_config(global)?;
+    let live = Arc::new(LiveGrpcImportClient::connect(cfg).await?);
+    if global.dry_run_connect {
+        client::set_preview_client(live.clone());
+    }
+    Ok(Some(live))
+}
+
+fn live_client_config(global: &GlobalArgs) -> Result<LiveGrpcImportClientConfig> {
     let server_url = global.server_url.clone().ok_or_else(|| {
         anyhow!("--server-url is required (use --dry-run to skip the live import)")
     })?;
-    let cfg = LiveGrpcImportClientConfig {
+    Ok(LiveGrpcImportClientConfig {
         server_url,
         timeout: Duration::from_secs(global.server_timeout_sec),
         tls_ca_path: global.server_tls_ca.clone(),
@@ -115,9 +148,28 @@ async fn build_import_client(global: &GlobalArgs) -> Result<Option<Arc<dyn Impor
                 jitter_ratio: global.server_retry_jitter_ratio,
             }
         },
-    };
-    let live = LiveGrpcImportClient::connect(cfg).await?;
-    Ok(Some(Arc::new(live)))
+        preview_only: global.dry_run_connect,
+    })
+}
+
+/// Connected dry-run: prove connectivity and print the server's current
+/// ThreadGroup reconciliation snapshot. No import RPC is issued.
+async fn report_connected_dry_run(global: &GlobalArgs) -> Result<()> {
+    let live = LiveGrpcImportClient::connect(live_client_config(global)?).await?;
+    let report = live.find_thread_group_reconciliation_report().await?;
+    println!(
+        "[dry-run-connect] active_groups={} redirected_groups={} split_groups={} \
+         pending_candidates={} ambiguous_candidates={} conflict_candidates={} \
+         unsupported_observations={}",
+        report.active_groups,
+        report.redirected_groups,
+        report.split_groups,
+        report.pending_candidates,
+        report.ambiguous_candidates,
+        report.conflict_candidates,
+        report.unsupported_observations,
+    );
+    Ok(())
 }
 
 /// Build the importer's `ChunkLimits` from CLI overrides. Lives here
@@ -224,6 +276,12 @@ async fn run_codex(global: &GlobalArgs, args: CodexArgs, user_id: i64) -> Result
     run_canonical_source(global, user_id, "codex", CodexSource::new(args)).await
 }
 
+async fn run_opencode(global: &GlobalArgs, args: OpenCodeArgs, user_id: i64) -> Result<()> {
+    let since = global.since_millis()?;
+    let source = OpenCodeSource::new(args, since)?;
+    run_canonical_source(global, user_id, "opencode", source).await
+}
+
 async fn run_plain(global: &GlobalArgs, args: PlainArgs, user_id: i64) -> Result<()> {
     if args.source_name == DEFAULT_PLAIN_SOURCE_NAME {
         eprintln!(
@@ -285,44 +343,47 @@ async fn run_plain(global: &GlobalArgs, args: PlainArgs, user_id: i64) -> Result
 
     let errors: usize = results.iter().filter(|r| r.error.is_some()).count();
 
-    // Phase A `--prune-missing`: only runs when explicitly requested,
-    // not under dry-run, and the import had no errors. Anything else
-    // surfaces as a Skip in the summary.
-    let prune_outcome = if !prune_requested {
-        PruneOutcome::Skipped(PruneSkipReason::NotRequested)
-    } else if global.dry_run {
-        eprintln!(
-            "WARNING: --prune-missing is ignored under --dry-run; \
-             rerun without --dry-run to compute prune candidates."
-        );
-        PruneOutcome::Skipped(PruneSkipReason::DryRun)
-    } else if errors > 0 {
-        eprintln!(
-            "WARNING: --prune-missing skipped because the import had {errors} session error(s)."
-        );
-        PruneOutcome::Skipped(PruneSkipReason::ImportHadErrors)
-    } else {
-        // Live run with no errors: ImportClient is non-None.
-        let live_client = client
-            .as_deref()
-            .ok_or_else(|| anyhow!("internal: prune live path without client"))?;
-        // Reuse the source's cached canonical root (already resolved
-        // during discover()) so we don't re-canonicalize.
-        let canonical_root = source.canonical_root()?.to_path_buf();
-        run_prune_for_plain(
-            live_client,
-            &PruneConfig {
-                source_name,
-                user_id,
-                canonical_root,
-                orphan_threads,
-                no_interactive,
-            },
-            d_external_id.into_inner(),
-            d_path.into_inner(),
-        )
-        .await?
-    };
+    let prune_outcome = emit_import_completed_before_prune(&event_output, &results, || async {
+        // Phase A `--prune-missing`: only runs when explicitly requested,
+        // not under dry-run, and the import had no errors. Anything else
+        // surfaces as a Skip in the summary.
+        if !prune_requested {
+            Ok(PruneOutcome::Skipped(PruneSkipReason::NotRequested))
+        } else if global.dry_run {
+            eprintln!(
+                "WARNING: --prune-missing is ignored under --dry-run; \
+                 rerun without --dry-run to compute prune candidates."
+            );
+            Ok(PruneOutcome::Skipped(PruneSkipReason::DryRun))
+        } else if errors > 0 {
+            eprintln!(
+                "WARNING: --prune-missing skipped because the import had {errors} session error(s)."
+            );
+            Ok(PruneOutcome::Skipped(PruneSkipReason::ImportHadErrors))
+        } else {
+            // Live run with no errors: ImportClient is non-None.
+            let live_client = client
+                .as_deref()
+                .ok_or_else(|| anyhow!("internal: prune live path without client"))?;
+            // Reuse the source's cached canonical root (already resolved
+            // during discover()) so we don't re-canonicalize.
+            let canonical_root = source.canonical_root()?.to_path_buf();
+            run_prune_for_plain(
+                live_client,
+                &PruneConfig {
+                    source_name,
+                    user_id,
+                    canonical_root,
+                    orphan_threads,
+                    no_interactive,
+                },
+                d_external_id.into_inner(),
+                d_path.into_inner(),
+            )
+            .await
+        }
+    })
+    .await?;
     print_prune_summary(&prune_outcome);
 
     #[cfg(any(feature = "summarize-after", feature = "personality-after"))]
@@ -472,6 +533,7 @@ where
     let errors: usize = results.iter().filter(|r| r.error.is_some()).count();
     #[cfg(any(feature = "summarize-after", feature = "personality-after"))]
     let memories_imported: usize = results.iter().map(|r| r.memories_imported).sum();
+    emit_import_completed(&event_output, &results)?;
 
     dispatch_post_import_workflows(
         global,
@@ -556,14 +618,65 @@ async fn dispatch_post_import_workflows(
     Ok(())
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct ImportSummaryAggregate {
+    sessions_processed: usize,
+    threads_created: usize,
+    memories_imported: usize,
+    memories_skipped_duplicate: usize,
+    memories_skipped_filtered: usize,
+    memories_deferred: usize,
+    memories_skipped_ignored: usize,
+    memories_skipped_warning: usize,
+    memories_rewired: usize,
+    errors_count: usize,
+}
+
+fn aggregate_import_results(results: &[CanonicalSessionResult]) -> ImportSummaryAggregate {
+    ImportSummaryAggregate {
+        sessions_processed: results.len(),
+        threads_created: results
+            .iter()
+            .filter(|result| result.thread_created)
+            .count(),
+        memories_imported: results.iter().map(|result| result.memories_imported).sum(),
+        memories_skipped_duplicate: results
+            .iter()
+            .map(|result| result.memories_skipped_duplicate)
+            .sum(),
+        memories_skipped_filtered: results
+            .iter()
+            .map(|result| result.memories_skipped_filtered)
+            .sum(),
+        memories_deferred: results.iter().map(|result| result.memories_deferred).sum(),
+        memories_skipped_ignored: results
+            .iter()
+            .map(|result| result.memories_skipped_ignored)
+            .sum(),
+        memories_skipped_warning: results
+            .iter()
+            .map(|result| result.memories_skipped_warning)
+            .sum(),
+        memories_rewired: results.iter().map(|result| result.memories_rewired).sum(),
+        errors_count: results
+            .iter()
+            .filter(|result| result.error.is_some())
+            .count(),
+    }
+}
+
 fn print_canonical_summary(label: &str, results: &[CanonicalSessionResult]) {
-    let sessions = results.len();
-    let threads_created = results.iter().filter(|r| r.thread_created).count();
-    let imported: usize = results.iter().map(|r| r.memories_imported).sum();
-    let dup: usize = results.iter().map(|r| r.memories_skipped_duplicate).sum();
-    let filtered: usize = results.iter().map(|r| r.memories_skipped_filtered).sum();
-    let rewired: usize = results.iter().map(|r| r.memories_rewired).sum();
-    let errors: usize = results.iter().filter(|r| r.error.is_some()).count();
+    let summary = aggregate_import_results(results);
+    let sessions = summary.sessions_processed;
+    let threads_created = summary.threads_created;
+    let imported = summary.memories_imported;
+    let dup = summary.memories_skipped_duplicate;
+    let filtered = summary.memories_skipped_filtered;
+    let deferred = summary.memories_deferred;
+    let ignored = summary.memories_skipped_ignored;
+    let warning_skipped = summary.memories_skipped_warning;
+    let rewired = summary.memories_rewired;
+    let errors = summary.errors_count;
     let skipped_results: Vec<&CanonicalSessionResult> =
         results.iter().filter(|r| r.skip_reason.is_some()).collect();
     println!("\n{label} summary:");
@@ -572,6 +685,21 @@ fn print_canonical_summary(label: &str, results: &[CanonicalSessionResult]) {
     println!("  Memories imported: {imported}");
     println!("  Memories skipped (duplicate): {dup}");
     println!("  Memories skipped (filtered): {filtered}");
+    if deferred > 0 {
+        println!("  Memories deferred: {deferred}");
+    }
+    if ignored > 0 {
+        println!("  Memories skipped (ignored): {ignored}");
+    }
+    if warning_skipped > 0 {
+        println!("  Memories skipped (warning): {warning_skipped}");
+    }
+    print_reason_summary("Ignored", results.iter().map(|r| &r.ignored_by_reason));
+    print_reason_summary(
+        "Warning exclusions",
+        results.iter().map(|r| &r.warning_exclusions_by_reason),
+    );
+    print_reason_summary("Warnings", results.iter().map(|r| &r.warnings_by_reason));
     if rewired > 0 {
         println!("  Memories rewired: {rewired}");
     }
@@ -598,5 +726,229 @@ fn print_canonical_summary(label: &str, results: &[CanonicalSessionResult]) {
             r.session_id,
             r.skip_reason.as_deref().unwrap_or("")
         );
+    }
+}
+
+/// Build the final event without changing the existing human-readable summary.
+/// The event is informational for now; exit status remains governed by the
+/// existing error checks until `import_completed` becomes the primary decision
+/// path.
+fn build_import_completed_report(results: &[CanonicalSessionResult]) -> ImportCompletedReport {
+    let summary = aggregate_import_results(results);
+    ImportCompletedReport {
+        sessions_processed: summary.sessions_processed,
+        threads_created: summary.threads_created,
+        memories_imported: summary.memories_imported,
+        memories_skipped_duplicate: summary.memories_skipped_duplicate,
+        memories_skipped_ignored: summary.memories_skipped_ignored,
+        errors_count: summary.errors_count,
+        sessions: results
+            .iter()
+            .map(|result| ImportCompletedSession {
+                session_key: result.session_key.clone(),
+                status: if result.error.is_some() {
+                    "failed".to_string()
+                } else {
+                    "completed".to_string()
+                },
+                imported_count: result.cumulative_imported_count(),
+                error: result.error.as_ref().map(|message| ImportSessionError {
+                    code: None,
+                    message: message.clone(),
+                }),
+            })
+            .collect(),
+    }
+}
+
+fn emit_import_completed<W: std::io::Write>(
+    event_output: &EventOutput<W>,
+    results: &[CanonicalSessionResult],
+) -> Result<()> {
+    event_output
+        .import_completed(&build_import_completed_report(results))
+        .map_err(|error| anyhow!("failed to write import_completed event: {error}"))
+}
+
+async fn emit_import_completed_before_prune<W, F, Fut>(
+    event_output: &EventOutput<W>,
+    results: &[CanonicalSessionResult],
+    prune: F,
+) -> Result<PruneOutcome>
+where
+    W: std::io::Write,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<PruneOutcome>>,
+{
+    emit_import_completed(event_output, results)?;
+    prune().await
+}
+
+fn print_reason_summary<'a, I>(label: &str, maps: I)
+where
+    I: Iterator<Item = &'a std::collections::BTreeMap<String, usize>>,
+{
+    let mut totals = std::collections::BTreeMap::<String, usize>::new();
+    for map in maps {
+        for (reason, count) in map {
+            *totals.entry(reason.clone()).or_default() += count;
+        }
+    }
+    if totals.is_empty() {
+        return;
+    }
+    println!("  {label} by reason:");
+    for (reason, count) in totals {
+        println!("    - {reason}: {count}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn import_completed_report_aggregates_results_and_keeps_parse_errors() {
+        let results = vec![
+            CanonicalSessionResult {
+                session_id: "ok".into(),
+                session_key: Some("codex:ok".into()),
+                thread_created: true,
+                memories_imported: 2,
+                memories_skipped_duplicate: 1,
+                memories_skipped_ignored: 3,
+                ..Default::default()
+            },
+            CanonicalSessionResult {
+                session_id: "parse-error".into(),
+                error: Some("invalid JSON".into()),
+                ..Default::default()
+            },
+        ];
+
+        let report = build_import_completed_report(&results);
+
+        assert_eq!(report.sessions_processed, 2);
+        assert_eq!(report.threads_created, 1);
+        assert_eq!(report.memories_imported, 2);
+        assert_eq!(report.memories_skipped_duplicate, 1);
+        assert_eq!(report.memories_skipped_ignored, 3);
+        assert_eq!(report.errors_count, 1);
+        assert_eq!(report.sessions[0].status, "completed");
+        assert_eq!(report.sessions[0].imported_count, 3);
+        assert_eq!(report.sessions[1].session_key, None);
+        assert_eq!(report.sessions[1].status, "failed");
+        assert_eq!(
+            report.sessions[1]
+                .error
+                .as_ref()
+                .map(|error| error.message.as_str()),
+            Some("invalid JSON")
+        );
+    }
+
+    #[test]
+    fn import_summary_and_completion_report_keep_aggregate_counts_in_parity() {
+        let results = vec![
+            CanonicalSessionResult {
+                thread_created: true,
+                memories_imported: 4,
+                memories_skipped_duplicate: 2,
+                memories_skipped_ignored: 5,
+                ..Default::default()
+            },
+            CanonicalSessionResult {
+                thread_created: true,
+                error: Some("chunk failed".into()),
+                ..Default::default()
+            },
+            CanonicalSessionResult {
+                ..Default::default()
+            },
+        ];
+
+        let summary_aggregates = (
+            results.len(),
+            results
+                .iter()
+                .filter(|result| result.thread_created)
+                .count(),
+            results.iter().map(|result| result.memories_imported).sum(),
+            results
+                .iter()
+                .map(|result| result.memories_skipped_duplicate)
+                .sum(),
+            results
+                .iter()
+                .map(|result| result.memories_skipped_ignored)
+                .sum(),
+            results
+                .iter()
+                .filter(|result| result.error.is_some())
+                .count(),
+        );
+        let report = build_import_completed_report(&results);
+        let report_aggregates = (
+            report.sessions_processed,
+            report.threads_created,
+            report.memories_imported,
+            report.memories_skipped_duplicate,
+            report.memories_skipped_ignored,
+            report.errors_count,
+        );
+
+        assert_eq!(summary_aggregates, (3, 2, 4, 2, 5, 1));
+        assert_eq!(report_aggregates, summary_aggregates);
+    }
+
+    #[test]
+    fn parse_error_execution_emits_import_completed_with_null_session_key() {
+        let output = EventOutput::new(true, "codex", Vec::new());
+        let results = vec![CanonicalSessionResult {
+            session_id: "unreadable.jsonl".into(),
+            error: Some("failed to parse session".into()),
+            ..Default::default()
+        }];
+
+        emit_import_completed(&output, &results).unwrap();
+
+        let event: serde_json::Value =
+            serde_json::from_str(String::from_utf8(output.into_inner()).unwrap().trim()).unwrap();
+        assert_eq!(event["event"], "import_completed");
+        assert_eq!(event["errors_count"], 1);
+        assert_eq!(event["success"], false);
+        assert_eq!(event["sessions"][0]["session_key"], serde_json::Value::Null);
+        assert_eq!(event["sessions"][0]["status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn plain_import_completed_event_is_emitted_before_prune_starts() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for SharedWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let output = EventOutput::new(true, "plain", SharedWriter(bytes.clone()));
+
+        emit_import_completed_before_prune(&output, &[], || async {
+            let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+            assert!(output.contains("\"event\":\"import_completed\""));
+            Ok(PruneOutcome::Skipped(PruneSkipReason::NothingToPrune))
+        })
+        .await
+        .unwrap();
     }
 }

@@ -573,12 +573,15 @@ mod tests {
 
     use async_trait::async_trait;
     use protobuf::llm_memory::service::{
-        AddMemoriesBatchRequest, AddMemoriesBatchResponse, UpdateMemoryParentsRequest,
-        UpdateMemoryParentsResponse,
+        AddLabelsRequest, AddMemoriesBatchRequest, AddMemoriesBatchResponse,
+        UpdateMemoryParentsRequest, UpdateMemoryParentsResponse,
     };
 
     #[async_trait]
     impl ImportClient for FakePruneClient {
+        async fn add_labels(&self, _request: AddLabelsRequest) -> Result<()> {
+            unimplemented!("FakePruneClient is for prune only")
+        }
         async fn add_memories_batch(
             &self,
             _request: AddMemoriesBatchRequest,
@@ -616,6 +619,13 @@ mod tests {
             _external_id: String,
         ) -> anyhow::Result<Option<MemoryListEntry>> {
             unimplemented!("FakePruneClient does not use exact external ID lookup")
+        }
+        async fn find_thread_by_channel_and_user_id(
+            &self,
+            _channel: String,
+            _user_id: i64,
+        ) -> anyhow::Result<Option<PbThreadId>> {
+            unimplemented!("FakePruneClient does not use thread channel lookup")
         }
         async fn delete_memory(&self, memory_id: PbMemoryId) -> Result<()> {
             if let Some(err_id) = *self.force_error_on_memory_id.lock().unwrap()

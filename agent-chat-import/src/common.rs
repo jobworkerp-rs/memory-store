@@ -14,6 +14,7 @@
 #![allow(dead_code)]
 
 pub mod canonical;
+pub mod git;
 pub mod ids;
 pub mod importer;
 pub mod labels;

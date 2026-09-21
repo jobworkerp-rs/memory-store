@@ -9,7 +9,7 @@ use infra_utils::infra::rdb::Rdb;
 use infra_utils::infra::rdb::RdbPool;
 use infra_utils::infra::rdb::UseRdbPool;
 use itertools::Itertools;
-use protobuf::llm_memory::data::{Memory, MemoryData, MemoryId, ThreadId, UserId};
+use protobuf::llm_memory::data::{Memory, MemoryData, MemoryId, MemoryKind, ThreadId, UserId};
 use sqlx::Executor;
 use std::collections::HashMap;
 
@@ -172,6 +172,16 @@ const FIND_BY_EXTERNAL_ID_SQL: &str = concat!(
     memory_columns!(),
     " FROM memory WHERE external_id = ",
     p!(1),
+    ";"
+);
+
+const FIND_BY_EXTERNAL_ID_AND_KIND_SQL: &str = concat!(
+    "SELECT ",
+    memory_columns!(),
+    " FROM memory WHERE external_id = ",
+    p!(1),
+    " AND memory_kind = ",
+    p!(2),
     ";"
 );
 
@@ -450,6 +460,25 @@ pub trait MemoryRepository: UseRdbPool + UseIdGenerator + Sync + Send {
             .map(|r| r.map(|r2| r2.to_proto()))
             .map_err(LlmMemoryError::DBError)
             .context(format!("error in find_by_external_id: {}", external_id))
+    }
+
+    /// Lookup a derived memory without allowing another memory namespace to
+    /// satisfy the request for the same external identifier.
+    async fn find_by_external_id_and_kind(
+        &self,
+        external_id: &str,
+        memory_kind: MemoryKind,
+    ) -> Result<Option<Memory>> {
+        sqlx::query_as::<Rdb, MemoryRow>(FIND_BY_EXTERNAL_ID_AND_KIND_SQL)
+            .bind(external_id)
+            .bind(memory_kind as i32)
+            .fetch_optional(self.db_pool())
+            .await
+            .map(|r| r.map(|r2| r2.to_proto()))
+            .map_err(LlmMemoryError::DBError)
+            .context(format!(
+                "error in find_by_external_id_and_kind: {external_id}"
+            ))
     }
 
     /// Bulk variant of `find_by_external_id` joined with `thread_memory`

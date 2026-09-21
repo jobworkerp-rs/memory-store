@@ -85,6 +85,10 @@ aws-credential-types = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 tokio-util = { version = "0.7", features = ["io"] }
+# Optional so the ThreadGroup test schema fixture can be shared with
+# downstream test crates through the `test-helper` feature without
+# pulling tempfile into release builds.
+tempfile = { version = "3", optional = true }
 
 [features]
 default = ["sqlite"]
@@ -96,7 +100,7 @@ lindera = ["lance-index/tokenizer-lindera", "dep:lindera"]
 # Exposes `infra::test_helper` to downstream test crates (e.g. `app`).
 # Production binaries never enable this feature, so the helper is
 # absent from release builds.
-test-helper = []
+test-helper = ["dep:tempfile"]
 
 [dev-dependencies]
 serial_test = "3"

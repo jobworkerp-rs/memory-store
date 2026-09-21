@@ -31,4 +31,11 @@ message ThreadSearchFilter {
   optional int64 first_message_before = 15;
   optional int64 last_message_after = 16;
   optional int64 last_message_before = 17;
+  // Explicit ThreadGroup expansion: restrict the search to Threads that
+  // are current members (active or deleted placeholder) of this group.
+  // Applied only when set; the default search is unchanged.
+  optional int64 thread_group_id = 18;
+  // Exact Thread id narrowing used by composed member searches. Unlike
+  // thread_group_id this identifies one current member.
+  optional int64 thread_id = 19;
 }

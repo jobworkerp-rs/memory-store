@@ -18,11 +18,11 @@ fn compat_enabled() -> bool {
 }
 
 fn validate_explicit_kind(kind: i32) -> Result<()> {
-    if (MemoryKind::Raw as i32..=MemoryKind::Reflection as i32).contains(&kind) {
+    if (MemoryKind::Raw as i32..=MemoryKind::ThreadGroupSummary as i32).contains(&kind) {
         return Ok(());
     }
     Err(
-        LlmMemoryError::InvalidArgument(format!("memory_kind must be one of 1..=7, got {kind}"))
+        LlmMemoryError::InvalidArgument(format!("memory_kind must be one of 1..=8, got {kind}"))
             .into(),
     )
 }
@@ -205,5 +205,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(updated.memory_kind, MemoryKind::Raw as i32);
+    }
+
+    #[test]
+    fn accepts_thread_group_summary_as_an_explicit_kind() {
+        let normalized =
+            normalize_memory_for_create(memory(MemoryKind::ThreadGroupSummary as i32), "test")
+                .unwrap();
+        assert_eq!(
+            normalized.memory_kind,
+            MemoryKind::ThreadGroupSummary as i32
+        );
     }
 }

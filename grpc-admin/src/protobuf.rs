@@ -40,6 +40,32 @@ pub mod llm_memory {
         // (P8) sort enums shared by service-side requests.
         pub type MemoryListSort = data::MemoryListSort;
         pub type ThreadListSort = data::ThreadListSort;
+        // ThreadGroup data types referenced by the locally generated
+        // service/thread_group.proto bindings via `super::data::*`.
+        pub type ThreadGroupId = data::ThreadGroupId;
+        pub type ThreadGroup = data::ThreadGroup;
+        pub type ThreadGroupMember = data::ThreadGroupMember;
+        pub type ThreadGroupThreadDisplay = data::ThreadGroupThreadDisplay;
+        pub type ThreadRelation = data::ThreadRelation;
+        pub type ThreadObservation = data::ThreadObservation;
+        pub type ThreadGroupCandidateAssociation = data::ThreadGroupCandidateAssociation;
+        pub type ThreadGroupEndpoint = data::ThreadGroupEndpoint;
+        pub type ThreadGroupObservationInput = data::ThreadGroupObservationInput;
+        pub type ThreadGroupLineage = data::ThreadGroupLineage;
+        pub type ManualCollection = data::ManualCollection;
+        pub type ManualCollectionMember = data::ManualCollectionMember;
+        pub type ThreadGroupStatus = data::ThreadGroupStatus;
+        pub type ThreadGroupingAuthority = data::ThreadGroupingAuthority;
+        pub type ThreadGroupMemberRole = data::ThreadGroupMemberRole;
+        pub type ThreadGroupMemberState = data::ThreadGroupMemberState;
+        pub type ThreadRelationType = data::ThreadRelationType;
+        pub type ThreadRelationState = data::ThreadRelationState;
+        pub type ThreadSelectionBasis = data::ThreadSelectionBasis;
+        pub type ThreadEvidenceConfidence = data::ThreadEvidenceConfidence;
+        pub type ThreadEvidenceKind = data::ThreadEvidenceKind;
+        pub type ThreadObservationPolarity = data::ThreadObservationPolarity;
+        pub type ThreadObservationState = data::ThreadObservationState;
+        pub type ThreadCandidateState = data::ThreadCandidateState;
         // Service-side generated proto code references these via
         // `super::data::*`, so the shim above must re-alias them
         // even though they are not used directly in handler code.

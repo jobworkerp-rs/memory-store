@@ -23,6 +23,30 @@
       "maintenance_window_required": true,
       "implementation": "thread_message_times_v1::ThreadMessageTimesV1Task",
       "lifecycle": "active"
+    },
+    {
+      "id": "thread-groups-canonical-keys-v1",
+      "generation": 1,
+      "description": "既存 Thread に不変な canonical key を割り当てる: resolved mapping から source-backed key を決定的に導出し、manual / non-source Thread には安定対応表へ一度だけ割り当てる",
+      "canonical_definition": {
+        "backends": ["postgres", "sqlite"],
+        "checkpoint_format": "thread-groups-canonical-keys-v1@1/checkpoint-v1",
+        "completion_required_by_schema_version": "20260920000001",
+        "dependencies": [],
+        "id": "thread-groups-canonical-keys-v1",
+        "implementation": "thread_groups_canonical_keys_v1::ThreadGroupsCanonicalKeysV1Task",
+        "introduced_by_schema_version": "20260920000001",
+        "maintenance_window_required": true,
+        "state_contract": "rdb-canonical-keyset-v1"
+      },
+      "canonical_definition_digest": "a4ce2f4dd2cffbd303f6393fcdfa567ba87111f0e9d99ab3207e160bd1e36bf2",
+      "backends": ["postgres", "sqlite"],
+      "introduced_by_schema_version": "20260920000001",
+      "completion_required_by_schema_version": "20260920000001",
+      "dependencies": [],
+      "maintenance_window_required": true,
+      "implementation": "thread_groups_canonical_keys_v1::ThreadGroupsCanonicalKeysV1Task",
+      "lifecycle": "active"
     }
   ]
 }

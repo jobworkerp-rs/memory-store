@@ -7,7 +7,10 @@ edition = "2024"
 [dependencies]
 
 command-utils = { path = "../modules/command-utils" }
+common = { path = "../common" }
 infra-utils = { path = "../modules/infra-utils" }
+# Random key material for manual / non-source Thread canonical keys.
+rand = { workspace = true }
 memory-utils = { path = "../modules/memory-utils" }
 protobuf = { path = "../protobuf" }
 infra = { path = "../infra" }
@@ -36,7 +39,6 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-rand = { workspace = true }
 command-utils = { path = "../modules/command-utils" }
 tempfile = "3"
 # Pull in `infra::test_helper::shared_id_generator()` for tests only.
