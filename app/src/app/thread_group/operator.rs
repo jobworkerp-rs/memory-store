@@ -88,29 +88,19 @@ impl ThreadGroupOperatorService {
                 already_merged: true,
             });
         }
-        let source = self
-            .groups
-            .find_by_id(source_group_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("source group {source_group_id} not found"))?;
-        let target = self
-            .groups
-            .find_by_id(target_group_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("target group {target_group_id} not found"))?;
+        let mut tx = self.pool.begin().await?;
+        self.locks.lock_group_membership_tx(&mut *tx).await?;
+        let source = self.groups.find_by_id_tx(&mut *tx, source_group_id).await?;
+        let target = self.groups.find_by_id_tx(&mut *tx, target_group_id).await?;
+        let source =
+            source.ok_or_else(|| anyhow::anyhow!("source group {source_group_id} not found"))?;
+        let target =
+            target.ok_or_else(|| anyhow::anyhow!("target group {target_group_id} not found"))?;
         if source.status != values::group_status::ACTIVE
             || target.status != values::group_status::ACTIVE
         {
             anyhow::bail!("merge requires two active groups");
         }
-
-        let mut tx = self.pool.begin().await?;
-        self.locks
-            .lock_thread_canonical_key_tx(&mut *tx, &source.group_canonical_key)
-            .await?;
-        self.locks
-            .lock_thread_canonical_key_tx(&mut *tx, &target.group_canonical_key)
-            .await?;
 
         let source_members = self
             .members
@@ -229,16 +219,13 @@ impl ThreadGroupOperatorService {
     ) -> anyhow::Result<Vec<i64>> {
         ensure_thread_group_writes()?;
         let canonical_partition = serde_json::to_string(&normalize_split_partitions(partitions))?;
+        let mut tx = self.pool.begin().await?;
+        self.locks.lock_group_membership_tx(&mut *tx).await?;
         let source = self
             .groups
-            .find_by_id(source_group_id)
+            .find_by_id_tx(&mut *tx, source_group_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("source group {source_group_id} not found"))?;
-
-        let mut tx = self.pool.begin().await?;
-        self.locks
-            .lock_thread_canonical_key_tx(&mut *tx, &source.group_canonical_key)
-            .await?;
         // A retry of a completed split must return the recorded
         // successors even though the source is now `split`, so consult
         // the audit before rejecting a non-active source.
@@ -372,18 +359,19 @@ impl ThreadGroupOperatorService {
         now: i64,
     ) -> anyhow::Result<()> {
         ensure_thread_group_writes()?;
+        let mut tx = self.pool.begin().await?;
+        self.locks
+            .lock_thread_canonical_key_tx(&mut *tx, thread_canonical_key)
+            .await?;
+        self.locks.lock_group_membership_tx(&mut *tx).await?;
         let group = self
             .groups
-            .find_by_id(group_id)
+            .find_by_id_tx(&mut *tx, group_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("group {group_id} not found"))?;
         if group.status != values::group_status::ACTIVE {
             anyhow::bail!("attach requires an active group");
         }
-        let mut tx = self.pool.begin().await?;
-        self.locks
-            .lock_thread_canonical_key_tx(&mut *tx, thread_canonical_key)
-            .await?;
         if self
             .members
             .find_current_by_thread_canonical_key_tx(&mut *tx, thread_canonical_key)

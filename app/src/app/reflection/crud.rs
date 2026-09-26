@@ -87,6 +87,10 @@ pub async fn delete(app: &ReflectionAppImpl, id: &ReflectionId) -> Result<()> {
         .ok_or_else(|| LlmMemoryError::NotFound(format!("reflection {} not found", id.value)))?;
     let memory_id = id.value;
     let mut tx = app.pool.begin().await?;
+    use infra::infra::thread_group::lock::ThreadGroupLockRepository;
+    infra::infra::thread_group::lock::ThreadGroupLockRepositoryImpl::new(app.pool)
+        .lock_group_membership_tx(&mut *tx)
+        .await?;
     let mut affected_thread_ids = app
         .thread_memory_repo
         .find_all_threads_by_memory_tx(&mut *tx, memory_id)
@@ -145,6 +149,11 @@ pub async fn delete(app: &ReflectionAppImpl, id: &ReflectionId) -> Result<()> {
     // Memory body last. By this point every dependent row is gone,
     // so a successful commit yields a fully consistent state.
     let mem_id = MemoryId { value: memory_id };
+    infra::infra::thread_group::memory_relation::ThreadGroupMemoryRelationRepositoryImpl::new(
+        app.pool,
+    )
+    .delete_by_memory_id_tx(&mut *tx, memory_id)
+    .await?;
     let deleted = app.memory_repo.delete_tx(&mut *tx, &mem_id).await?;
     if !deleted {
         // The sidecar guard above passed, so the memory row should

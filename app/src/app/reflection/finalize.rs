@@ -214,6 +214,7 @@ async fn run_phase3(
     } = parts;
 
     let mut tx = app.pool.begin().await?;
+    crate::app::thread_group::memory_relation::lock_group_mutations_tx(&mut tx, app.pool).await?;
 
     // Serialize every aggregate-thread membership change before deriving
     // extrema; otherwise concurrent finalize/delete transactions can each

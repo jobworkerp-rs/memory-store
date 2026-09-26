@@ -6,7 +6,10 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use app::app::memory::MemoryAppImpl;
 use app::app::memory_vector::MemoryVectorAppImpl;
+use app::app::thread_group::memory_relation::ThreadGroupMemoryRelationService;
+use app::app::thread_group::orphan_cleanup::ThreadGroupOrphanCleanupService;
 use app::app::thread_group::{
     GroupSearchMode, GroupSearchTarget, ObservationInput, ObservedEndpoint, ThreadDisplayView,
     ThreadGroupMemberSearchHit, ThreadGroupMemberSearchProvider, ThreadGroupMemberSearchQuery,
@@ -33,10 +36,12 @@ use crate::protobuf::llm_memory::service::{
     CountThreadGroupSummariesRequest, CountThreadGroupSummariesResponse,
     CreateManualCollectionRequest, CreateManualCollectionResponse, DeleteManualCollectionRequest,
     DeleteThreadGroupInactiveHistoryRequest, DeleteThreadGroupInactiveHistoryResponse,
-    DetachManualCollectionMemberRequest, FindManualCollectionListRequest,
-    FindManualCollectionMembersRequest, FindThreadGroupListRequest,
-    FindThreadGroupReconciliationReportRequest, FindThreadGroupSummaryRequest,
-    MergeThreadGroupsRequest, MergeThreadGroupsResponse, PreviewThreadGroupImportRequest,
+    DetachManualCollectionMemberRequest, ExecuteGlobalOrphanCleanupRequest,
+    FindManualCollectionListRequest, FindManualCollectionMembersRequest,
+    FindThreadGroupListRequest, FindThreadGroupReconciliationReportRequest,
+    FindThreadGroupSummaryRequest, GlobalOrphanCleanupPreview, GlobalOrphanCleanupResponse,
+    LinkThreadGroupMemoryRequest, MergeThreadGroupsRequest, MergeThreadGroupsResponse,
+    PreviewGlobalOrphanCleanupRequest, PreviewThreadGroupImportRequest,
     PreviewThreadGroupImportResponse, ProcessThreadGroupEventRequest,
     ProcessThreadGroupEventResponse, RecordThreadGroupObservationsRequest,
     RecordThreadGroupObservationsResponse, RecordThreadGroupOperatorDecisionRequest,
@@ -61,6 +66,9 @@ pub struct ThreadGroupGrpcImpl {
     reconcile_app: ThreadGroupReconciliationService,
     operator_app: ThreadGroupOperatorService,
     purge_app: ThreadGroupPurgeService,
+    memory_relation_app: ThreadGroupMemoryRelationService,
+    orphan_cleanup: Option<ThreadGroupOrphanCleanupService>,
+    pool: &'static RdbPool,
     outbox: ThreadGroupEventOutboxRepositoryImpl,
     memory_vector_app: Option<Arc<MemoryVectorAppImpl>>,
     thread_vector_app: Option<Arc<app::app::thread_vector::ThreadVectorAppImpl>>,
@@ -73,6 +81,9 @@ impl ThreadGroupGrpcImpl {
             reconcile_app: ThreadGroupReconciliationService::new(pool),
             operator_app: ThreadGroupOperatorService::new(pool),
             purge_app: ThreadGroupPurgeService::new(pool),
+            memory_relation_app: ThreadGroupMemoryRelationService::new(pool),
+            orphan_cleanup: None,
+            pool,
             outbox: ThreadGroupEventOutboxRepositoryImpl::new(pool),
             memory_vector_app: None,
             thread_vector_app: None,
@@ -84,9 +95,38 @@ impl ThreadGroupGrpcImpl {
         memory_vector_app: Option<Arc<MemoryVectorAppImpl>>,
         thread_vector_app: Option<Arc<app::app::thread_vector::ThreadVectorAppImpl>>,
     ) -> Self {
+        if let Some(cleanup) = self.orphan_cleanup.take() {
+            self.orphan_cleanup =
+                Some(cleanup.with_vectors(memory_vector_app.clone(), thread_vector_app.clone()));
+        }
         self.memory_vector_app = memory_vector_app;
         self.thread_vector_app = thread_vector_app;
         self
+    }
+
+    pub fn with_memory_app(mut self, app: Arc<MemoryAppImpl>) -> Self {
+        self.purge_app = self.purge_app.with_memory_app(app.clone());
+        self.orphan_cleanup = Some(
+            ThreadGroupOrphanCleanupService::new(self.pool, app).with_vectors(
+                self.memory_vector_app.clone(),
+                self.thread_vector_app.clone(),
+            ),
+        );
+        self
+    }
+}
+
+pub(crate) fn decode_group_memory_delete_policy(
+    value: i32,
+) -> Result<app::app::thread_group::memory_relation::GroupMemoryDeletePolicy, tonic::Status> {
+    use crate::protobuf::llm_memory::data::GroupMemoryDeletePolicy as Wire;
+    use app::app::thread_group::memory_relation::GroupMemoryDeletePolicy as Policy;
+    match Wire::try_from(value) {
+        Ok(Wire::Retain) => Ok(Policy::Retain),
+        Ok(Wire::Delete) => Ok(Policy::Delete),
+        _ => Err(tonic::Status::invalid_argument(
+            "on_group_delete must be RETAIN or DELETE",
+        )),
     }
 }
 
@@ -111,6 +151,18 @@ fn group_filter_allows(
 /// shape is shared here so their target-specific search contracts stay clear.
 fn member_search_hit(thread_id: i64, score: Option<f32>) -> Option<ThreadGroupMemberSearchHit> {
     score.map(|score| ThreadGroupMemberSearchHit { thread_id, score })
+}
+
+fn hybrid_options_or_default(
+    proto: Option<&crate::protobuf::llm_memory::data::HybridSearchOptions>,
+) -> infra::infra::memory_vector::repository::HybridOptions {
+    super::vector_decode::decode_hybrid_options(proto).unwrap_or(
+        infra::infra::memory_vector::repository::HybridOptions {
+            strategy: infra::infra::memory_vector::repository::HybridStrategy::Rrf,
+            vector_weight: None,
+            rrf_k: None,
+        },
+    )
 }
 
 #[tonic::async_trait]
@@ -149,17 +201,7 @@ impl ThreadGroupMemberSearchProvider for ThreadGroupVectorSearchProvider {
                             .await?
                     }
                     GroupSearchMode::Hybrid => {
-                        let options = super::vector_decode::decode_hybrid_options(
-                            query.hybrid_options.as_ref(),
-                        )
-                        .unwrap_or(
-                            infra::infra::memory_vector::repository::HybridOptions {
-                                strategy:
-                                    infra::infra::memory_vector::repository::HybridStrategy::Rrf,
-                                vector_weight: None,
-                                rrf_k: None,
-                            },
-                        );
+                        let options = hybrid_options_or_default(query.hybrid_options.as_ref());
                         app.hybrid_search(
                             &query.query_vectors[0],
                             &query.query_text,
@@ -196,52 +238,44 @@ impl ThreadGroupMemberSearchProvider for ThreadGroupVectorSearchProvider {
                         &memory_filter,
                     );
                 let user_id = memory_filter.user_id;
-                let result =
-                    match query.mode {
-                        GroupSearchMode::Keyword => {
-                            app.search_by_text(
-                                &query.query_text,
-                                filter.as_ref(),
-                                Some(&thread_filter),
-                                user_id,
-                                1,
-                                false,
-                            )
-                            .await?
-                        }
-                        GroupSearchMode::Semantic => {
-                            app.search_semantic(
-                                &query.query_text,
-                                filter.as_ref(),
-                                Some(&thread_filter),
-                                user_id,
-                                1,
-                                false,
-                            )
-                            .await?
-                        }
-                        GroupSearchMode::Hybrid => {
-                            let options = super::vector_decode::decode_hybrid_options(
-                            query.hybrid_options.as_ref(),
+                let result = match query.mode {
+                    GroupSearchMode::Keyword => {
+                        app.search_by_text(
+                            &query.query_text,
+                            filter.as_ref(),
+                            Some(&thread_filter),
+                            user_id,
+                            1,
+                            false,
                         )
-                        .unwrap_or(infra::infra::memory_vector::repository::HybridOptions {
-                            strategy: infra::infra::memory_vector::repository::HybridStrategy::Rrf,
-                            vector_weight: None,
-                            rrf_k: None,
-                        });
-                            app.hybrid_search(
-                                &query.query_vectors,
-                                &query.query_text,
-                                filter.as_ref(),
-                                Some(&thread_filter),
-                                user_id,
-                                1,
-                                &options,
-                                false,
-                            )
-                            .await?
-                        }
-                    };
+                        .await?
+                    }
+                    GroupSearchMode::Semantic => {
+                        app.search_semantic(
+                            &query.query_text,
+                            filter.as_ref(),
+                            Some(&thread_filter),
+                            user_id,
+                            1,
+                            false,
+                        )
+                        .await?
+                    }
+                    GroupSearchMode::Hybrid => {
+                        let options = hybrid_options_or_default(query.hybrid_options.as_ref());
+                        app.hybrid_search(
+                            &query.query_vectors,
+                            &query.query_text,
+                            filter.as_ref(),
+                            Some(&thread_filter),
+                            user_id,
+                            1,
+                            &options,
+                            false,
+                        )
+                        .await?
+                    }
+                };
                 Ok(member_search_hit(
                     thread_id,
                     result.first().map(|item| item.score),
@@ -837,7 +871,7 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
             .unwrap_or_else(|| format!("record:{}", request.subject_thread_id));
         let outcome = self
             .reconcile_app
-            .reconcile_subject(
+            .reconcile_imported_subject(
                 request.subject_thread_id,
                 &mapped.subject,
                 &mapped.observations,
@@ -1051,6 +1085,29 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
     }
 
     #[tracing::instrument(skip(self, request))]
+    async fn link_thread_group_memory(
+        &self,
+        request: tonic::Request<LinkThreadGroupMemoryRequest>,
+    ) -> Result<Response<SuccessResponse>, tonic::Status> {
+        let request = request.into_inner();
+        let relation = request
+            .relation
+            .ok_or_else(|| tonic::Status::invalid_argument("relation is required"))?;
+        let group_id = relation
+            .group_id
+            .ok_or_else(|| tonic::Status::invalid_argument("group_id is required"))?;
+        let memory_id = request
+            .memory_id
+            .ok_or_else(|| tonic::Status::invalid_argument("memory_id is required"))?;
+        let policy = decode_group_memory_delete_policy(relation.on_group_delete)?;
+        self.memory_relation_app
+            .link_existing(group_id.value, memory_id.value, &relation.purpose, policy)
+            .await
+            .map_err(|e| handle_error(&e))?;
+        Ok(Response::new(SuccessResponse { is_success: true }))
+    }
+
+    #[tracing::instrument(skip(self, request))]
     async fn create_manual_collection(
         &self,
         request: tonic::Request<CreateManualCollectionRequest>,
@@ -1203,6 +1260,64 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
         Ok(Response::new(Box::pin(stream)))
     }
 
+    #[tracing::instrument(skip(self, _request))]
+    async fn preview_global_orphan_cleanup(
+        &self,
+        _request: tonic::Request<PreviewGlobalOrphanCleanupRequest>,
+    ) -> Result<Response<GlobalOrphanCleanupPreview>, tonic::Status> {
+        let cleanup = self
+            .orphan_cleanup
+            .as_ref()
+            .ok_or_else(|| tonic::Status::unavailable("cleanup is not configured"))?;
+        let preview = cleanup
+            .preview()
+            .await
+            .map_err(|error| handle_error(&error))?;
+        Ok(Response::new(GlobalOrphanCleanupPreview {
+            digest: preview.digest,
+            orphan_relation_count: preview.orphan_relation_count,
+            safe_memory_ids: preview.safe_memory_ids,
+            unsafe_memory_ids: preview.unsafe_memory_ids,
+            orphan_memory_index_ids: preview.orphan_memory_index_ids,
+            orphan_thread_index_ids: preview.orphan_thread_index_ids,
+            memory_index_available: preview.memory_index_available,
+            thread_index_available: preview.thread_index_available,
+        }))
+    }
+
+    #[tracing::instrument(skip(self, request))]
+    async fn execute_global_orphan_cleanup(
+        &self,
+        request: tonic::Request<ExecuteGlobalOrphanCleanupRequest>,
+    ) -> Result<Response<GlobalOrphanCleanupResponse>, tonic::Status> {
+        let request = request.into_inner();
+        if request.actor_id.trim().is_empty() || request.reason.trim().is_empty() {
+            return Err(tonic::Status::invalid_argument(
+                "actor_id and reason are required",
+            ));
+        }
+        let cleanup = self
+            .orphan_cleanup
+            .as_ref()
+            .ok_or_else(|| tonic::Status::unavailable("cleanup is not configured"))?;
+        tracing::info!(actor_id = %request.actor_id, reason = %request.reason, "global orphan cleanup explicitly requested");
+        let outcome = cleanup
+            .execute(&request.expected_digest)
+            .await
+            .map_err(|error| handle_error(&error))?;
+        tracing::info!(actor_id = %request.actor_id, deleted_relations = outcome.deleted_relation_count, deleted_memories = outcome.deleted_memory_ids.len(), "global orphan cleanup RDB phase completed");
+        Ok(Response::new(GlobalOrphanCleanupResponse {
+            deleted_relation_count: outcome.deleted_relation_count,
+            deleted_memory_ids: outcome.deleted_memory_ids,
+            failed_memory_index_ids: outcome.failed_memory_index_ids,
+            failed_thread_index_ids: outcome.failed_thread_index_ids,
+            remaining_memory_index_ids: outcome.remaining_memory_index_ids,
+            remaining_thread_index_ids: outcome.remaining_thread_index_ids,
+            memory_index_available: outcome.memory_index_available,
+            thread_index_available: outcome.thread_index_available,
+        }))
+    }
+
     #[tracing::instrument(skip(self, request))]
     async fn preview_thread_group_purge(
         &self,
@@ -1229,6 +1344,10 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
             digest: preview.digest,
             purgeable_deletion_markers: preview.purgeable_deletion_markers,
             dangling_redirects: preview.dangling_redirects,
+            summary_memory_id: preview.summary_memory_id,
+            delete_memory_count: preview.delete_memory_count,
+            retain_memory_count: preview.retain_memory_count,
+            blocked_reason: preview.blocked_reason,
         }))
     }
 
@@ -1246,6 +1365,18 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
             .delete(request.group_id, &request.expected_digest)
             .await
             .map_err(|e| handle_error(&e))?;
+        let mut vector_cleanup_failed_ids = Vec::new();
+        let mut vector_cleanup_unverified_ids = Vec::new();
+        for id in &outcome.deleted_memory_ids {
+            if let Some(vector) = &self.memory_vector_app {
+                if let Err(error) = vector.delete_vector(*id).await {
+                    tracing::error!(memory_id = id, "post-purge vector cleanup failed: {error}");
+                    vector_cleanup_failed_ids.push(*id);
+                }
+            } else {
+                vector_cleanup_unverified_ids.push(*id);
+            }
+        }
         Ok(Response::new(DeleteThreadGroupInactiveHistoryResponse {
             deleted_memberships: outcome.deleted_memberships as i64,
             deleted_relations: outcome.deleted_relations as i64,
@@ -1253,6 +1384,9 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
             group_deleted: outcome.group_deleted,
             deleted_deletion_markers: outcome.deleted_deletion_markers as i64,
             repointed_redirects: outcome.repointed_redirects as i64,
+            deleted_memory_ids: outcome.deleted_memory_ids,
+            vector_cleanup_failed_ids,
+            vector_cleanup_unverified_ids,
         }))
     }
 }
@@ -1261,6 +1395,52 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
 mod search_contract_tests {
     use super::*;
     use crate::protobuf::llm_memory::data::ThreadGroupObservationInput;
+
+    #[test]
+    fn hybrid_options_default_when_absent_and_preserve_specified_values() {
+        let defaults = hybrid_options_or_default(None);
+        assert!(matches!(
+            defaults.strategy,
+            infra::infra::memory_vector::repository::HybridStrategy::Rrf
+        ));
+        assert_eq!(defaults.vector_weight, None);
+        assert_eq!(defaults.rrf_k, None);
+
+        let proto = crate::protobuf::llm_memory::data::HybridSearchOptions {
+            strategy: crate::protobuf::llm_memory::data::HybridStrategy::Weighted as i32,
+            vector_weight: Some(0.35),
+            rrf_k: Some(43.0),
+        };
+        let specified = hybrid_options_or_default(Some(&proto));
+        assert!(matches!(
+            specified.strategy,
+            infra::infra::memory_vector::repository::HybridStrategy::Weighted
+        ));
+        assert_eq!(specified.vector_weight, Some(0.35));
+        assert_eq!(specified.rrf_k, Some(43.0));
+    }
+
+    #[test]
+    fn rrf_and_unknown_strategy_values_fall_back_to_rrf_and_keep_options() {
+        for strategy in [
+            crate::protobuf::llm_memory::data::HybridStrategy::Rrf as i32,
+            i32::MAX,
+        ] {
+            let proto = crate::protobuf::llm_memory::data::HybridSearchOptions {
+                strategy,
+                vector_weight: Some(0.2),
+                rrf_k: Some(17.0),
+            };
+            let options = hybrid_options_or_default(Some(&proto));
+
+            assert!(matches!(
+                options.strategy,
+                infra::infra::memory_vector::repository::HybridStrategy::Rrf
+            ));
+            assert_eq!(options.vector_weight, Some(0.2));
+            assert_eq!(options.rrf_k, Some(17.0));
+        }
+    }
 
     #[test]
     fn proto_search_query_maps_target_mode_and_vector_without_exposing_cursor_shape() {

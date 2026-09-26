@@ -3,9 +3,7 @@
 //! The schema under test is the *committed* SQLite migration
 //! (`infra/atlas/sqlite/migrations/20260920000001_thread_group_schema.sql`),
 //! applied verbatim onto a throwaway temp-file database so these tests
-//! never touch the shared `test_db.sqlite3` used by the other repos —
-//! that DB is migrated from `infra/sql/sqlite`, which does not (yet)
-//! include the ThreadGroup tables (see completion report). The trailing
+//! never touch the shared `test_db.sqlite3` used by the other repos. The trailing
 //! `UPDATE memories_schema_contract ...` statement is the only thing
 //! stripped: the contract table is not part of the base test schema,
 //! and updating it is the migrate binary's job, not a repository
@@ -29,6 +27,9 @@ use infra_utils::infra::rdb::RdbPool;
 const BASE_SCHEMA: &str = include_str!("../../../sql/sqlite/001_schema.sql");
 const THREAD_GROUP_SCHEMA: &str =
     include_str!("../../../atlas/sqlite/migrations/20260920000001_thread_group_schema.sql");
+const MEMORY_RELATION_SCHEMA: &str = include_str!(
+    "../../../atlas/sqlite/migrations/20260926000001_thread_group_memory_relation.sql"
+);
 
 /// Deterministic base timestamp; individual tests offset from it.
 pub const T0: i64 = 1_700_000_000_000;
@@ -69,6 +70,14 @@ pub async fn setup_thread_group_pool() -> &'static RdbPool {
             .execute(&pool)
             .await
             .expect("thread group schema");
+        let relation_ddl = MEMORY_RELATION_SCHEMA
+            .split("UPDATE memories_schema_contract")
+            .next()
+            .expect("relationship migration has statements before the contract update");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(relation_ddl.to_owned()))
+            .execute(&pool)
+            .await
+            .expect("thread group memory relationship schema");
         pool
     })
     .await

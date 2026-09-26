@@ -49,6 +49,7 @@ pub mod deletion_marker;
 pub mod group;
 pub mod lock;
 pub mod member;
+pub mod memory_relation;
 pub mod observation;
 pub mod operator_decision;
 pub mod outbox;

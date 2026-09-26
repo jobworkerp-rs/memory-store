@@ -43,6 +43,8 @@ pub mod llm_memory {
         // ThreadGroup data types referenced by the locally generated
         // service/thread_group.proto bindings via `super::data::*`.
         pub type ThreadGroupId = data::ThreadGroupId;
+        pub type GroupMemoryRelationInput = data::GroupMemoryRelationInput;
+        pub type GroupMemoryDeletePolicy = data::GroupMemoryDeletePolicy;
         pub type ThreadGroup = data::ThreadGroup;
         pub type ThreadGroupMember = data::ThreadGroupMember;
         pub type ThreadGroupThreadDisplay = data::ThreadGroupThreadDisplay;

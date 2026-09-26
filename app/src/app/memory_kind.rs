@@ -18,7 +18,7 @@ fn compat_enabled() -> bool {
 }
 
 fn validate_explicit_kind(kind: i32) -> Result<()> {
-    if (MemoryKind::Raw as i32..=MemoryKind::ThreadGroupSummary as i32).contains(&kind) {
+    if (MemoryKind::Raw as i32..=MemoryKind::DerivedSummary as i32).contains(&kind) {
         return Ok(());
     }
     Err(
@@ -208,13 +208,11 @@ mod tests {
     }
 
     #[test]
-    fn accepts_thread_group_summary_as_an_explicit_kind() {
+    fn accepts_derived_summary_as_an_explicit_kind() {
         let normalized =
-            normalize_memory_for_create(memory(MemoryKind::ThreadGroupSummary as i32), "test")
-                .unwrap();
-        assert_eq!(
-            normalized.memory_kind,
-            MemoryKind::ThreadGroupSummary as i32
-        );
+            normalize_memory_for_create(memory(MemoryKind::DerivedSummary as i32), "test").unwrap();
+        assert_eq!(normalized.memory_kind, MemoryKind::DerivedSummary as i32);
+        let legacy = normalize_memory_for_create(memory(8), "test").unwrap();
+        assert_eq!(legacy.memory_kind, normalized.memory_kind);
     }
 }

@@ -1,7 +1,9 @@
 use anyhow::Result;
 use infra::error::LlmMemoryError;
 use infra::infra::media_object::rdb::{MediaObjectRepository, MediaObjectRepositoryImpl};
-use infra::infra::memory::rdb::{MemoryRepository, MemoryRepositoryImpl};
+use infra::infra::memory::rdb::{
+    CreatedAtRange, MemoryRepository, MemoryRepositoryImpl, MemorySort, UpdatedAtRange,
+};
 use infra::infra::memory_vector::dispatcher::{
     DispatchError, DispatchKind, DispatchTarget, EmbeddingDispatch, EmbeddingJobDispatcher,
 };
@@ -39,6 +41,16 @@ pub enum SearchKind {
     Vector,
     Fts,
     Hybrid,
+}
+
+/// Upper bound for resolving an `external_id_prefix` to RDB memory IDs
+/// before applying the allow-list to HybridSearch.
+pub const EXTERNAL_ID_PREFIX_RESOLUTION_CAP: usize = 10_000;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExternalIdPrefixResolution {
+    Matches(Vec<i64>),
+    TooMany { limit: usize },
 }
 
 /// Planner output for `build_search_filter_with_cfg`. Encodes which of
@@ -319,6 +331,44 @@ pub struct MemoryVectorAppImpl {
     /// non-media deployments) leaves search results without media —
     /// backward compatible.
     media: Option<super::memory::MediaSubsystem>,
+}
+
+async fn delete_orphan_ids<F, Fut>(ids: &[i64], mut delete: F) -> Result<u32>
+where
+    F: FnMut(i64) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut cleaned = 0u32;
+    let mut failures = Vec::new();
+    for &id in ids {
+        match delete(id).await {
+            Ok(()) => cleaned += 1,
+            Err(error) => failures.push(format!("{id}: {error}")),
+        }
+    }
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "orphan vector deletion failed for memory IDs [{}]; {cleaned} successfully removed",
+            failures.join(", ")
+        );
+    }
+    Ok(cleaned)
+}
+
+fn filter_orphan_index_records(index_ids: &[i64], existing_ids: &[i64]) -> Vec<i64> {
+    let existing_id_set: HashSet<i64> = existing_ids.iter().copied().collect();
+    index_ids
+        .iter()
+        .filter(|id| !existing_id_set.contains(id))
+        .copied()
+        .collect()
+}
+
+pub(crate) fn orphan_index_ids(index_ids: &[i64], existing_ids: &[i64]) -> Vec<i64> {
+    let mut orphan_ids = filter_orphan_index_records(index_ids, existing_ids);
+    orphan_ids.sort_unstable();
+    orphan_ids.dedup();
+    orphan_ids
 }
 
 impl MemoryVectorAppImpl {
@@ -613,6 +663,49 @@ impl MemoryVectorAppImpl {
             memory_user_id,
         )
         .await
+    }
+
+    /// Resolve a memory external-ID prefix to a bounded RDB allow-list.
+    /// The extra row distinguishes an exact-cap result from a truncated one.
+    pub async fn resolve_memory_ids_by_external_id_prefix(
+        &self,
+        external_id_prefix: &str,
+        memory_user_id: Option<i64>,
+        memory_kinds: &[i32],
+        limit: usize,
+    ) -> Result<ExternalIdPrefixResolution> {
+        let query_limit = i32::try_from(limit.saturating_add(1))
+            .map_err(|_| anyhow::anyhow!("external_id_prefix resolution limit is too large"))?;
+        let offset = 0;
+        let memories = self
+            .memory_repo
+            .find_list_by_condition_with_memory_kinds(
+                Some(&query_limit),
+                Some(&offset),
+                &[],
+                &[],
+                memory_kinds,
+                memory_user_id,
+                None,
+                UpdatedAtRange::default(),
+                CreatedAtRange::default(),
+                None,
+                Some(external_id_prefix),
+                None,
+                MemorySort::IdDesc,
+                false,
+            )
+            .await?;
+
+        if memories.len() > limit {
+            return Ok(ExternalIdPrefixResolution::TooMany { limit });
+        }
+
+        let memory_ids = memories
+            .into_iter()
+            .filter_map(|memory| memory.id.map(|id| id.value))
+            .collect();
+        Ok(ExternalIdPrefixResolution::Matches(memory_ids))
     }
 
     // ===== Search =====
@@ -1795,6 +1888,25 @@ impl MemoryVectorAppImpl {
 
     // ===== Index management =====
 
+    /// List distinct LanceDB memory IDs that do not exist in the RDB.
+    /// This is a read-only global check; it does not delete index records.
+    pub async fn list_orphan_index_ids(&self) -> Result<Vec<i64>> {
+        let lance_ids = self.vector_repo.get_all_memory_ids().await?;
+        let existing_ids = self.existing_index_memory_ids(&lance_ids).await?;
+        Ok(orphan_index_ids(&lance_ids, &existing_ids))
+    }
+
+    async fn existing_index_memory_ids(&self, index_ids: &[i64]) -> Result<Vec<i64>> {
+        if index_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let memories = self.memory_repo.find_by_ids(index_ids, false).await?;
+        Ok(memories
+            .iter()
+            .filter_map(|memory| memory.id.as_ref().map(|id| id.value))
+            .collect())
+    }
+
     /// Clean up orphaned LanceDB records (present in LanceDB but not in RDB).
     /// Loads all LanceDB memory_ids into memory (O(N) where N = total vector records).
     /// For millions of records, consider chunked streaming in the future.
@@ -1806,21 +1918,12 @@ impl MemoryVectorAppImpl {
             return Ok((0, 0, start.elapsed().as_millis() as i64));
         }
 
-        let rdb_memories = self.memory_repo.find_by_ids(&lance_ids, false).await?;
-        let rdb_id_set: std::collections::HashSet<i64> = rdb_memories
-            .iter()
-            .filter_map(|m| m.id.as_ref().map(|id| id.value))
-            .collect();
-
-        let mut cleaned = 0u32;
-        for &lance_id in &lance_ids {
-            if !rdb_id_set.contains(&lance_id) {
-                if let Err(e) = self.vector_repo.delete(lance_id).await {
-                    tracing::error!("Failed to clean orphan memory_id={}: {e}", lance_id);
-                }
-                cleaned += 1;
-            }
-        }
+        let existing_ids = self.existing_index_memory_ids(&lance_ids).await?;
+        let orphan_ids = filter_orphan_index_records(&lance_ids, &existing_ids);
+        let cleaned = delete_orphan_ids(&orphan_ids, |id| async move {
+            self.vector_repo.delete(id).await.map(|_| ())
+        })
+        .await?;
 
         let indexed = lance_ids.len() as u32 - cleaned;
         let duration_ms = start.elapsed().as_millis() as i64;
@@ -2474,6 +2577,233 @@ mod test {
     use protobuf::llm_memory::data::{MediaObjectId, MemoryData, MemoryKind, UserId};
     use rand::RngExt;
 
+    #[test]
+    fn global_orphan_cleanup_counts_only_successes_and_reports_failed_ids() {
+        TEST_RUNTIME.block_on(async {
+            let empty = super::delete_orphan_ids(&[], |_| std::future::ready(Ok(())))
+                .await
+                .unwrap();
+            assert_eq!(empty, 0);
+
+            let cleaned = super::delete_orphan_ids(&[10, 11], |_| std::future::ready(Ok(())))
+                .await
+                .unwrap();
+            assert_eq!(cleaned, 2);
+
+            let attempted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let result = super::delete_orphan_ids(&[20, 21, 22], |id| {
+                attempted.lock().unwrap().push(id);
+                std::future::ready(if id == 21 {
+                    Err(anyhow::anyhow!("storage error"))
+                } else {
+                    Ok(())
+                })
+            })
+            .await;
+            assert_eq!(*attempted.lock().unwrap(), vec![20, 21, 22]);
+            assert!(result.unwrap_err().to_string().contains("21"));
+        });
+    }
+
+    #[test]
+    fn list_orphan_ids_are_read_only_and_include_only_stale_ids() -> anyhow::Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let dim = 2;
+            let (app, pool, _db) = setup_app(dim).await?;
+            let live_id =
+                create_test_memory(&app.memory_repo, pool, "authoritative memory", 10).await?;
+            assert!(app.list_orphan_index_ids().await?.is_empty());
+            app.upsert_embedding(live_id, &[0.1, 0.2], Some("test"))
+                .await?;
+
+            let orphan_a = i64::MAX - 2;
+            let orphan_b = i64::MAX - 1;
+            let orphan_a_record = MemoryVectorRecord {
+                memory_id: orphan_a,
+                vector_kind: "text".to_string(),
+                chunk_index: 0,
+                begin_position: 0,
+                end_position: 0,
+                user_id: 10,
+                content: "orphan memory".to_string(),
+                content_type: 0,
+                role: 0,
+                embedding: vec![0.2, 0.1],
+                embedding_model: Some("test".to_string()),
+                metadata_json: None,
+                created_at: 1000,
+                updated_at: 1000,
+                indexed_at: command_utils::util::datetime::now_millis(),
+                memory_kind: 1,
+            };
+            let mut orphan_a_second_chunk = orphan_a_record.clone();
+            orphan_a_second_chunk.chunk_index = 1;
+            let mut orphan_b_record = orphan_a_record.clone();
+            orphan_b_record.memory_id = orphan_b;
+            app.vector_repo
+                .batch_upsert(vec![
+                    orphan_b_record,
+                    orphan_a_second_chunk,
+                    orphan_a_record,
+                ])
+                .await?;
+
+            assert_eq!(app.list_orphan_index_ids().await?, vec![orphan_a, orphan_b]);
+            let index_ids = app.vector_repo.get_all_memory_ids().await?;
+            assert!(index_ids.contains(&live_id));
+            assert_eq!(index_ids.iter().filter(|id| **id == orphan_a).count(), 2);
+            assert!(index_ids.contains(&orphan_b));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn external_id_prefix_resolution_matches_prefix_user_and_memory_kind() -> anyhow::Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let (app, pool, _db) = setup_app(2).await?;
+            let matching_id = create_test_memory_with_external_id(
+                &app.memory_repo,
+                pool,
+                "group summary",
+                10,
+                MemoryKind::DerivedSummary,
+                "thread-group-summary:42",
+            )
+            .await?;
+            create_test_memory_with_external_id(
+                &app.memory_repo,
+                pool,
+                "same kind, other prefix",
+                10,
+                MemoryKind::DerivedSummary,
+                "daily:1:2026-09-26",
+            )
+            .await?;
+            create_test_memory_with_external_id(
+                &app.memory_repo,
+                pool,
+                "same kind, different case",
+                10,
+                MemoryKind::DerivedSummary,
+                "Thread-Group-Summary:42",
+            )
+            .await?;
+            create_test_memory_with_external_id(
+                &app.memory_repo,
+                pool,
+                "same prefix, other kind",
+                10,
+                MemoryKind::Raw,
+                "thread-group-summary:raw",
+            )
+            .await?;
+            create_test_memory_with_external_id(
+                &app.memory_repo,
+                pool,
+                "same prefix, other user",
+                11,
+                MemoryKind::DerivedSummary,
+                "thread-group-summary:other-user",
+            )
+            .await?;
+
+            let resolved = app
+                .resolve_memory_ids_by_external_id_prefix(
+                    "thread-group-summary:",
+                    Some(10),
+                    &[MemoryKind::DerivedSummary as i32],
+                    1,
+                )
+                .await?;
+            assert_eq!(
+                resolved,
+                ExternalIdPrefixResolution::Matches(vec![matching_id])
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn external_id_prefix_resolution_returns_empty_when_nothing_matches() -> anyhow::Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let (app, pool, _db) = setup_app(2).await?;
+            create_test_memory_with_external_id(
+                &app.memory_repo,
+                pool,
+                "unrelated summary",
+                10,
+                MemoryKind::DerivedSummary,
+                "daily:1:2026-09-26",
+            )
+            .await?;
+
+            let resolved = app
+                .resolve_memory_ids_by_external_id_prefix(
+                    "thread-group-summary:",
+                    Some(10),
+                    &[MemoryKind::DerivedSummary as i32],
+                    1,
+                )
+                .await?;
+            assert_eq!(resolved, ExternalIdPrefixResolution::Matches(Vec::new()));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn external_id_prefix_resolution_reports_cap_overflow() -> anyhow::Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let (app, pool, _db) = setup_app(2).await?;
+            let first_id = create_test_memory_with_external_id(
+                &app.memory_repo,
+                pool,
+                "first group summary",
+                10,
+                MemoryKind::DerivedSummary,
+                "thread-group-summary:one",
+            )
+            .await?;
+            let second_id = create_test_memory_with_external_id(
+                &app.memory_repo,
+                pool,
+                "second group summary",
+                10,
+                MemoryKind::DerivedSummary,
+                "thread-group-summary:two",
+            )
+            .await?;
+            let memory_kinds = [MemoryKind::DerivedSummary as i32];
+
+            assert_eq!(
+                app.resolve_memory_ids_by_external_id_prefix(
+                    "thread-group-summary:",
+                    Some(10),
+                    &memory_kinds,
+                    1,
+                )
+                .await?,
+                ExternalIdPrefixResolution::TooMany { limit: 1 }
+            );
+
+            let ExternalIdPrefixResolution::Matches(mut resolved) = app
+                .resolve_memory_ids_by_external_id_prefix(
+                    "thread-group-summary:",
+                    Some(10),
+                    &memory_kinds,
+                    2,
+                )
+                .await?
+            else {
+                anyhow::bail!("exactly the cap should be returned without overflow")
+            };
+            resolved.sort_unstable();
+            let mut expected = vec![first_id, second_id];
+            expected.sort_unstable();
+            assert_eq!(resolved, expected);
+            Ok(())
+        })
+    }
+
     fn random_embedding(dim: usize) -> Vec<f32> {
         let mut rng = rand::rng();
         (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect()
@@ -2541,6 +2871,35 @@ mod test {
             media_object_id: None,
             thread_ids: Vec::new(),
             memory_kind: MemoryKind::Raw as i32,
+        };
+        let mut tx = pool.begin().await?;
+        let id = repo.create(&mut *tx, &data).await?;
+        tx.commit().await?;
+        Ok(id.value)
+    }
+
+    async fn create_test_memory_with_external_id(
+        repo: &MemoryRepositoryImpl,
+        pool: &'static infra_utils::infra::rdb::RdbPool,
+        content: &str,
+        user_id: i64,
+        memory_kind: MemoryKind,
+        external_id: &str,
+    ) -> anyhow::Result<i64> {
+        let data = MemoryData {
+            parent_ids: vec![],
+            user_id: Some(UserId { value: user_id }),
+            content: content.to_string(),
+            content_type: protobuf::llm_memory::data::ContentType::Text as i32,
+            params: None,
+            metadata: None,
+            created_at: 0,
+            updated_at: 0,
+            role: MessageRole::RoleUser as i32,
+            external_id: Some(external_id.to_string()),
+            media_object_id: None,
+            thread_ids: Vec::new(),
+            memory_kind: memory_kind as i32,
         };
         let mut tx = pool.begin().await?;
         let id = repo.create(&mut *tx, &data).await?;

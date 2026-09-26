@@ -52,6 +52,13 @@ service ThreadGroupService {
     // Attach a Thread to an existing active group as an operator-fixed
     // membership. There is no primary-membership detach: use split.
     rpc AttachThreadGroupMember(AttachThreadGroupMemberRequest) returns (SuccessResponse);
+    // Register an existing Memory after validating ownership, group
+    // existence, and any legacy external ID. New Memory must instead use
+    // ThreadService.AddMemory with group_memory_relation in one transaction.
+    rpc LinkThreadGroupMemory(LinkThreadGroupMemoryRequest) returns (SuccessResponse);
+    // Global operator action; never triggered by a group purge.
+    rpc PreviewGlobalOrphanCleanup(PreviewGlobalOrphanCleanupRequest) returns (GlobalOrphanCleanupPreview);
+    rpc ExecuteGlobalOrphanCleanup(ExecuteGlobalOrphanCleanupRequest) returns (GlobalOrphanCleanupResponse);
 
     // Record and apply an explicit operator confirmation / rejection /
     // retraction on a candidate association. Separate provenance from
@@ -92,6 +99,11 @@ message ThreadGroupPurgePreview {
     int64 purgeable_deletion_markers = 10;
     // Groups whose redirect points at this group.
     int64 dangling_redirects = 11;
+    // Present when a dedicated summary Memory is associated with this group.
+    optional int64 summary_memory_id = 12;
+    int64 delete_memory_count = 13;
+    int64 retain_memory_count = 14;
+    string blocked_reason = 15;
 }
 
 message DeleteThreadGroupInactiveHistoryRequest {
@@ -110,6 +122,9 @@ message DeleteThreadGroupInactiveHistoryResponse {
     bool group_deleted = 4;
     int64 deleted_deletion_markers = 5;
     int64 repointed_redirects = 6;
+    repeated int64 deleted_memory_ids = 7;
+    repeated int64 vector_cleanup_failed_ids = 8;
+    repeated int64 vector_cleanup_unverified_ids = 9;
 }
 
 message FindThreadGroupReconciliationReportRequest {}
@@ -197,6 +212,41 @@ message SearchThreadGroupsResponse {
     repeated ThreadGroupSearchResult results = 1;
     // Unset when this page is the last page. The value is opaque to clients.
     optional string next_page_token = 2;
+}
+
+message LinkThreadGroupMemoryRequest {
+    llm_memory.data.GroupMemoryRelationInput relation = 1;
+    llm_memory.data.MemoryId memory_id = 2;
+}
+
+message PreviewGlobalOrphanCleanupRequest {}
+
+message GlobalOrphanCleanupPreview {
+    string digest = 1;
+    int64 orphan_relation_count = 2;
+    repeated int64 safe_memory_ids = 3;
+    repeated int64 unsafe_memory_ids = 4;
+    repeated int64 orphan_memory_index_ids = 5;
+    repeated int64 orphan_thread_index_ids = 6;
+    bool memory_index_available = 7;
+    bool thread_index_available = 8;
+}
+
+message ExecuteGlobalOrphanCleanupRequest {
+    string expected_digest = 1;
+    string actor_id = 2;
+    string reason = 3;
+}
+
+message GlobalOrphanCleanupResponse {
+    uint64 deleted_relation_count = 1;
+    repeated int64 deleted_memory_ids = 2;
+    repeated int64 failed_memory_index_ids = 3;
+    repeated int64 failed_thread_index_ids = 4;
+    repeated int64 remaining_memory_index_ids = 5;
+    repeated int64 remaining_thread_index_ids = 6;
+    bool memory_index_available = 7;
+    bool thread_index_available = 8;
 }
 
 message FindThreadGroupSummaryRequest {

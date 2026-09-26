@@ -42,6 +42,7 @@ enum MessageRole {
 
 // Distinguishes the lifecycle and purpose of a memory/thread.
 enum MemoryKind {
+  option allow_alias = true;
   MEMORY_KIND_UNSPECIFIED = 0;
   // Directly accepted, non-derived memory such as conversations, documents, and notes.
   MEMORY_KIND_RAW = 1;
@@ -51,8 +52,12 @@ enum MemoryKind {
   MEMORY_KIND_MONTHLY_SUMMARY = 5;
   MEMORY_KIND_PERSONALITY = 6;
   MEMORY_KIND_REFLECTION = 7;
-  // Group-scoped summary generated from the current ThreadGroup membership.
-  MEMORY_KIND_THREAD_GROUP_SUMMARY = 8;
+  // Summary derived from another resource; scope and deletion policy are
+  // expressed by a separate relationship, not by this classification.
+  MEMORY_KIND_DERIVED_SUMMARY = 8;
+  // Kept in the descriptor for clients that still send the old enum name.
+  // Generated language enums may expose only the first alias.
+  MEMORY_KIND_THREAD_GROUP_SUMMARY = 8 [deprecated = true];
 }
 
 // Label match mode for thread label filtering

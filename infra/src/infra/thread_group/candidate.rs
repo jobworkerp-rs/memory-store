@@ -109,6 +109,20 @@ const UPDATE_SELECTION_SQL: &str = concat!(
     p!(5)
 );
 
+const UPDATE_CANDIDATE_STATE_SQL: &str = concat!(
+    "UPDATE thread_group_candidate_association \
+     SET state = ",
+    p!(1),
+    ", candidate_parent_thread_id = ",
+    p!(2),
+    ", updated_at = ",
+    p!(3),
+    " WHERE id = ",
+    p!(4),
+    " AND state = ",
+    p!(5)
+);
+
 const RECONNECT_SUBJECT_THREAD_SQL: &str = concat!(
     "UPDATE thread_group_candidate_association SET subject_thread_id = ",
     p!(1),
@@ -296,6 +310,30 @@ pub trait ThreadGroupCandidateAssociationRepository:
         let res = sqlx::query::<Rdb>(UPDATE_SELECTION_SQL)
             .bind(new_state)
             .bind(selected_observation_id)
+            .bind(updated_at)
+            .bind(id)
+            .bind(expected_state)
+            .execute(tx)
+            .await
+            .map_err(LlmMemoryError::DBError)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Resolve a pending source candidate to a known parent while keeping
+    /// the association attached to its original observation.
+    async fn update_candidate_state_tx<'c, E: Executor<'c, Database = Rdb>>(
+        &self,
+        tx: E,
+        id: i64,
+        expected_state: &str,
+        new_state: &str,
+        candidate_parent_thread_id: Option<i64>,
+        updated_at: i64,
+    ) -> Result<bool> {
+        let updated_at = fill_updated_at(updated_at);
+        let res = sqlx::query::<Rdb>(UPDATE_CANDIDATE_STATE_SQL)
+            .bind(new_state)
+            .bind(candidate_parent_thread_id)
             .bind(updated_at)
             .bind(id)
             .bind(expected_state)

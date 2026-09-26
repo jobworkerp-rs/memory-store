@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex};
 const SOURCE_ID: &str = "opencode";
 const IMPORT_SCHEMA: &str = "opencode-session-v1";
 const MESSAGE_SCHEMA: &str = "opencode-message-v1";
+const SESSION_CANDIDATE_SQL: &str = "SELECT (time_updated >= ?2 OR EXISTS(SELECT 1 FROM message m WHERE m.session_id=s.id AND m.time_updated >= ?2) OR EXISTS(SELECT 1 FROM part p WHERE p.session_id=s.id AND p.time_updated >= ?2)) FROM session s WHERE s.id=?1";
 const KNOWN_TYPES: &[&str] = &[
     "user",
     "assistant",
@@ -256,11 +257,7 @@ impl OpenCodeSource {
         let Some(since) = self.requested_since else {
             return Ok(true);
         };
-        let hit: bool = conn.query_row(
-            "SELECT (time_updated >= ?2 OR EXISTS(SELECT 1 FROM message m WHERE m.session_id=s.id AND m.time_updated >= ?2) OR EXISTS(SELECT 1 FROM part p WHERE p.session_id=s.id AND p.time_updated >= ?2)) FROM session s WHERE s.id=?1",
-            (id, since),
-            |row| row.get(0),
-        )?;
+        let hit: bool = conn.query_row(SESSION_CANDIDATE_SQL, (id, since), |row| row.get(0))?;
         Ok(hit)
     }
 
@@ -478,11 +475,7 @@ impl OpenCodeSource {
         let Some(since) = self.requested_since else {
             return Ok(true);
         };
-        let hit: bool = tx.query_row(
-            "SELECT (time_updated >= ?2 OR EXISTS(SELECT 1 FROM message m WHERE m.session_id=s.id AND m.time_updated >= ?2) OR EXISTS(SELECT 1 FROM part p WHERE p.session_id=s.id AND p.time_updated >= ?2)) FROM session s WHERE s.id=?1",
-            (id, since),
-            |row| row.get(0),
-        )?;
+        let hit: bool = tx.query_row(SESSION_CANDIDATE_SQL, (id, since), |row| row.get(0))?;
         Ok(hit)
     }
 }
@@ -503,27 +496,6 @@ struct SessionRow {
     agent: Option<String>,
     model: Option<String>,
     archived_at_ms: Option<i64>,
-}
-
-impl SessionRow {
-    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
-        Ok(Self {
-            id: row.get(0)?,
-            project_id: row.get(1)?,
-            directory: row.get(2)?,
-            title: row.get(3)?,
-            version: row.get(4)?,
-            created_at_ms: row.get(5)?,
-            updated_at_ms: row.get(6)?,
-            parent_id: row.get(7)?,
-            workspace_id: row.get(8)?,
-            path: row.get(9)?,
-            slug: row.get(10)?,
-            agent: row.get(11)?,
-            model: row.get(12)?,
-            archived_at_ms: row.get(13)?,
-        })
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1092,6 +1064,7 @@ fn build_session(
         thread_metadata: Some(
             json!({"source": SOURCE_ID, "import_schema": IMPORT_SCHEMA, "session": metadata}),
         ),
+        source_identity: Some(opencode_identity(&session.id)),
         thread_group_observations: observations_from_session(
             &session.id,
             session.parent_id.as_deref(),
@@ -1113,20 +1086,8 @@ fn observations_from_session(
         return Vec::new();
     };
     vec![ThreadGroupObservation {
-        subject: ThreadGroupSourceIdentity {
-            source: SOURCE_ID.into(),
-            native_kind: "session",
-            owner_scope: None,
-            identity_scope: ThreadGroupIdentityScope::Known(String::new()),
-            native_id: session_id.to_string(),
-        },
-        candidate_parent: Some(ThreadGroupSourceIdentity {
-            source: SOURCE_ID.into(),
-            native_kind: "session",
-            owner_scope: None,
-            identity_scope: ThreadGroupIdentityScope::Known(String::new()),
-            native_id: parent_id.to_string(),
-        }),
+        subject: opencode_identity(session_id),
+        candidate_parent: Some(opencode_identity(parent_id)),
         relation_kind: Some("delegated".into()),
         evidence_kind: ThreadGroupEvidenceKind::SourceField,
         polarity: ThreadGroupPolarity::Supports,
@@ -1134,6 +1095,16 @@ fn observations_from_session(
         source_record_ref: "opencode:session.parent_id".to_string(),
         adapter_version: OPENCODE_ADAPTER_VERSION,
     }]
+}
+
+fn opencode_identity(native_id: &str) -> ThreadGroupSourceIdentity {
+    ThreadGroupSourceIdentity {
+        source: SOURCE_ID.into(),
+        native_kind: "session",
+        owner_scope: None,
+        identity_scope: ThreadGroupIdentityScope::Known(String::new()),
+        native_id: native_id.to_string(),
+    }
 }
 
 fn normalize_part(
@@ -3191,6 +3162,69 @@ mod tests {
     }
 
     #[test]
+    fn connection_and_transaction_since_filter_match_entity_boundaries() {
+        let file = NamedTempFile::new().unwrap();
+        let mut conn = Connection::open(file.path()).unwrap();
+        parent_chain_schema(&conn);
+
+        for (session_id, updated_at) in [
+            ("ses-session-at", 100),
+            ("ses-session-before", 99),
+            ("ses-message-at", 0),
+            ("ses-message-before", 0),
+            ("ses-part-at", 0),
+            ("ses-part-before", 0),
+        ] {
+            conn.execute(
+                "INSERT INTO session(id, time_created, time_updated) VALUES (?1, 0, ?2)",
+                rusqlite::params![session_id, updated_at],
+            )
+            .unwrap();
+        }
+        for (session_id, updated_at) in [("ses-message-at", 100), ("ses-message-before", 99)] {
+            conn.execute(
+                "INSERT INTO message(id, session_id, time_created, time_updated, data) VALUES (?1, ?2, 0, ?3, '{}')",
+                rusqlite::params![format!("msg-{session_id}"), session_id, updated_at],
+            )
+            .unwrap();
+        }
+        for (session_id, updated_at) in [("ses-part-at", 100), ("ses-part-before", 99)] {
+            conn.execute(
+                "INSERT INTO part(id, message_id, session_id, time_created, time_updated, data) VALUES (?1, 'msg-part', ?2, 0, ?3, '{}')",
+                rusqlite::params![format!("prt-{session_id}"), session_id, updated_at],
+            )
+            .unwrap();
+        }
+
+        let source = OpenCodeSource::new(args(file.path()), Some(100)).unwrap();
+        let expected = [
+            ("ses-session-at", true),
+            ("ses-session-before", false),
+            ("ses-message-at", true),
+            ("ses-message-before", false),
+            ("ses-part-at", true),
+            ("ses-part-before", false),
+        ];
+
+        for (session_id, expected_hit) in expected {
+            assert_eq!(
+                source.session_is_candidate(&conn, session_id).unwrap(),
+                expected_hit,
+                "Connection predicate for {session_id}"
+            );
+        }
+
+        let tx = conn.transaction().unwrap();
+        for (session_id, expected_hit) in expected {
+            assert_eq!(
+                source.session_is_candidate_tx(&tx, session_id).unwrap(),
+                expected_hit,
+                "Transaction predicate for {session_id}"
+            );
+        }
+    }
+
+    #[test]
     fn since_discovery_includes_older_parent_before_changed_child() {
         let file = NamedTempFile::new().unwrap();
         let conn = Connection::open(file.path()).unwrap();
@@ -3246,6 +3280,38 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["ses-child"]
         );
+    }
+
+    #[test]
+    fn standalone_session_since_filter_ignores_unrelated_changed_sessions() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = Connection::open(file.path()).unwrap();
+        parent_chain_schema(&conn);
+        insert_parent_chain_session(&conn, "ses-target", None, 1, 99, None);
+        insert_parent_chain_session(&conn, "ses-unrelated", None, 2, 100, None);
+        drop(conn);
+
+        let mut options = args(file.path());
+        options.session_id = Some("ses-target".to_string());
+        options.all_sessions = false;
+        let source = OpenCodeSource::new(options, Some(100)).unwrap();
+
+        let inputs = source.discover().unwrap();
+        assert_eq!(
+            inputs
+                .iter()
+                .map(|input| input.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ses-target"]
+        );
+        assert!(matches!(
+            source.read_session(&inputs[0], None).unwrap(),
+            ReadSessionOutcome::Skipped {
+                session_id_hint: Some(id),
+                ref reason,
+                ..
+            } if id == "ses-target" && reason == "unchanged since requested timestamp"
+        ));
     }
 
     #[test]
@@ -3374,6 +3440,17 @@ mod tests {
         );
         assert_eq!(session.thread_group_observations.len(), 1);
         let observation = &session.thread_group_observations[0];
+        assert_eq!(
+            session
+                .source_identity
+                .as_ref()
+                .map(|identity| identity.native_id.as_str()),
+            Some("ses-child")
+        );
+        assert_eq!(
+            observation.subject,
+            session.source_identity.clone().unwrap()
+        );
         assert_eq!(observation.confidence, ThreadGroupConfidence::Exact);
         assert_eq!(
             observation.evidence_kind,
@@ -3403,5 +3480,39 @@ mod tests {
     fn absent_or_empty_parent_id_emits_no_observation() {
         assert!(observations_from_session("ses-child", None).is_empty());
         assert!(observations_from_session("ses-child", Some("")).is_empty());
+    }
+
+    #[test]
+    fn root_session_has_identity_without_parent_observation() {
+        let session = SessionRow {
+            id: "ses-root".to_string(),
+            project_id: None,
+            directory: None,
+            title: None,
+            version: None,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            parent_id: None,
+            workspace_id: None,
+            path: None,
+            slug: None,
+            agent: None,
+            model: None,
+            archived_at_ms: None,
+        };
+
+        let canonical = build_session(&session, json!({}), &args(Path::new("/tmp"))).unwrap();
+
+        let identity = canonical
+            .source_identity
+            .expect("root OpenCode sessions still have source identity");
+        assert_eq!(identity.source, SOURCE_ID);
+        assert_eq!(identity.native_kind, "session");
+        assert_eq!(
+            identity.identity_scope,
+            ThreadGroupIdentityScope::Known(String::new())
+        );
+        assert_eq!(identity.native_id, "ses-root");
+        assert!(canonical.thread_group_observations.is_empty());
     }
 }

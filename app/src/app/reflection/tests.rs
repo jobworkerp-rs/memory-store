@@ -2076,7 +2076,39 @@ fn run_delete_removes_reflection() -> Result<()> {
             "the aggregate thread must expose the reflection message bounds before delete"
         );
 
+        use infra::infra::thread_group::group::{ThreadGroupRepository, ThreadGroupRepositoryImpl};
+        let group_repo = ThreadGroupRepositoryImpl::new(
+            infra::test_helper::shared_id_generator(),
+            pool,
+        );
+        let group_id = group_repo
+            .create_tx(pool, &infra::infra::thread_group::rows::NewThreadGroup {
+                group_canonical_key: format!("{:064}", 999_803),
+                title: Some("reflection-delete-test".into()),
+                status: infra::infra::thread_group::rows::values::group_status::ACTIVE.into(),
+                grouping_authority: infra::infra::thread_group::rows::values::grouping_authority::RECONCILER.into(),
+                redirect_to_group_id: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await?;
+        crate::app::thread_group::memory_relation::ThreadGroupMemoryRelationService::new(pool)
+            .link_existing(
+                group_id,
+                id.value,
+                "reflection",
+                crate::app::thread_group::memory_relation::GroupMemoryDeletePolicy::Retain,
+            )
+            .await?;
+
         app.delete(&id).await?;
+
+        assert!(
+            infra::infra::thread_group::memory_relation::ThreadGroupMemoryRelationRepositoryImpl::new(pool)
+                .list_by_memory_id(id.value)
+                .await?
+                .is_empty()
+        );
 
         // Post-condition: every owning table is empty for this id.
         assert!(

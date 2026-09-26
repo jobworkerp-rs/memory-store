@@ -153,6 +153,25 @@ const LIST_BY_SUBJECT_SQL: &str = concat!(
     " ORDER BY observed_at, id"
 );
 
+const LIST_PENDING_BY_CANDIDATE_PARENT_SQL: &str = concat!(
+    "SELECT ",
+    THREAD_OBSERVATION_COLUMNS!(),
+    " FROM thread_observation WHERE candidate_parent_present = TRUE \
+      AND candidate_parent_identity_scope_known = TRUE \
+      AND candidate_parent_owner_scope = ",
+    p!(1),
+    " AND candidate_parent_source = ",
+    p!(2),
+    " AND candidate_parent_identity_scope_value = ",
+    p!(3),
+    " AND candidate_parent_native_id = ",
+    p!(4),
+    " AND EXISTS (SELECT 1 FROM thread_group_candidate_association association \
+                  WHERE association.selected_observation_id = thread_observation.id \
+                    AND association.state = 'pending') \
+      ORDER BY observed_at, id"
+);
+
 const SET_STATE_SQL: &str = concat!(
     "UPDATE thread_observation SET state = ",
     p!(1),
@@ -363,6 +382,51 @@ pub trait ThreadObservationRepository: UseRdbPool + UseIdGenerator + Send + Sync
                 .bind(subject_identity_scope_value)
                 .bind(subject_native_id)
                 .fetch_all(self.db_pool())
+                .await
+                .map_err(LlmMemoryError::DBError)?,
+        )
+    }
+
+    async fn list_by_subject_tx<'c, E: Executor<'c, Database = Rdb>>(
+        &self,
+        tx: E,
+        subject_owner_scope: &str,
+        subject_source: &str,
+        subject_identity_scope_known: bool,
+        subject_identity_scope_value: &str,
+        subject_native_id: &str,
+    ) -> Result<Vec<ThreadObservationRow>> {
+        Ok(
+            sqlx::query_as::<Rdb, ThreadObservationRow>(LIST_BY_SUBJECT_SQL)
+                .bind(subject_owner_scope)
+                .bind(subject_source)
+                .bind(subject_identity_scope_known)
+                .bind(subject_identity_scope_value)
+                .bind(subject_native_id)
+                .fetch_all(tx)
+                .await
+                .map_err(LlmMemoryError::DBError)?,
+        )
+    }
+
+    /// Pending associations use the observation's candidate-parent identity
+    /// as their lookup key, so discovery only reads evidence for this exact
+    /// owner-local parent instead of loading the global pending queue.
+    async fn list_pending_by_candidate_parent_tx<'c, E: Executor<'c, Database = Rdb>>(
+        &self,
+        tx: E,
+        parent_owner_scope: &str,
+        parent_source: &str,
+        parent_identity_scope_value: &str,
+        parent_native_id: &str,
+    ) -> Result<Vec<ThreadObservationRow>> {
+        Ok(
+            sqlx::query_as::<Rdb, ThreadObservationRow>(LIST_PENDING_BY_CANDIDATE_PARENT_SQL)
+                .bind(parent_owner_scope)
+                .bind(parent_source)
+                .bind(parent_identity_scope_value)
+                .bind(parent_native_id)
+                .fetch_all(tx)
                 .await
                 .map_err(LlmMemoryError::DBError)?,
         )

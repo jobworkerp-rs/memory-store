@@ -474,6 +474,7 @@ fn build_canonical_session(
         source_labels: labels,
         source_metadata: serde_json::Value::Object(session_meta),
         thread_metadata: None,
+        source_identity: Some(codex_identity(session_id)),
         thread_group_observations: observations_from_session_meta(session_id, payload),
     }
 }
@@ -1929,6 +1930,22 @@ mod tests {
             r#"{"type":"session_meta","payload":{"id":"resume-1","thread_source":"user","source":"cli"}}"#,
         );
         assert!(session.thread_group_observations.is_empty());
+        assert_eq!(session.source_identity, Some(codex_identity("resume-1")));
+    }
+
+    #[test]
+    fn codex_child_identity_matches_its_observation_subject() {
+        let session = session_from_meta(
+            r#"{"type":"session_meta","payload":{"id":"child-identity","thread_source":"subagent","parent_thread_id":"parent-identity"}}"#,
+        );
+        assert_eq!(
+            session.source_identity,
+            Some(codex_identity("child-identity"))
+        );
+        assert_eq!(
+            session.thread_group_observations[0].subject,
+            codex_identity("child-identity")
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Common abstraction for source-specific importers.
 //!
-//! Each source (claude-code, codex, plain) implements `ChatSource` to
+//! Each source (OpenCode, claude-code, codex, plain) implements `ChatSource` to
 //! discover sessions and parse them into a uniform canonical
 //! representation. The shared importer (`crate::common::importer`)
 //! consumes `CanonicalSession` + `Vec<CanonicalEntry>` (legacy) or a
@@ -117,6 +117,9 @@ pub struct CanonicalSession {
     /// Optional initial Thread metadata. Existing sources leave this unset;
     /// OpenCode uses it for its allow-listed session snapshot.
     pub thread_metadata: Option<serde_json::Value>,
+    /// Adapter identity of this source-backed thread, independent of any
+    /// parent/relationship observations emitted for the session.
+    pub source_identity: Option<ThreadGroupSourceIdentity>,
     /// Source-independent ThreadGroup adapter output. The current importer
     /// preserves it until the atomic import boundary consumes it.
     pub thread_group_observations: Vec<ThreadGroupObservation>,

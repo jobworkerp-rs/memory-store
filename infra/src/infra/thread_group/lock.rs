@@ -35,6 +35,7 @@ use sqlx::Executor;
 /// advisory-lock key spaces even if a raw string ever collided.
 const IDENTITY_LOCK_NAMESPACE: &str = "thread_group_identity";
 const THREAD_KEY_LOCK_NAMESPACE: &str = "thread_group_canonical_key";
+const MEMBERSHIP_LOCK_NAMESPACE: &str = "thread_group_membership_mutation";
 
 #[cfg(feature = "postgres")]
 const LOCK_SQL: &str = concat!(
@@ -58,6 +59,15 @@ fn encode_lock_subject(namespace: &str, parts: &[&str]) -> String {
 
 #[async_trait]
 pub trait ThreadGroupLockRepository: UseRdbPool + Send + Sync {
+    /// Keep membership placement, empty-group redirects, and operator group
+    /// mutations in one transaction-scoped section across source identities.
+    async fn lock_group_membership_tx<'c, E: Executor<'c, Database = Rdb>>(
+        &self,
+        tx: E,
+    ) -> Result<()> {
+        acquire_lock(tx, encode_lock_subject(MEMBERSHIP_LOCK_NAMESPACE, &[])).await
+    }
+
     /// Serialize the owner-local source-identity exclusive section
     /// (delete / marker purge / override re-import share it, design
     /// 5.2). Must be called inside the transaction that performs the

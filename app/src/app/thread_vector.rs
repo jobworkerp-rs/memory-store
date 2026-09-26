@@ -1,4 +1,4 @@
-use crate::app::memory_vector::approximate_fetch_limit;
+use crate::app::memory_vector::{approximate_fetch_limit, orphan_index_ids};
 use anyhow::Result;
 use infra::error::LlmMemoryError;
 use infra::infra::memory_vector::repository::{AggregationStrategy, HybridOptions, HybridStrategy};
@@ -517,6 +517,20 @@ impl ThreadVectorAppImpl {
 
     // ===== Index management =====
 
+    /// List distinct LanceDB thread IDs that do not exist in the RDB.
+    /// This is a read-only global check; it does not delete index records.
+    pub async fn list_orphan_index_ids(&self) -> Result<Vec<i64>> {
+        let (lance_ids, rdb_ids) = self.load_reconciliation_ids().await?;
+        Ok(orphan_index_ids(&lance_ids, &rdb_ids))
+    }
+
+    async fn load_reconciliation_ids(&self) -> Result<(Vec<i64>, Vec<i64>)> {
+        tokio::try_join!(
+            self.vector_repo.get_all_thread_ids(),
+            self.thread_repo.find_all_thread_ids(),
+        )
+    }
+
     /// Reconcile LanceDB and RDB:
     /// - Remove orphaned LanceDB entries (in LanceDB but not in RDB)
     /// - Detect and report missing entries (in RDB but not in LanceDB)
@@ -530,8 +544,6 @@ impl ThreadVectorAppImpl {
     /// The `user_id` parameter is **deprecated and ignored** — rebuild always
     /// operates on the entire index. It is kept for proto backward compatibility.
     pub async fn rebuild_index(&self, user_id: Option<i64>) -> Result<(u32, u32, u32, i64)> {
-        use infra::infra::thread::rdb::ThreadRepository;
-
         if user_id.is_some() {
             tracing::warn!(
                 "rebuild_index: user_id parameter is deprecated and ignored; rebuild always operates globally"
@@ -541,23 +553,19 @@ impl ThreadVectorAppImpl {
         let start = std::time::Instant::now();
 
         // Bulk-fetch all IDs from both sides (no N+1)
-        let (lance_ids, rdb_ids) = tokio::try_join!(
-            self.vector_repo.get_all_thread_ids(),
-            self.thread_repo.find_all_thread_ids(),
-        )?;
+        let (lance_ids, rdb_ids) = self.load_reconciliation_ids().await?;
 
-        let lance_set: std::collections::HashSet<i64> = lance_ids.into_iter().collect();
-        let rdb_set: std::collections::HashSet<i64> = rdb_ids.into_iter().collect();
+        let lance_set: std::collections::HashSet<i64> = lance_ids.iter().copied().collect();
 
         // Orphans: in LanceDB but not in RDB
-        let orphan_ids: Vec<i64> = lance_set.difference(&rdb_set).copied().collect();
+        let orphan_ids = orphan_index_ids(&lance_ids, &rdb_ids);
         let orphan_count = orphan_ids.len() as u32;
         for tid in &orphan_ids {
             self.vector_repo.delete(*tid).await?;
         }
 
         // Missing: in RDB but not in LanceDB
-        let missing_ids: Vec<i64> = rdb_set.difference(&lance_set).copied().collect();
+        let missing_ids = orphan_index_ids(&rdb_ids, &lance_ids);
         let missing_count = missing_ids.len() as u32;
         for tid in &missing_ids {
             tracing::info!(
@@ -758,4 +766,149 @@ fn aggregate_thread_scores(
     });
     merged.truncate(limit);
     merged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use infra::infra::memory_vector::config::{DistanceType, FtsConfig, VectorIndexConfig};
+    use infra::infra::thread::rdb::{ThreadRepository, ThreadRepositoryImpl};
+    use infra::infra::thread_label::rdb::ThreadLabelRepositoryImpl;
+    use infra::infra::thread_vector::config::ThreadVectorDBConfig;
+    use infra::infra::thread_vector::record::ThreadVectorRecord;
+    use infra::infra::thread_vector::repository::ThreadVectorRepositoryImpl;
+    use infra_utils::infra::test::{TEST_RUNTIME, setup_test_rdb_from};
+    use protobuf::llm_memory::data::{MemoryKind, ThreadData, UserId};
+
+    struct TestDb {
+        path: String,
+    }
+
+    impl TestDb {
+        fn create(dim: usize) -> anyhow::Result<(ThreadVectorDBConfig, Self)> {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos();
+            let path = format!("/tmp/test_thread_vector_app_lancedb_{ts}");
+            Ok((
+                ThreadVectorDBConfig {
+                    uri: path.clone(),
+                    table_name: "test_threads".to_string(),
+                    vector_size: dim,
+                    distance_type: DistanceType::Cosine,
+                    fts: FtsConfig::default(),
+                    vector_index: VectorIndexConfig::default(),
+                },
+                Self { path },
+            ))
+        }
+    }
+
+    impl Drop for TestDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    async fn setup_app(
+        dim: usize,
+    ) -> anyhow::Result<(ThreadVectorAppImpl, i64, ThreadData, TestDb)> {
+        let pool = if cfg!(feature = "postgres") {
+            let pool = setup_test_rdb_from("../infra/sql/postgres").await;
+            sqlx::query("TRUNCATE TABLE memory, thread, thread_memory, thread_label CASCADE;")
+                .execute(pool)
+                .await?;
+            pool
+        } else {
+            let pool = setup_test_rdb_from("../infra/sql/sqlite").await;
+            for table in ["thread_memory", "thread_label", "thread", "memory"] {
+                sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table}")))
+                    .execute(pool)
+                    .await?;
+            }
+            pool
+        };
+
+        let thread_repo =
+            ThreadRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let data = ThreadData {
+            default_system_memory_id: None,
+            user_id: Some(UserId { value: 10 }),
+            description: Some("authoritative thread".to_string()),
+            channel: None,
+            embedding: None,
+            embedding_dim: None,
+            created_at: 1,
+            updated_at: 1,
+            labels: Vec::new(),
+            memory_kind: MemoryKind::Raw as i32,
+            metadata: None,
+            first_message_at: None,
+            last_message_at: None,
+        };
+        let mut tx = pool.begin().await?;
+        let live_id = thread_repo.create(&mut *tx, &data).await?.value;
+        tx.commit().await?;
+
+        let (config, db) = TestDb::create(dim)?;
+        let vector_repo = ThreadVectorRepositoryImpl::new(config).await?;
+        let app = ThreadVectorAppImpl::new(
+            thread_repo,
+            ThreadLabelRepositoryImpl::new(pool),
+            vector_repo,
+            None,
+        );
+        Ok((app, live_id, data, db))
+    }
+
+    #[test]
+    fn list_orphan_ids_are_sorted_distinct_and_read_only() -> anyhow::Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let dim = 2;
+            let (app, live_id, data, _db) = setup_app(dim).await?;
+            assert!(app.list_orphan_index_ids().await?.is_empty());
+
+            let embedding = [0.1, 0.2];
+            let live_record = ThreadVectorRecord::from_thread_data(
+                live_id,
+                &data,
+                Vec::new(),
+                &embedding,
+                Some("test"),
+            );
+            let orphan_a = i64::MAX - 2;
+            let orphan_b = i64::MAX - 1;
+            let orphan_a_record = ThreadVectorRecord::from_thread_data(
+                orphan_a,
+                &data,
+                Vec::new(),
+                &embedding,
+                Some("test"),
+            );
+            let mut orphan_a_second_chunk = orphan_a_record.clone();
+            orphan_a_second_chunk.chunk_index = 1;
+            let orphan_b_record = ThreadVectorRecord::from_thread_data(
+                orphan_b,
+                &data,
+                Vec::new(),
+                &embedding,
+                Some("test"),
+            );
+            app.vector_repo
+                .batch_upsert(vec![
+                    orphan_b_record,
+                    live_record,
+                    orphan_a_second_chunk,
+                    orphan_a_record,
+                ])
+                .await?;
+
+            assert_eq!(app.list_orphan_index_ids().await?, vec![orphan_a, orphan_b]);
+            let index_ids = app.vector_repo.get_all_thread_ids().await?;
+            assert!(index_ids.contains(&live_id));
+            assert_eq!(index_ids.iter().filter(|id| **id == orphan_a).count(), 2);
+            assert!(index_ids.contains(&orphan_b));
+            Ok(())
+        })
+    }
 }

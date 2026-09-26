@@ -421,6 +421,11 @@ pub trait ThreadApp:
         validate_metadata(thread.metadata.as_deref())?;
         let db = self.thread_repository().db_pool();
         let mut tx = db.begin().await.map_err(LlmMemoryError::DBError)?;
+        super::thread_group::memory_relation::lock_group_mutations_tx(
+            &mut tx,
+            self.thread_repository().static_pool(),
+        )
+        .await?;
         lock_default_system_memory_scope_tx(&mut tx, thread.default_system_memory_id).await?;
         // Phase 2: validate / normalise default_system_memory_id (must be a
         // ROLE_SYSTEM Memory, or NULL/Some(0)).
@@ -506,6 +511,11 @@ pub trait ThreadApp:
             validate_metadata(w.metadata.as_deref())?;
             let pool = self.thread_repository().db_pool();
             let mut tx = pool.begin().await.map_err(LlmMemoryError::DBError)?;
+            super::thread_group::memory_relation::lock_group_mutations_tx(
+                &mut tx,
+                self.thread_repository().static_pool(),
+            )
+            .await?;
             lock_default_system_memory_scope_tx(&mut tx, w.default_system_memory_id).await?;
 
             // Reject user_id changes. This service treats `thread.user_id`
@@ -681,6 +691,12 @@ pub trait ThreadApp:
         tx: &mut sqlx::Transaction<'_, infra_utils::infra::rdb::Rdb>,
         id: &ThreadId,
     ) -> Result<DeleteThreadTxOutcome> {
+        use infra::infra::thread_group::lock::ThreadGroupLockRepository;
+        infra::infra::thread_group::lock::ThreadGroupLockRepositoryImpl::new(
+            self.thread_repository().static_pool(),
+        )
+        .lock_group_membership_tx(&mut **tx)
+        .await?;
         // 0. Lock the thread row first. On PostgreSQL this is a row-level
         //    FOR UPDATE lock that blocks concurrent add_memory from
         //    reading and inserting into a thread that is about to be
@@ -729,7 +745,14 @@ pub trait ThreadApp:
             .memory_repository()
             .delete_orphaned_by_ids_tx(&mut *tx, &candidate_ids)
             .await?;
+        let group_memory_relations =
+            infra::infra::thread_group::memory_relation::ThreadGroupMemoryRelationRepositoryImpl::new(
+                self.thread_repository().static_pool(),
+            );
         for mid in &exclusive_ids {
+            group_memory_relations
+                .delete_by_memory_id_tx(&mut **tx, *mid)
+                .await?;
             self.memory_rating_repository()
                 .delete_by_memory_id_tx(&mut **tx, *mid)
                 .await?;
@@ -973,6 +996,11 @@ pub trait ThreadApp:
         let pool = self.thread_repository().db_pool();
         let now = command_utils::util::datetime::now_millis();
         let mut tx = pool.begin().await.map_err(LlmMemoryError::DBError)?;
+        super::thread_group::memory_relation::lock_group_mutations_tx(
+            &mut tx,
+            self.thread_repository().static_pool(),
+        )
+        .await?;
 
         self.add_labels_core_tx(&mut tx, thread_id, &validated, now)
             .await?;
@@ -1002,6 +1030,11 @@ pub trait ThreadApp:
         let pool = self.thread_repository().db_pool();
         let now = command_utils::util::datetime::now_millis();
         let mut tx = pool.begin().await.map_err(LlmMemoryError::DBError)?;
+        super::thread_group::memory_relation::lock_group_mutations_tx(
+            &mut tx,
+            self.thread_repository().static_pool(),
+        )
+        .await?;
 
         self.add_labels_core_tx(&mut tx, thread_id, &validated, now)
             .await?;
@@ -1031,6 +1064,11 @@ pub trait ThreadApp:
         let trimmed: Vec<String> = labels.iter().map(|l| l.trim().to_string()).collect();
         let pool = self.thread_repository().db_pool();
         let mut tx = pool.begin().await.map_err(LlmMemoryError::DBError)?;
+        super::thread_group::memory_relation::lock_group_mutations_tx(
+            &mut tx,
+            self.thread_repository().static_pool(),
+        )
+        .await?;
 
         // Lock thread row — prevents concurrent deletion
         let _thread = self
@@ -1503,6 +1541,11 @@ pub trait ThreadApp:
     ) -> Result<UpdateMemoryParentsOutcome> {
         let pool = self.thread_repository().db_pool();
         let mut tx = pool.begin().await.map_err(LlmMemoryError::DBError)?;
+        super::thread_group::memory_relation::lock_group_mutations_tx(
+            &mut tx,
+            self.thread_repository().static_pool(),
+        )
+        .await?;
 
         // Lock thread row
         let _thread = self
@@ -2140,12 +2183,84 @@ impl ThreadAppImpl {
         memory: &MemoryData,
         dispatch_embedding: bool,
         operation: &str,
+        group_relation: Option<(
+            i64,
+            &str,
+            super::thread_group::memory_relation::GroupMemoryDeletePolicy,
+        )>,
     ) -> Result<MemoryId> {
         let pool = self.thread_repository().db_pool();
         let mut tx = pool.begin().await.map_err(LlmMemoryError::DBError)?;
+        super::thread_group::memory_relation::lock_group_mutations_tx(
+            &mut tx,
+            self.thread_repository().static_pool(),
+        )
+        .await?;
+        if let Some((group_id, purpose, _)) = group_relation {
+            crate::app::thread_group::ensure_thread_group_writes()?;
+            if purpose.is_empty() {
+                anyhow::bail!("group memory relationship purpose must not be empty");
+            }
+            if let Some(external_id) = memory.external_id.as_deref()
+                && external_id
+                    .starts_with(crate::app::thread_group::THREAD_GROUP_SUMMARY_EXTERNAL_ID_PREFIX)
+                && external_id
+                    != crate::app::thread_group::thread_group_summary_external_id(group_id)
+            {
+                anyhow::bail!("group memory relationship does not match legacy external ID");
+            }
+            use infra::infra::thread_group::lock::ThreadGroupLockRepository;
+            infra::infra::thread_group::lock::ThreadGroupLockRepositoryImpl::new(
+                self.thread_repository().static_pool(),
+            )
+            .lock_group_membership_tx(&mut *tx)
+            .await?;
+            use infra::infra::thread_group::group::ThreadGroupRepository;
+            if infra::infra::thread_group::group::ThreadGroupRepositoryImpl::new(
+                infra::infra::IdGeneratorWrapper::new(),
+                self.thread_repository().static_pool(),
+            )
+            .find_by_id_tx(&mut *tx, group_id)
+            .await?
+            .is_none()
+            {
+                anyhow::bail!("thread group {group_id} not found");
+            }
+        }
+        super::thread_group::memory_relation::validate_legacy_summary_target_tx(
+            &mut tx,
+            self.thread_repository().static_pool(),
+            memory.external_id.as_deref(),
+            memory.memory_kind,
+        )
+        .await?;
         let (memory_id, stored_memory, now, media) = self
             .add_memory_core_tx(&mut tx, thread_id, memory, false)
             .await?;
+        if let Some((group_id, purpose, policy)) = group_relation {
+            if policy == super::thread_group::memory_relation::GroupMemoryDeletePolicy::Delete {
+                super::thread_group::memory_relation::validate_delete_target_tx(
+                    &mut tx,
+                    self.thread_repository().static_pool(),
+                    group_id,
+                    memory_id.value,
+                    purpose,
+                )
+                .await?;
+            }
+            infra::infra::thread_group::memory_relation::ThreadGroupMemoryRelationRepositoryImpl::new(
+                self.thread_repository().static_pool(),
+            )
+            .insert_tx(
+                &mut *tx,
+                group_id,
+                memory_id.value,
+                purpose,
+                policy.as_str(),
+                now,
+            )
+            .await?;
+        }
 
         self.thread_repository()
             .refresh_message_bounds_tx(&mut tx, thread_id, now)
@@ -2158,6 +2273,24 @@ impl ThreadAppImpl {
             self.dispatch_embedding_if_enabled(&memory_id, &stored_memory, media);
         }
         Ok(memory_id)
+    }
+
+    pub async fn add_memory_with_group_relation(
+        &self,
+        thread_id: &ThreadId,
+        memory: &MemoryData,
+        group_id: i64,
+        purpose: &str,
+        policy: super::thread_group::memory_relation::GroupMemoryDeletePolicy,
+    ) -> Result<MemoryId> {
+        self.add_memory_with_membership_refresh(
+            thread_id,
+            memory,
+            true,
+            "add_memory_with_group_relation",
+            Some((group_id, purpose, policy)),
+        )
+        .await
     }
 }
 
@@ -2221,7 +2354,7 @@ impl ThreadApp for ThreadAppImpl {
     }
 
     async fn add_memory(&self, thread_id: &ThreadId, memory: &MemoryData) -> Result<MemoryId> {
-        self.add_memory_with_membership_refresh(thread_id, memory, true, "add_memory")
+        self.add_memory_with_membership_refresh(thread_id, memory, true, "add_memory", None)
             .await
     }
 
@@ -2231,7 +2364,7 @@ impl ThreadApp for ThreadAppImpl {
     /// Embedding dispatch is intentionally skipped; use `redispatch_embeddings`
     /// after bulk import completes.
     async fn add_memory_only(&self, thread_id: &ThreadId, memory: &MemoryData) -> Result<MemoryId> {
-        self.add_memory_with_membership_refresh(thread_id, memory, false, "add_memory_only")
+        self.add_memory_with_membership_refresh(thread_id, memory, false, "add_memory_only", None)
             .await
     }
 
@@ -2289,6 +2422,7 @@ impl ThreadApp for ThreadAppImpl {
         // ----- Phase 1: transaction begin + thread resolution -----
         let pool = self.thread_repository().static_pool();
         let mut tx = pool.begin().await.map_err(LlmMemoryError::DBError)?;
+        super::thread_group::memory_relation::lock_group_mutations_tx(&mut tx, pool).await?;
 
         // ----- Phase 1 (cont.): design 8.2 suppression gate. Runs in the
         // same transaction as the content write, before any row is
@@ -2331,6 +2465,21 @@ impl ThreadApp for ThreadAppImpl {
             if marker.is_some() && decision != SuppressionDecision::Suppress {
                 marker_repo.consume_tx(&mut *tx, key).await?;
             }
+        }
+        if marker_key.is_some() && crate::app::thread_group::thread_group_writes_enabled() {
+            ThreadGroupLockRepositoryImpl::new(pool)
+                .lock_group_membership_tx(&mut *tx)
+                .await?;
+        }
+
+        for item in &memories {
+            super::thread_group::memory_relation::validate_legacy_summary_target_tx(
+                &mut tx,
+                pool,
+                item.memory.external_id.as_deref(),
+                item.memory.memory_kind,
+            )
+            .await?;
         }
 
         let (thread_id, thread_created, _target_user_id, target_memory_kind) = match thread_target {
@@ -3006,6 +3155,7 @@ impl ThreadAppImpl {
             pending.sort();
             pending.dedup();
         }
+        locks.lock_group_membership_tx(&mut *tx).await?;
 
         // Authoritative in-transaction state, read only after the locks
         // are held.

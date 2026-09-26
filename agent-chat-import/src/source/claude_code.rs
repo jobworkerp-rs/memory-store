@@ -1588,6 +1588,11 @@ fn build_canonical_session(info: &SessionInfo, args: &ClaudeCodeArgs) -> Canonic
         source_labels: labels,
         source_metadata: serde_json::Value::Object(session_meta),
         thread_metadata: None,
+        source_identity: Some(claude_identity(
+            info.project_hash.as_deref(),
+            "session",
+            info.session_id.clone(),
+        )),
         thread_group_observations: Vec::new(),
     }
 }
@@ -1825,6 +1830,34 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    #[test]
+    fn claude_root_has_identity_without_parent_observation() {
+        let info = session_info(Some("proj-key"));
+        let session = build_canonical_session(&info, &args_with_file(PathBuf::from("/dev/null")));
+        assert!(main_session_observations(&info, &[]).is_empty());
+        assert_eq!(
+            session.source_identity,
+            Some(claude_identity(
+                Some("proj-key"),
+                "session",
+                "sess-1".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn claude_unknown_project_identity_does_not_guess_a_scope() {
+        let info = session_info(None);
+        let session = build_canonical_session(&info, &args_with_file(PathBuf::from("/dev/null")));
+        assert_eq!(
+            session
+                .source_identity
+                .as_ref()
+                .map(|identity| &identity.identity_scope),
+            Some(&ThreadGroupIdentityScope::Unknown)
+        );
     }
 
     #[test]

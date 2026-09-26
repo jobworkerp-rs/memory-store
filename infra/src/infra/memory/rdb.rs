@@ -373,6 +373,53 @@ pub trait MemoryRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         Ok(del)
     }
 
+    /// Parent references are JSON arrays without a reverse index; purge is
+    /// infrequent and must inspect the authoritative rows, not infer from
+    /// thread junctions alone.
+    async fn find_referring_memory_ids_tx<'c, E: Executor<'c, Database = Rdb>>(
+        &self,
+        tx: E,
+        memory_id: i64,
+    ) -> Result<Vec<i64>> {
+        Ok(self
+            .find_referring_memory_ids_for_targets_tx(tx, &[memory_id])
+            .await?
+            .remove(&memory_id)
+            .unwrap_or_default())
+    }
+
+    /// Collect parent references for multiple targets in a single table scan.
+    /// An absent key means no other Memory references that target.
+    async fn find_referring_memory_ids_for_targets_tx<'c, E: Executor<'c, Database = Rdb>>(
+        &self,
+        tx: E,
+        target_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, Vec<i64>>> {
+        let targets: std::collections::HashSet<i64> = target_ids.iter().copied().collect();
+        if targets.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows: Vec<(i64, Option<sqlx::types::Json<Vec<i64>>>)> =
+            sqlx::query_as("SELECT id, parent_ids FROM memory ORDER BY id")
+                .fetch_all(tx)
+                .await?;
+        let mut referring = std::collections::HashMap::<i64, Vec<i64>>::new();
+        for (source_id, parents) in rows {
+            let mut matched = std::collections::HashSet::new();
+            if let Some(parents) = parents {
+                for target_id in parents.0 {
+                    if target_id != source_id
+                        && targets.contains(&target_id)
+                        && matched.insert(target_id)
+                    {
+                        referring.entry(target_id).or_default().push(source_id);
+                    }
+                }
+            }
+        }
+        Ok(referring)
+    }
+
     async fn fill_thread_ids(&self, memories: &mut [Memory]) -> Result<()> {
         if memories.is_empty() {
             return Ok(());
@@ -1627,14 +1674,18 @@ fn build_memory_condition_sql(
     }
     if let Some(prefix) = external_id_prefix {
         // LIKE prefix match with `\` `%` `_` escaped so callers can pass
-        // arbitrary delimiters (e.g. `under_score:`). `ESCAPE '\\'` is
-        // honoured by both SQLite and PostgreSQL.
+        // arbitrary delimiters. The SUBSTR equality also enforces the same
+        // case-sensitive prefix semantics on SQLite and PostgreSQL.
         let ph = crate::sql::build_in_placeholders(1, binds.len() + 1);
-        clauses.push(format!("{external_id_col} LIKE {ph} ESCAPE '\\'"));
+        let exact_ph = crate::sql::build_in_placeholders(1, binds.len() + 2);
+        let comparison_ph = crate::sql::build_in_placeholders(1, binds.len() + 3);
+        clauses.push(format!("{external_id_col} LIKE {ph} ESCAPE '\\' AND SUBSTR({external_id_col}, 1, LENGTH({exact_ph})) = {comparison_ph}"));
         binds.push(ConditionBind::Str(format!(
             "{}%",
             crate::sql::escape_like(prefix)
         )));
+        binds.push(ConditionBind::Str(prefix.to_string()));
+        binds.push(ConditionBind::Str(prefix.to_string()));
     }
     append_timestamp_range_clauses(
         &mut clauses,
@@ -3184,11 +3235,14 @@ mod test {
         // leak rows into other tests.
         let seed = [
             "obsidian:s1:abc",
+            "Obsidian:s1:case-different",
             "obsidian:s2:def",
             "obsidian-private:s1:ghi",
             "under_score:s1:jkl",     // metachar literal
             "under_scoreX:s1:mno",    // would falsely match without escape
             "with\\backslash:s1:pqr", // backslash literal
+            "percent%:s1:pqr",
+            "percentX:s1:mno",
         ];
         let mut tx = db.begin().await.context("begin seed")?;
         for (i, eid) in seed.iter().enumerate() {
@@ -3309,6 +3363,30 @@ mod test {
                 .collect::<std::collections::HashSet<String>>()
         );
 
+        let by_percent = repository
+            .find_list_by_condition(
+                None,
+                None,
+                &[],
+                &[],
+                Some(user_id.value),
+                None,
+                UpdatedAtRange::default(),
+                CreatedAtRange::default(),
+                None,
+                Some("percent%:"),
+                None,
+                MemorySort::default(),
+                false,
+            )
+            .await?;
+        assert_eq!(
+            collect_eids(by_percent),
+            ["percent%:s1:pqr".to_string()]
+                .into_iter()
+                .collect::<std::collections::HashSet<String>>()
+        );
+
         // Cleanup
         sqlx::query(concat!("DELETE FROM memory WHERE user_id = ", p!(1)))
             .bind(user_id.value)
@@ -3324,6 +3402,51 @@ mod test {
         TEST_RUNTIME.block_on(async {
             let rdb_pool = setup_pool().await;
             _test_external_id_prefix_filter(rdb_pool).await
+        })
+    }
+
+    #[test]
+    fn parent_reference_batch_preserves_targets_self_exclusion_and_nullable_rows() -> Result<()> {
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_pool().await;
+            let repository =
+                MemoryRepositoryImpl::new(crate::test_helper::shared_id_generator(), pool);
+            let mut tx = pool.begin().await?;
+            let data = MemoryData {
+                user_id: Some(UserId { value: 9_558_002 }),
+                content: "reference test".into(),
+                ..Default::default()
+            };
+            let first = repository.create(&mut *tx, &data).await?;
+            let second = repository.create(&mut *tx, &data).await?;
+            let other = repository.create(&mut *tx, &data).await?;
+            repository
+                .update_parent_ids(&mut *tx, &other, &[first, second, first])
+                .await?;
+            repository
+                .update_parent_ids(&mut *tx, &first, &[first])
+                .await?;
+            sqlx::query(concat!(
+                "UPDATE memory SET parent_ids = NULL WHERE id = ",
+                p!(1)
+            ))
+            .bind(second.value)
+            .execute(&mut *tx)
+            .await?;
+            let refs = repository
+                .find_referring_memory_ids_for_targets_tx(&mut *tx, &[first.value, second.value])
+                .await?;
+            assert_eq!(refs.get(&first.value), Some(&vec![other.value]));
+            assert_eq!(refs.get(&second.value), Some(&vec![other.value]));
+            assert!(
+                repository
+                    .find_referring_memory_ids_for_targets_tx(&mut *tx, &[])
+                    .await?
+                    .is_empty()
+            );
+            tx.rollback().await?;
+            Ok(())
         })
     }
 

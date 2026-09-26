@@ -194,8 +194,9 @@ pub async fn create_server(
     let thread_vector_app_arc: Option<
         std::sync::Arc<app::app::thread_vector::ThreadVectorAppImpl>,
     > = app_module.thread_vector_app.take();
+    let memory_app_arc = std::sync::Arc::new(app_module.memory_app);
     let memory = MemoryGrpcImpl::new(
-        app_module.memory_app,
+        memory_app_arc.clone(),
         vector_app_arc.clone(),
         Some(media_app_arc.clone()),
     );
@@ -242,6 +243,7 @@ pub async fn create_server(
         .add_service(
             ThreadGroupServiceServer::new(
                 ThreadGroupGrpcImpl::new(thread_group_pool)
+                    .with_memory_app(memory_app_arc)
                     .with_search_apps(vector_app_arc.clone(), thread_vector_app_arc.clone()),
             )
             .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)

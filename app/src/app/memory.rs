@@ -65,6 +65,13 @@ pub struct MemoryListCondition {
     pub sort: MemorySort,
 }
 
+/// RDB deletion effects that must be finalized only after the caller commits.
+pub struct MemoryDeletion {
+    pub deleted: bool,
+    affected_thread_ids: Vec<i64>,
+    post_delete: Option<(i64, MediaObjectRow)>,
+}
+
 #[async_trait]
 pub trait MemoryApp:
     UseMemoryRepository
@@ -102,7 +109,24 @@ pub trait MemoryApp:
     async fn delete_memory(&self, id: &MemoryId) -> Result<bool> {
         let db = self.memory_repository().db_pool();
         let mut tx = db.begin().await.map_err(LlmMemoryError::DBError)?;
-        super::thread::lock_default_system_memory_scope_tx(&mut tx, Some(id.value)).await?;
+        let effects = self.delete_memory_rdb_tx(&mut tx, id).await?;
+        tx.commit().await.map_err(LlmMemoryError::DBError)?;
+        let deleted = effects.deleted;
+        self.finish_memory_deletion(id, effects).await;
+        Ok(deleted)
+    }
+
+    async fn delete_memory_rdb_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, infra_utils::infra::rdb::Rdb>,
+        id: &MemoryId,
+    ) -> Result<MemoryDeletion> {
+        let static_db = self.thread_repository().static_pool();
+        use infra::infra::thread_group::lock::ThreadGroupLockRepository;
+        infra::infra::thread_group::lock::ThreadGroupLockRepositoryImpl::new(static_db)
+            .lock_group_membership_tx(&mut **tx)
+            .await?;
+        super::thread::lock_default_system_memory_scope_tx(tx, Some(id.value)).await?;
         // Lock the referencing thread rows before the memory row so that the
         // row-lock order matches `update_thread` (`thread` -> `memory`) on
         // PostgreSQL. The advisory lock taken above prevents another
@@ -110,18 +134,18 @@ pub trait MemoryApp:
         // delete is in flight, so the locked id list is complete.
         let mut affected_thread_ids = self
             .thread_repository()
-            .find_thread_ids_by_default_system_memory_for_update_tx(&mut *tx, id.value)
+            .find_thread_ids_by_default_system_memory_for_update_tx(&mut **tx, id.value)
             .await?;
         let membership_thread_ids = self
             .thread_memory_repository()
-            .find_all_threads_by_memory_tx(&mut *tx, id.value)
+            .find_all_threads_by_memory_tx(&mut **tx, id.value)
             .await?;
         affected_thread_ids.extend(membership_thread_ids);
         affected_thread_ids.sort_unstable();
         affected_thread_ids.dedup();
         for thread_id in &affected_thread_ids {
             self.thread_repository()
-                .find_row_for_update_tx(&mut *tx, &ThreadId { value: *thread_id })
+                .find_row_for_update_tx(&mut **tx, &ThreadId { value: *thread_id })
                 .await?;
         }
         // With the thread rows fixed, locking the memory row now serializes
@@ -129,12 +153,18 @@ pub trait MemoryApp:
         // default candidate.
         let locked = self
             .memory_repository()
-            .find_by_ids_for_update_tx(&mut tx, &[id.value])
+            .find_by_ids_for_update_tx(tx, &[id.value])
             .await?;
         if locked.is_empty() {
             // Already deleted or never existed — nothing to do.
-            tx.commit().await.map_err(LlmMemoryError::DBError)?;
-            return Ok(false);
+            infra::infra::thread_group::memory_relation::ThreadGroupMemoryRelationRepositoryImpl::new(static_db)
+                .delete_by_memory_id_tx(&mut **tx, id.value)
+                .await?;
+            return Ok(MemoryDeletion {
+                deleted: false,
+                affected_thread_ids: Vec::new(),
+                post_delete: None,
+            });
         }
         // The media_object this memory referenced (image memory feature).
         // Taken from the row-locked pre-delete row.
@@ -149,17 +179,17 @@ pub trait MemoryApp:
         // Clearing the default is safe: affected threads will simply have no
         // default system prompt until one is reassigned.
         self.thread_repository()
-            .clear_default_system_memory_tx(&mut *tx, id.value)
+            .clear_default_system_memory_tx(&mut **tx, id.value)
             .await?;
         self.memory_rating_repository()
-            .delete_by_memory_id_tx(&mut *tx, id.value)
+            .delete_by_memory_id_tx(&mut **tx, id.value)
             .await?;
         self.thread_memory_repository()
-            .delete_by_memory_tx(&mut *tx, id.value)
+            .delete_by_memory_tx(&mut **tx, id.value)
             .await?;
         let now = command_utils::util::datetime::now_millis();
         self.thread_repository()
-            .refresh_message_bounds_for_thread_ids_tx(&mut tx, &affected_thread_ids, now)
+            .refresh_message_bounds_for_thread_ids_tx(tx, &affected_thread_ids, now)
             .await?;
         // media_object ref_count decrement in the SAME tx (design 2/3
         // §7.5.4). The claim winner runs the storage->DB delete after
@@ -168,24 +198,36 @@ pub trait MemoryApp:
         let mut post_delete: Option<(i64, MediaObjectRow)> = None;
         if let (Some(moid), Some(media)) = (media_object_id, self.media_subsystem()) {
             // Primary defense: row-lock the media_object (design §6.3).
-            media
-                .repository
-                .find_by_id_for_update_tx(&mut tx, moid)
-                .await?;
-            post_delete = decr_and_maybe_claim(&media.repository, &mut tx, moid).await?;
+            media.repository.find_by_id_for_update_tx(tx, moid).await?;
+            post_delete = decr_and_maybe_claim(&media.repository, tx, moid).await?;
         }
-        let deleted = self.memory_repository().delete_tx(&mut *tx, id).await?;
-        tx.commit().await.map_err(LlmMemoryError::DBError)?;
+        infra::infra::thread_group::memory_relation::ThreadGroupMemoryRelationRepositoryImpl::new(
+            static_db,
+        )
+        .delete_by_memory_id_tx(&mut **tx, id.value)
+        .await?;
+        let deleted = self.memory_repository().delete_tx(&mut **tx, id).await?;
+        Ok(MemoryDeletion {
+            deleted,
+            affected_thread_ids,
+            post_delete,
+        })
+    }
+
+    async fn finish_memory_deletion(&self, id: &MemoryId, effects: MemoryDeletion) {
+        if !effects.deleted {
+            return;
+        }
         // Post-commit: claim winner runs storage->DB delete (best-effort;
         // finish_delete marks 5->2 on failure and the GC retries).
-        if let (Some((moid, row)), Some(media)) = (post_delete, self.media_subsystem()) {
+        if let (Some((moid, row)), Some(media)) = (effects.post_delete, self.media_subsystem()) {
             let _ = media.finalizer.finish_delete(moid, &row).await;
         }
         // Rating cache entries (keyed by rating_id) are not cleared here because
         // this app has no access to the rating cache; 60s TTL provides acceptable staleness.
         let k = Arc::new(Self::find_cache_key(&id.value));
         let _ = self.delete_cache(&k).await;
-        for thread_id in affected_thread_ids {
+        for thread_id in effects.affected_thread_ids {
             let _ = self.delete_thread_cache_by_id(thread_id).await;
             if let Some(tva) = self.thread_vector_app()
                 && let Err(e) = tva.sync_thread_scalars(thread_id).await
@@ -193,7 +235,6 @@ pub trait MemoryApp:
                 tracing::warn!("sync_thread_scalars after delete_memory failed: {e}");
             }
         }
-        Ok(deleted)
     }
 
     /// Atomically replace ONLY `content` (+ updated_at) and invalidate
@@ -205,6 +246,12 @@ pub trait MemoryApp:
     async fn update_content_no_dispatch(&self, id: &MemoryId, content: &str) -> Result<bool> {
         let pool = self.memory_repository().db_pool();
         let mut tx = pool.begin().await.map_err(LlmMemoryError::DBError)?;
+        use infra::infra::thread_group::lock::ThreadGroupLockRepository;
+        infra::infra::thread_group::lock::ThreadGroupLockRepositoryImpl::new(
+            self.thread_repository().static_pool(),
+        )
+        .lock_group_membership_tx(&mut *tx)
+        .await?;
         let ok = self
             .memory_repository()
             .update_content_only(&mut *tx, id, content)
@@ -725,6 +772,18 @@ impl MemoryApp for MemoryAppImpl {
         )?;
         let db = self.memory_repository().db_pool();
         let mut tx = db.begin().await.map_err(LlmMemoryError::DBError)?;
+        super::thread_group::memory_relation::lock_group_mutations_tx(
+            &mut tx,
+            self.thread_repository().static_pool(),
+        )
+        .await?;
+        super::thread_group::memory_relation::validate_legacy_summary_target_tx(
+            &mut tx,
+            self.thread_repository().static_pool(),
+            memory.external_id.as_deref(),
+            memory.memory_kind,
+        )
+        .await?;
 
         // The locked media_object's kind/backend, carried out of the tx
         // so the post-commit dispatch can pick the embedding axis without
@@ -770,6 +829,12 @@ impl MemoryApp for MemoryAppImpl {
         };
         let pool = self.memory_repository().db_pool();
         let mut tx = pool.begin().await.map_err(LlmMemoryError::DBError)?;
+        use infra::infra::thread_group::lock::ThreadGroupLockRepository;
+        infra::infra::thread_group::lock::ThreadGroupLockRepositoryImpl::new(
+            self.thread_repository().static_pool(),
+        )
+        .lock_group_membership_tx(&mut *tx)
+        .await?;
         let existing = self
             .memory_repository()
             .find_by_ids_for_update_tx(&mut tx, &[id.value])
@@ -791,6 +856,13 @@ impl MemoryApp for MemoryAppImpl {
             stored.memory_kind,
             "MemoryService.UpdateMemory",
         )?;
+        super::thread_group::memory_relation::validate_legacy_summary_target_tx(
+            &mut tx,
+            self.thread_repository().static_pool(),
+            normalized.external_id.as_deref(),
+            normalized.memory_kind,
+        )
+        .await?;
         let w = &normalized;
 
         // Post-commit storage delete jobs for media that hit ref_count=0.

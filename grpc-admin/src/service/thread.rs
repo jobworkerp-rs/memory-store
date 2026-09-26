@@ -69,11 +69,22 @@ pub trait ThreadGrpc {
 
 const DEFAULT_TTL: Duration = Duration::from_secs(30);
 const LIST_TTL: Duration = Duration::from_secs(5);
+use super::thread_group::decode_group_memory_delete_policy;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protobuf::llm_memory::data::MemoryKind;
+
+    #[test]
+    fn linked_memory_policy_rejects_unspecified_and_unknown_values() {
+        assert!(decode_group_memory_delete_policy(0).is_err());
+        assert!(decode_group_memory_delete_policy(99).is_err());
+        assert_eq!(
+            decode_group_memory_delete_policy(2).unwrap(),
+            app::app::thread_group::memory_relation::GroupMemoryDeletePolicy::Delete
+        );
+    }
 
     #[test]
     fn thread_list_options_accepts_explicit_memory_kinds() {
@@ -321,7 +332,25 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
             .memory
             .as_ref()
             .ok_or_else(|| tonic::Status::invalid_argument("memory is required"))?;
-        match self.app().add_memory(thread_id, memory).await {
+        let added = if let Some(relation) = &req.group_memory_relation {
+            let group_id = relation
+                .group_id
+                .as_ref()
+                .ok_or_else(|| tonic::Status::invalid_argument("group_id is required"))?;
+            let policy = decode_group_memory_delete_policy(relation.on_group_delete)?;
+            self.app()
+                .add_memory_with_group_relation(
+                    thread_id,
+                    memory,
+                    group_id.value,
+                    &relation.purpose,
+                    policy,
+                )
+                .await
+        } else {
+            self.app().add_memory(thread_id, memory).await
+        };
+        match added {
             Ok(id) => Ok(Response::new(AddMemoryResponse { id: Some(id) })),
             Err(e) => Err(handle_error(&e)),
         }

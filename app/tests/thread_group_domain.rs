@@ -3,6 +3,12 @@
 // exercised by the repository / migration suites instead.
 #![cfg(not(feature = "postgres"))]
 
+use app::app::memory::{MemoryApp, MemoryAppImpl};
+use app::app::thread::{ThreadApp, ThreadAppImpl};
+use app::app::thread_group::memory_relation::{
+    GroupMemoryDeletePolicy, ThreadGroupMemoryRelationService,
+};
+use app::app::thread_group::orphan_cleanup::ThreadGroupOrphanCleanupService;
 use app::app::thread_group::{
     Candidate, CandidateEvidence, CandidateSelection, Group, GroupError, GroupStatus, Membership,
     MembershipProvenance, MembershipRole, MembershipState, ObservationInput, ObservedEndpoint,
@@ -15,7 +21,11 @@ use app::app::thread_group::{
 use common::thread_group_key::{IdentityScope, source_thread_canonical_key};
 use infra::infra::IdGeneratorWrapper;
 use infra::infra::memory::rdb::{MemoryRepository, MemoryRepositoryImpl};
+use infra::infra::memory_rating::rdb::MemoryRatingRepositoryImpl;
 use infra::infra::thread::rdb::{ThreadRepository, ThreadRepositoryImpl};
+use infra::infra::thread_group::audit::{
+    ThreadGroupAuditRepository, ThreadGroupAuditRepositoryImpl,
+};
 use infra::infra::thread_group::candidate::{
     ThreadGroupCandidateAssociationRepository, ThreadGroupCandidateAssociationRepositoryImpl,
 };
@@ -26,6 +36,7 @@ use infra::infra::thread_group::group::{ThreadGroupRepository, ThreadGroupReposi
 use infra::infra::thread_group::member::{
     ThreadGroupMemberRepository, ThreadGroupMemberRepositoryImpl,
 };
+use infra::infra::thread_group::memory_relation::ThreadGroupMemoryRelationRepositoryImpl;
 use infra::infra::thread_group::observation::{
     ThreadObservationRepository, ThreadObservationRepositoryImpl,
 };
@@ -40,11 +51,13 @@ use infra::infra::thread_group::relation::{
 };
 use infra::infra::thread_group::rows::values;
 use infra::infra::thread_group::rows::{
-    NewThreadDeletionMarker, NewThreadRelation, SourceIdentityKey,
+    NewGroupAuditMerge, NewThreadDeletionMarker, NewThreadRelation, SourceIdentityKey,
 };
 use infra::infra::thread_group::test_support::{
     insert_thread, key, new_group, new_member, setup_thread_group_pool,
 };
+use infra::infra::thread_label::rdb::ThreadLabelRepositoryImpl;
+use infra::infra::thread_memory::rdb::{ThreadMemoryRepository, ThreadMemoryRepositoryImpl};
 
 fn candidate(parent: &str, confidence: SourceConfidence) -> Candidate {
     Candidate {
@@ -500,6 +513,28 @@ fn key_of(endpoint: &ObservedEndpoint) -> String {
     .expect("known scope")
 }
 
+async fn candidate_rows_for(
+    pool: &'static infra_utils::infra::rdb::RdbPool,
+    subject: &ObservedEndpoint,
+) -> Vec<infra::infra::thread_group::rows::ThreadGroupCandidateAssociationRow> {
+    ThreadGroupCandidateAssociationRepositoryImpl::new(
+        infra::test_helper::shared_id_generator(),
+        pool,
+    )
+    .list_by_subject_identity(
+        &subject.owner_scope,
+        &subject.source,
+        matches!(&subject.identity_scope, &IdentityScope::Known(_)),
+        match &subject.identity_scope {
+            IdentityScope::Known(scope) => scope.as_str(),
+            IdentityScope::Unknown => "",
+        },
+        &subject.native_id,
+    )
+    .await
+    .unwrap()
+}
+
 #[test]
 fn reconcile_attaches_child_to_parent_group() {
     run(async {
@@ -590,6 +625,842 @@ fn reconcile_subject_is_idempotent() {
             .await
             .unwrap();
         assert_eq!(relations.len(), 1, "replay must not duplicate the edge");
+    });
+}
+
+#[test]
+fn late_parent_discovery_reconciles_all_pending_children() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let service = ThreadGroupReconciliationService::with_id_generator(
+            pool,
+            infra::test_helper::shared_id_generator(),
+        );
+        let parent = recon_endpoint("late-parent-many");
+        let children = [
+            recon_endpoint("late-child-one"),
+            recon_endpoint("late-child-two"),
+        ];
+        insert_thread(pool, 26_001, None).await;
+        insert_thread(pool, 26_002, None).await;
+        insert_thread(pool, 26_003, None).await;
+
+        let mut singleton_group_ids = Vec::new();
+        for (index, child) in children.iter().enumerate() {
+            let outcome = service
+                .reconcile_subject(
+                    26_002 + index as i64,
+                    child,
+                    &[observation(child.clone(), Some(parent.clone()))],
+                    "late-parent",
+                    1_001 + index as i64,
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome.pending, 1);
+            singleton_group_ids.push(outcome.group_id.expect("orphan singleton group"));
+        }
+        for child in &children {
+            assert_eq!(
+                candidate_rows_for(pool, child)
+                    .await
+                    .iter()
+                    .filter(|row| row.state == values::candidate_state::PENDING)
+                    .count(),
+                1
+            );
+        }
+
+        let groups =
+            ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let inbound_id = groups
+            .create_tx(pool, &new_group(33_807_001))
+            .await
+            .unwrap();
+        assert!(
+            groups
+                .redirect_tx(pool, inbound_id, singleton_group_ids[0], 1_009)
+                .await
+                .unwrap()
+        );
+        let read = ThreadGroupReadService::new(pool);
+        let active_before = read.reconciliation_report().await.unwrap().active_groups;
+
+        let parent_outcome = service
+            .reconcile_subject(26_001, &parent, &[], "late-parent", 1_010)
+            .await
+            .unwrap();
+        let target_group = parent_outcome.group_id.unwrap();
+        assert_eq!(
+            read.reconciliation_report().await.unwrap().active_groups,
+            active_before - 1,
+            "the new parent group replaces both former active singleton groups"
+        );
+        let visible = read.list_groups(false, None, None).await.unwrap();
+        assert!(visible.iter().any(|group| group.id == target_group));
+        for old_group_id in singleton_group_ids {
+            assert!(visible.iter().all(|group| group.id != old_group_id));
+            let old = groups.find_by_id(old_group_id).await.unwrap().unwrap();
+            assert_eq!(old.status, values::group_status::REDIRECTED);
+            assert_eq!(old.redirect_to_group_id, Some(target_group));
+        }
+        assert_eq!(
+            groups
+                .find_by_id(inbound_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .redirect_to_group_id,
+            Some(target_group),
+            "redirected history must not form a chain through the moved singleton"
+        );
+        let relations = ThreadRelationRepositoryImpl::new(IdGeneratorWrapper::new(), pool);
+        let members = ThreadGroupMemberRepositoryImpl::new(pool);
+        for child in &children {
+            let relation = relations
+                .find_active_by_child_canonical_key(&key_of(child))
+                .await
+                .unwrap()
+                .expect("late-discovered parent relation");
+            assert_eq!(relation.parent_thread_canonical_key, key_of(&parent));
+            assert_eq!(
+                members
+                    .find_current_by_thread_canonical_key(&key_of(child))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .group_id,
+                parent_outcome.group_id.unwrap()
+            );
+        }
+        for child in &children {
+            assert!(
+                candidate_rows_for(pool, child)
+                    .await
+                    .iter()
+                    .all(|row| row.state != values::candidate_state::PENDING)
+            );
+        }
+    });
+}
+
+#[test]
+fn automatic_group_stays_active_while_another_current_member_remains() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let service = ThreadGroupReconciliationService::with_id_generator(
+            pool,
+            infra::test_helper::shared_id_generator(),
+        );
+        let parent = recon_endpoint("partial-move-parent");
+        let child = recon_endpoint("partial-move-child");
+        insert_thread(pool, 26_051, None).await;
+        insert_thread(pool, 26_052, None).await;
+        insert_thread(pool, 26_053, None).await;
+        let orphan = service
+            .reconcile_subject(
+                26_052,
+                &child,
+                &[observation(child.clone(), Some(parent.clone()))],
+                "partial-move",
+                1_000,
+            )
+            .await
+            .unwrap();
+        let old_group = orphan.group_id.unwrap();
+        let remaining = new_member(old_group, Some(26_053), key(26_053));
+        ThreadGroupMemberRepositoryImpl::new(pool)
+            .insert_tx(pool, &remaining)
+            .await
+            .unwrap();
+
+        let parent_group = service
+            .reconcile_subject(26_051, &parent, &[], "partial-move", 1_001)
+            .await
+            .unwrap()
+            .group_id
+            .unwrap();
+        let groups =
+            ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let old = groups.find_by_id(old_group).await.unwrap().unwrap();
+        assert_eq!(old.status, values::group_status::ACTIVE);
+        assert_eq!(old.redirect_to_group_id, None);
+        assert_eq!(
+            ThreadGroupMemberRepositoryImpl::new(pool)
+                .find_current_by_thread_canonical_key(&key_of(&child))
+                .await
+                .unwrap()
+                .unwrap()
+                .group_id,
+            parent_group
+        );
+    });
+}
+
+#[test]
+fn automatic_move_does_not_redirect_an_operator_owned_group() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let service = ThreadGroupReconciliationService::with_id_generator(
+            pool,
+            infra::test_helper::shared_id_generator(),
+        );
+        let parent = recon_endpoint("manual-group-parent");
+        let child = recon_endpoint("manual-group-child");
+        insert_thread(pool, 26_054, None).await;
+        insert_thread(pool, 26_055, None).await;
+        let old_group = service
+            .reconcile_subject(
+                26_055,
+                &child,
+                &[observation(child.clone(), Some(parent.clone()))],
+                "manual-group",
+                1_000,
+            )
+            .await
+            .unwrap()
+            .group_id
+            .unwrap();
+        let groups =
+            ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        groups
+            .set_grouping_authority_tx(pool, old_group, values::grouping_authority::OPERATOR, 1_001)
+            .await
+            .unwrap();
+
+        service
+            .reconcile_subject(26_054, &parent, &[], "manual-group", 1_002)
+            .await
+            .unwrap();
+        let old = groups.find_by_id(old_group).await.unwrap().unwrap();
+        assert_eq!(old.status, values::group_status::ACTIVE);
+        assert_eq!(old.redirect_to_group_id, None);
+    });
+}
+
+#[test]
+fn pending_replay_is_idempotent_and_parent_discovery_drains_pending_count() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let service = ThreadGroupReconciliationService::with_id_generator(
+            pool,
+            infra::test_helper::shared_id_generator(),
+        );
+        let parent = recon_endpoint("late-parent-replay");
+        let child = recon_endpoint("late-child-replay");
+        let input = observation(child.clone(), Some(parent.clone()));
+        insert_thread(pool, 26_004, None).await;
+        insert_thread(pool, 26_005, None).await;
+
+        let first = service
+            .reconcile_subject(
+                26_005,
+                &child,
+                std::slice::from_ref(&input),
+                "late-replay",
+                1_100,
+            )
+            .await
+            .unwrap();
+        let replay = service
+            .reconcile_subject(
+                26_005,
+                &child,
+                std::slice::from_ref(&input),
+                "late-replay",
+                1_101,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.observation_ids, replay.observation_ids);
+        assert_eq!(first.pending, 1);
+        assert_eq!(replay.pending, 1);
+
+        let pending = candidate_rows_for(pool, &child)
+            .await
+            .into_iter()
+            .filter(|row| row.state == values::candidate_state::PENDING)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pending.len(),
+            1,
+            "one observation owns one pending association"
+        );
+
+        service
+            .reconcile_subject(26_004, &parent, &[], "late-replay", 1_102)
+            .await
+            .unwrap();
+        service
+            .reconcile_subject(26_004, &parent, &[], "late-replay", 1_103)
+            .await
+            .unwrap();
+        let resolved_candidates = candidate_rows_for(pool, &child).await;
+        assert!(
+            resolved_candidates
+                .iter()
+                .all(|row| row.state != values::candidate_state::PENDING)
+        );
+        assert_eq!(resolved_candidates.len(), 1);
+        assert_eq!(
+            resolved_candidates[0].state,
+            values::candidate_state::CANDIDATE
+        );
+        assert_eq!(
+            ThreadRelationRepositoryImpl::new(IdGeneratorWrapper::new(), pool)
+                .list_by_child_canonical_key(&key_of(&child), None)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "parent replay must not duplicate the relation"
+        );
+    });
+}
+
+#[test]
+fn selected_relation_replay_resolves_only_matching_stale_pending_evidence() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let service = ThreadGroupReconciliationService::with_id_generator(
+            pool,
+            infra::test_helper::shared_id_generator(),
+        );
+        let parent = recon_endpoint("replay-pending-parent");
+        let child = recon_endpoint("replay-pending-child");
+        let evidence = observation(child.clone(), Some(parent.clone()));
+        insert_thread(pool, 26_041, None).await;
+        insert_thread(pool, 26_042, None).await;
+        service
+            .reconcile_subject(26_041, &parent, &[], "pending-replay", 1_000)
+            .await
+            .unwrap();
+        let first = service
+            .reconcile_subject(
+                26_042,
+                &child,
+                std::slice::from_ref(&evidence),
+                "pending-replay",
+                1_001,
+            )
+            .await
+            .unwrap();
+        let mut stale = infra::infra::thread_group::test_support::new_candidate(26_041);
+        stale.subject_thread_id = Some(26_042);
+        stale.subject_owner_scope = child.owner_scope.clone();
+        stale.subject_source = child.source.clone();
+        stale.subject_native_id = child.native_id.clone();
+        stale.selected_observation_id = first.observation_ids.first().copied();
+        let candidates = ThreadGroupCandidateAssociationRepositoryImpl::new(
+            infra::test_helper::shared_id_generator(),
+            pool,
+        );
+        candidates.insert_tx(pool, &stale).await.unwrap();
+        let mut unrelated = infra::infra::thread_group::test_support::new_candidate(26_042);
+        unrelated.subject_thread_id = Some(26_042);
+        unrelated.subject_owner_scope = child.owner_scope.clone();
+        unrelated.subject_source = child.source.clone();
+        unrelated.subject_native_id = child.native_id.clone();
+        candidates.insert_tx(pool, &unrelated).await.unwrap();
+
+        let replay = service
+            .reconcile_subject(26_042, &child, &[evidence], "pending-replay", 1_002)
+            .await
+            .unwrap();
+        assert_eq!(replay.relation_selected, first.relation_selected);
+        let rows = candidate_rows_for(pool, &child).await;
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| {
+            row.selected_observation_id == first.observation_ids.first().copied()
+                && row.state == values::candidate_state::CANDIDATE
+                && row.candidate_parent_thread_id == Some(26_041)
+        }));
+        assert!(rows.iter().any(|row| {
+            row.selected_observation_id.is_none() && row.state == values::candidate_state::PENDING
+        }));
+    });
+}
+
+#[test]
+fn a_missing_parent_remains_pending_without_creating_a_relation() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let service = ThreadGroupReconciliationService::with_id_generator(
+            pool,
+            infra::test_helper::shared_id_generator(),
+        );
+        let parent = recon_endpoint("never-imported-parent");
+        let child = recon_endpoint("orphan-child");
+        insert_thread(pool, 26_006, None).await;
+
+        let outcome = service
+            .reconcile_subject(
+                26_006,
+                &child,
+                &[observation(child.clone(), Some(parent))],
+                "missing-parent",
+                1_200,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.pending, 1);
+        let orphan_group =
+            ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool)
+                .find_by_id(
+                    outcome
+                        .group_id
+                        .expect("pending child keeps a singleton group"),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(orphan_group.status, values::group_status::ACTIVE);
+        assert_eq!(orphan_group.redirect_to_group_id, None);
+        assert!(
+            ThreadRelationRepositoryImpl::new(IdGeneratorWrapper::new(), pool)
+                .find_active_by_child_canonical_key(&key_of(&child))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            candidate_rows_for(pool, &child)
+                .await
+                .iter()
+                .filter(|row| row.state == values::candidate_state::PENDING)
+                .count(),
+            1
+        );
+    });
+}
+
+#[test]
+fn distinct_missing_parents_are_retained_and_become_a_conflict_when_discovered() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let service = ThreadGroupReconciliationService::with_id_generator(
+            pool,
+            infra::test_helper::shared_id_generator(),
+        );
+        let parent_a = recon_endpoint("late-ambiguous-parent-a");
+        let parent_b = recon_endpoint("late-ambiguous-parent-b");
+        let child = recon_endpoint("late-ambiguous-child");
+        insert_thread(pool, 26_007, None).await;
+        insert_thread(pool, 26_008, None).await;
+        insert_thread(pool, 26_009, None).await;
+
+        let outcome = service
+            .reconcile_subject(
+                26_009,
+                &child,
+                &[
+                    observation(child.clone(), Some(parent_a.clone())),
+                    observation(child.clone(), Some(parent_b.clone())),
+                ],
+                "late-ambiguous",
+                1_300,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.pending, 2);
+        let candidates = candidate_rows_for(pool, &child).await;
+        assert_eq!(
+            candidates.len(),
+            2,
+            "pending associations are keyed by observation, not unresolved parent id"
+        );
+
+        service
+            .reconcile_subject(26_007, &parent_a, &[], "late-ambiguous", 1_301)
+            .await
+            .unwrap();
+        service
+            .reconcile_subject(26_008, &parent_b, &[], "late-ambiguous", 1_302)
+            .await
+            .unwrap();
+
+        assert!(
+            ThreadRelationRepositoryImpl::new(IdGeneratorWrapper::new(), pool)
+                .find_active_by_child_canonical_key(&key_of(&child))
+                .await
+                .unwrap()
+                .is_none(),
+            "equal-ranked discovered parents must not leave an active edge"
+        );
+        let resolved_candidates = candidate_rows_for(pool, &child).await;
+        assert!(
+            resolved_candidates
+                .iter()
+                .all(|row| row.state != values::candidate_state::PENDING)
+        );
+        assert_eq!(
+            resolved_candidates
+                .iter()
+                .filter(|row| row.state == values::candidate_state::CONFLICT)
+                .count(),
+            2,
+            "both selected parents are retained as conflicting candidates"
+        );
+    });
+}
+
+#[test]
+fn late_discovery_does_not_promote_an_operator_rejected_pending_candidate() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let service = ThreadGroupReconciliationService::with_id_generator(
+            pool,
+            infra::test_helper::shared_id_generator(),
+        );
+        let parent = recon_endpoint("late-rejected-parent");
+        let child = recon_endpoint("late-rejected-child");
+        insert_thread(pool, 26_010, None).await;
+        insert_thread(pool, 26_011, None).await;
+        service
+            .reconcile_subject(
+                26_011,
+                &child,
+                &[observation(child.clone(), Some(parent.clone()))],
+                "late-rejected",
+                1_700,
+            )
+            .await
+            .unwrap();
+        let association = candidate_rows_for(pool, &child)
+            .await
+            .into_iter()
+            .find(|row| row.state == values::candidate_state::PENDING)
+            .expect("pending association");
+        service
+            .record_operator_decision(
+                association.id,
+                values::operator_decision::REJECT,
+                "operator",
+                "not a parent",
+                1_701,
+            )
+            .await
+            .unwrap();
+
+        service
+            .reconcile_subject(26_010, &parent, &[], "late-rejected", 1_702)
+            .await
+            .unwrap();
+        assert!(
+            ThreadRelationRepositoryImpl::new(IdGeneratorWrapper::new(), pool)
+                .find_active_by_child_canonical_key(&key_of(&child))
+                .await
+                .unwrap()
+                .is_none(),
+            "a rejected association must not be reactivated by parent discovery"
+        );
+        assert!(candidate_rows_for(pool, &child).await.iter().any(
+            |row| row.id == association.id && row.state == values::candidate_state::SUPERSEDED
+        ));
+    });
+}
+
+#[test]
+fn unknown_parent_scope_does_not_resolve_to_known_empty_scope() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let service = ThreadGroupReconciliationService::with_id_generator(
+            pool,
+            infra::test_helper::shared_id_generator(),
+        );
+        let known_parent = recon_endpoint("scope-collision-parent");
+        let unknown_parent = ObservedEndpoint {
+            identity_scope: IdentityScope::unknown(),
+            ..known_parent.clone()
+        };
+        let child = recon_endpoint("scope-collision-child");
+        insert_thread(pool, 26_012, None).await;
+        insert_thread(pool, 26_013, None).await;
+        service
+            .reconcile_subject(26_012, &known_parent, &[], "unknown-parent", 1_400)
+            .await
+            .unwrap();
+
+        let outcome = service
+            .reconcile_subject(
+                26_013,
+                &child,
+                &[observation(child.clone(), Some(unknown_parent))],
+                "unknown-parent",
+                1_401,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.pending, 1);
+        assert!(
+            ThreadRelationRepositoryImpl::new(IdGeneratorWrapper::new(), pool)
+                .find_active_by_child_canonical_key(&key_of(&child))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    });
+}
+
+#[test]
+fn late_parent_discovery_respects_deletion_marker() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let service = ThreadGroupReconciliationService::with_id_generator(
+            pool,
+            infra::test_helper::shared_id_generator(),
+        );
+        let parent = recon_endpoint("late-guarded-parent");
+        let child = recon_endpoint("late-operator-child");
+        insert_thread(pool, 26_014, None).await;
+        insert_thread(pool, 26_015, None).await;
+        service
+            .reconcile_subject(
+                26_015,
+                &child,
+                &[observation(child.clone(), Some(parent.clone()))],
+                "late-guarded",
+                1_500,
+            )
+            .await
+            .unwrap();
+
+        let identity = SourceIdentityKey {
+            owner_scope: &parent.owner_scope,
+            source: &parent.source,
+            identity_scope: "",
+            native_id: &parent.native_id,
+        };
+        ThreadDeletionMarkerRepositoryImpl::new(pool)
+            .put_tx(
+                pool,
+                &NewThreadDeletionMarker {
+                    identity,
+                    forbid_reimport: true,
+                    recursive: false,
+                    actor_id: "operator".into(),
+                    reason: Some("deleted parent".into()),
+                    deleted_at: 1_502,
+                },
+            )
+            .await
+            .unwrap();
+
+        service
+            .reconcile_subject(26_014, &parent, &[], "late-guarded", 1_503)
+            .await
+            .unwrap();
+        let member = ThreadGroupMemberRepositoryImpl::new(pool)
+            .find_current_by_thread_canonical_key(&key_of(&child))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(member.provenance, values::grouping_authority::RECONCILER);
+        assert!(
+            ThreadRelationRepositoryImpl::new(IdGeneratorWrapper::new(), pool)
+                .find_active_by_child_canonical_key(&key_of(&child))
+                .await
+                .unwrap()
+                .is_none(),
+            "a deletion marker blocks automatic late adoption"
+        );
+        assert_eq!(
+            candidate_rows_for(pool, &child)
+                .await
+                .iter()
+                .filter(|row| row.state == values::candidate_state::PENDING)
+                .count(),
+            1
+        );
+    });
+}
+
+#[test]
+fn imported_subject_registration_rejects_forbidden_marker_without_creating_membership() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let subject = recon_endpoint("import-guard-root");
+        insert_thread(pool, 26_018, None).await;
+        ThreadDeletionMarkerRepositoryImpl::new(pool)
+            .put_tx(
+                pool,
+                &NewThreadDeletionMarker {
+                    identity: SourceIdentityKey {
+                        owner_scope: &subject.owner_scope,
+                        source: &subject.source,
+                        identity_scope: "",
+                        native_id: &subject.native_id,
+                    },
+                    forbid_reimport: true,
+                    recursive: false,
+                    actor_id: "operator".into(),
+                    reason: None,
+                    deleted_at: 1_700,
+                },
+            )
+            .await
+            .unwrap();
+        let service = ThreadGroupReconciliationService::with_id_generator(
+            pool,
+            infra::test_helper::shared_id_generator(),
+        );
+        assert!(
+            service
+                .reconcile_imported_subject(26_018, &subject, &[], "import-guard", 1_701)
+                .await
+                .is_err()
+        );
+        assert!(
+            ThreadGroupMemberRepositoryImpl::new(pool)
+                .find_current_by_thread_canonical_key(&key_of(&subject))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    });
+}
+
+#[test]
+fn imported_subject_registration_checks_owner_and_existing_identity() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let service = ThreadGroupReconciliationService::with_id_generator(
+            pool,
+            infra::test_helper::shared_id_generator(),
+        );
+        let subject = recon_endpoint("import-guard-owner-root");
+        insert_thread(pool, 26_019, None).await;
+        insert_thread(pool, 26_020, None).await;
+        let mut other_owner = subject.clone();
+        other_owner.owner_scope = "user:2".into();
+        assert!(
+            service
+                .reconcile_imported_subject(26_019, &other_owner, &[], "import-owner", 1_702)
+                .await
+                .is_err()
+        );
+        assert!(
+            service
+                .reconcile_imported_subject(26_019, &subject, &[], "import-owner", 1_703)
+                .await
+                .unwrap()
+                .group_id
+                .is_some()
+        );
+        assert!(
+            service
+                .reconcile_imported_subject(26_020, &subject, &[], "import-owner", 1_704)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            ThreadGroupMemberRepositoryImpl::new(pool)
+                .find_current_by_thread_canonical_key(&key_of(&subject))
+                .await
+                .unwrap()
+                .unwrap()
+                .thread_id,
+            Some(26_019)
+        );
+    });
+}
+
+#[test]
+fn unknown_scope_import_keeps_evidence_without_promoting_identity() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let service = ThreadGroupReconciliationService::with_id_generator(
+            pool,
+            infra::test_helper::shared_id_generator(),
+        );
+        insert_thread(pool, 26_021, None).await;
+        let mut subject = recon_endpoint("claude-unknown-fork");
+        subject.identity_scope = IdentityScope::unknown();
+        let parent = recon_endpoint("claude-known-parent");
+        let result = service
+            .reconcile_imported_subject(
+                26_021,
+                &subject,
+                &[observation(subject.clone(), Some(parent))],
+                "unknown-fork",
+                1_705,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.observation_ids.len(), 1);
+        assert!(result.group_id.is_none());
+        let membership_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM thread_group_member WHERE thread_id = ?")
+                .bind(26_021_i64)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(membership_count, 0);
+    });
+}
+
+#[test]
+fn late_parent_relation_does_not_move_operator_owned_child_membership() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let service = ThreadGroupReconciliationService::with_id_generator(
+            pool,
+            infra::test_helper::shared_id_generator(),
+        );
+        let parent = recon_endpoint("late-operator-parent");
+        let child = recon_endpoint("late-operator-child-fixed");
+        insert_thread(pool, 26_016, None).await;
+        insert_thread(pool, 26_017, None).await;
+        service
+            .reconcile_subject(
+                26_017,
+                &child,
+                &[observation(child.clone(), Some(parent.clone()))],
+                "late-operator",
+                1_600,
+            )
+            .await
+            .unwrap();
+
+        let member_repo = ThreadGroupMemberRepositoryImpl::new(pool);
+        let existing = member_repo
+            .find_current_by_thread_canonical_key(&key_of(&child))
+            .await
+            .unwrap()
+            .unwrap();
+        let operator_group = existing.group_id;
+        let mut tx = pool.begin().await.unwrap();
+        member_repo
+            .set_role_provenance_tx(
+                &mut *tx,
+                &key_of(&child),
+                &existing.role,
+                values::grouping_authority::OPERATOR,
+                1_601,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        service
+            .reconcile_subject(26_016, &parent, &[], "late-operator", 1_602)
+            .await
+            .unwrap();
+        let member = ThreadGroupMemberRepositoryImpl::new(pool)
+            .find_current_by_thread_canonical_key(&key_of(&child))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(member.group_id, operator_group);
+        assert_eq!(member.provenance, values::grouping_authority::OPERATOR);
+        assert!(
+            ThreadRelationRepositoryImpl::new(IdGeneratorWrapper::new(), pool)
+                .find_active_by_child_canonical_key(&key_of(&child))
+                .await
+                .unwrap()
+                .is_some(),
+            "the relation may resolve while operator-owned membership stays fixed"
+        );
     });
 }
 
@@ -1372,6 +2243,66 @@ fn group_read_model_contains_live_and_deleted_display_information() {
 }
 
 #[test]
+fn lineage_and_group_view_count_the_same_unresolved_candidates() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let group_repo =
+            ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let group_id = group_repo
+            .create_tx(pool, &new_group(98_763_001))
+            .await
+            .unwrap();
+        let other_group_id = group_repo
+            .create_tx(pool, &new_group(98_763_002))
+            .await
+            .unwrap();
+        insert_thread(pool, 98_763_001, None).await;
+        ThreadGroupMemberRepositoryImpl::new(pool)
+            .insert_tx(
+                pool,
+                &new_member(group_id, Some(98_763_001), key(98_763_001)),
+            )
+            .await
+            .unwrap();
+        let candidates = ThreadGroupCandidateAssociationRepositoryImpl::new(
+            infra::test_helper::shared_id_generator(),
+            pool,
+        );
+        for (index, state) in [
+            values::candidate_state::PENDING,
+            values::candidate_state::AMBIGUOUS,
+            values::candidate_state::CONFLICT,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut by_group =
+                infra::infra::thread_group::test_support::new_candidate(92_010 + index as u64);
+            by_group.state = state.to_string();
+            by_group.candidate_group_id = Some(group_id);
+            by_group.subject_thread_id = Some(98_763_001); // Both paths still count this row once.
+            candidates.insert_tx(pool, &by_group).await.unwrap();
+
+            let mut by_thread =
+                infra::infra::thread_group::test_support::new_candidate(92_020 + index as u64);
+            by_thread.state = state.to_string();
+            by_thread.candidate_group_id = Some(other_group_id);
+            by_thread.subject_thread_id = Some(98_763_001);
+            candidates.insert_tx(pool, &by_thread).await.unwrap();
+
+            let mut outside =
+                infra::infra::thread_group::test_support::new_candidate(92_030 + index as u64);
+            outside.state = state.to_string();
+            candidates.insert_tx(pool, &outside).await.unwrap();
+        }
+        let read = ThreadGroupReadService::new(pool);
+        let lineage = read.get_lineage(group_id).await.unwrap().unwrap();
+        assert_eq!(lineage.unresolved.len(), 6);
+        assert_eq!(lineage.group.unresolved_count, 6);
+    });
+}
+
+#[test]
 fn lineage_returns_only_active_relations_for_tree_data() {
     run(async {
         let pool = setup_thread_group_pool().await;
@@ -1454,7 +2385,7 @@ fn group_summary_lookup_and_count_use_the_group_summary_kind() {
                     content: "group summary".into(),
                     content_type: protobuf::llm_memory::data::ContentType::Text as i32,
                     external_id: Some(format!("thread-group-summary:{group_id}")),
-                    memory_kind: protobuf::llm_memory::data::MemoryKind::ThreadGroupSummary as i32,
+                    memory_kind: protobuf::llm_memory::data::MemoryKind::DerivedSummary as i32,
                     ..Default::default()
                 },
             )
@@ -1468,7 +2399,7 @@ fn group_summary_lookup_and_count_use_the_group_summary_kind() {
             .expect("group summary");
         assert_eq!(
             summary.data.unwrap().memory_kind,
-            protobuf::llm_memory::data::MemoryKind::ThreadGroupSummary as i32
+            protobuf::llm_memory::data::MemoryKind::DerivedSummary as i32
         );
         assert_eq!(read.count_group_summaries().await.unwrap(), before + 1);
     });
@@ -1504,6 +2435,1435 @@ fn thread_group_search_filter_resolves_current_members() {
             ids,
             vec![30_001],
             "only live members are searchable; placeholders are not"
+        );
+    });
+}
+
+#[test]
+fn purge_preview_rejects_wrong_kind_at_group_summary_external_id() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let groups =
+            ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let group_id = groups.create_tx(pool, &new_group(92_110)).await.unwrap();
+        let memories = MemoryRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        memories
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+                    content: "unrelated".into(),
+                    external_id: Some(format!("thread-group-summary:{group_id}")),
+                    memory_kind: protobuf::llm_memory::data::MemoryKind::Raw as i32,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let error = ThreadGroupPurgeService::new(pool)
+            .preview(group_id)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("different kind"));
+        assert!(groups.find_by_id(group_id).await.unwrap().is_some());
+    });
+}
+
+#[test]
+fn purge_preview_is_stale_after_summary_is_created() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let groups =
+            ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let group_id = groups.create_tx(pool, &new_group(92_120)).await.unwrap();
+        let purge = ThreadGroupPurgeService::new(pool);
+        let before = purge.preview(group_id).await.unwrap().unwrap();
+        assert!(before.summary_memory_id.is_none());
+        let memories = MemoryRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let summary_id = memories
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+                    content: "group summary".into(),
+                    external_id: Some(format!("thread-group-summary:{group_id}")),
+                    memory_kind: protobuf::llm_memory::data::MemoryKind::DerivedSummary as i32,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let after = purge.preview(group_id).await.unwrap().unwrap();
+        assert_eq!(after.summary_memory_id, Some(summary_id.value));
+        assert_ne!(before.digest, after.digest);
+        let stale = purge.delete(group_id, &before.digest).await.unwrap_err();
+        assert!(stale.to_string().contains("stale"));
+        let blocked = purge.delete(group_id, &after.digest).await.unwrap_err();
+        assert!(
+            blocked
+                .to_string()
+                .contains("no explicit delete relationship")
+        );
+        assert!(groups.find_by_id(group_id).await.unwrap().is_some());
+        assert!(
+            memories
+                .find_by_external_id(&format!("thread-group-summary:{group_id}"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    });
+}
+
+#[test]
+fn purge_preview_is_stale_after_summary_content_changes_without_identity_change() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let groups =
+            ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let group_id = groups.create_tx(pool, &new_group(92_125)).await.unwrap();
+        let memories = MemoryRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let id = memories
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+                    external_id: Some(format!("thread-group-summary:{group_id}")),
+                    memory_kind: protobuf::llm_memory::data::MemoryKind::DerivedSummary as i32,
+                    content: "original".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let purge = ThreadGroupPurgeService::new(pool);
+        let before = purge.preview(group_id).await.unwrap().unwrap();
+        assert_eq!(before.summary_memory_id, Some(id.value));
+        let mut tx = pool.begin().await.unwrap();
+        assert!(
+            memories
+                .update_content_only(&mut *tx, &id, "changed")
+                .await
+                .unwrap()
+        );
+        tx.commit().await.unwrap();
+        let after = purge.preview(group_id).await.unwrap().unwrap();
+        assert_eq!(after.summary_memory_id, before.summary_memory_id);
+        assert_ne!(after.digest, before.digest);
+        assert!(
+            purge
+                .delete(group_id, &before.digest)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("stale")
+        );
+        assert!(groups.find_by_id(group_id).await.unwrap().is_some());
+    });
+}
+
+#[test]
+fn group_memory_link_rejects_missing_group_and_shared_owned_memory() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let groups =
+            ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let first = groups.create_tx(pool, &new_group(92_140)).await.unwrap();
+        let second = groups.create_tx(pool, &new_group(92_141)).await.unwrap();
+        let third = groups.create_tx(pool, &new_group(92_142)).await.unwrap();
+        insert_thread(pool, 92_143, None).await;
+        infra::infra::thread_label::rdb::ThreadLabelRepository::add_labels(
+            &ThreadLabelRepositoryImpl::new(pool),
+            92_143,
+            &["thread_group_summary".into(), format!("group_{first}")],
+            1,
+        )
+        .await
+        .unwrap();
+        let memories = MemoryRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let id = memories
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+                    content: "generated".into(),
+                    external_id: Some(format!("thread-group-summary:{first}")),
+                    memory_kind: protobuf::llm_memory::data::MemoryKind::DerivedSummary as i32,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        ThreadMemoryRepositoryImpl::new(pool)
+            .insert_auto_position_tx(pool, 92_143, id.value, 1)
+            .await
+            .unwrap();
+        let relation = ThreadGroupMemoryRelationService::new(pool);
+        assert!(
+            relation
+                .link_existing(
+                    9_999_999,
+                    id.value,
+                    "summary",
+                    GroupMemoryDeletePolicy::Delete
+                )
+                .await
+                .is_err()
+        );
+        relation
+            .link_existing(first, id.value, "summary", GroupMemoryDeletePolicy::Delete)
+            .await
+            .unwrap();
+        relation
+            .link_existing(first, id.value, "summary", GroupMemoryDeletePolicy::Delete)
+            .await
+            .unwrap();
+        assert!(
+            relation
+                .link_existing(
+                    first,
+                    id.value,
+                    "reference",
+                    GroupMemoryDeletePolicy::Retain
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            relation
+                .link_existing(
+                    second,
+                    id.value,
+                    "reference",
+                    GroupMemoryDeletePolicy::Retain
+                )
+                .await
+                .is_err()
+        );
+        let other = memories
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+                    content: "shared".into(),
+                    memory_kind: protobuf::llm_memory::data::MemoryKind::DerivedSummary as i32,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        relation
+            .link_existing(
+                first,
+                other.value,
+                "reference",
+                GroupMemoryDeletePolicy::Retain,
+            )
+            .await
+            .unwrap();
+        relation
+            .link_existing(
+                second,
+                other.value,
+                "reference",
+                GroupMemoryDeletePolicy::Retain,
+            )
+            .await
+            .unwrap();
+        relation
+            .link_existing(
+                second,
+                other.value,
+                "reference",
+                GroupMemoryDeletePolicy::Retain,
+            )
+            .await
+            .unwrap();
+        assert!(
+            relation
+                .link_existing(
+                    third,
+                    other.value,
+                    "summary",
+                    GroupMemoryDeletePolicy::Delete
+                )
+                .await
+                .is_err()
+        );
+        let mismatched = memories
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+                    content: "group summary".into(),
+                    memory_kind: protobuf::llm_memory::data::MemoryKind::DerivedSummary as i32,
+                    external_id: Some(format!("thread-group-summary:{second}")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            relation
+                .link_existing(
+                    third,
+                    mismatched.value,
+                    "summary",
+                    GroupMemoryDeletePolicy::Delete
+                )
+                .await
+                .is_err()
+        );
+    });
+}
+
+#[test]
+fn purge_does_not_leave_group_memory_relations_orphaned() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let groups =
+            ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let group_id = groups.create_tx(pool, &new_group(92_145)).await.unwrap();
+        let purge = ThreadGroupPurgeService::new(pool);
+        let before = purge.preview(group_id).await.unwrap().unwrap();
+        let memories = MemoryRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let id = memories
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+                    content: "linked".into(),
+                    memory_kind: protobuf::llm_memory::data::MemoryKind::DerivedSummary as i32,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        ThreadGroupMemoryRelationService::new(pool)
+            .link_existing(
+                group_id,
+                id.value,
+                "reference",
+                GroupMemoryDeletePolicy::Retain,
+            )
+            .await
+            .unwrap();
+        let after = purge.preview(group_id).await.unwrap().unwrap();
+        assert_ne!(before.digest, after.digest);
+        assert!(
+            purge
+                .delete(group_id, &before.digest)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("stale")
+        );
+        assert!(after.blocked_reason.is_empty());
+        assert!(
+            purge
+                .delete(group_id, &after.digest)
+                .await
+                .unwrap()
+                .group_deleted
+        );
+        assert!(groups.find_by_id(group_id).await.unwrap().is_none());
+        assert!(memories.find(&id, false).await.unwrap().is_some());
+    });
+}
+
+#[test]
+fn purge_preview_tracks_parent_references_across_multiple_retained_memories() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let ids = infra::test_helper::shared_id_generator();
+        let group = ThreadGroupRepositoryImpl::new(ids.clone(), pool)
+            .create_tx(pool, &new_group(92_166))
+            .await
+            .unwrap();
+        let memories = MemoryRepositoryImpl::new(ids, pool);
+        let data = protobuf::llm_memory::data::MemoryData {
+            user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+            content: "reference".into(),
+            ..Default::default()
+        };
+        let first = memories.create(pool, &data).await.unwrap();
+        let second = memories.create(pool, &data).await.unwrap();
+        let links = ThreadGroupMemoryRelationService::new(pool);
+        for id in [&first, &second] {
+            links
+                .link_existing(
+                    group,
+                    id.value,
+                    "reference",
+                    GroupMemoryDeletePolicy::Retain,
+                )
+                .await
+                .unwrap();
+        }
+        let purge = ThreadGroupPurgeService::new(pool);
+        let before = purge.preview(group).await.unwrap().unwrap();
+        let child = memories
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    parent_ids: vec![second],
+                    ..data
+                },
+            )
+            .await
+            .unwrap();
+        let after = purge.preview(group).await.unwrap().unwrap();
+        assert_ne!(before.digest, after.digest);
+        assert!(
+            purge
+                .delete(group, &before.digest)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("stale")
+        );
+        memories.delete(&child).await.unwrap();
+        assert_eq!(
+            before.digest,
+            purge.preview(group).await.unwrap().unwrap().digest
+        );
+    });
+}
+
+#[test]
+fn sqlite_purge_reserves_the_writer_before_checking_memory_relationships() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let ids = infra::test_helper::shared_id_generator();
+        let groups = ThreadGroupRepositoryImpl::new(ids.clone(), pool);
+        let group_id = groups.create_tx(pool, &new_group(92_155)).await.unwrap();
+        let id = MemoryRepositoryImpl::new(ids, pool)
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+                    content: "guard".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        groups
+            .reserve_purge_write_tx(&mut *tx, group_id)
+            .await
+            .unwrap();
+        let mut link = tokio::spawn(async move {
+            ThreadGroupMemoryRelationService::new(pool)
+                .link_existing(
+                    group_id,
+                    id.value,
+                    "reference",
+                    GroupMemoryDeletePolicy::Retain,
+                )
+                .await
+        });
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(100), &mut link).await;
+        let pending = outcome.is_err();
+        if let Ok(result) = outcome {
+            assert!(
+                result.unwrap().is_err(),
+                "the concurrent relationship write must not commit"
+            );
+        }
+        groups.delete_tx(&mut *tx, group_id).await.unwrap();
+        tx.commit().await.unwrap();
+        if pending {
+            assert!(link.await.unwrap().is_err());
+        }
+        assert!(
+            ThreadGroupMemoryRelationRepositoryImpl::new(pool)
+                .list_by_group_id(group_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn global_orphan_cleanup_requires_preview_and_keeps_unproven_memory() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let groups =
+            ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let removed_group = groups.create_tx(pool, &new_group(92_158)).await.unwrap();
+        let surviving_group = groups.create_tx(pool, &new_group(92_159)).await.unwrap();
+        let repo = MemoryRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let old = repo
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+                    content: "unknown provenance".into(),
+                    external_id: Some(format!("thread-group-summary:{removed_group}")),
+                    memory_kind: protobuf::llm_memory::data::MemoryKind::DerivedSummary as i32,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let retained = repo
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+                    content: "retained".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let surviving_summary = repo
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+                    content: "existing group".into(),
+                    external_id: Some(format!("thread-group-summary:{surviving_group}")),
+                    memory_kind: protobuf::llm_memory::data::MemoryKind::DerivedSummary as i32,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        ThreadGroupMemoryRelationRepositoryImpl::new(pool)
+            .insert_tx(
+                pool,
+                removed_group,
+                retained.value,
+                "reference",
+                "retain",
+                1,
+            )
+            .await
+            .unwrap();
+        ThreadGroupMemoryRelationRepositoryImpl::new(pool)
+            .insert_tx(pool, removed_group, 9_999_991, "summary", "delete", 2)
+            .await
+            .unwrap();
+        groups.delete_tx(pool, removed_group).await.unwrap();
+        let config = memory_utils::cache::stretto::MemoryCacheConfig::default();
+        let ids = infra::test_helper::shared_id_generator();
+        let memory_app = MemoryAppImpl::new(
+            MemoryRepositoryImpl::new(ids.clone(), pool),
+            MemoryRatingRepositoryImpl::new(ids.clone(), pool),
+            ThreadRepositoryImpl::new(ids, pool),
+            ThreadMemoryRepositoryImpl::new(pool),
+            ThreadLabelRepositoryImpl::new(pool),
+            memory_utils::cache::stretto::new_memory_cache(&config),
+            memory_utils::cache::stretto::new_memory_cache(&config),
+            None,
+        );
+        let cleanup = ThreadGroupOrphanCleanupService::new(pool, std::sync::Arc::new(memory_app));
+        let preview = cleanup.preview().await.unwrap();
+        assert_eq!(preview.digest, cleanup.preview().await.unwrap().digest);
+        assert_eq!(preview.orphan_relation_count, 2);
+        assert!(!preview.memory_index_available);
+        assert!(!preview.thread_index_available);
+        assert!(preview.unsafe_memory_ids.contains(&old.value));
+        assert!(!preview.unsafe_memory_ids.contains(&surviving_summary.value));
+        assert!(cleanup.execute("incorrect").await.is_err());
+        let outcome = cleanup.execute(&preview.digest).await.unwrap();
+        assert_eq!(outcome.deleted_relation_count, 1);
+        assert_eq!(cleanup.preview().await.unwrap().orphan_relation_count, 1);
+        assert!(!outcome.memory_index_available);
+        assert!(!outcome.thread_index_available);
+        assert!(repo.find(&old, false).await.unwrap().is_some());
+        assert!(repo.find(&retained, false).await.unwrap().is_some());
+        assert!(
+            repo.find(&surviving_summary, false)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(groups.find_by_id(surviving_group).await.unwrap().is_some());
+    });
+}
+
+#[test]
+fn global_orphan_cleanup_removes_verified_summary_but_keeps_storage_thread() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let ids = infra::test_helper::shared_id_generator();
+        let groups = ThreadGroupRepositoryImpl::new(ids.clone(), pool);
+        let group = groups.create_tx(pool, &new_group(92_160)).await.unwrap();
+        insert_thread(pool, 92_161, None).await;
+        infra::infra::thread_label::rdb::ThreadLabelRepository::add_labels(
+            &ThreadLabelRepositoryImpl::new(pool),
+            92_161,
+            &["thread_group_summary".into(), format!("group_{group}")],
+            1,
+        )
+        .await
+        .unwrap();
+        let repo = MemoryRepositoryImpl::new(ids.clone(), pool);
+        let id = repo
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+                    content: "orphaned".into(),
+                    external_id: Some(format!("thread-group-summary:{group}")),
+                    memory_kind: protobuf::llm_memory::data::MemoryKind::DerivedSummary as i32,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        ThreadMemoryRepositoryImpl::new(pool)
+            .insert_auto_position_tx(pool, 92_161, id.value, 1)
+            .await
+            .unwrap();
+        ThreadGroupMemoryRelationService::new(pool)
+            .link_existing(group, id.value, "summary", GroupMemoryDeletePolicy::Delete)
+            .await
+            .unwrap();
+        groups.delete_tx(pool, group).await.unwrap();
+        let config = memory_utils::cache::stretto::MemoryCacheConfig::default();
+        let memory_app = MemoryAppImpl::new(
+            repo,
+            MemoryRatingRepositoryImpl::new(ids.clone(), pool),
+            ThreadRepositoryImpl::new(ids, pool),
+            ThreadMemoryRepositoryImpl::new(pool),
+            ThreadLabelRepositoryImpl::new(pool),
+            memory_utils::cache::stretto::new_memory_cache(&config),
+            memory_utils::cache::stretto::new_memory_cache(&config),
+            None,
+        );
+        let cleanup = ThreadGroupOrphanCleanupService::new(pool, std::sync::Arc::new(memory_app));
+        let before = cleanup.preview().await.unwrap();
+        assert_eq!(before.safe_memory_ids, vec![id.value]);
+        let mut tx = pool.begin().await.unwrap();
+        MemoryRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool)
+            .update_content_only(&mut *tx, &id, "changed")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            cleanup
+                .execute(&before.digest)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("stale")
+        );
+        let after = cleanup.preview().await.unwrap();
+        let outcome = cleanup.execute(&after.digest).await.unwrap();
+        assert_eq!(outcome.deleted_memory_ids, vec![id.value]);
+        assert!(
+            MemoryRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool)
+                .find(&id, false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ThreadRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool)
+                .find(&protobuf::llm_memory::data::ThreadId { value: 92_161 })
+                .await
+                .unwrap()
+                .is_some()
+        );
+    });
+}
+
+#[test]
+fn purge_deletes_owned_memory_but_retains_reference_and_storage_thread() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let ids = infra::test_helper::shared_id_generator();
+        let group = ThreadGroupRepositoryImpl::new(ids.clone(), pool)
+            .create_tx(pool, &new_group(92_156))
+            .await
+            .unwrap();
+        insert_thread(pool, 92_157, None).await;
+        let repo = MemoryRepositoryImpl::new(ids.clone(), pool);
+        let make = |text: &str| protobuf::llm_memory::data::MemoryData {
+            user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+            content: text.into(),
+            memory_kind: protobuf::llm_memory::data::MemoryKind::DerivedSummary as i32,
+            ..Default::default()
+        };
+        let owned = repo
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    external_id: Some(format!("thread-group-summary:{group}")),
+                    ..make("owned")
+                },
+            )
+            .await
+            .unwrap();
+        let retained = repo.create(pool, &make("reference")).await.unwrap();
+        infra::infra::thread_label::rdb::ThreadLabelRepository::add_labels(
+            &ThreadLabelRepositoryImpl::new(pool),
+            92_157,
+            &[format!("group_{group}"), "thread_group_summary".into()],
+            1,
+        )
+        .await
+        .unwrap();
+        ThreadMemoryRepositoryImpl::new(pool)
+            .insert_auto_position_tx(pool, 92_157, owned.value, 1)
+            .await
+            .unwrap();
+        let relations = ThreadGroupMemoryRelationService::new(pool);
+        relations
+            .link_existing(
+                group,
+                owned.value,
+                "summary",
+                GroupMemoryDeletePolicy::Delete,
+            )
+            .await
+            .unwrap();
+        relations
+            .link_existing(
+                group,
+                retained.value,
+                "reference",
+                GroupMemoryDeletePolicy::Retain,
+            )
+            .await
+            .unwrap();
+        let config = memory_utils::cache::stretto::MemoryCacheConfig::default();
+        let app = MemoryAppImpl::new(
+            repo,
+            MemoryRatingRepositoryImpl::new(ids.clone(), pool),
+            ThreadRepositoryImpl::new(ids, pool),
+            ThreadMemoryRepositoryImpl::new(pool),
+            ThreadLabelRepositoryImpl::new(pool),
+            memory_utils::cache::stretto::new_memory_cache(&config),
+            memory_utils::cache::stretto::new_memory_cache(&config),
+            None,
+        );
+        let purge = ThreadGroupPurgeService::new(pool).with_memory_app(std::sync::Arc::new(app));
+        let preview = purge.preview(group).await.unwrap().unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        assert!(
+            MemoryRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool)
+                .update_content_only(&mut *tx, &retained, "changed")
+                .await
+                .unwrap()
+        );
+        tx.commit().await.unwrap();
+        let changed = purge.preview(group).await.unwrap().unwrap();
+        assert_ne!(preview.digest, changed.digest);
+        assert!(
+            purge
+                .delete(group, &preview.digest)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("stale")
+        );
+        sqlx::query("INSERT INTO memory (id, content, user_id, parent_ids, created_at, updated_at, role, content_type, memory_kind) VALUES (929901, 'legacy', 1, NULL, 0, 0, 0, 0, 0)")
+            .execute(pool).await.unwrap();
+        assert!(purge.preview(group).await.is_ok());
+        let child = MemoryRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool)
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+                    content: "references the summary".into(),
+                    parent_ids: vec![owned],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let referenced = purge.preview(group).await.unwrap().unwrap();
+        assert!(referenced.blocked_reason.contains("parent"));
+        assert_ne!(changed.digest, referenced.digest);
+        assert!(
+            purge
+                .delete(group, &referenced.digest)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("parent")
+        );
+        MemoryRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool)
+            .delete(&child)
+            .await
+            .unwrap();
+        infra::infra::thread_label::rdb::ThreadLabelRepository::remove_labels(
+            &ThreadLabelRepositoryImpl::new(pool),
+            92_157,
+            &[format!("group_{group}")],
+        )
+        .await
+        .unwrap();
+        let invalid = purge.preview(group).await.unwrap().unwrap();
+        assert!(invalid.blocked_reason.contains("storage Thread"));
+        assert!(purge.delete(group, &invalid.digest).await.is_err());
+        assert!(
+            MemoryRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool)
+                .find(&owned, false)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        infra::infra::thread_label::rdb::ThreadLabelRepository::add_labels(
+            &ThreadLabelRepositoryImpl::new(pool),
+            92_157,
+            &[format!("group_{group}")],
+            2,
+        )
+        .await
+        .unwrap();
+        let changed = purge.preview(group).await.unwrap().unwrap();
+        let outcome = purge.delete(group, &changed.digest).await.unwrap();
+        assert!(outcome.group_deleted);
+        assert!(
+            MemoryRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool)
+                .find(&owned, false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            MemoryRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool)
+                .find(&retained, false)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            ThreadRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool)
+                .find(&protobuf::llm_memory::data::ThreadId { value: 92_157 })
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            ThreadGroupMemoryRelationRepositoryImpl::new(pool)
+                .list_by_group_id(group)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn delete_relationship_requires_owned_dedicated_summary_thread() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let group = ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool)
+            .create_tx(pool, &new_group(92_162))
+            .await
+            .unwrap();
+        insert_thread(pool, 92_163, None).await;
+        infra::infra::thread_label::rdb::ThreadLabelRepository::add_labels(
+            &ThreadLabelRepositoryImpl::new(pool),
+            92_163,
+            &["thread_group_summary".into(), format!("group_{group}")],
+            1,
+        )
+        .await
+        .unwrap();
+        let repo = MemoryRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let id = repo
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    user_id: Some(protobuf::llm_memory::data::UserId { value: 2 }),
+                    content: "someone else's summary".into(),
+                    external_id: Some(format!("thread-group-summary:{group}")),
+                    memory_kind: protobuf::llm_memory::data::MemoryKind::DerivedSummary as i32,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        ThreadMemoryRepositoryImpl::new(pool)
+            .insert_auto_position_tx(pool, 92_163, id.value, 1)
+            .await
+            .unwrap();
+        let links = ThreadGroupMemoryRelationService::new(pool);
+        assert!(
+            links
+                .link_existing(group, id.value, "summary", GroupMemoryDeletePolicy::Delete)
+                .await
+                .is_err()
+        );
+        assert!(
+            links
+                .link_existing(
+                    group,
+                    id.value,
+                    "reference",
+                    GroupMemoryDeletePolicy::Retain
+                )
+                .await
+                .is_ok()
+        );
+    });
+}
+
+#[test]
+fn purge_rolls_back_first_owned_memory_when_later_delete_link_is_unsafe() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let ids = infra::test_helper::shared_id_generator();
+        let group = ThreadGroupRepositoryImpl::new(ids.clone(), pool)
+            .create_tx(pool, &new_group(92_164))
+            .await
+            .unwrap();
+        insert_thread(pool, 92_165, None).await;
+        infra::infra::thread_label::rdb::ThreadLabelRepository::add_labels(
+            &ThreadLabelRepositoryImpl::new(pool),
+            92_165,
+            &["thread_group_summary".into(), format!("group_{group}")],
+            1,
+        )
+        .await
+        .unwrap();
+        let repo = MemoryRepositoryImpl::new(ids.clone(), pool);
+        let owned = repo
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+                    content: "valid".into(),
+                    external_id: Some(format!("thread-group-summary:{group}")),
+                    memory_kind: protobuf::llm_memory::data::MemoryKind::DerivedSummary as i32,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        ThreadMemoryRepositoryImpl::new(pool)
+            .insert_auto_position_tx(pool, 92_165, owned.value, 1)
+            .await
+            .unwrap();
+        ThreadGroupMemoryRelationService::new(pool)
+            .link_existing(
+                group,
+                owned.value,
+                "summary",
+                GroupMemoryDeletePolicy::Delete,
+            )
+            .await
+            .unwrap();
+        let unsafe_memory = repo
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+                    content: "unverified".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        ThreadGroupMemoryRelationRepositoryImpl::new(pool)
+            .insert_tx(pool, group, unsafe_memory.value, "other", "delete", 1)
+            .await
+            .unwrap();
+        let config = memory_utils::cache::stretto::MemoryCacheConfig::default();
+        let app = MemoryAppImpl::new(
+            repo,
+            MemoryRatingRepositoryImpl::new(ids.clone(), pool),
+            ThreadRepositoryImpl::new(ids, pool),
+            ThreadMemoryRepositoryImpl::new(pool),
+            ThreadLabelRepositoryImpl::new(pool),
+            memory_utils::cache::stretto::new_memory_cache(&config),
+            memory_utils::cache::stretto::new_memory_cache(&config),
+            None,
+        );
+        let purge = ThreadGroupPurgeService::new(pool).with_memory_app(std::sync::Arc::new(app));
+        let preview = purge.preview(group).await.unwrap().unwrap();
+        assert!(purge.delete(group, &preview.digest).await.is_err());
+        assert!(
+            MemoryRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool)
+                .find(&owned, false)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool)
+                .find_by_id(group)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    });
+}
+
+#[test]
+fn deleting_memory_detaches_group_relationship_in_the_same_transaction() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let ids = infra::test_helper::shared_id_generator();
+        let groups = ThreadGroupRepositoryImpl::new(ids.clone(), pool);
+        let group_id = groups.create_tx(pool, &new_group(92_146)).await.unwrap();
+        let memories = MemoryRepositoryImpl::new(ids.clone(), pool);
+        let id = memories
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+                    content: "linked".into(),
+                    memory_kind: protobuf::llm_memory::data::MemoryKind::DerivedSummary as i32,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        ThreadGroupMemoryRelationService::new(pool)
+            .link_existing(
+                group_id,
+                id.value,
+                "reference",
+                GroupMemoryDeletePolicy::Retain,
+            )
+            .await
+            .unwrap();
+        let config = memory_utils::cache::stretto::MemoryCacheConfig::default();
+        let app = MemoryAppImpl::new(
+            memories,
+            MemoryRatingRepositoryImpl::new(ids.clone(), pool),
+            ThreadRepositoryImpl::new(ids, pool),
+            ThreadMemoryRepositoryImpl::new(pool),
+            ThreadLabelRepositoryImpl::new(pool),
+            memory_utils::cache::stretto::new_memory_cache(&config),
+            memory_utils::cache::stretto::new_memory_cache(&config),
+            None,
+        );
+        assert!(app.delete_memory(&id).await.unwrap());
+        assert!(
+            ThreadGroupMemoryRelationRepositoryImpl::new(pool)
+                .list_by_memory_id(id.value)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(groups.find_by_id(group_id).await.unwrap().is_some());
+    });
+}
+
+#[test]
+fn memory_service_rejects_summary_for_missing_group_without_blocking_raw_memory() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let ids = infra::test_helper::shared_id_generator();
+        let config = memory_utils::cache::stretto::MemoryCacheConfig::default();
+        let app = MemoryAppImpl::new(
+            MemoryRepositoryImpl::new(ids.clone(), pool),
+            MemoryRatingRepositoryImpl::new(ids.clone(), pool),
+            ThreadRepositoryImpl::new(ids, pool),
+            ThreadMemoryRepositoryImpl::new(pool),
+            ThreadLabelRepositoryImpl::new(pool),
+            memory_utils::cache::stretto::new_memory_cache(&config),
+            memory_utils::cache::stretto::new_memory_cache(&config),
+            None,
+        );
+        let mut memory = protobuf::llm_memory::data::MemoryData {
+            user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+            content: "group body".into(),
+            memory_kind: protobuf::llm_memory::data::MemoryKind::DerivedSummary as i32,
+            external_id: Some("thread-group-summary:99999999".into()),
+            ..Default::default()
+        };
+        assert!(app.create_memory(&memory).await.is_err());
+        memory.external_id = None;
+        let id = app.create_memory(&memory).await.unwrap();
+        assert!(
+            MemoryRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool)
+                .find(&id, false)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        memory.external_id = Some("thread-group-summary:99999999".into());
+        assert!(app.update_memory(&id, &Some(memory.clone())).await.is_err());
+        let groups =
+            ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let group_id = groups.create_tx(pool, &new_group(92_149)).await.unwrap();
+        memory.external_id = Some(format!("thread-group-summary:{group_id}"));
+        assert!(app.update_memory(&id, &Some(memory)).await.unwrap().updated);
+    });
+}
+
+#[test]
+fn deleting_thread_detaches_relationship_for_its_exclusive_memory() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let ids = infra::test_helper::shared_id_generator();
+        let groups = ThreadGroupRepositoryImpl::new(ids.clone(), pool);
+        let group_id = groups.create_tx(pool, &new_group(92_147)).await.unwrap();
+        insert_thread(pool, 92_148, None).await;
+        let memories = MemoryRepositoryImpl::new(ids.clone(), pool);
+        let id = memories
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+                    content: "thread body".into(),
+                    memory_kind: protobuf::llm_memory::data::MemoryKind::Raw as i32,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        ThreadMemoryRepositoryImpl::new(pool)
+            .insert_auto_position_tx(pool, 92_148, id.value, 1)
+            .await
+            .unwrap();
+        ThreadGroupMemoryRelationService::new(pool)
+            .link_existing(
+                group_id,
+                id.value,
+                "attachment",
+                GroupMemoryDeletePolicy::Retain,
+            )
+            .await
+            .unwrap();
+        let config = memory_utils::cache::stretto::MemoryCacheConfig::default();
+        let app = ThreadAppImpl::new(
+            ThreadRepositoryImpl::new(ids.clone(), pool),
+            ThreadMemoryRepositoryImpl::new(pool),
+            ThreadLabelRepositoryImpl::new(pool),
+            memories,
+            MemoryRatingRepositoryImpl::new(ids, pool),
+            memory_utils::cache::stretto::new_memory_cache(&config),
+            memory_utils::cache::stretto::new_memory_cache(&config),
+            None,
+            None,
+            None,
+        );
+        let (deleted, exclusive_ids) = app
+            .delete_thread(&protobuf::llm_memory::data::ThreadId { value: 92_148 })
+            .await
+            .unwrap();
+        assert!(deleted);
+        assert_eq!(exclusive_ids, vec![id.value]);
+        assert!(
+            ThreadGroupMemoryRelationRepositoryImpl::new(pool)
+                .list_by_memory_id(id.value)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(groups.find_by_id(group_id).await.unwrap().is_some());
+    });
+}
+
+#[test]
+fn thread_add_memory_rejects_legacy_summary_for_missing_group() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        insert_thread(pool, 92_150, None).await;
+        sqlx::query("UPDATE thread SET memory_kind = 8 WHERE id = ?")
+            .bind(92_150_i64)
+            .execute(pool)
+            .await
+            .unwrap();
+        let ids = infra::test_helper::shared_id_generator();
+        let config = memory_utils::cache::stretto::MemoryCacheConfig::default();
+        let app = ThreadAppImpl::new(
+            ThreadRepositoryImpl::new(ids.clone(), pool),
+            ThreadMemoryRepositoryImpl::new(pool),
+            ThreadLabelRepositoryImpl::new(pool),
+            MemoryRepositoryImpl::new(ids.clone(), pool),
+            MemoryRatingRepositoryImpl::new(ids, pool),
+            memory_utils::cache::stretto::new_memory_cache(&config),
+            memory_utils::cache::stretto::new_memory_cache(&config),
+            None,
+            None,
+            None,
+        );
+        let thread = protobuf::llm_memory::data::ThreadId { value: 92_150 };
+        let mut memory = protobuf::llm_memory::data::MemoryData {
+            user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+            content: "generated".into(),
+            external_id: Some("thread-group-summary:99999999".into()),
+            memory_kind: protobuf::llm_memory::data::MemoryKind::DerivedSummary as i32,
+            ..Default::default()
+        };
+        assert!(app.add_memory(&thread, &memory).await.is_err());
+        let groups =
+            ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let group_id = groups.create_tx(pool, &new_group(92_151)).await.unwrap();
+        let other_group = groups.create_tx(pool, &new_group(92_152)).await.unwrap();
+        let mut invalid = memory.clone();
+        invalid.external_id = Some(format!("thread-group-summary:{other_group}"));
+        invalid.memory_kind = protobuf::llm_memory::data::MemoryKind::Raw as i32;
+        assert!(
+            app.add_memory(&thread, &invalid)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("kind")
+        );
+        memory.external_id = Some(format!("thread-group-summary:{group_id}"));
+        assert!(app.add_memory(&thread, &memory).await.is_ok());
+        let before = ThreadMemoryRepositoryImpl::new(pool)
+            .find_memory_ids_by_thread_tx(pool, thread.value)
+            .await
+            .unwrap();
+        memory.external_id = None;
+        assert!(
+            app.add_memory_with_group_relation(
+                &thread,
+                &memory,
+                9_999_999,
+                "summary",
+                GroupMemoryDeletePolicy::Delete
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            ThreadMemoryRepositoryImpl::new(pool)
+                .find_memory_ids_by_thread_tx(pool, thread.value)
+                .await
+                .unwrap()
+                .len(),
+            before.len()
+        );
+        let linked_id = app
+            .add_memory_with_group_relation(
+                &thread,
+                &memory,
+                group_id,
+                "reference",
+                GroupMemoryDeletePolicy::Retain,
+            )
+            .await
+            .unwrap();
+        let links = ThreadGroupMemoryRelationRepositoryImpl::new(pool)
+            .list_by_group_id(group_id)
+            .await
+            .unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].memory_id, linked_id.value);
+    });
+}
+
+#[test]
+fn memory_writes_reject_wrong_kind_at_reserved_summary_external_id() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let ids = infra::test_helper::shared_id_generator();
+        let groups = ThreadGroupRepositoryImpl::new(ids.clone(), pool);
+        let group = groups.create_tx(pool, &new_group(92_153)).await.unwrap();
+        let other_group = groups.create_tx(pool, &new_group(92_154)).await.unwrap();
+        let config = memory_utils::cache::stretto::MemoryCacheConfig::default();
+        let app = MemoryAppImpl::new(
+            MemoryRepositoryImpl::new(ids.clone(), pool),
+            MemoryRatingRepositoryImpl::new(ids.clone(), pool),
+            ThreadRepositoryImpl::new(ids, pool),
+            ThreadMemoryRepositoryImpl::new(pool),
+            ThreadLabelRepositoryImpl::new(pool),
+            memory_utils::cache::stretto::new_memory_cache(&config),
+            memory_utils::cache::stretto::new_memory_cache(&config),
+            None,
+        );
+        let raw = protobuf::llm_memory::data::MemoryData {
+            user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+            content: "raw".into(),
+            memory_kind: protobuf::llm_memory::data::MemoryKind::Raw as i32,
+            ..Default::default()
+        };
+        let invalid = protobuf::llm_memory::data::MemoryData {
+            external_id: Some(format!("thread-group-summary:{group}")),
+            ..raw.clone()
+        };
+        assert!(
+            app.create_memory(&invalid)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("kind")
+        );
+        let summary = app
+            .create_memory(&protobuf::llm_memory::data::MemoryData {
+                memory_kind: protobuf::llm_memory::data::MemoryKind::DerivedSummary as i32,
+                ..invalid
+            })
+            .await
+            .unwrap();
+        assert!(
+            app.update_memory(
+                &summary,
+                &Some(protobuf::llm_memory::data::MemoryData {
+                    user_id: Some(protobuf::llm_memory::data::UserId { value: 1 }),
+                    content: "revised summary".into(),
+                    external_id: Some(format!("thread-group-summary:{group}")),
+                    memory_kind: protobuf::llm_memory::data::MemoryKind::Unspecified as i32,
+                    ..Default::default()
+                })
+            )
+            .await
+            .is_ok()
+        );
+        let raw_id = app.create_memory(&raw).await.unwrap();
+        let attempted = protobuf::llm_memory::data::MemoryData {
+            external_id: Some(format!("thread-group-summary:{other_group}")),
+            ..raw
+        };
+        assert!(
+            app.update_memory(&raw_id, &Some(attempted))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("kind")
+        );
+        let repo = MemoryRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        assert!(
+            repo.find(&raw_id, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .unwrap()
+                .external_id
+                .is_none()
+        );
+        assert!(repo.find(&summary, false).await.unwrap().is_some());
+    });
+}
+
+#[test]
+fn purge_rejects_replaced_membership_even_when_counts_match() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let groups =
+            ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let group_id = groups.create_tx(pool, &new_group(92_100)).await.unwrap();
+        let members = ThreadGroupMemberRepositoryImpl::new(pool);
+        let mut old = new_member(group_id, None, key(92_101));
+        old.state = values::member_state::DELETED.to_string();
+        old.deleted_at = Some(1);
+        members.insert_tx(pool, &old).await.unwrap();
+
+        let purge = ThreadGroupPurgeService::new(pool);
+        let preview = purge.preview(group_id).await.unwrap().unwrap();
+        assert_eq!(preview.inactive_memberships, 1);
+
+        members.delete_by_group_id_tx(pool, group_id).await.unwrap();
+        let mut replacement = new_member(group_id, None, key(92_102));
+        replacement.state = values::member_state::DELETED.to_string();
+        replacement.deleted_at = Some(1);
+        members.insert_tx(pool, &replacement).await.unwrap();
+        let current = purge.preview(group_id).await.unwrap().unwrap();
+        assert_eq!(current.inactive_memberships, preview.inactive_memberships);
+        assert_ne!(current.digest, preview.digest);
+        let error = purge.delete(group_id, &preview.digest).await.unwrap_err();
+        assert!(error.to_string().contains("stale"));
+        assert!(groups.find_by_id(group_id).await.unwrap().is_some());
+    });
+}
+
+#[test]
+fn purge_rejects_replaced_relation_even_when_counts_match() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let groups =
+            ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let group_id = groups.create_tx(pool, &new_group(92_200)).await.unwrap();
+        let members = ThreadGroupMemberRepositoryImpl::new(pool);
+        for id in [92_201, 92_202] {
+            let mut member = new_member(group_id, None, key(id));
+            member.state = values::member_state::DELETED.to_string();
+            member.deleted_at = Some(1);
+            members.insert_tx(pool, &member).await.unwrap();
+        }
+        let relations =
+            ThreadRelationRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let relation = infra::infra::thread_group::test_support::new_relation(92_201, 92_202);
+        let original_id = relations.insert_tx(pool, &relation).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        relations
+            .set_state_tx(
+                &mut *tx,
+                original_id,
+                values::relation_state::ACTIVE,
+                values::relation_state::RETRACTED,
+                2_000,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let purge = ThreadGroupPurgeService::new(pool);
+        let preview = purge.preview(group_id).await.unwrap().unwrap();
+        assert_eq!(preview.inactive_relations, 1);
+        relations.delete_by_id_tx(pool, original_id).await.unwrap();
+        let replacement_id = relations.insert_tx(pool, &relation).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        relations
+            .set_state_tx(
+                &mut *tx,
+                replacement_id,
+                values::relation_state::ACTIVE,
+                values::relation_state::RETRACTED,
+                2_000,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let current = purge.preview(group_id).await.unwrap().unwrap();
+        assert_eq!(current.inactive_relations, preview.inactive_relations);
+        assert_ne!(current.digest, preview.digest);
+        assert!(
+            purge
+                .delete(group_id, &preview.digest)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("stale")
+        );
+    });
+}
+
+#[test]
+fn purge_rejects_replaced_audit_even_when_counts_match() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let groups =
+            ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let group_id = groups.create_tx(pool, &new_group(92_300)).await.unwrap();
+        let target_id = groups.create_tx(pool, &new_group(92_301)).await.unwrap();
+        let audit =
+            ThreadGroupAuditRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let merge = NewGroupAuditMerge {
+            source_group_id: group_id,
+            target_group_id: target_id,
+            actor_id: "operator".into(),
+            reason: "test".into(),
+            created_at: 1,
+        };
+        let first_id = audit.append_merge_tx(pool, &merge).await.unwrap();
+        let purge = ThreadGroupPurgeService::new(pool);
+        let preview = purge.preview(group_id).await.unwrap().unwrap();
+        assert_eq!(preview.audit_rows, 1);
+        audit.delete_by_id_tx(pool, first_id).await.unwrap();
+        audit.append_merge_tx(pool, &merge).await.unwrap();
+
+        let current = purge.preview(group_id).await.unwrap().unwrap();
+        assert_eq!(current.audit_rows, preview.audit_rows);
+        assert_ne!(current.digest, preview.digest);
+        assert!(
+            purge
+                .delete(group_id, &preview.digest)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("stale")
         );
     });
 }
@@ -1575,6 +3935,7 @@ fn purge_preview_and_delete_removes_redirected_history() {
         .await;
         let active_preview = purge.preview(group_c).await.unwrap().unwrap();
         assert!(active_preview.active_memberships >= 1);
+        assert!(active_preview.blocked_reason.contains("active members"));
         assert!(
             purge.delete(group_c, &active_preview.digest).await.is_err(),
             "active group must not be purged"
@@ -2157,8 +4518,10 @@ fn purge_preserves_cross_group_inactive_relation() {
             .unwrap();
 
         let preview = purge.preview(group_a).await.unwrap().expect("preview");
+        assert_eq!(preview.inactive_relations, 1);
         let outcome = purge.delete(group_a, &preview.digest).await.unwrap();
         assert!(outcome.group_deleted);
+        assert_eq!(outcome.deleted_relations, 1);
 
         assert!(
             relations.find_by_id(crossing_id).await.unwrap().is_some(),

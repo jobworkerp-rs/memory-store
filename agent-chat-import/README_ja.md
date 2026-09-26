@@ -78,6 +78,8 @@ memories-import --user-id 1 --server-url http://localhost:9010 claude-code \
   --session-file ~/.claude/projects/-home-me-app/abc123.jsonl
 ```
 
+Claude Code の main session は、`/fork` の親子 observation がなくても project key と元の session ID から source identity を登録する。project key を特定できない場合は identity scope を `Unknown` のままにし、推測した root membership は作らない。fork の observation は従来どおり明示根拠があるときだけ確定する。
+
 ### 1 プロジェクト分まとめて取り込む
 
 ```bash
@@ -365,6 +367,8 @@ jobworkerp のデフォルト channel が使われる。
 
 OpenAI Codex CLI の rollout JSONL を取り込む。1 rollout = 1 thread。`session_meta.payload.id` (UUIDv4) を `session_id` として使用するため、同じ rollout を再 import すると idempotent に skip される (`external_id` UNIQUE)。
 
+通常の rollout は親子 observation が空でも `session_meta.payload.id` から source identity / root membership を登録する。subagent の `parent_thread_id` と user fork の `forked_from_id` による exact observation はこれと独立して送信する。
+
 ```bash
 # 単一 rollout
 memories-import --user-id 1 --server-url http://localhost:9010 codex \
@@ -377,6 +381,12 @@ memories-import --user-id 1 --server-url http://localhost:9010 codex \
 # 全件 dry-run
 memories-import --user-id 1 --dry-run codex --all-sessions
 ```
+
+### Codex / Claude Code の既存 ThreadGroup を修復する場合
+
+1. 修正版サーバーと `memories-import` を用意し、読み取り専用で親子の RAW Thread、source identity の owner / scope、削除 marker、operator 固定所属、要約参照を確認する。Claude Code は親子の project key が一致することを確認する。scope が `Unknown` のものを空文字列 scope とみなして結合しない。
+2. 対象親のファイルを指定して `--dry-run-connect` で確認し、書き込みを承認された接続先で親ファイルを `--since` なしで再 import する。Codex は `codex --session-file`、Claude Code は `claude-code --session-file` を使う（上記の単一ファイル例を参照）。既存 Thread の identity 登録と保存済み pending の再評価を行う。
+3. `FindThreadGroupLineage` と reconciliation report で active relation / membership と pending の変化を確認する。未解決が残る場合にのみ、対象の子ファイルを個別に再 import する。意図しない group merge、削除 marker / operator 所属 / 要約参照の変化があれば中断する。
 
 ### type ごとの取り込み方針
 
@@ -431,9 +441,20 @@ memories-import --user-id 1 --server-url http://localhost:9010 opencode \
 
 - **重複再実行で安全**: `--since` は session/message/part の更新時刻で候補を再評価するが、既存 Memory の本文や metadata は上書きしない。未完了 message / tool (`pending` / `running`) は defer され、次回実行時に再評価される
 - **親 session の補完**: `--since` で更新対象になった session は、`parent_id` を持つ場合に未更新の祖先も親から順に取り込む。subagent だけが取り込まれて lineage 上の root になることを防ぐためであり、祖先も通常の重複排除を通る
+- **ThreadGroup の root 登録**: `parent_id` のない session も source identity を登録し、親子 observation が空でも root の primary membership を作る。子は `parent_id` を exact evidence として送信する。子が先に取り込まれた場合は pending evidence を保存し、親が後から登録されたときに再評価する。重複だけの再取り込みでも既存 Thread の identity と deletion marker を確認してから group の再照合を行う。削除 marker がある場合は再照合せずエラーにする
+- **緊急停止中の重複だけの取り込み**: `--no-thread-group-writes` で OpenCode の全 entry が既存 Memory と重複する場合、deletion marker を排他的に確認できないため label / parent link を変更せずエラーにする。新しい entry がある場合は batch 側で通常どおり source identity を用いて suppression を判定する
 - **elide 済み tool output**: `state.time.compacted` を持つ completed tool は、OpenCode による compaction で output が消去されているため、call (input) のみを取り込み、output / 内部 attachment は生成しない。`error` status の tool は compacted でも `state.error` を tool output として常に保存する
 - **参照添付**: media RPC に送らず、秘密情報を含む URL は redacted reference として保存する。metadata には原 MIME と filename のみ保存する
 - **usage の重複除去**: message 単位の usage は同一 message の複数 part に繰り返されるため、`message_id` 単位で重複を除いた最初の part にだけ `metadata.opencode.usage` を保存する
+
+### 既存の分割済み ThreadGroup の修復
+
+1. 修正版のサーバーと `memories-import` を両方配置し、使用する binary のビルド元・checksum を確認する。対象の owner、親 session ID、子 session ID、元の primary membership、削除 marker、operator 固定所属、要約参照を読み取り専用で控える。marker や operator 判断がある場合は自動で統合せず、担当者が影響を判断する。
+2. `--dry-run-connect` と `--session-id` で親と各子の予定差分を確認する。親の RAW Thread があること、identity scope が `Known("")` で owner が一致することを確認し、対象外の Thread に group の変更がないか点検する。接続先を指定した dry-run も ThreadGroup を書き換えない。
+3. 承認済みの接続先で上記の単一 session コマンドを使い、親を再取り込みする。親の Memory が重複だけでも source identity と membership が登録され、保存済みの子の pending evidence が再評価される。必要な場合だけ子を個別に再取り込みする。`--since` により全 entry が除外されると既存 Thread を特定できないため、この作業では `--since` を指定しない。
+4. `FindThreadGroupLineage` / `FindThreadGroupReconciliationReport` で親子の active relation、primary membership、pending の減少を確認する。統合前の group ID の存続ではなく、現在の所属・redirect と要約参照を確認する。意図しない merge、marker の変化、operator 指定の移動があれば作業を止め、事前に控えた状態と照合する。
+
+修正版の自動 redirect は **これから空になる group** に適用する。過去の不具合で既に `ACTIVE`・current member 0 件になった group は、親や子を再 import しても自動で redirect されるとは限らない。旧 ID や要約 Memory の履歴を壊さないよう、空 group の一括削除や `merge_groups` の代用（target の member を operator 固定に変える）は避け、必要な対象だけ別途確認する。
 
 ## `plain` サブコマンド
 

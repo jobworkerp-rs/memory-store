@@ -593,6 +593,7 @@ fn build_per_file_session(
             "rel_path": rel_str,
         }),
         thread_metadata: None,
+        source_identity: None,
         thread_group_observations: Vec::new(),
     }
 }
@@ -631,6 +632,7 @@ fn build_per_dir_session(
             "file_count": loaded.iter().filter(|l| l.is_entry()).count(),
         }),
         thread_metadata: None,
+        source_identity: None,
         thread_group_observations: Vec::new(),
     }
 }
@@ -667,6 +669,7 @@ fn build_single_session(
             "file_count": loaded.iter().filter(|l| l.is_entry()).count(),
         }),
         thread_metadata: None,
+        source_identity: None,
         thread_group_observations: Vec::new(),
     }
 }
@@ -1186,6 +1189,19 @@ mod tests {
         assert!(names.contains(&"a.md".to_string()));
         assert!(names.contains(&"b.txt".to_string()));
         assert!(!names.iter().any(|n| n.ends_with(".png")));
+    }
+
+    #[test]
+    fn plain_sessions_have_no_thread_group_source_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("note.md"), "plain note");
+        let source = PlainSource::new(args(dir.path().to_path_buf(), ThreadStrategy::PerFile));
+        let input = source.discover().unwrap().remove(0);
+
+        let session = session_from_outcome(source.read_session(&input, None).unwrap());
+
+        assert!(session.source_identity.is_none());
+        assert!(session.thread_group_observations.is_empty());
     }
 
     #[test]

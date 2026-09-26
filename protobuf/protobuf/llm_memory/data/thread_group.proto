@@ -12,6 +12,19 @@ message ThreadGroupId {
     int64 value = 1;
 }
 
+// A Memory can be related to a group without being owned by that group.
+enum GroupMemoryDeletePolicy {
+    GROUP_MEMORY_DELETE_POLICY_UNSPECIFIED = 0;
+    GROUP_MEMORY_DELETE_POLICY_RETAIN = 1;
+    GROUP_MEMORY_DELETE_POLICY_DELETE = 2;
+}
+
+message GroupMemoryRelationInput {
+    ThreadGroupId group_id = 1;
+    string purpose = 2;
+    GroupMemoryDeletePolicy on_group_delete = 3;
+}
+
 enum ThreadGroupStatus {
     THREAD_GROUP_STATUS_UNSPECIFIED = 0;
     THREAD_GROUP_STATUS_ACTIVE = 1;

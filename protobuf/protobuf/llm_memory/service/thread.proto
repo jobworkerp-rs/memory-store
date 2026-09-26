@@ -4,8 +4,8 @@ package llm_memory.service;
 
 import "llm_memory/data/common.proto";
 import "llm_memory/data/thread.proto";
-import "llm_memory/data/memory.proto";
 import "llm_memory/data/thread_group.proto";
+import "llm_memory/data/memory.proto";
 import "llm_memory/service/common.proto";
 
 // Response returned on thread creation. Carries the auto-assigned id.
@@ -82,6 +82,9 @@ message AddMemoryRequest {
     // The Thread's `default_system_memory_id` may be auto-injected
     // into `parent_ids` — see ThreadData.default_system_memory_id.
     llm_memory.data.MemoryData memory = 2;
+    // Atomically attach the new Memory to a ThreadGroup. When omitted the
+    // historical AddMemory behavior is unchanged.
+    llm_memory.data.GroupMemoryRelationInput group_memory_relation = 3;
 }
 
 // Paginated request to list the Memories attached to a Thread.

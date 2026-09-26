@@ -12,7 +12,10 @@ use crate::protobuf::llm_memory::service::{
 use crate::service::error_handle::handle_error;
 use crate::service::memory::enrich_memory_media;
 use crate::service::memory_kind::{normalize_memory_kinds, normalize_memory_search_filter};
-use app::app::memory_vector::{CountMode, CountSearchInput, MemoryVectorAppImpl};
+use app::app::memory_vector::{
+    CountMode, CountSearchInput, EXTERNAL_ID_PREFIX_RESOLUTION_CAP, ExternalIdPrefixResolution,
+    MemoryVectorAppImpl,
+};
 use async_stream::stream;
 use command_utils::trace::Tracing;
 use futures::stream::BoxStream;
@@ -59,6 +62,44 @@ fn to_proto_result(item: app::app::memory_vector::MemorySearchResultItem) -> Mem
         matched_begin_position: item.matched_begin_position,
         matched_end_position: item.matched_end_position,
         matched_content: item.matched_content,
+    }
+}
+
+fn reject_external_id_prefix_for_non_hybrid_search(
+    filter: &crate::protobuf::llm_memory::data::MemorySearchFilter,
+) -> Result<(), tonic::Status> {
+    if filter.external_id_prefix.is_some() {
+        return Err(tonic::Status::invalid_argument(
+            "external_id_prefix is supported only by HybridSearch",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_external_id_prefix_for_hybrid_search(
+    filter: &crate::protobuf::llm_memory::data::MemorySearchFilter,
+) -> Result<(), tonic::Status> {
+    if filter
+        .external_id_prefix
+        .as_ref()
+        .is_some_and(|prefix| prefix.is_empty())
+    {
+        return Err(tonic::Status::invalid_argument(
+            "external_id_prefix must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_and_validate_memory_search_filter(
+    filter: &mut crate::protobuf::llm_memory::data::MemorySearchFilter,
+    allow_external_id_prefix: bool,
+) -> Result<(), tonic::Status> {
+    normalize_memory_search_filter(filter)?;
+    if allow_external_id_prefix {
+        validate_external_id_prefix_for_hybrid_search(filter)
+    } else {
+        reject_external_id_prefix_for_non_hybrid_search(filter)
     }
 }
 
@@ -286,7 +327,7 @@ impl<T: MemoryVectorGrpc + Tracing + Send + Debug + Sync + 'static> MemoryVector
         if let Some(options) = req.options.as_mut()
             && let Some(filter) = options.filter.as_mut()
         {
-            normalize_memory_search_filter(filter)?;
+            normalize_and_validate_memory_search_filter(filter, false)?;
         }
         let vectors: Vec<Vec<f32>> = req.query_vectors.iter().map(|v| v.values.clone()).collect();
         if vectors.is_empty() {
@@ -354,7 +395,7 @@ impl<T: MemoryVectorGrpc + Tracing + Send + Debug + Sync + 'static> MemoryVector
         if let Some(options) = req.options.as_mut()
             && let Some(filter) = options.filter.as_mut()
         {
-            normalize_memory_search_filter(filter)?;
+            normalize_and_validate_memory_search_filter(filter, false)?;
         }
         if req.query_text.is_empty() {
             return Err(tonic::Status::invalid_argument("query_text is required"));
@@ -404,7 +445,7 @@ impl<T: MemoryVectorGrpc + Tracing + Send + Debug + Sync + 'static> MemoryVector
         if let Some(options) = req.options.as_mut()
             && let Some(filter) = options.filter.as_mut()
         {
-            normalize_memory_search_filter(filter)?;
+            normalize_and_validate_memory_search_filter(filter, true)?;
         }
         let vectors: Vec<Vec<f32>> = req.query_vectors.iter().map(|v| v.values.clone()).collect();
         if vectors.is_empty() {
@@ -426,7 +467,41 @@ impl<T: MemoryVectorGrpc + Tracing + Send + Debug + Sync + 'static> MemoryVector
         let proto_filter = options.and_then(|o| o.filter.as_ref());
         let memory_user_id = proto_filter.and_then(|f| f.user_id);
         let thread_filter = proto_filter.and_then(|f| f.thread_filter.as_ref());
-        let filter = proto_filter.and_then(SafeFilter::from_proto_filter);
+        let mut filter = proto_filter.and_then(SafeFilter::from_proto_filter);
+        if let Some(external_id_prefix) = proto_filter.and_then(|f| f.external_id_prefix.as_deref())
+        {
+            let memory_kinds = proto_filter.map_or(&[][..], |f| f.memory_kinds.as_slice());
+            let resolved = self
+                .app()
+                .resolve_memory_ids_by_external_id_prefix(
+                    external_id_prefix,
+                    memory_user_id,
+                    memory_kinds,
+                    EXTERNAL_ID_PREFIX_RESOLUTION_CAP,
+                )
+                .await
+                .map_err(|e| handle_error(&e))?;
+            let memory_ids = match resolved {
+                ExternalIdPrefixResolution::Matches(memory_ids) => memory_ids,
+                ExternalIdPrefixResolution::TooMany { limit } => {
+                    return Err(tonic::Status::failed_precondition(format!(
+                        "external_id_prefix matched more than {limit} memories; narrow the prefix or add filters",
+                    )));
+                }
+            };
+            if memory_ids.is_empty() {
+                let empty_results =
+                    futures::stream::empty::<Result<MemorySearchResult, tonic::Status>>();
+                let stream: Self::HybridSearchStream = Box::pin(empty_results);
+                return Ok(Response::new(stream));
+            }
+            let prefix_filter = SafeFilter::in_i64_list("memory_id", &memory_ids)
+                .map_err(|e| tonic::Status::internal(e.to_string()))?;
+            filter = Some(match filter {
+                Some(existing) => existing.and(prefix_filter),
+                None => prefix_filter,
+            });
+        }
 
         let hybrid_opts = req.hybrid_options.as_ref();
         let hybrid_options = HybridOptions {
@@ -495,7 +570,7 @@ impl<T: MemoryVectorGrpc + Tracing + Send + Debug + Sync + 'static> MemoryVector
         if let Some(options) = req.options.as_mut()
             && let Some(filter) = options.filter.as_mut()
         {
-            normalize_memory_search_filter(filter)?;
+            normalize_and_validate_memory_search_filter(filter, false)?;
         }
         if req.query_text.trim().is_empty() {
             return Err(tonic::Status::invalid_argument("query_text is required"));
@@ -544,7 +619,7 @@ impl<T: MemoryVectorGrpc + Tracing + Send + Debug + Sync + 'static> MemoryVector
         if let Some(options) = req.options.as_mut()
             && let Some(filter) = options.filter.as_mut()
         {
-            normalize_memory_search_filter(filter)?;
+            normalize_and_validate_memory_search_filter(filter, false)?;
         }
         let media_object_id = req
             .media_object_id
@@ -725,7 +800,7 @@ impl<T: MemoryVectorGrpc + Tracing + Send + Debug + Sync + 'static> MemoryVector
         let _s = Self::trace_request("memory_vector", "count_search_matches", &request);
         let mut req = request.into_inner();
         if let Some(filter) = req.filter.as_mut() {
-            normalize_memory_search_filter(filter)?;
+            normalize_and_validate_memory_search_filter(filter, false)?;
         }
 
         // UNSPECIFIED (and any unknown enum tag) is rejected explicitly
@@ -984,6 +1059,51 @@ mod tests {
             .expect("ok")
             .expect("some");
         assert_eq!(v.embedding_model, None);
+    }
+
+    #[test]
+    fn non_hybrid_search_rejects_external_id_prefix() {
+        let mut filter = crate::protobuf::llm_memory::data::MemorySearchFilter {
+            external_id_prefix: Some("thread-group-summary:".to_string()),
+            ..Default::default()
+        };
+        let error = normalize_and_validate_memory_search_filter(&mut filter, false)
+            .expect_err("only HybridSearch implements external_id_prefix");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            error.message(),
+            "external_id_prefix is supported only by HybridSearch"
+        );
+    }
+
+    #[test]
+    fn hybrid_search_rejects_empty_prefix_but_accepts_a_real_prefix() {
+        let mut filter = crate::protobuf::llm_memory::data::MemorySearchFilter::default();
+        assert!(normalize_and_validate_memory_search_filter(&mut filter, true).is_ok());
+
+        filter.external_id_prefix = Some("thread-group-summary:".to_string());
+        assert!(normalize_and_validate_memory_search_filter(&mut filter, true).is_ok());
+
+        filter.external_id_prefix = Some(String::new());
+        let error = normalize_and_validate_memory_search_filter(&mut filter, true)
+            .expect_err("empty prefix would unintentionally match every external ID");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(error.message(), "external_id_prefix must not be empty");
+    }
+
+    #[test]
+    fn search_filter_is_normalized_before_external_id_prefix_policy() {
+        let mut filter = crate::protobuf::llm_memory::data::MemorySearchFilter {
+            memory_kinds: vec![2, 1, 2],
+            external_id_prefix: Some("prefix".to_string()),
+            ..Default::default()
+        };
+
+        let error = normalize_and_validate_memory_search_filter(&mut filter, false)
+            .expect_err("non-hybrid searches must reject an external ID prefix");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(filter.memory_kinds, vec![1, 2]);
     }
 
     // ===== Image memory Phase 4: RedispatchEmbeddings.kinds =====

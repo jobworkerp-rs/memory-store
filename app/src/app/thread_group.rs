@@ -5,8 +5,10 @@
 
 mod domain;
 mod lifecycle;
+pub mod memory_relation;
 mod observation;
 mod operator;
+pub mod orphan_cleanup;
 mod outbox;
 mod prelude;
 mod read_search;

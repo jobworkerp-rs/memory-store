@@ -45,6 +45,14 @@ const FIND_BY_ID_SQL: &str = concat!(
     p!(1)
 );
 
+const LIST_REDIRECTING_TO_SQL: &str = concat!(
+    "SELECT ",
+    THREAD_GROUP_COLUMNS!(),
+    " FROM thread_group WHERE status = 'redirected' AND redirect_to_group_id = ",
+    p!(1),
+    " ORDER BY id"
+);
+
 const FIND_ACTIVE_BY_CANONICAL_KEY_SQL: &str = concat!(
     "SELECT ",
     THREAD_GROUP_COLUMNS!(),
@@ -94,6 +102,17 @@ const REPOINT_REDIRECT_SQL: &str = concat!(
     " WHERE id = ",
     p!(3),
     " AND status = 'redirected'"
+);
+
+const REPOINT_REDIRECT_FROM_SQL: &str = concat!(
+    "UPDATE thread_group SET redirect_to_group_id = ",
+    p!(1),
+    ", updated_at = ",
+    p!(2),
+    " WHERE id = ",
+    p!(3),
+    " AND status = 'redirected' AND redirect_to_group_id = ",
+    p!(4)
 );
 
 // A split group keeps `redirect_to_group_id` NULL; the pairing CHECK
@@ -147,6 +166,32 @@ pub trait ThreadGroupRepository: UseRdbPool + UseIdGenerator + Send + Sync {
             .fetch_optional(self.db_pool())
             .await
             .map_err(LlmMemoryError::DBError)?)
+    }
+
+    async fn find_by_id_tx<'c, E: Executor<'c, Database = Rdb>>(
+        &self,
+        tx: E,
+        id: i64,
+    ) -> Result<Option<ThreadGroupRow>> {
+        Ok(sqlx::query_as::<Rdb, ThreadGroupRow>(FIND_BY_ID_SQL)
+            .bind(id)
+            .fetch_optional(tx)
+            .await
+            .map_err(LlmMemoryError::DBError)?)
+    }
+
+    async fn list_redirecting_to_tx<'c, E: Executor<'c, Database = Rdb>>(
+        &self,
+        tx: E,
+        target_group_id: i64,
+    ) -> Result<Vec<ThreadGroupRow>> {
+        Ok(
+            sqlx::query_as::<Rdb, ThreadGroupRow>(LIST_REDIRECTING_TO_SQL)
+                .bind(target_group_id)
+                .fetch_all(tx)
+                .await
+                .map_err(LlmMemoryError::DBError)?,
+        )
     }
 
     /// Idempotent lookup over the active-key partial UNIQUE index.
@@ -322,6 +367,26 @@ pub trait ThreadGroupRepository: UseRdbPool + UseIdGenerator + Send + Sync {
         Ok(res.rows_affected() > 0)
     }
 
+    async fn repoint_redirect_from_tx<'c, E: Executor<'c, Database = Rdb>>(
+        &self,
+        tx: E,
+        id: i64,
+        expected_target_group_id: i64,
+        redirect_to_group_id: i64,
+        updated_at: i64,
+    ) -> Result<bool> {
+        let updated_at = fill_updated_at(updated_at);
+        let res = sqlx::query::<Rdb>(REPOINT_REDIRECT_FROM_SQL)
+            .bind(redirect_to_group_id)
+            .bind(updated_at)
+            .bind(id)
+            .bind(expected_target_group_id)
+            .execute(tx)
+            .await
+            .map_err(LlmMemoryError::DBError)?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// `active → split`. Returns false when the source is not active.
     async fn mark_split_tx<'c, E: Executor<'c, Database = Rdb>>(
         &self,
@@ -360,6 +425,29 @@ pub struct ThreadGroupRepositoryImpl {
 impl ThreadGroupRepositoryImpl {
     pub fn new(id_generator: IdGeneratorWrapper, pool: &'static RdbPool) -> Self {
         Self { pool, id_generator }
+    }
+
+    /// SQLite's deferred transaction does not reserve the single-writer
+    /// lock until its first write. Reserve it before a purge reads from other
+    /// connections, so a relationship cannot be inserted after validation.
+    pub async fn reserve_purge_write_tx<'c, E: Executor<'c, Database = Rdb>>(
+        &self,
+        tx: E,
+        group_id: i64,
+    ) -> Result<()> {
+        #[cfg(not(feature = "postgres"))]
+        {
+            sqlx::query(concat!(
+                "UPDATE thread_group SET updated_at = updated_at WHERE id = ",
+                p!(1)
+            ))
+            .bind(group_id)
+            .execute(tx)
+            .await?;
+        }
+        #[cfg(feature = "postgres")]
+        let _ = (tx, group_id);
+        Ok(())
     }
 }
 

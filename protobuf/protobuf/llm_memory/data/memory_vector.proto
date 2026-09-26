@@ -50,6 +50,9 @@ message MemorySearchFilter {
   // memory record itself, including memories that are not attached to a
   // thread.
   repeated MemoryKind memory_kinds = 11;
+  // Restrict HybridSearch to memories whose external_id starts with this
+  // value. Other search RPCs reject this field rather than silently ignoring it.
+  optional string external_id_prefix = 12;
 }
 
 // Common search options

@@ -1194,23 +1194,11 @@ impl ThreadGroupReadService {
         }
         relations.sort_by_key(|relation| relation.id);
 
-        let member_thread_ids: HashSet<i64> = members.iter().filter_map(|m| m.thread_id).collect();
         let mut unresolved = Vec::new();
-        for state in [
-            values::candidate_state::PENDING,
-            values::candidate_state::AMBIGUOUS,
-            values::candidate_state::CONFLICT,
-        ] {
-            for candidate in self.candidates.list_by_state(state, None, None).await? {
-                let in_group = candidate.candidate_group_id == Some(group_id)
-                    || candidate
-                        .subject_thread_id
-                        .is_some_and(|id| member_thread_ids.contains(&id));
-                if in_group {
-                    unresolved.push(candidate);
-                }
-            }
-        }
+        self.for_each_unresolved_candidate(group_id, &members, |candidate| {
+            unresolved.push(candidate);
+        })
+        .await?;
 
         // Evidence for each member's owner-local identity. A member
         // without source identity (manual thread) contributes none.
@@ -1298,7 +1286,7 @@ impl ThreadGroupReadService {
         self.memories
             .find_by_external_id_and_kind(
                 &thread_group_summary_external_id(group_id),
-                MemoryKind::ThreadGroupSummary,
+                MemoryKind::DerivedSummary,
             )
             .await
     }
@@ -1401,11 +1389,22 @@ impl ThreadGroupReadService {
         group_id: i64,
         members: &[ThreadGroupMemberRow],
     ) -> anyhow::Result<i64> {
+        let mut count = 0;
+        self.for_each_unresolved_candidate(group_id, members, |_| count += 1)
+            .await?;
+        Ok(count)
+    }
+
+    async fn for_each_unresolved_candidate(
+        &self,
+        group_id: i64,
+        members: &[ThreadGroupMemberRow],
+        mut visit: impl FnMut(ThreadGroupCandidateAssociationRow),
+    ) -> anyhow::Result<()> {
         let member_thread_ids: HashSet<i64> = members
             .iter()
             .filter_map(|member| member.thread_id)
             .collect();
-        let mut count = 0;
         for state in [
             values::candidate_state::PENDING,
             values::candidate_state::AMBIGUOUS,
@@ -1417,26 +1416,18 @@ impl ThreadGroupReadService {
                         .subject_thread_id
                         .is_some_and(|id| member_thread_ids.contains(&id))
                 {
-                    count += 1;
+                    visit(candidate);
                 }
             }
         }
-        Ok(count)
+        Ok(())
     }
 
     async fn member_displays(
         &self,
         members: &[ThreadGroupMemberRow],
     ) -> anyhow::Result<Vec<ThreadDisplayView>> {
-        let thread_ids = members
-            .iter()
-            .filter_map(|member| member.thread_id)
-            .collect::<Vec<_>>();
-        let threads = self.threads.find_by_ids(&thread_ids).await?;
-        let by_id = threads
-            .into_iter()
-            .filter_map(|thread| thread.id.map(|id| (id.value, thread)))
-            .collect::<std::collections::HashMap<_, _>>();
+        let by_id = self.member_threads_by_id(members).await?;
         Ok(members
             .iter()
             .map(|member| {
@@ -1461,15 +1452,7 @@ impl ThreadGroupReadService {
         &self,
         members: &[ThreadGroupMemberRow],
     ) -> anyhow::Result<Vec<MembershipSnapshotEntry>> {
-        let thread_ids = members
-            .iter()
-            .filter_map(|member| member.thread_id)
-            .collect::<Vec<_>>();
-        let threads = self.threads.find_by_ids(&thread_ids).await?;
-        let by_id = threads
-            .into_iter()
-            .filter_map(|thread| thread.id.map(|id| (id.value, thread)))
-            .collect::<std::collections::HashMap<_, _>>();
+        let by_id = self.member_threads_by_id(members).await?;
         Ok(members
             .iter()
             .map(|member| {
@@ -1486,6 +1469,21 @@ impl ThreadGroupReadService {
                     last_message_at: data.and_then(|data| data.last_message_at),
                 }
             })
+            .collect())
+    }
+
+    async fn member_threads_by_id(
+        &self,
+        members: &[ThreadGroupMemberRow],
+    ) -> anyhow::Result<std::collections::HashMap<i64, protobuf::llm_memory::data::Thread>> {
+        let thread_ids = members
+            .iter()
+            .filter_map(|member| member.thread_id)
+            .collect::<Vec<_>>();
+        let threads = self.threads.find_by_ids(&thread_ids).await?;
+        Ok(threads
+            .into_iter()
+            .filter_map(|thread| thread.id.map(|id| (id.value, thread)))
             .collect())
     }
 

@@ -402,7 +402,7 @@ impl<T: MemoryGrpc + Tracing + Send + Debug + Sync + 'static> MemoryService for 
 #[derive(DebugStub)]
 pub(crate) struct MemoryGrpcImpl {
     #[debug_stub = "MemoryAppImpl"]
-    memory_app: MemoryAppImpl,
+    memory_app: Arc<MemoryAppImpl>,
     #[debug_stub = "Option<Arc<MemoryVectorAppImpl>>"]
     vector_app: Option<std::sync::Arc<app::app::memory_vector::MemoryVectorAppImpl>>,
     #[debug_stub = "Option<Arc<MediaAppImpl>>"]
@@ -411,7 +411,7 @@ pub(crate) struct MemoryGrpcImpl {
 
 impl MemoryGrpcImpl {
     pub fn new(
-        memory_app: MemoryAppImpl,
+        memory_app: Arc<MemoryAppImpl>,
         vector_app: Option<std::sync::Arc<app::app::memory_vector::MemoryVectorAppImpl>>,
         media_app: Option<Arc<MediaAppImpl>>,
     ) -> Self {
