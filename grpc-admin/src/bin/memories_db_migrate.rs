@@ -323,8 +323,11 @@ fn selected_tasks_for_schema_version(
 }
 
 async fn run_uninitialized_dry_run() -> Result<()> {
+    let pool = open_target_pool().await?;
+    let had_history_schema = atlas_history_schema_exists(&pool).await?;
+    drop(pool);
     let atlas_result = run_atlas(&["migrate", "apply", "--dry-run"]).await;
-    let cleanup_result = cleanup_uninitialized_dry_run_history().await;
+    let cleanup_result = cleanup_uninitialized_dry_run_history(had_history_schema).await;
     match (atlas_result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Ok(()), Err(error)) => Err(error),
@@ -335,20 +338,27 @@ async fn run_uninitialized_dry_run() -> Result<()> {
     }
 }
 
-async fn cleanup_uninitialized_dry_run_history() -> Result<()> {
+async fn cleanup_uninitialized_dry_run_history(had_history_schema: bool) -> Result<()> {
     let pool = open_target_pool().await?;
     let has_application_table = table_exists(&pool, "thread").await?;
     let has_history = atlas_history_exists(&pool).await?;
     let has_contract = table_exists(&pool, "memories_schema_contract").await?;
     let has_task_state = table_exists(&pool, "memories_data_migration_task_state").await?;
     if !has_history {
+        if has_application_table || has_contract || has_task_state {
+            bail!(
+                "Atlas dry-run changed an uninitialized target beyond its empty revision history"
+            );
+        }
+        cleanup_new_atlas_history_schema(&pool, had_history_schema).await?;
         return Ok(());
     }
     if has_application_table || has_contract || has_task_state {
         bail!("Atlas dry-run changed an uninitialized target beyond its empty revision history");
     }
 
-    let revision_count: i64 = sqlx::query_scalar(ATLAS_HISTORY_COUNT_SQL)
+    let (count_sql, _, drop_sql) = atlas_history_sql()?;
+    let revision_count: i64 = sqlx::query_scalar(count_sql)
         .fetch_one(&pool)
         .await
         .context("checking Atlas dry-run revision history")?;
@@ -357,13 +367,43 @@ async fn cleanup_uninitialized_dry_run_history() -> Result<()> {
     }
     // Atlas creates its revision table before rendering a dry-run plan. An
     // empty table is not migration state, so remove it to preserve dry-run.
-    sqlx::query(ATLAS_HISTORY_DROP_SQL)
+    sqlx::query(drop_sql)
         .execute(&pool)
         .await
         .context("restoring uninitialized target after Atlas dry-run")?;
+    cleanup_new_atlas_history_schema(&pool, had_history_schema).await?;
     if schema_state(&pool).await? != SchemaState::Uninitialized {
         bail!("Atlas dry-run cleanup did not restore the uninitialized target state");
     }
+    Ok(())
+}
+
+async fn atlas_history_schema_exists(pool: &RdbPool) -> Result<bool> {
+    #[cfg(feature = "postgres")]
+    if !postgres_history_is_scoped()? {
+        return sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'atlas_schema_revisions')",
+        )
+        .fetch_one(pool)
+        .await
+        .context("checking dedicated Atlas revision schema");
+    }
+    let _ = pool;
+    Ok(false)
+}
+
+async fn cleanup_new_atlas_history_schema(pool: &RdbPool, had_history_schema: bool) -> Result<()> {
+    #[cfg(feature = "postgres")]
+    if !had_history_schema
+        && !postgres_history_is_scoped()?
+        && atlas_history_schema_exists(pool).await?
+    {
+        sqlx::query("DROP SCHEMA atlas_schema_revisions")
+            .execute(pool)
+            .await
+            .context("restoring dedicated Atlas revision schema after dry-run")?;
+    }
+    let _ = (pool, had_history_schema);
     Ok(())
 }
 
@@ -517,9 +557,24 @@ async fn current_schema_contract_version(pool: &RdbPool) -> Result<String> {
 async fn open_target_pool() -> Result<RdbPool> {
     let url = migration_database_url()?;
     target_backend_for_url(&url)?;
+    #[cfg(feature = "postgres")]
+    let url = postgres_sqlx_database_url(&url)?;
     sqlx::Pool::<Rdb>::connect(&url)
         .await
         .context("connecting to migration target database")
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_sqlx_database_url(target_url: &str) -> Result<String> {
+    let url = Url::parse(target_url).context("parsing PostgreSQL target URL")?;
+    if url
+        .query_pairs()
+        .any(|(key, _)| key == "search_path" || key == "options[search_path]")
+    {
+        postgres_schema_url(target_url, &postgres_target_schema(target_url)?)
+    } else {
+        Ok(target_url.to_string())
+    }
 }
 
 fn migration_database_url() -> Result<String> {
@@ -551,6 +606,9 @@ fn atlas_database_url(target_url: &str) -> Result<String> {
         .filter(|(key, _)| !(key.starts_with("options[") && key.ends_with(']')))
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect::<Vec<_>>();
+    let options_only_search_path = url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "options[search_path]").then(|| value.into_owned()));
     {
         let mut query = url.query_pairs_mut();
         query.clear();
@@ -559,6 +617,11 @@ fn atlas_database_url(target_url: &str) -> Result<String> {
                 .iter()
                 .map(|(key, value)| (key.as_str(), value.as_str())),
         );
+        if !pairs.iter().any(|(key, _)| key == "search_path")
+            && let Some(schema) = options_only_search_path
+        {
+            query.append_pair("search_path", &schema);
+        }
     }
     Ok(url.into())
 }
@@ -639,7 +702,8 @@ async fn schema_state(pool: &RdbPool) -> Result<SchemaState> {
 /// Atlas history may stop at a fixed-catalog boundary. Fresh databases start
 /// at v1 with a normal applied revision; adopted schemas require a baseline.
 async fn valid_schema_history_prefix_len(pool: &RdbPool) -> Result<Option<usize>> {
-    let history: Vec<(String, i64)> = sqlx::query_as(ATLAS_HISTORY_SELECT_SQL)
+    let (_, select_sql, _) = atlas_history_sql()?;
+    let history: Vec<(String, i64)> = sqlx::query_as(select_sql)
         .fetch_all(pool)
         .await
         .context("reading Atlas schema revision history")?;
@@ -670,12 +734,21 @@ async fn valid_schema_history_prefix_len(pool: &RdbPool) -> Result<Option<usize>
 }
 
 #[cfg(feature = "postgres")]
-const ATLAS_HISTORY_COUNT_SQL: &str = "SELECT COUNT(*) FROM atlas_schema_revisions";
+const ATLAS_HISTORY_COUNT_SQL: &str =
+    "SELECT COUNT(*) FROM atlas_schema_revisions.atlas_schema_revisions";
 #[cfg(feature = "postgres")]
 const ATLAS_HISTORY_SELECT_SQL: &str =
+    "SELECT version, type FROM atlas_schema_revisions.atlas_schema_revisions ORDER BY version ASC";
+#[cfg(feature = "postgres")]
+const ATLAS_HISTORY_DROP_SQL: &str = "DROP TABLE atlas_schema_revisions.atlas_schema_revisions";
+
+#[cfg(feature = "postgres")]
+const ATLAS_SCOPED_HISTORY_COUNT_SQL: &str = "SELECT COUNT(*) FROM atlas_schema_revisions";
+#[cfg(feature = "postgres")]
+const ATLAS_SCOPED_HISTORY_SELECT_SQL: &str =
     "SELECT version, type FROM atlas_schema_revisions ORDER BY version ASC";
 #[cfg(feature = "postgres")]
-const ATLAS_HISTORY_DROP_SQL: &str = "DROP TABLE atlas_schema_revisions";
+const ATLAS_SCOPED_HISTORY_DROP_SQL: &str = "DROP TABLE atlas_schema_revisions";
 
 #[cfg(not(feature = "postgres"))]
 const ATLAS_HISTORY_COUNT_SQL: &str = "SELECT COUNT(*) FROM atlas_schema_revisions";
@@ -684,11 +757,43 @@ const ATLAS_HISTORY_SELECT_SQL: &str =
     "SELECT version, type FROM atlas_schema_revisions ORDER BY version ASC";
 #[cfg(not(feature = "postgres"))]
 const ATLAS_HISTORY_DROP_SQL: &str = "DROP TABLE atlas_schema_revisions";
+
+fn atlas_history_sql() -> Result<(&'static str, &'static str, &'static str)> {
+    #[cfg(feature = "postgres")]
+    if postgres_history_is_scoped()? {
+        return Ok((
+            ATLAS_SCOPED_HISTORY_COUNT_SQL,
+            ATLAS_SCOPED_HISTORY_SELECT_SQL,
+            ATLAS_SCOPED_HISTORY_DROP_SQL,
+        ));
+    }
+    Ok((
+        ATLAS_HISTORY_COUNT_SQL,
+        ATLAS_HISTORY_SELECT_SQL,
+        ATLAS_HISTORY_DROP_SQL,
+    ))
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_history_is_scoped() -> Result<bool> {
+    let url = Url::parse(&migration_database_url()?).context("parsing PostgreSQL target URL")?;
+    Ok(url
+        .query_pairs()
+        .any(|(key, _)| key == "search_path" || key == "options[search_path]"))
+}
 
 async fn atlas_history_exists(pool: &RdbPool) -> Result<bool> {
     #[cfg(feature = "postgres")]
     {
-        return table_exists(pool, "atlas_schema_revisions").await;
+        if !postgres_history_is_scoped()? {
+            return sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'atlas_schema_revisions' AND table_name = 'atlas_schema_revisions')",
+            )
+            .fetch_one(pool)
+            .await
+            .context("checking dedicated Atlas revision history");
+        }
+        table_exists(pool, "atlas_schema_revisions").await
     }
     #[cfg(not(feature = "postgres"))]
     {
@@ -1650,7 +1755,11 @@ mod tests {
         let output = command.run(&["schema", "apply"]).await?;
         assert!(output.contains("apply status=completed"));
 
-        let pool = sqlx::Pool::<Rdb>::connect(database_url).await?;
+        #[cfg(feature = "postgres")]
+        let fixture_url = super::postgres_sqlx_database_url(database_url)?;
+        #[cfg(not(feature = "postgres"))]
+        let fixture_url = database_url.to_string();
+        let pool = sqlx::Pool::<Rdb>::connect(&fixture_url).await?;
         #[cfg(feature = "postgres")]
         {
             let expected_schema = expected_postgres_schema
@@ -1669,6 +1778,13 @@ mod tests {
 
         let output = command.run(&["schema", "status"]).await?;
         assert!(output.contains("schema_status status=managed pending_count=0"));
+        #[cfg(feature = "postgres")]
+        {
+            let output = command.run(&["schema", "apply"]).await?;
+            assert!(output.contains("apply status=completed"));
+            let output = command.run(&["schema", "status"]).await?;
+            assert!(output.contains("schema_status status=managed pending_count=0"));
+        }
 
         let vector_config = infra::infra::thread_vector::config::ThreadVectorDBConfig::from_env()?;
         let vector = infra::infra::thread_vector::repository::ThreadVectorRepositoryImpl::new(
@@ -2117,16 +2233,39 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    fn postgres_uses_target_schema_for_atlas_revision_history() {
+    fn atlas_postgres_url_scopes_options_only_search_path() {
+        let url = atlas_database_url(
+            "postgres://user:secret@example.invalid/memories?options%5Bsearch_path%5D=tenant_a",
+        )
+        .unwrap();
+        let query = url::Url::parse(&url).unwrap();
+        assert!(
+            query
+                .query_pairs()
+                .any(|(key, value)| key == "search_path" && value == "tenant_a")
+        );
+        assert!(
+            !query
+                .query_pairs()
+                .any(|(key, _)| key == "options[search_path]")
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_uses_dedicated_schema_for_unscoped_atlas_revision_history() {
         assert_eq!(
             ATLAS_HISTORY_COUNT_SQL,
-            "SELECT COUNT(*) FROM atlas_schema_revisions"
+            "SELECT COUNT(*) FROM atlas_schema_revisions.atlas_schema_revisions"
         );
         assert_eq!(
             ATLAS_HISTORY_SELECT_SQL,
-            "SELECT version, type FROM atlas_schema_revisions ORDER BY version ASC"
+            "SELECT version, type FROM atlas_schema_revisions.atlas_schema_revisions ORDER BY version ASC"
         );
-        assert_eq!(ATLAS_HISTORY_DROP_SQL, "DROP TABLE atlas_schema_revisions");
+        assert_eq!(
+            ATLAS_HISTORY_DROP_SQL,
+            "DROP TABLE atlas_schema_revisions.atlas_schema_revisions"
+        );
     }
 
     #[cfg(feature = "postgres")]
@@ -2418,7 +2557,7 @@ mod tests {
     #[cfg(feature = "postgres")]
     #[test]
     #[ignore = "requires TEST_POSTGRES_URL, fixed Atlas artifact, and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
-    fn postgres_migration_e2e_with_fixed_atlas_artifact() {
+    fn postgres_dedicated_history_schema_e2e_with_fixed_atlas_artifact() {
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
             use sqlx::postgres::PgPoolOptions;
 
@@ -2426,27 +2565,34 @@ mod tests {
             let binary = fixed_e2e_release_binary().unwrap();
             let service_url = std::env::var("TEST_POSTGRES_URL")
                 .expect("TEST_POSTGRES_URL must be set for the PostgreSQL E2E test");
-            let temporary = tempfile::tempdir().unwrap();
-            let schema = format!(
-                "memories_db_migrate_e2e_{}_{}",
+            let database_name = format!(
+                "memories_db_migrate_history_{}_{}",
                 std::process::id(),
                 command_utils::util::datetime::now_millis()
             );
-            let database_url = postgres_schema_url(&service_url, &schema).unwrap();
+            let mut url = url::Url::parse(&service_url).unwrap();
+            assert!(
+                !url.query_pairs()
+                    .any(|(key, _)| key == "search_path" || key == "options[search_path]"),
+                "dedicated-history E2E requires an unscoped PostgreSQL URL"
+            );
+            url.set_path(&format!("/{database_name}"));
+            let database_url = url.to_string();
             let admin_pool = PgPoolOptions::new()
                 .max_connections(1)
                 .connect(&service_url)
                 .await
                 .unwrap();
             sqlx::query(sqlx::AssertSqlSafe(format!(
-                "CREATE SCHEMA {}",
-                quote_postgres_identifier(&schema)
+                "CREATE DATABASE {}",
+                quote_postgres_identifier(&database_name)
             )))
             .execute(&admin_pool)
             .await
             .unwrap();
+            let temporary = tempfile::tempdir().unwrap();
             let vector_uri = temporary.path().join("threads.lancedb");
-            let result = {
+            let result: Result<()> = async {
                 let _environment =
                     ScopedE2eEnvironment::configure(&artifact_root, &database_url, &vector_uri);
                 let command = MigrationE2eCommand {
@@ -2455,21 +2601,142 @@ mod tests {
                     database_url: &database_url,
                     vector_uri: &vector_uri,
                 };
-                run_thread_message_times_migration_e2e(&command, &database_url, Some(&schema)).await
-            };
+                let status = command.run(&["schema", "status"]).await?;
+                assert!(status.contains("schema_status status=uninitialized"));
+                command.run(&["schema", "apply", "--dry-run"]).await?;
+                let status = command.run(&["schema", "status"]).await?;
+                assert!(status.contains("schema_status status=uninitialized"));
+                let pool = PgPoolOptions::new().connect(&database_url).await?;
+                let schema_left_by_dry_run: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'atlas_schema_revisions')",
+                )
+                .fetch_one(&pool)
+                .await?;
+                assert!(!schema_left_by_dry_run);
+                sqlx::query("CREATE SCHEMA atlas_schema_revisions")
+                    .execute(&pool)
+                    .await?;
+                drop(pool);
+                command.run(&["schema", "apply", "--dry-run"]).await?;
+                let pool = PgPoolOptions::new().connect(&database_url).await?;
+                let existing_schema_preserved: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'atlas_schema_revisions')",
+                )
+                .fetch_one(&pool)
+                .await?;
+                assert!(existing_schema_preserved);
+                drop(pool);
+                command.run(&["schema", "apply"]).await?;
+                let pool = PgPoolOptions::new().connect(&database_url).await?;
+                let history_in_dedicated_schema: bool = sqlx::query_scalar(
+                    "SELECT to_regclass('atlas_schema_revisions.atlas_schema_revisions') IS NOT NULL",
+                )
+                .fetch_one(&pool)
+                .await?;
+                assert!(history_in_dedicated_schema);
+                let history_in_public: bool = sqlx::query_scalar(
+                    "SELECT to_regclass('public.atlas_schema_revisions') IS NOT NULL",
+                )
+                .fetch_one(&pool)
+                .await?;
+                assert!(!history_in_public);
+                assert!(super::table_exists(&pool, "memories_schema_contract").await?);
+                assert!(super::table_exists(&pool, "memories_data_migration_task_state").await?);
+                drop(pool);
+                let status = command.run(&["schema", "status"]).await?;
+                assert!(status.contains("schema_status status=managed pending_count=0"));
+                command.run(&["schema", "apply"]).await?;
+                let status = command.run(&["schema", "status"]).await?;
+                assert!(status.contains("schema_status status=managed pending_count=0"));
+                Ok(())
+            }
+            .await;
             let cleanup = sqlx::query(sqlx::AssertSqlSafe(format!(
-                "DROP SCHEMA {} CASCADE",
-                quote_postgres_identifier(&schema)
+                "DROP DATABASE {} WITH (FORCE)",
+                quote_postgres_identifier(&database_name)
             )))
             .execute(&admin_pool)
             .await;
             match (result, cleanup) {
                 (Ok(()), Ok(_)) => {}
-                (Err(error), Ok(_)) => panic!("PostgreSQL migration E2E failed: {error:#}"),
-                (Ok(()), Err(error)) => panic!("PostgreSQL E2E schema cleanup failed: {error:#}"),
-                (Err(run_error), Err(cleanup_error)) => panic!(
-                    "PostgreSQL migration E2E failed: {run_error:#}; schema cleanup also failed: {cleanup_error:#}"
+                (Err(error), Ok(_)) => panic!("dedicated-history E2E failed: {error:#}"),
+                (Ok(()), Err(error)) => panic!("dedicated-history E2E cleanup failed: {error:#}"),
+                (Err(error), Err(cleanup_error)) => panic!(
+                    "dedicated-history E2E failed: {error:#}; cleanup also failed: {cleanup_error:#}"
                 ),
+            }
+        });
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "requires TEST_POSTGRES_URL, fixed Atlas artifact, and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
+    fn postgres_migration_e2e_with_fixed_atlas_artifact() {
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            use sqlx::postgres::PgPoolOptions;
+
+            let artifact_root = fixed_e2e_atlas_artifact_root().unwrap();
+            let binary = fixed_e2e_release_binary().unwrap();
+            let service_url = std::env::var("TEST_POSTGRES_URL")
+                .expect("TEST_POSTGRES_URL must be set for the PostgreSQL E2E test");
+            let admin_pool = PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&service_url)
+                .await
+                .unwrap();
+            for (index, excluded_option) in [None, Some("search_path"), Some("options[search_path]")]
+                .into_iter()
+                .enumerate()
+            {
+                let temporary = tempfile::tempdir().unwrap();
+                let schema = format!(
+                    "memories_db_migrate_e2e_{}_{}_{}",
+                    std::process::id(),
+                    command_utils::util::datetime::now_millis(),
+                    index,
+                );
+                let mut url = url::Url::parse(&postgres_schema_url(&service_url, &schema).unwrap()).unwrap();
+                if let Some(excluded_option) = excluded_option {
+                    let pairs = url.query_pairs()
+                        .filter(|(key, _)| key != excluded_option)
+                        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                        .collect::<Vec<_>>();
+                    url.query_pairs_mut().clear().extend_pairs(pairs);
+                }
+                let database_url = url.to_string();
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "CREATE SCHEMA {}",
+                    quote_postgres_identifier(&schema)
+                )))
+                .execute(&admin_pool)
+                .await
+                .unwrap();
+                let vector_uri = temporary.path().join("threads.lancedb");
+                let result = {
+                    let _environment =
+                        ScopedE2eEnvironment::configure(&artifact_root, &database_url, &vector_uri);
+                    let command = MigrationE2eCommand {
+                        binary: &binary,
+                        artifact_root: &artifact_root,
+                        database_url: &database_url,
+                        vector_uri: &vector_uri,
+                    };
+                    run_thread_message_times_migration_e2e(&command, &database_url, Some(&schema)).await
+                };
+                let cleanup = sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "DROP SCHEMA {} CASCADE",
+                    quote_postgres_identifier(&schema)
+                )))
+                .execute(&admin_pool)
+                .await;
+                match (result, cleanup) {
+                    (Ok(()), Ok(_)) => {}
+                    (Err(error), Ok(_)) => panic!("PostgreSQL migration E2E failed: {error:#}"),
+                    (Ok(()), Err(error)) => panic!("PostgreSQL E2E schema cleanup failed: {error:#}"),
+                    (Err(run_error), Err(cleanup_error)) => panic!(
+                        "PostgreSQL migration E2E failed: {run_error:#}; schema cleanup also failed: {cleanup_error:#}"
+                    ),
+                }
             }
         });
     }
