@@ -36,6 +36,8 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let user_id = cli.validate_user_id().unwrap_or_else(|e| e.exit());
+    cli.validate_group_owner_user_id(user_id)
+        .unwrap_or_else(|e| e.exit());
 
     init_tracing(cli.global.verbose).await?;
     common::importer::set_thread_group_writes_enabled(!cli.global.no_thread_group_writes);
@@ -123,6 +125,9 @@ async fn build_import_client(global: &GlobalArgs) -> Result<Option<Arc<dyn Impor
     }
     let cfg = live_client_config(global)?;
     let live = Arc::new(LiveGrpcImportClient::connect(cfg).await?);
+    if !global.no_thread_group_writes {
+        live.ensure_thread_group_owner_capability().await?;
+    }
     if global.dry_run_connect {
         client::set_preview_client(live.clone());
     }
@@ -138,6 +143,7 @@ fn live_client_config(global: &GlobalArgs) -> Result<LiveGrpcImportClientConfig>
         timeout: Duration::from_secs(global.server_timeout_sec),
         tls_ca_path: global.server_tls_ca.clone(),
         auth_token: global.auth_token.clone(),
+        group_owner_user_id: global.group_owner_user_id,
         retry: if global.no_retry {
             RetryPolicy::no_retry()
         } else {
@@ -156,6 +162,7 @@ fn live_client_config(global: &GlobalArgs) -> Result<LiveGrpcImportClientConfig>
 /// ThreadGroup reconciliation snapshot. No import RPC is issued.
 async fn report_connected_dry_run(global: &GlobalArgs) -> Result<()> {
     let live = LiveGrpcImportClient::connect(live_client_config(global)?).await?;
+    live.ensure_thread_group_owner_capability().await?;
     let report = live.find_thread_group_reconciliation_report().await?;
     println!(
         "[dry-run-connect] active_groups={} redirected_groups={} split_groups={} \

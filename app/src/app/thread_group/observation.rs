@@ -4,21 +4,20 @@ use super::prelude::*;
 use super::{EVIDENCE_FINGERPRINT_VERSION, THREAD_GROUP_POLICY_VERSION, known_scope_value};
 
 /// One endpoint of an observed relation, already mapped to the
-/// owner-local identity key. `owner_scope` is assigned by the importer
-/// (`user:{thread.user_id}`) before this point; the adapter contract
-/// leaves it absent.
+/// owner-local identity key. The importer assigns the typed user id;
+/// adapters never choose an owner.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservedEndpoint {
     pub source: String,
     pub identity_scope: IdentityScope,
-    pub owner_scope: String,
+    pub user_id: i64,
     pub native_id: String,
 }
 
 impl ObservedEndpoint {
     pub(crate) fn to_source_identity(&self) -> SourceIdentity {
         SourceIdentity::new(
-            self.owner_scope.clone(),
+            self.user_id,
             self.source.clone(),
             self.identity_scope.clone(),
             self.native_id.clone(),
@@ -32,7 +31,7 @@ impl ObservedEndpoint {
 /// identity lock key directly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceIdentityInput {
-    pub owner_scope: String,
+    pub user_id: i64,
     pub source: String,
     pub identity_scope: IdentityScope,
     pub native_id: String,
@@ -41,7 +40,7 @@ pub struct SourceIdentityInput {
 impl SourceIdentityInput {
     pub fn as_source_identity(&self) -> SourceIdentity {
         SourceIdentity::new(
-            self.owner_scope.clone(),
+            self.user_id,
             self.source.clone(),
             self.identity_scope.clone(),
             self.native_id.clone(),
@@ -60,7 +59,7 @@ impl SourceIdentityInput {
             return None;
         };
         Some(SourceIdentityKey {
-            owner_scope: &self.owner_scope,
+            user_id: self.user_id,
             source: &self.source,
             identity_scope: scope,
             native_id: &self.native_id,
@@ -121,7 +120,7 @@ pub fn new_observation(
     let fingerprint = observation_fingerprint(input, origin);
     let (subject_identity_scope_known, subject_identity_scope_value) =
         split_scope(&input.subject.identity_scope);
-    let (parent_known, parent_value, parent_source, parent_owner, parent_native) =
+    let (parent_known, parent_value, parent_source, parent_user_id, parent_native) =
         match input.candidate_parent.as_ref() {
             Some(parent) => {
                 let (known, value) = split_scope(&parent.identity_scope);
@@ -129,29 +128,23 @@ pub fn new_observation(
                     known,
                     value,
                     parent.source.clone(),
-                    parent.owner_scope.clone(),
+                    Some(parent.user_id),
                     parent.native_id.clone(),
                 )
             }
-            None => (
-                false,
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-            ),
+            None => (false, String::new(), String::new(), None, String::new()),
         };
     NewThreadObservation {
         subject_source: input.subject.source.clone(),
         subject_identity_scope_known,
         subject_identity_scope_value,
-        subject_owner_scope: input.subject.owner_scope.clone(),
+        subject_user_id: input.subject.user_id,
         subject_native_id: input.subject.native_id.clone(),
         candidate_parent_present: input.candidate_parent.is_some(),
         candidate_parent_source: parent_source,
         candidate_parent_identity_scope_known: parent_known,
         candidate_parent_identity_scope_value: parent_value,
-        candidate_parent_owner_scope: parent_owner,
+        candidate_parent_user_id: parent_user_id,
         candidate_parent_native_id: parent_native,
         relation_kind: input.relation_kind.clone(),
         origin: origin.to_string(),
@@ -293,7 +286,7 @@ pub(crate) async fn record_observation_and_event(
         policy_version: THREAD_GROUP_POLICY_VERSION.to_string(),
         source: Some(input.subject.source.clone()),
         identity_scope: known_scope_value(&input.subject.identity_scope),
-        owner_scope: Some(input.subject.owner_scope.clone()),
+        user_id: Some(input.subject.user_id),
         native_id_ref: Some(input.subject.native_id.clone()),
         group_id: None,
         thread_id,
@@ -357,7 +350,7 @@ impl ThreadGroupObservationService {
     ) -> anyhow::Result<RecordObservationOutcome> {
         let subject_scope = known_scope_value(&input.subject.identity_scope).unwrap_or_default();
         let lock_key = SourceIdentityKey {
-            owner_scope: &input.subject.owner_scope,
+            user_id: input.subject.user_id,
             source: &input.subject.source,
             identity_scope: &subject_scope,
             native_id: &input.subject.native_id,
@@ -392,13 +385,13 @@ pub(crate) fn observation_identity(row: &NewThreadObservation) -> ObservationIde
         subject_source: &row.subject_source,
         subject_identity_scope_known: row.subject_identity_scope_known,
         subject_identity_scope_value: &row.subject_identity_scope_value,
-        subject_owner_scope: &row.subject_owner_scope,
+        subject_user_id: row.subject_user_id,
         subject_native_id: &row.subject_native_id,
         candidate_parent_present: row.candidate_parent_present,
         candidate_parent_source: &row.candidate_parent_source,
         candidate_parent_identity_scope_known: row.candidate_parent_identity_scope_known,
         candidate_parent_identity_scope_value: &row.candidate_parent_identity_scope_value,
-        candidate_parent_owner_scope: &row.candidate_parent_owner_scope,
+        candidate_parent_user_id: row.candidate_parent_user_id,
         candidate_parent_native_id: &row.candidate_parent_native_id,
         evidence_kind: &row.evidence_kind,
         evidence_fingerprint: &row.evidence_fingerprint,
@@ -430,7 +423,7 @@ mod tests {
             subject: ObservedEndpoint {
                 source: "codex".into(),
                 identity_scope: IdentityScope::known(""),
-                owner_scope: "user:pass2-direct".into(),
+                user_id: 1,
                 native_id: "direct-replay".into(),
             },
             candidate_parent: None,
@@ -449,7 +442,7 @@ mod tests {
         ObservedEndpoint {
             source: "codex".into(),
             identity_scope: IdentityScope::known(""),
-            owner_scope: "user:pass4-state".into(),
+            user_id: 1,
             native_id: native_id.into(),
         }
     }
@@ -483,7 +476,7 @@ mod tests {
                 infra::test_helper::shared_id_generator(),
                 pool,
             )
-            .list_by_subject("user:pass2-direct", "codex", true, "", "direct-replay")
+            .list_by_subject(1, "codex", true, "", "direct-replay")
             .await
             .expect("observation lookup");
             assert_eq!(observations.len(), 1);
@@ -547,7 +540,7 @@ mod tests {
                 infra::test_helper::shared_id_generator(),
                 pool,
             )
-            .list_by_subject("user:pass4-state", "codex", true, "", "reconcile-child")
+            .list_by_subject(1, "codex", true, "", "reconcile-child")
             .await
             .expect("observation lookup");
             assert_eq!(observations.len(), 1);

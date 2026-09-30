@@ -1,7 +1,7 @@
 //! `source_thread_identity` repository (design 5.6).
 //!
 //! Resolved owner-local mapping only: a row exists exactly when one
-//! `(owner_scope, source, identity_scope, native_id)` tuple maps to
+//! `(user_id, source, identity_scope, native_id)` tuple maps to
 //! exactly one thread. Pending / ambiguous / unsupported identities live
 //! in observations and candidate associations and never reach this
 //! table — that restriction is enforced by the `resolution_state` CHECK
@@ -24,7 +24,7 @@ use sqlx::Executor;
 // `last_seen_at`; `first_seen_at` is written only on the initial insert.
 const UPSERT_RESOLVED_SQL: &str = concat!(
     "INSERT INTO source_thread_identity \
-     (owner_scope, source, identity_scope, native_id, thread_id, resolution_state, \
+     (user_id, owner_scope, source, identity_scope, native_id, thread_id, resolution_state, \
       first_seen_at, last_seen_at) \
      VALUES (",
     p!(1),
@@ -36,18 +36,20 @@ const UPSERT_RESOLVED_SQL: &str = concat!(
     p!(4),
     ",",
     p!(5),
-    ", 'resolved', ",
-    p!(6),
     ",",
+    p!(6),
+    ", 'resolved', ",
     p!(7),
-    ") ON CONFLICT (owner_scope, source, identity_scope, native_id) DO UPDATE SET \
+    ",",
+    p!(8),
+    ") ON CONFLICT (user_id, source, identity_scope, native_id) DO UPDATE SET \
        thread_id = excluded.thread_id, last_seen_at = excluded.last_seen_at"
 );
 
 const FIND_RESOLVED_SQL: &str = concat!(
     "SELECT ",
     SOURCE_THREAD_IDENTITY_COLUMNS!(),
-    " FROM source_thread_identity WHERE owner_scope = ",
+    " FROM source_thread_identity WHERE user_id = ",
     p!(1),
     " AND source = ",
     p!(2),
@@ -62,7 +64,7 @@ const LIST_BY_THREAD_SQL: &str = concat!(
     SOURCE_THREAD_IDENTITY_COLUMNS!(),
     " FROM source_thread_identity WHERE thread_id = ",
     p!(1),
-    " ORDER BY owner_scope, source, identity_scope, native_id"
+    " ORDER BY user_id, source, identity_scope, native_id"
 );
 
 const REBIND_SQL: &str = concat!(
@@ -70,7 +72,7 @@ const REBIND_SQL: &str = concat!(
     p!(1),
     ", last_seen_at = ",
     p!(2),
-    " WHERE owner_scope = ",
+    " WHERE user_id = ",
     p!(3),
     " AND source = ",
     p!(4),
@@ -81,7 +83,7 @@ const REBIND_SQL: &str = concat!(
 );
 
 const DELETE_SQL: &str = concat!(
-    "DELETE FROM source_thread_identity WHERE owner_scope = ",
+    "DELETE FROM source_thread_identity WHERE user_id = ",
     p!(1),
     " AND source = ",
     p!(2),
@@ -104,7 +106,10 @@ pub trait SourceThreadIdentityRepository: UseRdbPool + Send + Sync {
         seen_at: i64,
     ) -> Result<()> {
         sqlx::query::<Rdb>(UPSERT_RESOLVED_SQL)
-            .bind(identity.owner_scope)
+            .bind(identity.user_id)
+            .bind(common::thread_group_key::legacy_owner_scope(
+                identity.user_id,
+            ))
             .bind(identity.source)
             .bind(identity.identity_scope)
             .bind(identity.native_id)
@@ -124,7 +129,7 @@ pub trait SourceThreadIdentityRepository: UseRdbPool + Send + Sync {
     ) -> Result<Option<SourceThreadIdentityRow>> {
         Ok(
             sqlx::query_as::<Rdb, SourceThreadIdentityRow>(FIND_RESOLVED_SQL)
-                .bind(identity.owner_scope)
+                .bind(identity.user_id)
                 .bind(identity.source)
                 .bind(identity.identity_scope)
                 .bind(identity.native_id)
@@ -141,7 +146,7 @@ pub trait SourceThreadIdentityRepository: UseRdbPool + Send + Sync {
     ) -> Result<Option<SourceThreadIdentityRow>> {
         Ok(
             sqlx::query_as::<Rdb, SourceThreadIdentityRow>(FIND_RESOLVED_SQL)
-                .bind(identity.owner_scope)
+                .bind(identity.user_id)
                 .bind(identity.source)
                 .bind(identity.identity_scope)
                 .bind(identity.native_id)
@@ -193,7 +198,7 @@ pub trait SourceThreadIdentityRepository: UseRdbPool + Send + Sync {
         let res = sqlx::query::<Rdb>(REBIND_SQL)
             .bind(thread_id)
             .bind(seen_at)
-            .bind(identity.owner_scope)
+            .bind(identity.user_id)
             .bind(identity.source)
             .bind(identity.identity_scope)
             .bind(identity.native_id)
@@ -209,7 +214,7 @@ pub trait SourceThreadIdentityRepository: UseRdbPool + Send + Sync {
         identity: &SourceIdentityKey<'_>,
     ) -> Result<bool> {
         let res = sqlx::query::<Rdb>(DELETE_SQL)
-            .bind(identity.owner_scope)
+            .bind(identity.user_id)
             .bind(identity.source)
             .bind(identity.identity_scope)
             .bind(identity.native_id)

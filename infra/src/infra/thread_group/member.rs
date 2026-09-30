@@ -26,7 +26,7 @@ use sqlx::Executor;
 
 const INSERT_SQL: &str = concat!(
     "INSERT INTO thread_group_member \
-     (group_id, thread_id, thread_canonical_key, owner_scope, source, identity_scope, native_id, \
+     (group_id, thread_id, thread_canonical_key, user_id, owner_scope, source, identity_scope, native_id, \
       role, state, provenance, deleted_at, created_at, updated_at) \
      VALUES (",
     p!(1),
@@ -54,6 +54,8 @@ const INSERT_SQL: &str = concat!(
     p!(12),
     ",",
     p!(13),
+    ",",
+    p!(14),
     ")"
 );
 
@@ -82,7 +84,7 @@ const LIST_CURRENT_BY_GROUP_SQL: &str = concat!(
 );
 
 const EXISTS_SOURCE_IDENTITY_OUTSIDE_GROUP_SQL: &str = concat!(
-    "SELECT 1 FROM thread_group_member WHERE owner_scope = ",
+    "SELECT 1 FROM thread_group_member WHERE user_id = ",
     p!(1),
     " AND source = ",
     p!(2),
@@ -193,7 +195,8 @@ pub trait ThreadGroupMemberRepository: UseRdbPool + Send + Sync {
             .bind(member.group_id)
             .bind(member.thread_id)
             .bind(&member.thread_canonical_key)
-            .bind(&member.owner_scope)
+            .bind(member.user_id)
+            .bind(common::thread_group_key::legacy_owner_scope(member.user_id))
             .bind(&member.source)
             .bind(&member.identity_scope)
             .bind(&member.native_id)
@@ -284,14 +287,14 @@ pub trait ThreadGroupMemberRepository: UseRdbPool + Send + Sync {
     /// history.
     async fn exists_source_identity_outside_group(
         &self,
-        owner_scope: &str,
+        user_id: i64,
         source: &str,
         identity_scope: &str,
         native_id: &str,
         exclude_group_id: i64,
     ) -> Result<bool> {
         let found = sqlx::query_scalar::<_, i64>(EXISTS_SOURCE_IDENTITY_OUTSIDE_GROUP_SQL)
-            .bind(owner_scope)
+            .bind(user_id)
             .bind(source)
             .bind(identity_scope)
             .bind(native_id)
@@ -307,14 +310,14 @@ pub trait ThreadGroupMemberRepository: UseRdbPool + Send + Sync {
     async fn exists_source_identity_outside_group_tx<'c, E: Executor<'c, Database = Rdb>>(
         &self,
         tx: E,
-        owner_scope: &str,
+        user_id: i64,
         source: &str,
         identity_scope: &str,
         native_id: &str,
         exclude_group_id: i64,
     ) -> Result<bool> {
         let found = sqlx::query_scalar::<_, i64>(EXISTS_SOURCE_IDENTITY_OUTSIDE_GROUP_SQL)
-            .bind(owner_scope)
+            .bind(user_id)
             .bind(source)
             .bind(identity_scope)
             .bind(native_id)

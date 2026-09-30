@@ -10,6 +10,14 @@ pub const THREAD_MESSAGE_TIMES_V1_IDENTITY: &str = "thread-message-times-v1@1";
 pub const THREAD_GROUPS_CANONICAL_KEYS_V1_ID: &str = "thread-groups-canonical-keys-v1";
 pub const THREAD_GROUPS_CANONICAL_KEYS_V1_GENERATION: u32 = 1;
 pub const THREAD_GROUPS_CANONICAL_KEYS_V1_IDENTITY: &str = "thread-groups-canonical-keys-v1@1";
+pub const THREAD_GROUPS_CANONICAL_KEYS_V2_GENERATION: u32 = 2;
+pub const THREAD_GROUPS_CANONICAL_KEYS_V2_IDENTITY: &str = "thread-groups-canonical-keys-v1@2";
+
+pub const THREAD_GROUPS_USER_IDS_V1_ID: &str = "thread-groups-user-ids-v1";
+pub const THREAD_GROUPS_USER_IDS_V1_GENERATION: u32 = 1;
+pub const THREAD_GROUPS_USER_IDS_V1_IDENTITY: &str = "thread-groups-user-ids-v1@1";
+pub const THREAD_GROUPS_USER_IDS_V2_GENERATION: u32 = 2;
+pub const THREAD_GROUPS_USER_IDS_V2_IDENTITY: &str = "thread-groups-user-ids-v1@2";
 
 const CATALOG_JSON: &str = include_str!("../../../infra/atlas/post-migration-tasks.json");
 const HISTORY_JSON: &str = include_str!("../../../infra/atlas/post-migration-task-history.json");
@@ -80,8 +88,8 @@ impl TaskCatalogEntry {
         {
             bail!("task {} has unsupported or empty backends", self.identity());
         }
-        if self.lifecycle != "active" {
-            bail!("task {} is not active", self.identity());
+        if self.lifecycle != "active" && self.lifecycle != "retired" {
+            bail!("task {} has an unsupported lifecycle", self.identity());
         }
         if !super::has_registered_implementation(&self.implementation) {
             bail!("task {} has an unknown implementation", self.identity());
@@ -172,7 +180,8 @@ pub fn select_tasks_for_schema_version(
         .tasks
         .iter()
         .filter(|task| {
-            task.backends.iter().any(|candidate| candidate == backend)
+            task.lifecycle == "active"
+                && task.backends.iter().any(|candidate| candidate == backend)
                 && task.introduced_by_schema_version.as_str() <= schema_version
         })
         .map(TaskCatalogEntry::identity)
@@ -294,6 +303,88 @@ fn validate_history(catalog: &TaskCatalog) -> Result<()> {
         }
     }
     validate_history_chain(&history)?;
+    validate_history_lifecycles(catalog, &history)?;
+    Ok(())
+}
+
+fn validate_history_lifecycles(catalog: &TaskCatalog, history: &TaskHistory) -> Result<()> {
+    let registered = history
+        .lifecycle_transitions
+        .iter()
+        .filter(|transition| transition.kind == "registered")
+        .map(|transition| transition.identity.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut lifecycle = history
+        .entries
+        .iter()
+        .filter(|entry| !registered.contains(entry.identity.as_str()))
+        .map(|entry| {
+            (
+                entry.identity.clone(),
+                (entry.canonical_definition_digest.clone(), "active"),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for transition in &history.lifecycle_transitions {
+        let entry = history
+            .entries
+            .iter()
+            .find(|entry| entry.identity == transition.identity)
+            .with_context(|| {
+                format!(
+                    "task history transition references absent task {}",
+                    transition.identity
+                )
+            })?;
+        if entry.canonical_definition_digest != transition.canonical_definition_digest {
+            bail!(
+                "task history transition digest differs for {}",
+                transition.identity
+            );
+        }
+        match transition.kind.as_str() {
+            "registered" => {
+                if lifecycle
+                    .insert(
+                        transition.identity.clone(),
+                        (transition.canonical_definition_digest.clone(), "active"),
+                    )
+                    .is_some()
+                {
+                    bail!("task {} was registered more than once", transition.identity);
+                }
+            }
+            "retired" => {
+                let Some((digest, state)) = lifecycle.get_mut(&transition.identity) else {
+                    bail!(
+                        "task {} was retired before registration",
+                        transition.identity
+                    );
+                };
+                if *digest != transition.canonical_definition_digest || *state != "active" {
+                    bail!(
+                        "task {} has an invalid retirement transition",
+                        transition.identity
+                    );
+                }
+                *state = "retired";
+            }
+            _ => bail!("unknown task history transition kind: {}", transition.kind),
+        }
+    }
+
+    for task in &catalog.tasks {
+        let Some((digest, state)) = lifecycle.get(&task.identity()) else {
+            bail!("task {} has no lifecycle history", task.identity());
+        };
+        if digest != &task.canonical_definition_digest || *state != task.lifecycle {
+            bail!(
+                "task {} lifecycle differs from immutable history",
+                task.identity()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -367,6 +458,39 @@ pub fn thread_groups_canonical_keys_v1() -> Result<TaskCatalogEntry> {
     Ok(task)
 }
 
+pub fn thread_groups_canonical_keys_v2() -> Result<TaskCatalogEntry> {
+    let task = load_catalog()?
+        .tasks
+        .into_iter()
+        .find(|task| task.identity() == THREAD_GROUPS_CANONICAL_KEYS_V2_IDENTITY)
+        .context("thread-groups-canonical-keys-v1@2 is missing from task catalog")?;
+    Ok(task)
+}
+
+pub fn thread_groups_user_ids_v1() -> Result<TaskCatalogEntry> {
+    let task = load_catalog()?
+        .tasks
+        .into_iter()
+        .find(|task| {
+            task.id == THREAD_GROUPS_USER_IDS_V1_ID
+                && task.generation == THREAD_GROUPS_USER_IDS_V1_GENERATION
+        })
+        .context("thread-groups-user-ids-v1@1 is missing from task catalog")?;
+    if task.identity() != THREAD_GROUPS_USER_IDS_V1_IDENTITY {
+        bail!("thread-groups-user-ids-v1 catalog identity is invalid");
+    }
+    Ok(task)
+}
+
+pub fn thread_groups_user_ids_v2() -> Result<TaskCatalogEntry> {
+    let task = load_catalog()?
+        .tasks
+        .into_iter()
+        .find(|task| task.identity() == THREAD_GROUPS_USER_IDS_V2_IDENTITY)
+        .context("thread-groups-user-ids-v1@2 is missing from task catalog")?;
+    Ok(task)
+}
+
 pub fn thread_message_times_v1() -> Result<TaskCatalogEntry> {
     let task = load_catalog()?
         .tasks
@@ -433,6 +557,7 @@ mod tests {
     use super::{
         HISTORY_JSON, TaskCatalog, TaskCatalogEntry, TaskHistory, canonical_definition_digest,
         load_catalog, select_tasks_for_schema_version, thread_groups_canonical_keys_v1,
+        thread_groups_canonical_keys_v2, thread_groups_user_ids_v1, thread_groups_user_ids_v2,
         thread_message_times_v1, validate_fixed_catalog_entry, validate_history_chain,
     };
     use crate::db_migrate::has_registered_implementation;
@@ -441,7 +566,7 @@ mod tests {
     #[test]
     fn catalog_is_valid_and_contains_the_required_tasks() {
         let catalog = load_catalog().expect("catalog must be valid");
-        assert_eq!(catalog.tasks.len(), 2);
+        assert_eq!(catalog.tasks.len(), 5);
         assert_eq!(
             thread_message_times_v1().unwrap().identity(),
             "thread-message-times-v1@1"
@@ -450,10 +575,22 @@ mod tests {
             thread_groups_canonical_keys_v1().unwrap().identity(),
             "thread-groups-canonical-keys-v1@1"
         );
+        assert_eq!(
+            thread_groups_canonical_keys_v2().unwrap().identity(),
+            "thread-groups-canonical-keys-v1@2"
+        );
+        assert_eq!(
+            thread_groups_user_ids_v1().unwrap().identity(),
+            "thread-groups-user-ids-v1@1"
+        );
+        assert_eq!(
+            thread_groups_user_ids_v2().unwrap().identity(),
+            "thread-groups-user-ids-v1@2"
+        );
     }
 
     #[test]
-    fn new_task_is_selected_for_both_backends_at_its_schema_version() {
+    fn only_replacement_generations_are_selected_at_the_typed_owner_schema_version() {
         let catalog = load_catalog().unwrap();
         for backend in ["sqlite", "postgres"] {
             let selected =
@@ -463,8 +600,20 @@ mod tests {
                     .iter()
                     .map(TaskCatalogEntry::identity)
                     .collect::<Vec<_>>(),
+                vec!["thread-message-times-v1@1"]
+            );
+        }
+        for backend in ["sqlite", "postgres"] {
+            let selected =
+                select_tasks_for_schema_version(&catalog, "20260930000001", backend).unwrap();
+            assert_eq!(
+                selected
+                    .iter()
+                    .map(TaskCatalogEntry::identity)
+                    .collect::<Vec<_>>(),
                 vec![
-                    "thread-groups-canonical-keys-v1@1",
+                    "thread-groups-canonical-keys-v1@2",
+                    "thread-groups-user-ids-v1@2",
                     "thread-message-times-v1@1"
                 ]
             );

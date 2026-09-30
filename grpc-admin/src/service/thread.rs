@@ -662,16 +662,23 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
         let source_identity = req
             .source_identity
             .as_ref()
-            .map(|endpoint| SourceIdentityInput {
-                owner_scope: endpoint.owner_scope.clone(),
-                source: endpoint.source.clone(),
-                identity_scope: if endpoint.identity_scope_known {
-                    IdentityScope::known(endpoint.identity_scope.clone())
-                } else {
-                    IdentityScope::unknown()
-                },
-                native_id: endpoint.native_id.clone(),
-            });
+            .map(|endpoint| {
+                Ok::<SourceIdentityInput, tonic::Status>(SourceIdentityInput {
+                    user_id: super::thread_group::owner_user_id_from_proto(
+                        endpoint.user_id,
+                        &endpoint.owner_scope,
+                        "user_id",
+                    )?,
+                    source: endpoint.source.clone(),
+                    identity_scope: if endpoint.identity_scope_known {
+                        IdentityScope::known(endpoint.identity_scope.clone())
+                    } else {
+                        IdentityScope::unknown()
+                    },
+                    native_id: endpoint.native_id.clone(),
+                })
+            })
+            .transpose()?;
 
         let input = AddMemoriesBatchInput {
             thread_target,

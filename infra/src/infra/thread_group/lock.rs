@@ -77,10 +77,11 @@ pub trait ThreadGroupLockRepository: UseRdbPool + Send + Sync {
         tx: E,
         identity: &SourceIdentityKey<'_>,
     ) -> Result<()> {
+        let user_id = identity.user_id.to_string();
         let subject = encode_lock_subject(
             IDENTITY_LOCK_NAMESPACE,
             &[
-                identity.owner_scope,
+                &user_id,
                 identity.source,
                 identity.identity_scope,
                 identity.native_id,

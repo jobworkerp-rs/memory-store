@@ -2083,6 +2083,7 @@ fn run_delete_removes_reflection() -> Result<()> {
         );
         let group_id = group_repo
             .create_tx(pool, &infra::infra::thread_group::rows::NewThreadGroup {
+                user_id: 1,
                 group_canonical_key: format!("{:064}", 999_803),
                 title: Some("reflection-delete-test".into()),
                 status: infra::infra::thread_group::rows::values::group_status::ACTIVE.into(),

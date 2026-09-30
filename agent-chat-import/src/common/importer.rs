@@ -636,8 +636,7 @@ async fn run_import_with_event_sink(
 
     // Owner-local source identity for the suppression gate / revival.
     // Empty for plain / non-source sessions (no adapter observation).
-    let owner_scope = format!("user:{user_id}");
-    let source_identity = source_identity_to_proto(session, &owner_scope);
+    let source_identity = source_identity_to_proto(session, user_id);
 
     for (chunk_idx0, range) in chunks.iter().enumerate() {
         let chunk_idx = chunk_idx0 + 1;
@@ -757,28 +756,27 @@ async fn finalize_thread_group_observations(
 }
 
 /// Map the adapter's source-independent observations to the gRPC import
-/// contract. `owner_scope` is assigned here as `user:{user_id}` (design
-/// 4.2.1); the adapter deliberately leaves it unset.
+/// contract. The typed owner is assigned here; the adapter deliberately
+/// leaves it unset.
 async fn record_thread_group_observations(
     client: &dyn ImportClient,
     session: &CanonicalSession,
     user_id: i64,
     thread_id: i64,
 ) -> std::result::Result<(), String> {
-    let owner_scope = format!("user:{user_id}");
     let Some(subject) = canonical_source_identity(session) else {
         return Ok(());
     };
-    let subject_proto = endpoint_to_proto(subject, &owner_scope);
+    let subject_proto = endpoint_to_proto(subject, user_id);
     let observations = session
         .thread_group_observations
         .iter()
         .map(|observation| ThreadGroupObservationInput {
-            subject: Some(endpoint_to_proto(&observation.subject, &owner_scope)),
+            subject: Some(endpoint_to_proto(&observation.subject, user_id)),
             candidate_parent: observation
                 .candidate_parent
                 .as_ref()
-                .map(|parent| endpoint_to_proto(parent, &owner_scope)),
+                .map(|parent| endpoint_to_proto(parent, user_id)),
             relation_kind: observation.relation_kind.clone(),
             evidence_kind: evidence_kind_to_proto(observation.evidence_kind),
             polarity: polarity_to_proto(observation.polarity),
@@ -793,6 +791,7 @@ async fn record_thread_group_observations(
         subject: Some(subject_proto),
         observations,
         operation_id: None,
+        group_owner_user_id: Some(client.group_owner_user_id(user_id)),
     };
     client
         .record_thread_group_observations(request)
@@ -801,10 +800,7 @@ async fn record_thread_group_observations(
     Ok(())
 }
 
-fn endpoint_to_proto(
-    identity: &ThreadGroupSourceIdentity,
-    owner_scope: &str,
-) -> ThreadGroupEndpoint {
+fn endpoint_to_proto(identity: &ThreadGroupSourceIdentity, user_id: i64) -> ThreadGroupEndpoint {
     let (identity_scope_known, identity_scope) = match &identity.identity_scope {
         ThreadGroupIdentityScope::Known(value) => (true, value.clone()),
         ThreadGroupIdentityScope::Unknown => (false, String::new()),
@@ -813,8 +809,9 @@ fn endpoint_to_proto(
         source: identity.source.clone(),
         identity_scope_known,
         identity_scope,
-        owner_scope: owner_scope.to_string(),
+        owner_scope: format!("user:{user_id}"),
         native_id: identity.native_id.clone(),
+        user_id: Some(user_id),
     }
 }
 
@@ -829,9 +826,9 @@ fn canonical_source_identity(session: &CanonicalSession) -> Option<&ThreadGroupS
 
 fn source_identity_to_proto(
     session: &CanonicalSession,
-    owner_scope: &str,
+    user_id: i64,
 ) -> Option<ThreadGroupEndpoint> {
-    canonical_source_identity(session).map(|identity| endpoint_to_proto(identity, owner_scope))
+    canonical_source_identity(session).map(|identity| endpoint_to_proto(identity, user_id))
 }
 
 fn evidence_kind_to_proto(kind: ThreadGroupEvidenceKind) -> i32 {
@@ -2243,8 +2240,7 @@ async fn flush_chunk(
         }),
     };
 
-    let owner_scope = format!("user:{user_id}");
-    let source_identity = source_identity_to_proto(session, &owner_scope);
+    let source_identity = source_identity_to_proto(session, user_id);
     let request = AddMemoriesBatchRequest {
         thread_target: Some(thread_target),
         memories: pb_sorted,
@@ -2702,6 +2698,7 @@ mod tests {
         opencode_thread: Mutex<Option<PbThreadId>>,
         thread_lookup_calls: Mutex<Vec<(String, i64)>>,
         thread_lookup_error: Mutex<Option<String>>,
+        group_owner_user_id: Mutex<Option<i64>>,
         prefix_queries: Mutex<Vec<String>>,
         fail_batch_call: Mutex<Option<usize>>,
     }
@@ -2766,6 +2763,9 @@ mod tests {
         fn set_opencode_thread(&self, thread_id: Option<i64>) {
             *self.opencode_thread.lock().unwrap() = thread_id.map(|value| PbThreadId { value });
         }
+        fn set_group_owner_user_id(&self, user_id: i64) {
+            *self.group_owner_user_id.lock().unwrap() = Some(user_id);
+        }
         fn thread_lookup_calls(&self) -> Vec<(String, i64)> {
             self.thread_lookup_calls.lock().unwrap().clone()
         }
@@ -2785,6 +2785,13 @@ mod tests {
 
     #[async_trait]
     impl crate::client::ImportClient for FakeImportClient {
+        fn group_owner_user_id(&self, source_user_id: i64) -> i64 {
+            self.group_owner_user_id
+                .lock()
+                .unwrap()
+                .unwrap_or(source_user_id)
+        }
+
         async fn add_labels(&self, request: AddLabelsRequest) -> anyhow::Result<()> {
             self.side_effect_order.lock().unwrap().push("labels");
             self.recorded_labels.lock().unwrap().push(request);
@@ -3376,6 +3383,7 @@ mod tests {
     async fn opencode_root_identity_is_sent_with_empty_observation_record() {
         let session = opencode_session();
         let fake = FakeImportClient::default();
+        fake.set_group_owner_user_id(7);
 
         let result = run_import_streaming(
             &fake,
@@ -3406,6 +3414,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].subject_thread_id, 9_000);
         assert_eq!(records[0].subject, Some(batch_identity.clone()));
+        assert_eq!(records[0].group_owner_user_id, Some(7));
         assert!(records[0].observations.is_empty());
     }
 
@@ -4829,18 +4838,20 @@ mod tests {
             identity_scope: ThreadGroupIdentityScope::Known(String::new()),
             native_id: "s1".into(),
         };
-        let proto = endpoint_to_proto(&known, "user:7");
+        let proto = endpoint_to_proto(&known, 7);
         assert!(proto.identity_scope_known);
         assert_eq!(proto.identity_scope, "");
         assert_eq!(proto.owner_scope, "user:7");
+        assert_eq!(proto.user_id, Some(7));
         assert_eq!(proto.native_id, "s1");
 
         let unknown = ThreadGroupSourceIdentity {
             identity_scope: ThreadGroupIdentityScope::Unknown,
             ..known
         };
-        let proto = endpoint_to_proto(&unknown, "user:7");
+        let proto = endpoint_to_proto(&unknown, 7);
         assert!(!proto.identity_scope_known);
+        assert_eq!(proto.user_id, Some(7));
     }
 
     #[test]

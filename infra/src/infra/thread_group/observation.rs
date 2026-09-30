@@ -27,10 +27,10 @@ use sqlx::Executor;
 const INSERT_SQL: &str = concat!(
     "INSERT INTO thread_observation \
      (id, subject_source, subject_identity_scope_known, subject_identity_scope_value, \
-      subject_owner_scope, subject_native_id, \
+      subject_user_id, subject_owner_scope, subject_native_id, \
       candidate_parent_present, candidate_parent_source, \
       candidate_parent_identity_scope_known, candidate_parent_identity_scope_value, \
-      candidate_parent_owner_scope, candidate_parent_native_id, \
+      candidate_parent_user_id, candidate_parent_owner_scope, candidate_parent_native_id, \
       relation_kind, origin, evidence_kind, polarity, source_confidence, \
       evidence_fingerprint, source_record_ref, state, import_run_id, \
       observed_at, created_at, updated_at) \
@@ -82,6 +82,10 @@ const INSERT_SQL: &str = concat!(
     p!(23),
     ",",
     p!(24),
+    ",",
+    p!(25),
+    ",",
+    p!(26),
     ")"
 );
 
@@ -97,7 +101,7 @@ const FIND_BY_IDENTITY_SQL: &str = concat!(
     p!(2),
     " AND subject_identity_scope_value = ",
     p!(3),
-    " AND subject_owner_scope = ",
+    " AND subject_user_id = ",
     p!(4),
     " AND subject_native_id = ",
     p!(5),
@@ -109,7 +113,7 @@ const FIND_BY_IDENTITY_SQL: &str = concat!(
     p!(8),
     " AND candidate_parent_identity_scope_value = ",
     p!(9),
-    " AND candidate_parent_owner_scope = ",
+    " AND candidate_parent_user_id IS NOT DISTINCT FROM ",
     p!(10),
     " AND candidate_parent_native_id = ",
     p!(11),
@@ -134,13 +138,13 @@ const LIST_BY_STATE_SQL: &str = concat!(
     " ORDER BY observed_at, id"
 );
 
-// Subject-side listing: owner-local by construction (subject_owner_scope
+// Subject-side listing: owner-local by construction (subject_user_id
 // is part of every bind), state filter optional.
 const LIST_BY_SUBJECT_SQL: &str = concat!(
     "SELECT ",
     THREAD_OBSERVATION_COLUMNS!(),
     " FROM thread_observation WHERE \
-      subject_owner_scope = ",
+      subject_user_id = ",
     p!(1),
     " AND subject_source = ",
     p!(2),
@@ -158,7 +162,7 @@ const LIST_PENDING_BY_CANDIDATE_PARENT_SQL: &str = concat!(
     THREAD_OBSERVATION_COLUMNS!(),
     " FROM thread_observation WHERE candidate_parent_present = TRUE \
       AND candidate_parent_identity_scope_known = TRUE \
-      AND candidate_parent_owner_scope = ",
+      AND candidate_parent_user_id = ",
     p!(1),
     " AND candidate_parent_source = ",
     p!(2),
@@ -205,13 +209,21 @@ pub trait ThreadObservationRepository: UseRdbPool + UseIdGenerator + Send + Sync
             .bind(&observation.subject_source)
             .bind(observation.subject_identity_scope_known)
             .bind(&observation.subject_identity_scope_value)
-            .bind(&observation.subject_owner_scope)
+            .bind(observation.subject_user_id)
+            .bind(common::thread_group_key::legacy_owner_scope(
+                observation.subject_user_id,
+            ))
             .bind(&observation.subject_native_id)
             .bind(observation.candidate_parent_present)
             .bind(&observation.candidate_parent_source)
             .bind(observation.candidate_parent_identity_scope_known)
             .bind(&observation.candidate_parent_identity_scope_value)
-            .bind(&observation.candidate_parent_owner_scope)
+            .bind(observation.candidate_parent_user_id)
+            .bind(
+                observation
+                    .candidate_parent_user_id
+                    .map_or_else(String::new, common::thread_group_key::legacy_owner_scope),
+            )
             .bind(&observation.candidate_parent_native_id)
             .bind(&observation.relation_kind)
             .bind(&observation.origin)
@@ -249,13 +261,13 @@ pub trait ThreadObservationRepository: UseRdbPool + UseIdGenerator + Send + Sync
                 .bind(identity.subject_source)
                 .bind(identity.subject_identity_scope_known)
                 .bind(identity.subject_identity_scope_value)
-                .bind(identity.subject_owner_scope)
+                .bind(identity.subject_user_id)
                 .bind(identity.subject_native_id)
                 .bind(identity.candidate_parent_present)
                 .bind(identity.candidate_parent_source)
                 .bind(identity.candidate_parent_identity_scope_known)
                 .bind(identity.candidate_parent_identity_scope_value)
-                .bind(identity.candidate_parent_owner_scope)
+                .bind(identity.candidate_parent_user_id)
                 .bind(identity.candidate_parent_native_id)
                 .bind(identity.evidence_kind)
                 .bind(identity.evidence_fingerprint)
@@ -275,13 +287,13 @@ pub trait ThreadObservationRepository: UseRdbPool + UseIdGenerator + Send + Sync
                 .bind(identity.subject_source)
                 .bind(identity.subject_identity_scope_known)
                 .bind(identity.subject_identity_scope_value)
-                .bind(identity.subject_owner_scope)
+                .bind(identity.subject_user_id)
                 .bind(identity.subject_native_id)
                 .bind(identity.candidate_parent_present)
                 .bind(identity.candidate_parent_source)
                 .bind(identity.candidate_parent_identity_scope_known)
                 .bind(identity.candidate_parent_identity_scope_value)
-                .bind(identity.candidate_parent_owner_scope)
+                .bind(identity.candidate_parent_user_id)
                 .bind(identity.candidate_parent_native_id)
                 .bind(identity.evidence_kind)
                 .bind(identity.evidence_fingerprint)
@@ -328,7 +340,7 @@ pub trait ThreadObservationRepository: UseRdbPool + UseIdGenerator + Send + Sync
                     subject_source: &observation.subject_source,
                     subject_identity_scope_known: observation.subject_identity_scope_known,
                     subject_identity_scope_value: &observation.subject_identity_scope_value,
-                    subject_owner_scope: &observation.subject_owner_scope,
+                    subject_user_id: observation.subject_user_id,
                     subject_native_id: &observation.subject_native_id,
                     candidate_parent_present: observation.candidate_parent_present,
                     candidate_parent_source: &observation.candidate_parent_source,
@@ -336,7 +348,7 @@ pub trait ThreadObservationRepository: UseRdbPool + UseIdGenerator + Send + Sync
                         .candidate_parent_identity_scope_known,
                     candidate_parent_identity_scope_value: &observation
                         .candidate_parent_identity_scope_value,
-                    candidate_parent_owner_scope: &observation.candidate_parent_owner_scope,
+                    candidate_parent_user_id: observation.candidate_parent_user_id,
                     candidate_parent_native_id: &observation.candidate_parent_native_id,
                     evidence_kind: &observation.evidence_kind,
                     evidence_fingerprint: &observation.evidence_fingerprint,
@@ -368,7 +380,7 @@ pub trait ThreadObservationRepository: UseRdbPool + UseIdGenerator + Send + Sync
     /// exactly as in the UNIQUE key.
     async fn list_by_subject(
         &self,
-        subject_owner_scope: &str,
+        subject_user_id: i64,
         subject_source: &str,
         subject_identity_scope_known: bool,
         subject_identity_scope_value: &str,
@@ -376,7 +388,7 @@ pub trait ThreadObservationRepository: UseRdbPool + UseIdGenerator + Send + Sync
     ) -> Result<Vec<ThreadObservationRow>> {
         Ok(
             sqlx::query_as::<Rdb, ThreadObservationRow>(LIST_BY_SUBJECT_SQL)
-                .bind(subject_owner_scope)
+                .bind(subject_user_id)
                 .bind(subject_source)
                 .bind(subject_identity_scope_known)
                 .bind(subject_identity_scope_value)
@@ -390,7 +402,7 @@ pub trait ThreadObservationRepository: UseRdbPool + UseIdGenerator + Send + Sync
     async fn list_by_subject_tx<'c, E: Executor<'c, Database = Rdb>>(
         &self,
         tx: E,
-        subject_owner_scope: &str,
+        subject_user_id: i64,
         subject_source: &str,
         subject_identity_scope_known: bool,
         subject_identity_scope_value: &str,
@@ -398,7 +410,7 @@ pub trait ThreadObservationRepository: UseRdbPool + UseIdGenerator + Send + Sync
     ) -> Result<Vec<ThreadObservationRow>> {
         Ok(
             sqlx::query_as::<Rdb, ThreadObservationRow>(LIST_BY_SUBJECT_SQL)
-                .bind(subject_owner_scope)
+                .bind(subject_user_id)
                 .bind(subject_source)
                 .bind(subject_identity_scope_known)
                 .bind(subject_identity_scope_value)
@@ -415,14 +427,14 @@ pub trait ThreadObservationRepository: UseRdbPool + UseIdGenerator + Send + Sync
     async fn list_pending_by_candidate_parent_tx<'c, E: Executor<'c, Database = Rdb>>(
         &self,
         tx: E,
-        parent_owner_scope: &str,
+        parent_user_id: i64,
         parent_source: &str,
         parent_identity_scope_value: &str,
         parent_native_id: &str,
     ) -> Result<Vec<ThreadObservationRow>> {
         Ok(
             sqlx::query_as::<Rdb, ThreadObservationRow>(LIST_PENDING_BY_CANDIDATE_PARENT_SQL)
-                .bind(parent_owner_scope)
+                .bind(parent_user_id)
                 .bind(parent_source)
                 .bind(parent_identity_scope_value)
                 .bind(parent_native_id)
@@ -584,7 +596,7 @@ mod tests {
         absent_parent.candidate_parent_source = String::new();
         absent_parent.candidate_parent_identity_scope_known = false;
         absent_parent.candidate_parent_identity_scope_value = String::new();
-        absent_parent.candidate_parent_owner_scope = String::new();
+        absent_parent.candidate_parent_user_id = None;
         absent_parent.candidate_parent_native_id = String::new();
         let (_, created) = repo.insert_or_find(&absent_parent).await?;
         assert!(created, "no-parent is a presence state, not a value");
@@ -624,7 +636,7 @@ mod tests {
 
         // Subject-side listing and the state work-queue scan.
         let subject_rows = repo
-            .list_by_subject("user:1", "codex", true, "", "subject-1")
+            .list_by_subject(1, "codex", true, "", "subject-1")
             .await?;
         assert!(subject_rows.iter().any(|r| r.id == id));
         assert!(subject_rows.iter().any(|r| r.id == again.id));

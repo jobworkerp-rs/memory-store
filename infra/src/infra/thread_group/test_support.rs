@@ -30,6 +30,8 @@ const THREAD_GROUP_SCHEMA: &str =
 const MEMORY_RELATION_SCHEMA: &str = include_str!(
     "../../../atlas/sqlite/migrations/20260926000001_thread_group_memory_relation.sql"
 );
+const USER_ID_SCHEMA: &str =
+    include_str!("../../../atlas/sqlite/migrations/20260930000001_thread_group_user_ids.sql");
 
 /// Deterministic base timestamp; individual tests offset from it.
 pub const T0: i64 = 1_700_000_000_000;
@@ -78,6 +80,14 @@ pub async fn setup_thread_group_pool() -> &'static RdbPool {
             .execute(&pool)
             .await
             .expect("thread group memory relationship schema");
+        let user_id_ddl = USER_ID_SCHEMA
+            .split("UPDATE memories_schema_contract")
+            .next()
+            .expect("typed user id migration has statements before the contract update");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(user_id_ddl.to_owned()))
+            .execute(&pool)
+            .await
+            .expect("typed ThreadGroup user id schema");
         pool
     })
     .await
@@ -101,6 +111,7 @@ pub async fn insert_thread(pool: &RdbPool, id: i64, last_message_at: Option<i64>
 
 pub fn new_group(n: u64) -> NewThreadGroup {
     NewThreadGroup {
+        user_id: 1,
         group_canonical_key: key(n),
         title: Some(format!("group-{n}")),
         status: values::group_status::ACTIVE.to_string(),
@@ -120,7 +131,7 @@ pub fn new_member(
         group_id,
         thread_id,
         thread_canonical_key: thread_key,
-        owner_scope: "user:1".to_string(),
+        user_id: 1,
         source: Some("codex".to_string()),
         identity_scope: Some(String::new()),
         native_id: Some("session-1".to_string()),
@@ -139,11 +150,11 @@ pub fn new_relation(parent_key: u64, child_key: u64) -> NewThreadRelation {
         child_thread_id: Some(child_key as i64 * 100),
         parent_thread_canonical_key: key(parent_key),
         child_thread_canonical_key: key(child_key),
-        parent_owner_scope: "user:1".to_string(),
+        parent_user_id: 1,
         parent_source: Some("codex".to_string()),
         parent_identity_scope: Some(String::new()),
         parent_native_id: Some(format!("parent-{parent_key}")),
-        child_owner_scope: "user:1".to_string(),
+        child_user_id: 1,
         child_source: Some("codex".to_string()),
         child_identity_scope: Some(String::new()),
         child_native_id: Some(format!("child-{child_key}")),
@@ -163,13 +174,13 @@ pub fn new_observation(n: u64) -> NewThreadObservation {
         subject_source: "codex".to_string(),
         subject_identity_scope_known: true,
         subject_identity_scope_value: String::new(),
-        subject_owner_scope: "user:1".to_string(),
+        subject_user_id: 1,
         subject_native_id: format!("subject-{n}"),
         candidate_parent_present: true,
         candidate_parent_source: "codex".to_string(),
         candidate_parent_identity_scope_known: true,
         candidate_parent_identity_scope_value: String::new(),
-        candidate_parent_owner_scope: "user:1".to_string(),
+        candidate_parent_user_id: Some(1),
         candidate_parent_native_id: format!("parent-{n}"),
         relation_kind: Some(values::relation_type::DELEGATED.to_string()),
         origin: values::observation_origin::ADAPTER.to_string(),
@@ -192,13 +203,13 @@ pub fn observation_identity(o: &NewThreadObservation) -> ObservationIdentity<'_>
         subject_source: &o.subject_source,
         subject_identity_scope_known: o.subject_identity_scope_known,
         subject_identity_scope_value: &o.subject_identity_scope_value,
-        subject_owner_scope: &o.subject_owner_scope,
+        subject_user_id: o.subject_user_id,
         subject_native_id: &o.subject_native_id,
         candidate_parent_present: o.candidate_parent_present,
         candidate_parent_source: &o.candidate_parent_source,
         candidate_parent_identity_scope_known: o.candidate_parent_identity_scope_known,
         candidate_parent_identity_scope_value: &o.candidate_parent_identity_scope_value,
-        candidate_parent_owner_scope: &o.candidate_parent_owner_scope,
+        candidate_parent_user_id: o.candidate_parent_user_id,
         candidate_parent_native_id: &o.candidate_parent_native_id,
         evidence_kind: &o.evidence_kind,
         evidence_fingerprint: &o.evidence_fingerprint,
@@ -211,7 +222,7 @@ pub fn new_candidate(n: u64) -> NewThreadGroupCandidateAssociation {
         subject_source: "codex".to_string(),
         subject_identity_scope_known: true,
         subject_identity_scope_value: String::new(),
-        subject_owner_scope: "user:1".to_string(),
+        subject_user_id: 1,
         subject_native_id: format!("subject-{n}"),
         candidate_group_id: None,
         candidate_parent_thread_id: None,
@@ -226,7 +237,7 @@ pub fn identity(n: u64) -> SourceIdentityKey<'static> {
     // Leaked static strings keep the borrowed key trivially constructible
     // in tests without lifetime plumbing.
     SourceIdentityKey {
-        owner_scope: Box::leak(format!("user:{}", n % 3).into_boxed_str()),
+        user_id: (n % 3) as i64,
         source: Box::leak("codex".to_string().into_boxed_str()),
         identity_scope: Box::leak(String::new().into_boxed_str()),
         native_id: Box::leak(format!("native-{n}").into_boxed_str()),
@@ -241,12 +252,13 @@ pub fn new_deletion_marker(n: u64) -> NewThreadDeletionMarker<'static> {
         actor_id: "operator-a".to_string(),
         reason: Some("privacy".to_string()),
         deleted_at: T0,
+        thread_canonical_key: None,
     }
 }
 
 pub fn new_operator_decision(association_id: i64) -> NewOperatorDecision {
     NewOperatorDecision {
-        owner_scope: "user:1".to_string(),
+        user_id: 1,
         candidate_association_id: association_id,
         actor_id: "operator-a".to_string(),
         decision: values::operator_decision::CONFIRM.to_string(),
@@ -259,7 +271,7 @@ pub fn new_operator_decision(association_id: i64) -> NewOperatorDecision {
 
 pub fn new_collection(n: u64) -> NewManualCollection {
     NewManualCollection {
-        owner_scope: "user:1".to_string(),
+        user_id: 1,
         title: format!("collection-{n}"),
         created_at: T0,
         updated_at: T0,
@@ -274,7 +286,7 @@ pub fn new_event(n: u64, event_id: String) -> NewThreadGroupEvent {
         policy_version: "thread-group-policy-v1".to_string(),
         source: Some("codex".to_string()),
         identity_scope: Some(String::new()),
-        owner_scope: Some("user:1".to_string()),
+        user_id: Some(1),
         native_id_ref: Some(format!("native-{n}")),
         group_id: None,
         thread_id: Some(n as i64 * 100),

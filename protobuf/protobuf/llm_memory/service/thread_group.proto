@@ -16,6 +16,10 @@ import "llm_memory/service/common.proto";
 // unchanged. A generic primary ThreadGroup create RPC is deliberately
 // absent (spec 3.1); operator-created groups come only from split.
 service ThreadGroupService {
+    // Explicitly reports owner-aware ThreadGroup behavior. New clients must
+    // require this capability before using independent group-owner fields or
+    // filters; a legacy server returns UNIMPLEMENTED for this RPC.
+    rpc GetThreadGroupCapabilities(ThreadGroupCapabilitiesRequest) returns (ThreadGroupCapabilitiesResponse);
     // Read model: active groups ordered by
     // `latest_activity_at DESC, group_canonical_key ASC` by default.
     rpc FindThreadGroupList(FindThreadGroupListRequest) returns (stream llm_memory.data.ThreadGroup);
@@ -85,6 +89,14 @@ service ThreadGroupService {
     rpc DeleteThreadGroupInactiveHistory(DeleteThreadGroupInactiveHistoryRequest) returns (DeleteThreadGroupInactiveHistoryResponse);
 }
 
+message ThreadGroupCapabilitiesRequest {}
+
+message ThreadGroupCapabilitiesResponse {
+    // Group ownership is independent from each member Thread owner, and all
+    // owner-aware ThreadGroup request fields and filters are honored.
+    bool supports_independent_group_owner_scope = 1;
+}
+
 message ThreadGroupPurgePreview {
     int64 group_id = 1;
     string group_status = 2;
@@ -146,6 +158,7 @@ message FindThreadGroupListRequest {
     optional int64 offset = 2;
     // Include redirected / split history. Default false = active only.
     bool include_inactive = 3;
+    optional int64 user_id = 4;
 }
 
 enum ThreadGroupSearchTarget {
@@ -185,6 +198,8 @@ message SearchThreadGroupsRequest {
     // filter is evaluated against current members and supports date/label
     // narrowing without requiring a text query.
     optional llm_memory.data.ThreadSearchFilter browse_filter = 5;
+    // Group ownership selection; independent from member Thread/Memory filters.
+    optional int64 user_id = 6;
 }
 
 message ThreadGroupSearchWitness {
@@ -251,13 +266,16 @@ message GlobalOrphanCleanupResponse {
 
 message FindThreadGroupSummaryRequest {
     int64 group_id = 1;
+    optional int64 user_id = 2;
 }
 
 message ThreadGroupSummaryResponse {
     optional llm_memory.data.Memory summary = 1;
 }
 
-message CountThreadGroupSummariesRequest {}
+message CountThreadGroupSummariesRequest {
+    optional int64 user_id = 1;
+}
 
 message CountThreadGroupSummariesResponse {
     int64 count = 1;
@@ -270,6 +288,8 @@ message RecordThreadGroupObservationsRequest {
     repeated llm_memory.data.ThreadGroupObservationInput observations = 3;
     // Import-run correlation id. Distinct from the event id.
     optional string operation_id = 4;
+    // Caller-selected owner for any group created by this import.
+    optional int64 group_owner_user_id = 5;
 }
 
 message RecordThreadGroupObservationsResponse {
@@ -301,6 +321,7 @@ message PreviewThreadGroupImportRequest {
     llm_memory.data.ThreadGroupEndpoint subject = 1;
     repeated llm_memory.data.ThreadGroupObservationInput observations = 2;
     bool explicit_override = 3;
+    optional int64 group_owner_user_id = 4;
 }
 
 message PreviewThreadGroupImportResponse {
@@ -367,6 +388,7 @@ message AttachThreadGroupMemberRequest {
 message CreateManualCollectionRequest {
     string owner_scope = 1;
     string title = 2;
+    optional int64 user_id = 3;
 }
 
 message CreateManualCollectionResponse {
@@ -377,28 +399,34 @@ message FindManualCollectionListRequest {
     string owner_scope = 1;
     optional int32 limit = 2;
     optional int64 offset = 3;
+    optional int64 user_id = 4;
 }
 
 message RenameManualCollectionRequest {
     int64 collection_id = 1;
     string title = 2;
+    optional int64 user_id = 3;
 }
 
 message DeleteManualCollectionRequest {
     int64 collection_id = 1;
+    optional int64 user_id = 2;
 }
 
 message AttachManualCollectionMemberRequest {
     int64 collection_id = 1;
     int64 thread_id = 2;
     string owner_scope = 3;
+    optional int64 user_id = 4;
 }
 
 message DetachManualCollectionMemberRequest {
     int64 collection_id = 1;
     int64 thread_id = 2;
+    optional int64 user_id = 3;
 }
 
 message FindManualCollectionMembersRequest {
     int64 collection_id = 1;
+    optional int64 user_id = 2;
 }

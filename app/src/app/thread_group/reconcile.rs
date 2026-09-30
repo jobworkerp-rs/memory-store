@@ -100,6 +100,7 @@ impl ThreadGroupReconciliationService {
             observations,
             operation_id,
             now,
+            subject.user_id,
             false,
         )
         .await
@@ -112,6 +113,7 @@ impl ThreadGroupReconciliationService {
         subject_thread_id: i64,
         subject: &ObservedEndpoint,
         observations: &[ObservationInput],
+        group_owner_user_id: i64,
         operation_id: &str,
         now: i64,
     ) -> anyhow::Result<ReconciliationOutcome> {
@@ -121,6 +123,7 @@ impl ThreadGroupReconciliationService {
             observations,
             operation_id,
             now,
+            group_owner_user_id,
             true,
         )
         .await
@@ -134,15 +137,16 @@ impl ThreadGroupReconciliationService {
         observations: &[ObservationInput],
         operation_id: &str,
         now: i64,
+        group_owner_user_id: i64,
         import_guard: bool,
     ) -> anyhow::Result<ReconciliationOutcome> {
         ensure_thread_group_writes()?;
         let mut outcome = ReconciliationOutcome::default();
         let subject_scope = known_scope_value(&subject.identity_scope).unwrap_or_default();
-        let subject_key = source_thread_canonical_key(&subject.to_source_identity());
+        let subject_identity_key = source_thread_canonical_key(&subject.to_source_identity());
 
         let lock_key = SourceIdentityKey {
-            owner_scope: &subject.owner_scope,
+            user_id: subject.user_id,
             source: &subject.source,
             identity_scope: &subject_scope,
             native_id: &subject.native_id,
@@ -164,16 +168,18 @@ impl ThreadGroupReconciliationService {
                 )
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("imported subject thread not found"))?;
-            if subject.owner_scope != format!("user:{}", row.user_id) {
+            if subject.user_id != row.user_id {
                 anyhow::bail!("imported subject owner does not match thread owner");
             }
-            if subject_key.is_none() && observations.is_empty() {
+            if subject_identity_key.is_none() && observations.is_empty() {
                 anyhow::bail!("unknown imported subject requires observation evidence");
             }
-            if subject_key.is_some() && self.markers.find_tx(&mut *tx, &lock_key).await?.is_some() {
+            if subject_identity_key.is_some()
+                && self.markers.find_tx(&mut *tx, &lock_key).await?.is_some()
+            {
                 anyhow::bail!("imported subject has a deletion marker");
             }
-            if subject_key.is_some()
+            if subject_identity_key.is_some()
                 && let Some(existing) = self
                     .source_identities
                     .find_resolved_tx(&mut *tx, &lock_key)
@@ -184,25 +190,34 @@ impl ThreadGroupReconciliationService {
             }
         }
 
-        if let Some(key) = subject_key.as_deref()
-            && self
+        // A thread may be observed through several source identities. Keep
+        // its first assigned canonical key and map each later identity to the
+        // live thread instead of treating the alias key as a new thread.
+        let subject_key = if let Some(identity_key) = subject_identity_key.as_deref() {
+            match self
                 .canonical_keys
                 .find_by_thread_id_tx(&mut *tx, subject_thread_id)
                 .await?
-                .is_none()
-        {
-            self.canonical_keys
-                .assign_tx(
-                    &mut *tx,
-                    subject_thread_id,
-                    &subject.owner_scope,
-                    key,
-                    values::canonical_key_origin::SOURCE_IDENTITY,
-                    now,
-                )
-                .await?;
-        }
-        if subject_key.is_some() {
+            {
+                Some(assigned_key) => Some(assigned_key.key),
+                None => {
+                    self.canonical_keys
+                        .assign_tx(
+                            &mut *tx,
+                            subject_thread_id,
+                            subject.user_id,
+                            identity_key,
+                            values::canonical_key_origin::SOURCE_IDENTITY,
+                            now,
+                        )
+                        .await?;
+                    Some(identity_key.to_string())
+                }
+            }
+        } else {
+            None
+        };
+        if subject_identity_key.is_some() {
             self.source_identities
                 .upsert_resolved_tx(&mut *tx, &lock_key, subject_thread_id, now)
                 .await?;
@@ -271,7 +286,7 @@ impl ThreadGroupReconciliationService {
                 continue;
             };
             let parent_lock = SourceIdentityKey {
-                owner_scope: &parent.owner_scope,
+                user_id: parent.user_id,
                 source: &parent.source,
                 identity_scope: &parent_scope,
                 native_id: &parent.native_id,
@@ -384,7 +399,7 @@ impl ThreadGroupReconciliationService {
                             .find_resolved_tx(
                                 &mut *tx,
                                 &SourceIdentityKey {
-                                    owner_scope: &parent.owner_scope,
+                                    user_id: parent.user_id,
                                     source: &parent.source,
                                     identity_scope: &parent_scope,
                                     native_id: &parent.native_id,
@@ -457,6 +472,7 @@ impl ThreadGroupReconciliationService {
                             *observation_id,
                             operation_id,
                             now,
+                            group_owner_user_id,
                         )
                         .await?;
                     outcome.relation_selected = relation_id;
@@ -505,6 +521,7 @@ impl ThreadGroupReconciliationService {
                         .create_tx(
                             &mut *tx,
                             &NewThreadGroup {
+                                user_id: group_owner_user_id,
                                 group_canonical_key: group_key,
                                 title: None,
                                 status: values::group_status::ACTIVE.to_string(),
@@ -525,7 +542,7 @@ impl ThreadGroupReconciliationService {
                         group_id,
                         thread_id: Some(subject_thread_id),
                         thread_canonical_key: subject_key.clone(),
-                        owner_scope: subject.owner_scope.clone(),
+                        user_id: subject.user_id,
                         source: Some(subject.source.clone()),
                         identity_scope: known_scope_value(&subject.identity_scope),
                         native_id: Some(subject.native_id.clone()),
@@ -553,7 +570,7 @@ impl ThreadGroupReconciliationService {
             self.observations
                 .list_pending_by_candidate_parent_tx(
                     &mut *tx,
-                    &subject.owner_scope,
+                    subject.user_id,
                     &subject.source,
                     &parent_scope,
                     &subject.native_id,
@@ -584,10 +601,10 @@ impl ThreadGroupReconciliationService {
         let Some(trigger) = self.observations.find_by_id(observation_id).await? else {
             return Ok(());
         };
-        if !trigger.subject_identity_scope_known
-            || !trigger.candidate_parent_present
-            || !trigger.candidate_parent_identity_scope_known
-        {
+        let Some(parent) = observation_parent_endpoint(&trigger)? else {
+            return Ok(());
+        };
+        if !trigger.subject_identity_scope_known || !trigger.candidate_parent_identity_scope_known {
             return Ok(());
         }
 
@@ -595,24 +612,17 @@ impl ThreadGroupReconciliationService {
             &trigger.subject_source,
             true,
             &trigger.subject_identity_scope_value,
-            &trigger.subject_owner_scope,
+            trigger.subject_user_id,
             &trigger.subject_native_id,
         );
-        let parent = candidate_endpoint(
-            &trigger.candidate_parent_source,
-            true,
-            &trigger.candidate_parent_identity_scope_value,
-            &trigger.candidate_parent_owner_scope,
-            &trigger.candidate_parent_native_id,
-        );
-        let Some(subject_key) = source_thread_canonical_key(&subject.to_source_identity()) else {
+        if source_thread_canonical_key(&subject.to_source_identity()).is_none() {
             return Ok(());
-        };
+        }
         let Some(subject_scope) = known_scope_value(&subject.identity_scope) else {
             return Ok(());
         };
         let subject_lock = SourceIdentityKey {
-            owner_scope: &subject.owner_scope,
+            user_id: subject.user_id,
             source: &subject.source,
             identity_scope: &subject_scope,
             native_id: &subject.native_id,
@@ -628,7 +638,7 @@ impl ThreadGroupReconciliationService {
             .candidates
             .list_by_subject_identity_tx(
                 &mut *tx,
-                &subject.owner_scope,
+                subject.user_id,
                 &subject.source,
                 true,
                 &subject_scope,
@@ -657,7 +667,7 @@ impl ThreadGroupReconciliationService {
             return Ok(());
         };
         let parent_lock = SourceIdentityKey {
-            owner_scope: &parent.owner_scope,
+            user_id: parent.user_id,
             source: &parent.source,
             identity_scope: &parent_scope,
             native_id: &parent.native_id,
@@ -685,9 +695,18 @@ impl ThreadGroupReconciliationService {
             tx.commit().await?;
             return Ok(());
         };
+        let Some(subject_thread_key) = self
+            .canonical_keys
+            .find_by_thread_id_tx(&mut *tx, subject_identity.thread_id)
+            .await?
+            .map(|row| row.key)
+        else {
+            tx.commit().await?;
+            return Ok(());
+        };
         let Some(subject_member) = self
             .members
-            .find_current_by_thread_canonical_key_tx(&mut *tx, &subject_key)
+            .find_current_by_thread_canonical_key_tx(&mut *tx, &subject_thread_key)
             .await?
         else {
             tx.commit().await?;
@@ -699,7 +718,7 @@ impl ThreadGroupReconciliationService {
         }
         if self
             .relations
-            .find_active_by_child_canonical_key_tx(&mut *tx, &subject_key)
+            .find_active_by_child_canonical_key_tx(&mut *tx, &subject_thread_key)
             .await?
             .is_some_and(|relation| relation.selected_operator_decision_id.is_some())
         {
@@ -737,7 +756,7 @@ impl ThreadGroupReconciliationService {
             .observations
             .list_by_subject_tx(
                 &mut *tx,
-                &subject.owner_scope,
+                subject.user_id,
                 &subject.source,
                 true,
                 &subject_scope,
@@ -748,7 +767,7 @@ impl ThreadGroupReconciliationService {
             .candidates
             .list_by_subject_identity_tx(
                 &mut *tx,
-                &subject.owner_scope,
+                subject.user_id,
                 &subject.source,
                 true,
                 &subject_scope,
@@ -779,7 +798,7 @@ impl ThreadGroupReconciliationService {
             {
                 continue;
             }
-            let Some(parent) = observation_parent_endpoint(row) else {
+            let Some(parent) = observation_parent_endpoint(row)? else {
                 continue;
             };
             let Some((confidence, relation_type)) = promotable_source_candidate(
@@ -793,7 +812,7 @@ impl ThreadGroupReconciliationService {
                 continue;
             };
             let parent_lock = SourceIdentityKey {
-                owner_scope: &parent.owner_scope,
+                user_id: parent.user_id,
                 source: &parent.source,
                 identity_scope: &parent_scope,
                 native_id: &parent.native_id,
@@ -847,12 +866,6 @@ impl ThreadGroupReconciliationService {
             return Ok(());
         }
 
-        let subject_thread_key = self
-            .canonical_keys
-            .find_by_thread_id_tx(&mut *tx, subject_identity.thread_id)
-            .await?
-            .map(|row| row.key)
-            .unwrap_or(subject_key);
         let selection = select_parent_candidate(
             &candidates
                 .iter()
@@ -876,7 +889,7 @@ impl ThreadGroupReconciliationService {
                             .find_resolved_tx(
                                 &mut *tx,
                                 &SourceIdentityKey {
-                                    owner_scope: &candidate_parent.owner_scope,
+                                    user_id: candidate_parent.user_id,
                                     source: &candidate_parent.source,
                                     identity_scope: &candidate_parent_scope,
                                     native_id: &candidate_parent.native_id,
@@ -914,7 +927,7 @@ impl ThreadGroupReconciliationService {
                             .find_resolved_tx(
                                 &mut *tx,
                                 &SourceIdentityKey {
-                                    owner_scope: &candidate_parent.owner_scope,
+                                    user_id: candidate_parent.user_id,
                                     source: &candidate_parent.source,
                                     identity_scope: &candidate_parent_scope,
                                     native_id: &candidate_parent.native_id,
@@ -960,7 +973,7 @@ impl ThreadGroupReconciliationService {
                     .find_resolved_tx(
                         &mut *tx,
                         &SourceIdentityKey {
-                            owner_scope: &winner_parent.owner_scope,
+                            user_id: winner_parent.user_id,
                             source: &winner_parent.source,
                             identity_scope: &winner_parent_scope,
                             native_id: &winner_parent.native_id,
@@ -995,6 +1008,7 @@ impl ThreadGroupReconciliationService {
                         winner_observation_id,
                         operation_id,
                         now,
+                        subject.user_id,
                     )
                     .await?
                 };
@@ -1007,7 +1021,7 @@ impl ThreadGroupReconciliationService {
                             .find_resolved_tx(
                                 &mut *tx,
                                 &SourceIdentityKey {
-                                    owner_scope: &candidate_parent.owner_scope,
+                                    user_id: candidate_parent.user_id,
                                     source: &candidate_parent.source,
                                     identity_scope: &candidate_parent_scope,
                                     native_id: &candidate_parent.native_id,
@@ -1045,7 +1059,7 @@ impl ThreadGroupReconciliationService {
                                 .find_resolved_tx(
                                     &mut *tx,
                                     &SourceIdentityKey {
-                                        owner_scope: &candidate_parent.owner_scope,
+                                        user_id: candidate_parent.user_id,
                                         source: &candidate_parent.source,
                                         identity_scope: &candidate_parent_scope,
                                         native_id: &candidate_parent.native_id,
@@ -1096,10 +1110,11 @@ impl ThreadGroupReconciliationService {
         observation_id: i64,
         operation_id: &str,
         now: i64,
+        group_owner_user_id: i64,
     ) -> anyhow::Result<Option<i64>> {
         let parent_scope = known_scope_value(&parent.identity_scope).unwrap_or_default();
         let parent_lock = SourceIdentityKey {
-            owner_scope: &parent.owner_scope,
+            user_id: parent.user_id,
             source: &parent.source,
             identity_scope: &parent_scope,
             native_id: &parent.native_id,
@@ -1128,6 +1143,7 @@ impl ThreadGroupReconciliationService {
                     parent_thread_id,
                     &winner.parent_key,
                     parent,
+                    Some(group_owner_user_id),
                     now,
                 )
                 .await?;
@@ -1190,11 +1206,11 @@ impl ThreadGroupReconciliationService {
             child_thread_id: Some(subject_thread_id),
             parent_thread_canonical_key: winner.parent_key.clone(),
             child_thread_canonical_key: subject_key.to_string(),
-            parent_owner_scope: parent.owner_scope.clone(),
+            parent_user_id: parent.user_id,
             parent_source: Some(parent.source.clone()),
             parent_identity_scope: known_scope_value(&parent.identity_scope),
             parent_native_id: Some(parent.native_id.clone()),
-            child_owner_scope: subject.owner_scope.clone(),
+            child_user_id: subject.user_id,
             child_source: Some(subject.source.clone()),
             child_identity_scope: known_scope_value(&subject.identity_scope),
             child_native_id: Some(subject.native_id.clone()),
@@ -1217,6 +1233,7 @@ impl ThreadGroupReconciliationService {
             parent_thread_id,
             &winner.parent_key,
             parent,
+            Some(group_owner_user_id),
             now,
         )
         .await?;
@@ -1290,6 +1307,7 @@ impl ThreadGroupReconciliationService {
         parent_thread_id: Option<i64>,
         parent_key: &str,
         parent: &ObservedEndpoint,
+        group_owner_user_id: Option<i64>,
         now: i64,
     ) -> anyhow::Result<()> {
         if let Some(member) = self
@@ -1301,7 +1319,14 @@ impl ThreadGroupReconciliationService {
             return Ok(());
         }
         let (target_group_id, anchor_key) = self
-            .resolve_anchor_group(tx, parent_thread_id, parent_key, parent, now)
+            .resolve_anchor_group(
+                tx,
+                parent_thread_id,
+                parent_key,
+                parent,
+                group_owner_user_id,
+                now,
+            )
             .await?;
         self.place_member(
             tx,
@@ -1328,6 +1353,7 @@ impl ThreadGroupReconciliationService {
         parent_thread_id: Option<i64>,
         parent_key: &str,
         parent: &ObservedEndpoint,
+        group_owner_user_id: Option<i64>,
         now: i64,
     ) -> anyhow::Result<(i64, String)> {
         let mut current_key = parent_key.to_string();
@@ -1359,7 +1385,7 @@ impl ThreadGroupReconciliationService {
                     .as_deref()
                     .map(IdentityScope::known)
                     .unwrap_or_else(IdentityScope::unknown),
-                owner_scope: relation.parent_owner_scope.clone(),
+                user_id: relation.parent_user_id,
                 native_id: relation.parent_native_id.clone().unwrap_or_default(),
             };
             current_thread_id = relation.parent_thread_id;
@@ -1378,6 +1404,11 @@ impl ThreadGroupReconciliationService {
                     .create_tx(
                         &mut **tx,
                         &NewThreadGroup {
+                            user_id: group_owner_user_id.ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "cannot create a ThreadGroup without a saved subject ThreadGroup owner"
+                                )
+                            })?,
                             group_canonical_key: group_key,
                             title: None,
                             status: values::group_status::ACTIVE.to_string(),
@@ -1521,7 +1552,7 @@ impl ThreadGroupReconciliationService {
                     group_id: target_group_id,
                     thread_id: stored_thread_id,
                     thread_canonical_key: key.to_string(),
-                    owner_scope: endpoint.owner_scope.clone(),
+                    user_id: endpoint.user_id,
                     source: Some(endpoint.source.clone()),
                     identity_scope: known_scope_value(&endpoint.identity_scope),
                     native_id: Some(endpoint.native_id.clone()),
@@ -1582,7 +1613,7 @@ impl ThreadGroupReconciliationService {
                         .as_deref()
                         .map(IdentityScope::known)
                         .unwrap_or_else(IdentityScope::unknown),
-                    owner_scope: relation.child_owner_scope.clone(),
+                    user_id: relation.child_user_id,
                     native_id: relation.child_native_id.clone().unwrap_or_default(),
                 };
                 self.place_member(
@@ -1655,7 +1686,7 @@ impl ThreadGroupReconciliationService {
             .candidates
             .list_by_subject_identity_tx(
                 &mut **tx,
-                &subject.owner_scope,
+                subject.user_id,
                 &subject.source,
                 true,
                 &scope,
@@ -1698,7 +1729,7 @@ impl ThreadGroupReconciliationService {
             .candidates
             .list_by_subject_identity_tx(
                 &mut **tx,
-                &subject.owner_scope,
+                subject.user_id,
                 &subject.source,
                 matches!(subject.identity_scope, IdentityScope::Known(_)),
                 &known_scope_value(&subject.identity_scope).unwrap_or_default(),
@@ -1746,7 +1777,7 @@ impl ThreadGroupReconciliationService {
                     ),
                     subject_identity_scope_value: known_scope_value(&subject.identity_scope)
                         .unwrap_or_default(),
-                    subject_owner_scope: subject.owner_scope.clone(),
+                    subject_user_id: subject.user_id,
                     subject_native_id: subject.native_id.clone(),
                     candidate_group_id: None,
                     candidate_parent_thread_id,
@@ -1783,7 +1814,7 @@ impl ThreadGroupReconciliationService {
             policy_version: THREAD_GROUP_POLICY_VERSION.to_string(),
             source: None,
             identity_scope: None,
-            owner_scope: None,
+            user_id: None,
             native_id_ref: None,
             group_id: None,
             thread_id: None,
@@ -1806,7 +1837,7 @@ impl ThreadGroupReconciliationService {
     pub async fn ensure_thread_canonical_key(
         &self,
         thread_id: i64,
-        owner_scope: &str,
+        user_id: i64,
         now: i64,
     ) -> anyhow::Result<String> {
         ensure_thread_group_writes()?;
@@ -1826,7 +1857,7 @@ impl ThreadGroupReconciliationService {
             .assign_tx(
                 &mut *tx,
                 thread_id,
-                owner_scope,
+                user_id,
                 &key,
                 values::canonical_key_origin::CREATION_UUID,
                 now,
@@ -1855,7 +1886,24 @@ impl ThreadGroupReconciliationService {
         );
         let suppressed = decision == SuppressionDecision::Suppress;
 
-        let subject_canonical = source_thread_canonical_key(&subject.to_source_identity());
+        let subject_canonical = if let Some(key) = marker
+            .as_ref()
+            .and_then(|row| row.thread_canonical_key.clone())
+        {
+            Some(key)
+        } else if let Some(identity_key) = observed_endpoint_key(subject) {
+            let resolved = self.source_identities.find_resolved(&identity_key).await?;
+            match resolved {
+                Some(identity) => self
+                    .canonical_keys
+                    .find_by_thread_id(identity.thread_id)
+                    .await?
+                    .map(|row| row.key),
+                None => source_thread_canonical_key(&subject.to_source_identity()),
+            }
+        } else {
+            None
+        };
         let would_revive = match subject_canonical {
             Some(key) => self
                 .members
@@ -1919,7 +1967,7 @@ impl ThreadGroupReconciliationService {
 
     /// Owner scope (`user:{thread.user_id}`) of a thread. Used when the
     /// attach path must generate a canonical key for a manual thread.
-    pub async fn thread_owner_scope(&self, thread_id: i64) -> anyhow::Result<Option<String>> {
+    pub async fn thread_user_id(&self, thread_id: i64) -> anyhow::Result<Option<i64>> {
         let repo = ThreadRepositoryImpl::new(IdGeneratorWrapper::new(), self.pool);
         let thread = repo
             .find(&protobuf::llm_memory::data::ThreadId { value: thread_id })
@@ -1927,7 +1975,7 @@ impl ThreadGroupReconciliationService {
         Ok(thread
             .and_then(|thread| thread.data)
             .and_then(|data| data.user_id)
-            .map(|user_id| format!("user:{}", user_id.value)))
+            .map(|user_id| user_id.value))
     }
 
     /// Source identity endpoint for a thread, when it is source-backed.
@@ -1944,7 +1992,7 @@ impl ThreadGroupReconciliationService {
             .map(|row| ObservedEndpoint {
                 source: row.source,
                 identity_scope: IdentityScope::known(row.identity_scope),
-                owner_scope: row.owner_scope,
+                user_id: row.user_id,
                 native_id: row.native_id,
             }))
     }
@@ -2010,6 +2058,46 @@ impl ThreadGroupReconciliationService {
             .await?
             .ok_or_else(|| anyhow::anyhow!("candidate association not found"))?;
 
+        let subject = self
+            .resolve_candidate_subject_tx(&mut tx, &candidate)
+            .await?;
+        if matches!(
+            decision,
+            values::operator_decision::CONFIRM | values::operator_decision::RETRACT
+        ) {
+            if !candidate.subject_identity_scope_known {
+                anyhow::bail!("candidate subject identity scope is unknown");
+            }
+            let (resolved_thread_id, _) = subject.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("candidate subject identity is unresolved or has no canonical key")
+            })?;
+            anyhow::ensure!(
+                candidate.subject_thread_id == Some(*resolved_thread_id),
+                "candidate subject identity no longer resolves to its recorded subject Thread"
+            );
+        }
+
+        let operator_group_owner_user_id = if decision == values::operator_decision::CONFIRM {
+            if let Some((_, subject_key)) = subject.as_ref() {
+                if let Some(member) = self
+                    .members
+                    .find_current_by_thread_canonical_key_tx(&mut *tx, subject_key)
+                    .await?
+                {
+                    self.groups
+                        .find_by_id_tx(&mut *tx, member.group_id)
+                        .await?
+                        .map(|group| group.user_id)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         if let Some(latest) = self
             .decisions
             .find_latest_by_candidate_association_id(candidate_association_id)
@@ -2038,7 +2126,7 @@ impl ThreadGroupReconciliationService {
             .insert_tx(
                 &mut *tx,
                 &NewOperatorDecision {
-                    owner_scope: candidate.subject_owner_scope.clone(),
+                    user_id: candidate.subject_user_id,
                     candidate_association_id,
                     actor_id: actor_id.to_string(),
                     decision: decision.to_string(),
@@ -2050,16 +2138,12 @@ impl ThreadGroupReconciliationService {
             )
             .await?;
 
-        let subject_key = candidate_subject_key(&candidate);
         let mut relation_id = None;
         let new_state = match decision {
             values::operator_decision::CONFIRM => {
-                let subject_key = subject_key
+                let (subject_thread_id, subject_key) = subject
                     .clone()
-                    .ok_or_else(|| anyhow::anyhow!("subject identity scope unknown"))?;
-                let subject_thread_id = candidate
-                    .subject_thread_id
-                    .ok_or_else(|| anyhow::anyhow!("subject thread unresolved"))?;
+                    .ok_or_else(|| anyhow::anyhow!("subject identity is unresolved"))?;
                 let parent_thread_id = candidate
                     .candidate_parent_thread_id
                     .ok_or_else(|| anyhow::anyhow!("candidate parent unresolved"))?;
@@ -2081,7 +2165,7 @@ impl ThreadGroupReconciliationService {
                     &candidate.subject_source,
                     candidate.subject_identity_scope_known,
                     &candidate.subject_identity_scope_value,
-                    &candidate.subject_owner_scope,
+                    candidate.subject_user_id,
                     &candidate.subject_native_id,
                 );
                 let parent_endpoint = match self
@@ -2095,11 +2179,31 @@ impl ThreadGroupReconciliationService {
                         &row.source,
                         true,
                         &row.identity_scope,
-                        &row.owner_scope,
+                        row.user_id,
                         &row.native_id,
                     ),
-                    None => candidate_endpoint("", false, "", "", ""),
+                    None => {
+                        let parent_user_id = self
+                            .thread_user_id(parent_thread_id)
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("parent thread owner missing"))?;
+                        candidate_endpoint("", false, "", parent_user_id, "")
+                    }
                 };
+                let parent_identity_scope = known_scope_value(&parent_endpoint.identity_scope);
+                let subject_identity_scope = known_scope_value(&subject_endpoint.identity_scope);
+                let parent_source = parent_identity_scope
+                    .as_ref()
+                    .map(|_| parent_endpoint.source.clone());
+                let parent_native_id = parent_identity_scope
+                    .as_ref()
+                    .map(|_| parent_endpoint.native_id.clone());
+                let child_source = subject_identity_scope
+                    .as_ref()
+                    .map(|_| subject_endpoint.source.clone());
+                let child_native_id = subject_identity_scope
+                    .as_ref()
+                    .map(|_| subject_endpoint.native_id.clone());
 
                 if let Some(existing) = self
                     .relations
@@ -2130,18 +2234,14 @@ impl ThreadGroupReconciliationService {
                                     child_thread_id: Some(subject_thread_id),
                                     parent_thread_canonical_key: parent_key.clone(),
                                     child_thread_canonical_key: subject_key.clone(),
-                                    parent_owner_scope: parent_endpoint.owner_scope.clone(),
-                                    parent_source: Some(parent_endpoint.source.clone()),
-                                    parent_identity_scope: known_scope_value(
-                                        &parent_endpoint.identity_scope,
-                                    ),
-                                    parent_native_id: Some(parent_endpoint.native_id.clone()),
-                                    child_owner_scope: subject_endpoint.owner_scope.clone(),
-                                    child_source: Some(subject_endpoint.source.clone()),
-                                    child_identity_scope: known_scope_value(
-                                        &subject_endpoint.identity_scope,
-                                    ),
-                                    child_native_id: Some(subject_endpoint.native_id.clone()),
+                                    parent_user_id: parent_endpoint.user_id,
+                                    parent_source,
+                                    parent_identity_scope,
+                                    parent_native_id,
+                                    child_user_id: subject_endpoint.user_id,
+                                    child_source,
+                                    child_identity_scope: subject_identity_scope,
+                                    child_native_id,
                                     relation_type: values::relation_type::DELEGATED.to_string(),
                                     state: values::relation_state::ACTIVE.to_string(),
                                     selection_basis: values::selection_basis::OPERATOR_CONFIRMATION
@@ -2163,6 +2263,7 @@ impl ThreadGroupReconciliationService {
                         Some(parent_thread_id),
                         &parent_key,
                         &parent_endpoint,
+                        operator_group_owner_user_id,
                         now,
                     )
                     .await?;
@@ -2171,7 +2272,7 @@ impl ThreadGroupReconciliationService {
             }
             values::operator_decision::REJECT => values::candidate_state::SUPERSEDED,
             values::operator_decision::RETRACT => {
-                if let Some(subject_key) = &subject_key
+                if let Some((_, subject_key)) = &subject
                     && let Some(existing) = self
                         .relations
                         .find_active_by_child_canonical_key_tx(&mut *tx, subject_key)
@@ -2210,6 +2311,31 @@ impl ThreadGroupReconciliationService {
             state: new_state.to_string(),
         })
     }
+
+    async fn resolve_candidate_subject_tx(
+        &self,
+        tx: &mut RdbTransaction<'_>,
+        candidate: &ThreadGroupCandidateAssociationRow,
+    ) -> anyhow::Result<Option<(i64, String)>> {
+        let Some(identity_key) = candidate_subject_identity_key(candidate) else {
+            return Ok(None);
+        };
+        let Some(identity) = self
+            .source_identities
+            .find_resolved_tx(&mut **tx, &identity_key)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(canonical_key) = self
+            .canonical_keys
+            .find_by_thread_id_tx(&mut **tx, identity.thread_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((identity.thread_id, canonical_key.key)))
+    }
 }
 
 /// Read-only preview of what a session import would do, produced by the
@@ -2232,17 +2358,17 @@ pub struct OperatorDecisionOutcome {
     pub state: String,
 }
 
-fn candidate_subject_key(candidate: &ThreadGroupCandidateAssociationRow) -> Option<String> {
-    source_thread_canonical_key(&SourceIdentity::new(
-        candidate.subject_owner_scope.clone(),
-        candidate.subject_source.clone(),
-        if candidate.subject_identity_scope_known {
-            IdentityScope::known(candidate.subject_identity_scope_value.clone())
-        } else {
-            IdentityScope::unknown()
-        },
-        candidate.subject_native_id.clone(),
-    ))
+fn candidate_subject_identity_key(
+    candidate: &ThreadGroupCandidateAssociationRow,
+) -> Option<SourceIdentityKey<'_>> {
+    candidate
+        .subject_identity_scope_known
+        .then_some(SourceIdentityKey {
+            user_id: candidate.subject_user_id,
+            source: &candidate.subject_source,
+            identity_scope: &candidate.subject_identity_scope_value,
+            native_id: &candidate.subject_native_id,
+        })
 }
 
 fn observed_endpoint_key(endpoint: &ObservedEndpoint) -> Option<SourceIdentityKey<'_>> {
@@ -2250,7 +2376,7 @@ fn observed_endpoint_key(endpoint: &ObservedEndpoint) -> Option<SourceIdentityKe
         return None;
     };
     Some(SourceIdentityKey {
-        owner_scope: &endpoint.owner_scope,
+        user_id: endpoint.user_id,
         source: &endpoint.source,
         identity_scope: scope,
         native_id: &endpoint.native_id,
@@ -2261,7 +2387,7 @@ fn candidate_endpoint(
     source: &str,
     identity_scope_known: bool,
     identity_scope_value: &str,
-    owner_scope: &str,
+    user_id: i64,
     native_id: &str,
 ) -> ObservedEndpoint {
     ObservedEndpoint {
@@ -2271,21 +2397,45 @@ fn candidate_endpoint(
         } else {
             IdentityScope::unknown()
         },
-        owner_scope: owner_scope.to_string(),
+        user_id,
         native_id: native_id.to_string(),
     }
 }
 
-fn observation_parent_endpoint(row: &ThreadObservationRow) -> Option<ObservedEndpoint> {
-    row.candidate_parent_present.then(|| {
-        candidate_endpoint(
-            &row.candidate_parent_source,
-            row.candidate_parent_identity_scope_known,
-            &row.candidate_parent_identity_scope_value,
-            &row.candidate_parent_owner_scope,
-            &row.candidate_parent_native_id,
-        )
-    })
+fn candidate_endpoint_if_present(
+    present: bool,
+    source: &str,
+    identity_scope_known: bool,
+    identity_scope_value: &str,
+    user_id: Option<i64>,
+    native_id: &str,
+) -> anyhow::Result<Option<ObservedEndpoint>> {
+    if !present {
+        anyhow::ensure!(user_id.is_none(), "absent candidate parent has a user id");
+        return Ok(None);
+    }
+
+    let user_id = user_id.ok_or_else(|| anyhow::anyhow!("candidate parent user id missing"))?;
+    Ok(Some(candidate_endpoint(
+        source,
+        identity_scope_known,
+        identity_scope_value,
+        user_id,
+        native_id,
+    )))
+}
+
+fn observation_parent_endpoint(
+    row: &ThreadObservationRow,
+) -> anyhow::Result<Option<ObservedEndpoint>> {
+    candidate_endpoint_if_present(
+        row.candidate_parent_present,
+        &row.candidate_parent_source,
+        row.candidate_parent_identity_scope_known,
+        &row.candidate_parent_identity_scope_value,
+        row.candidate_parent_user_id,
+        &row.candidate_parent_native_id,
+    )
 }
 
 fn winner_observation_id(
@@ -2355,6 +2505,31 @@ mod tests {
     use infra::infra::thread_group::test_support::{insert_thread, setup_thread_group_pool};
 
     #[test]
+    fn absent_observation_parent_keeps_a_null_user_id() {
+        assert_eq!(
+            candidate_endpoint_if_present(false, "", false, "", None, "")
+                .expect("absent parent is valid"),
+            None
+        );
+    }
+
+    #[test]
+    fn present_observation_parent_requires_a_typed_user_id() {
+        assert!(candidate_endpoint_if_present(true, "codex", true, "", None, "parent").is_err());
+
+        assert_eq!(
+            candidate_endpoint_if_present(true, "codex", true, "", Some(42), "parent")
+                .expect("present parent has owner"),
+            Some(ObservedEndpoint {
+                source: "codex".into(),
+                identity_scope: IdentityScope::known(""),
+                user_id: 42,
+                native_id: "parent".into(),
+            })
+        );
+    }
+
+    #[test]
     fn source_candidate_gate_requires_supported_evidence() {
         assert_eq!(
             promotable_source_candidate(
@@ -2400,7 +2575,7 @@ mod tests {
         ObservedEndpoint {
             source: "codex".into(),
             identity_scope: IdentityScope::known(""),
-            owner_scope: "user:pass2-reconcile".into(),
+            user_id: 42,
             native_id: native_id.into(),
         }
     }
@@ -2452,7 +2627,7 @@ mod tests {
                 infra::test_helper::shared_id_generator(),
                 pool,
             )
-            .list_by_subject("user:pass2-reconcile", "codex", true, "", "reconcile-child")
+            .list_by_subject(42, "codex", true, "", "reconcile-child")
             .await
             .expect("observation lookup");
             assert_eq!(observations.len(), 1);

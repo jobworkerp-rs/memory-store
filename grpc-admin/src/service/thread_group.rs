@@ -16,7 +16,7 @@ use app::app::thread_group::{
     ThreadGroupOperatorService, ThreadGroupPurgeService, ThreadGroupReadService,
     ThreadGroupReconciliationService, ThreadGroupView, ThreadRelationEndpointView,
 };
-use common::thread_group_key::IdentityScope;
+use common::thread_group_key::{IdentityScope, legacy_owner_scope};
 use infra::infra::thread_group::outbox::{
     ThreadGroupEventOutboxRepository, ThreadGroupEventOutboxRepositoryImpl,
 };
@@ -47,9 +47,10 @@ use crate::protobuf::llm_memory::service::{
     RecordThreadGroupObservationsResponse, RecordThreadGroupOperatorDecisionRequest,
     RecordThreadGroupOperatorDecisionResponse, RenameManualCollectionRequest,
     SearchThreadGroupsRequest, SearchThreadGroupsResponse, SplitThreadGroupRequest,
-    SplitThreadGroupResponse, SuccessResponse, ThreadGroupPurgePreview,
-    ThreadGroupReconciliationReport, ThreadGroupSearchMode, ThreadGroupSearchTarget,
-    ThreadGroupSearchWitness, ThreadGroupSummaryResponse,
+    SplitThreadGroupResponse, SuccessResponse, ThreadGroupCapabilitiesRequest,
+    ThreadGroupCapabilitiesResponse, ThreadGroupPurgePreview, ThreadGroupReconciliationReport,
+    ThreadGroupSearchMode, ThreadGroupSearchTarget, ThreadGroupSearchWitness,
+    ThreadGroupSummaryResponse,
 };
 use crate::service::error_handle::handle_error;
 use async_stream::stream;
@@ -113,6 +114,18 @@ impl ThreadGroupGrpcImpl {
             ),
         );
         self
+    }
+}
+
+fn require_group_owner_user_id(value: Option<i64>) -> Result<i64, tonic::Status> {
+    match value {
+        Some(user_id) if user_id > 0 => Ok(user_id),
+        Some(_) => Err(tonic::Status::invalid_argument(
+            "group_owner_user_id must be greater than zero",
+        )),
+        None => Err(tonic::Status::invalid_argument(
+            "group_owner_user_id is required",
+        )),
     }
 }
 
@@ -292,25 +305,48 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-fn endpoint_from_proto(endpoint: Option<&ThreadGroupEndpoint>) -> ObservedEndpoint {
-    let Some(endpoint) = endpoint else {
-        return ObservedEndpoint {
-            source: String::new(),
-            identity_scope: IdentityScope::unknown(),
-            owner_scope: String::new(),
-            native_id: String::new(),
-        };
+pub(super) fn owner_user_id_from_proto(
+    user_id: Option<i64>,
+    owner_scope: &str,
+    field_name: &str,
+) -> Result<i64, tonic::Status> {
+    let legacy_user_id = if owner_scope.is_empty() {
+        None
+    } else {
+        let user_id =
+            common::thread_group_key::parse_legacy_owner_scope(owner_scope).ok_or_else(|| {
+                tonic::Status::invalid_argument(format!(
+                    "{field_name} must use the legacy user:<id> format"
+                ))
+            })?;
+        Some(user_id)
     };
-    ObservedEndpoint {
+    match (user_id, legacy_user_id) {
+        (Some(current), Some(legacy)) if current != legacy => Err(tonic::Status::invalid_argument(
+            format!("{field_name} and its legacy owner_scope disagree"),
+        )),
+        (Some(current), _) | (None, Some(current)) => Ok(current),
+        (None, None) => Err(tonic::Status::invalid_argument(format!(
+            "{field_name} is required"
+        ))),
+    }
+}
+
+fn endpoint_from_proto(
+    endpoint: Option<&ThreadGroupEndpoint>,
+) -> Result<ObservedEndpoint, tonic::Status> {
+    let endpoint =
+        endpoint.ok_or_else(|| tonic::Status::invalid_argument("subject endpoint is required"))?;
+    Ok(ObservedEndpoint {
         source: endpoint.source.clone(),
         identity_scope: if endpoint.identity_scope_known {
             IdentityScope::known(endpoint.identity_scope.clone())
         } else {
             IdentityScope::unknown()
         },
-        owner_scope: endpoint.owner_scope.clone(),
+        user_id: owner_user_id_from_proto(endpoint.user_id, &endpoint.owner_scope, "user_id")?,
         native_id: endpoint.native_id.clone(),
-    }
+    })
 }
 
 fn evidence_kind_str(value: i32) -> String {
@@ -462,7 +498,10 @@ fn thread_display_proto(view: &ThreadDisplayView) -> ThreadGroupThreadDisplay {
 
 fn group_proto(view: &ThreadGroupView) -> ThreadGroup {
     ThreadGroup {
-        id: Some(ThreadGroupId { value: view.id }),
+        id: Some(ThreadGroupId {
+            value: view.id,
+            user_id: Some(view.user_id),
+        }),
         group_canonical_key: view.group_canonical_key.clone(),
         title: view.title.clone(),
         status: status_proto(&view.status),
@@ -476,6 +515,7 @@ fn group_proto(view: &ThreadGroupView) -> ThreadGroup {
         deleted_member_count: view.deleted_member_count,
         unresolved_count: view.unresolved_count,
         membership_snapshot_digest: view.membership_snapshot_digest.clone(),
+        user_id: Some(view.user_id),
     }
 }
 
@@ -487,7 +527,7 @@ fn member_proto(
         group_id: row.group_id,
         thread_id: row.thread_id,
         thread_canonical_key: row.thread_canonical_key.clone(),
-        owner_scope: row.owner_scope.clone(),
+        owner_scope: legacy_owner_scope(row.user_id),
         source: row.source.clone(),
         identity_scope: row.identity_scope.clone(),
         native_id: row.native_id.clone(),
@@ -496,6 +536,7 @@ fn member_proto(
         provenance: authority_proto(&row.provenance),
         deleted_at: row.deleted_at,
         display: display.map(thread_display_proto),
+        user_id: Some(row.user_id),
     }
 }
 
@@ -523,6 +564,8 @@ fn relation_proto(
         child_display: endpoint
             .and_then(|value| value.child_display.as_ref())
             .map(thread_display_proto),
+        parent_user_id: Some(row.parent_user_id),
+        child_user_id: Some(row.child_user_id),
     }
 }
 
@@ -533,12 +576,13 @@ fn candidate_proto(row: &ThreadGroupCandidateAssociationRow) -> ThreadGroupCandi
         subject_source: row.subject_source.clone(),
         subject_identity_scope_known: row.subject_identity_scope_known,
         subject_identity_scope_value: row.subject_identity_scope_value.clone(),
-        subject_owner_scope: row.subject_owner_scope.clone(),
+        subject_owner_scope: legacy_owner_scope(row.subject_user_id),
         subject_native_id: row.subject_native_id.clone(),
         candidate_group_id: row.candidate_group_id,
         candidate_parent_thread_id: row.candidate_parent_thread_id,
         state: candidate_state_proto(&row.state),
         selected_observation_id: row.selected_observation_id,
+        subject_user_id: Some(row.subject_user_id),
     }
 }
 
@@ -568,7 +612,7 @@ fn observation_proto(row: &ThreadObservationRow) -> ThreadObservation {
         subject_source: row.subject_source.clone(),
         subject_identity_scope_known: row.subject_identity_scope_known,
         subject_identity_scope_value: row.subject_identity_scope_value.clone(),
-        subject_owner_scope: row.subject_owner_scope.clone(),
+        subject_owner_scope: legacy_owner_scope(row.subject_user_id),
         subject_native_id: row.subject_native_id.clone(),
         candidate_parent_present: row.candidate_parent_present,
         candidate_parent_source: Some(row.candidate_parent_source.clone()),
@@ -576,7 +620,7 @@ fn observation_proto(row: &ThreadObservationRow) -> ThreadObservation {
         candidate_parent_identity_scope_value: Some(
             row.candidate_parent_identity_scope_value.clone(),
         ),
-        candidate_parent_owner_scope: Some(row.candidate_parent_owner_scope.clone()),
+        candidate_parent_owner_scope: row.candidate_parent_user_id.map(legacy_owner_scope),
         candidate_parent_native_id: Some(row.candidate_parent_native_id.clone()),
         relation_kind: row.relation_kind.clone(),
         evidence_kind: evidence_kind_proto(&row.evidence_kind),
@@ -586,6 +630,8 @@ fn observation_proto(row: &ThreadObservationRow) -> ThreadObservation {
         adapter_version: String::new(),
         source_record_ref: row.source_record_ref.clone().unwrap_or_default(),
         observed_at: row.observed_at,
+        subject_user_id: Some(row.subject_user_id),
+        candidate_parent_user_id: row.candidate_parent_user_id,
     }
 }
 
@@ -594,10 +640,11 @@ fn manual_collection_proto(
 ) -> ManualCollection {
     ManualCollection {
         id: row.id,
-        owner_scope: row.owner_scope.clone(),
+        owner_scope: legacy_owner_scope(row.user_id),
         title: row.title.clone(),
         created_at: row.created_at,
         updated_at: row.updated_at,
+        user_id: Some(row.user_id),
     }
 }
 
@@ -607,20 +654,22 @@ fn manual_collection_member_proto(
     ManualCollectionMember {
         collection_id: row.collection_id,
         thread_id: row.thread_id,
-        owner_scope: row.owner_scope.clone(),
+        owner_scope: legacy_owner_scope(row.user_id),
+        user_id: Some(row.user_id),
     }
 }
 
 fn observation_input_from_proto(
     input: &crate::protobuf::llm_memory::data::ThreadGroupObservationInput,
     now: i64,
-) -> ObservationInput {
-    ObservationInput {
-        subject: endpoint_from_proto(input.subject.as_ref()),
+) -> Result<ObservationInput, tonic::Status> {
+    Ok(ObservationInput {
+        subject: endpoint_from_proto(input.subject.as_ref())?,
         candidate_parent: input
             .candidate_parent
             .as_ref()
-            .map(|parent| endpoint_from_proto(Some(parent))),
+            .map(|parent| endpoint_from_proto(Some(parent)))
+            .transpose()?,
         relation_kind: input.relation_kind.clone(),
         evidence_kind: evidence_kind_str(input.evidence_kind),
         polarity: polarity_str(input.polarity),
@@ -629,7 +678,7 @@ fn observation_input_from_proto(
         source_record_ref: input.source_record_ref.clone(),
         import_run_id: None,
         observed_at: input.observed_at.unwrap_or(now),
-    }
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -645,14 +694,14 @@ fn observation_batch_from_proto(
     subject: Option<&crate::protobuf::llm_memory::data::ThreadGroupEndpoint>,
     observations: &[crate::protobuf::llm_memory::data::ThreadGroupObservationInput],
     now: i64,
-) -> MappedObservationBatch {
-    MappedObservationBatch {
-        subject: endpoint_from_proto(subject),
+) -> Result<MappedObservationBatch, tonic::Status> {
+    Ok(MappedObservationBatch {
+        subject: endpoint_from_proto(subject)?,
         observations: observations
             .iter()
             .map(|input| observation_input_from_proto(input, now))
-            .collect(),
-    }
+            .collect::<Result<Vec<_>, _>>()?,
+    })
 }
 
 fn member_search_query_from_proto(
@@ -728,6 +777,15 @@ fn search_result_proto(
 impl ThreadGroupService for ThreadGroupGrpcImpl {
     type FindThreadGroupListStream = BoxStream<'static, Result<ThreadGroup, tonic::Status>>;
 
+    async fn get_thread_group_capabilities(
+        &self,
+        _request: tonic::Request<ThreadGroupCapabilitiesRequest>,
+    ) -> Result<Response<ThreadGroupCapabilitiesResponse>, tonic::Status> {
+        Ok(Response::new(ThreadGroupCapabilitiesResponse {
+            supports_independent_group_owner_scope: true,
+        }))
+    }
+
     #[tracing::instrument(skip(self, request))]
     async fn find_thread_group_list(
         &self,
@@ -740,6 +798,7 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
                 request.include_inactive,
                 request.limit.map(i64::from),
                 request.offset,
+                request.user_id,
             )
             .await
             .map_err(|e| handle_error(&e))?;
@@ -782,6 +841,7 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
                 page_size as usize,
                 request.page_token.as_deref(),
                 request.browse_filter.as_ref(),
+                request.user_id,
             )
             .await
             .map_err(|error| handle_error(&error))?;
@@ -796,10 +856,11 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
         &self,
         request: tonic::Request<ThreadGroupId>,
     ) -> Result<Response<ThreadGroupLineage>, tonic::Status> {
-        let group_id = request.into_inner().value;
+        let request = request.into_inner();
+        let group_id = request.value;
         let lineage = self
             .read_app
-            .get_lineage(group_id)
+            .get_lineage(group_id, request.user_id)
             .await
             .map_err(|e| handle_error(&e))?
             .ok_or_else(|| {
@@ -836,22 +897,24 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
         &self,
         request: tonic::Request<FindThreadGroupSummaryRequest>,
     ) -> Result<Response<ThreadGroupSummaryResponse>, tonic::Status> {
+        let request = request.into_inner();
         let summary = self
             .read_app
-            .find_group_summary(request.into_inner().group_id)
+            .find_group_summary(request.group_id, request.user_id)
             .await
             .map_err(|e| handle_error(&e))?;
         Ok(Response::new(ThreadGroupSummaryResponse { summary }))
     }
 
-    #[tracing::instrument(skip(self, _request))]
+    #[tracing::instrument(skip(self, request))]
     async fn count_thread_group_summaries(
         &self,
-        _request: tonic::Request<CountThreadGroupSummariesRequest>,
+        request: tonic::Request<CountThreadGroupSummariesRequest>,
     ) -> Result<Response<CountThreadGroupSummariesResponse>, tonic::Status> {
+        let request = request.into_inner();
         let count = self
             .read_app
-            .count_group_summaries()
+            .count_group_summaries(request.user_id)
             .await
             .map_err(|e| handle_error(&e))?;
         Ok(Response::new(CountThreadGroupSummariesResponse { count }))
@@ -863,9 +926,10 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
         request: tonic::Request<RecordThreadGroupObservationsRequest>,
     ) -> Result<Response<RecordThreadGroupObservationsResponse>, tonic::Status> {
         let request = request.into_inner();
+        let group_owner_user_id = require_group_owner_user_id(request.group_owner_user_id)?;
         let now = now_millis();
         let mapped =
-            observation_batch_from_proto(request.subject.as_ref(), &request.observations, now);
+            observation_batch_from_proto(request.subject.as_ref(), &request.observations, now)?;
         let operation_id = request
             .operation_id
             .unwrap_or_else(|| format!("record:{}", request.subject_thread_id));
@@ -875,6 +939,7 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
                 request.subject_thread_id,
                 &mapped.subject,
                 &mapped.observations,
+                group_owner_user_id,
                 &operation_id,
                 now,
             )
@@ -927,9 +992,10 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
         request: tonic::Request<PreviewThreadGroupImportRequest>,
     ) -> Result<Response<PreviewThreadGroupImportResponse>, tonic::Status> {
         let request = request.into_inner();
+        let _group_owner_user_id = require_group_owner_user_id(request.group_owner_user_id)?;
         let now = now_millis();
         let mapped =
-            observation_batch_from_proto(request.subject.as_ref(), &request.observations, now);
+            observation_batch_from_proto(request.subject.as_ref(), &request.observations, now)?;
         let preview = self
             .reconcile_app
             .preview_import(
@@ -1047,22 +1113,22 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
             .source_endpoint_for_thread(request.thread_id)
             .await
             .map_err(|e| handle_error(&e))?;
-        // Owner scope is the thread's creator namespace; a source-backed
-        // thread takes it from the mapping, a manual thread from the row.
-        let owner_scope = match endpoint.as_ref() {
-            Some(endpoint) => endpoint.owner_scope.clone(),
+        // Thread ownership is the typed creator id, whether source-backed
+        // or manually created.
+        let user_id = match endpoint.as_ref() {
+            Some(endpoint) => endpoint.user_id,
             None => self
                 .reconcile_app
-                .thread_owner_scope(request.thread_id)
+                .thread_user_id(request.thread_id)
                 .await
                 .map_err(|e| handle_error(&e))?
-                .unwrap_or_default(),
+                .ok_or_else(|| tonic::Status::not_found("thread owner not found"))?,
         };
         // Resolve (or generate) the thread's canonical key server-side;
         // an optional caller-supplied key is validated, never trusted.
         let canonical_key = self
             .reconcile_app
-            .ensure_thread_canonical_key(request.thread_id, &owner_scope, now)
+            .ensure_thread_canonical_key(request.thread_id, user_id, now)
             .await
             .map_err(|e| handle_error(&e))?;
         if !request.thread_canonical_key.is_empty() && request.thread_canonical_key != canonical_key
@@ -1113,14 +1179,17 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
         request: tonic::Request<CreateManualCollectionRequest>,
     ) -> Result<Response<CreateManualCollectionResponse>, tonic::Status> {
         let request = request.into_inner();
-        if request.owner_scope.trim().is_empty() || request.title.trim().is_empty() {
+        if request.title.trim().is_empty()
+            || (request.user_id.is_none() && request.owner_scope.trim().is_empty())
+        {
             return Err(tonic::Status::invalid_argument(
-                "owner_scope and title must not be empty",
+                "user_id (or legacy owner_scope) and title are required",
             ));
         }
+        let user_id = owner_user_id_from_proto(request.user_id, &request.owner_scope, "user_id")?;
         let id = self
             .operator_app
-            .create_manual_collection(&request.owner_scope, &request.title, now_millis())
+            .create_manual_collection(user_id, &request.title, now_millis())
             .await
             .map_err(|e| handle_error(&e))?;
         Ok(Response::new(CreateManualCollectionResponse { id }))
@@ -1135,13 +1204,10 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
         request: tonic::Request<FindManualCollectionListRequest>,
     ) -> Result<Response<Self::FindManualCollectionListStream>, tonic::Status> {
         let request = request.into_inner();
+        let user_id = owner_user_id_from_proto(request.user_id, &request.owner_scope, "user_id")?;
         let rows = self
             .operator_app
-            .list_manual_collections(
-                &request.owner_scope,
-                request.limit.map(i64::from),
-                request.offset,
-            )
+            .list_manual_collections(user_id, request.limit.map(i64::from), request.offset)
             .await
             .map_err(|e| handle_error(&e))?;
         let stream = stream! {
@@ -1160,7 +1226,12 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
         let request = request.into_inner();
         let renamed = self
             .operator_app
-            .rename_manual_collection(request.collection_id, &request.title, now_millis())
+            .rename_manual_collection(
+                request.collection_id,
+                request.user_id,
+                &request.title,
+                now_millis(),
+            )
             .await
             .map_err(|e| handle_error(&e))?;
         if !renamed {
@@ -1177,7 +1248,7 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
         let request = request.into_inner();
         let deleted = self
             .operator_app
-            .delete_manual_collection(request.collection_id)
+            .delete_manual_collection(request.collection_id, request.user_id)
             .await
             .map_err(|e| handle_error(&e))?;
         if !deleted {
@@ -1192,11 +1263,12 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
         request: tonic::Request<AttachManualCollectionMemberRequest>,
     ) -> Result<Response<SuccessResponse>, tonic::Status> {
         let request = request.into_inner();
+        let user_id = owner_user_id_from_proto(request.user_id, &request.owner_scope, "user_id")?;
         self.operator_app
             .attach_manual_collection_member(
                 request.collection_id,
                 request.thread_id,
-                &request.owner_scope,
+                user_id,
                 now_millis(),
             )
             .await
@@ -1211,7 +1283,12 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
     ) -> Result<Response<SuccessResponse>, tonic::Status> {
         let request = request.into_inner();
         self.operator_app
-            .detach_manual_collection_member(request.collection_id, request.thread_id, now_millis())
+            .detach_manual_collection_member(
+                request.collection_id,
+                request.thread_id,
+                request.user_id,
+                now_millis(),
+            )
             .await
             .map_err(|e| handle_error(&e))?;
         Ok(Response::new(SuccessResponse { is_success: true }))
@@ -1249,7 +1326,7 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
         let request = request.into_inner();
         let rows = self
             .operator_app
-            .list_manual_collection_members(request.collection_id)
+            .list_manual_collection_members(request.collection_id, request.user_id)
             .await
             .map_err(|e| handle_error(&e))?;
         let stream = stream! {
@@ -1397,6 +1474,23 @@ mod search_contract_tests {
     use crate::protobuf::llm_memory::data::ThreadGroupObservationInput;
 
     #[test]
+    fn group_owner_is_required_positive_and_independent_from_source_owner() {
+        assert_eq!(
+            require_group_owner_user_id(Some(7)).unwrap(),
+            7,
+            "a caller may choose a group owner different from the source Thread owner"
+        );
+        assert_eq!(
+            require_group_owner_user_id(None).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            require_group_owner_user_id(Some(0)).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[test]
     fn hybrid_options_default_when_absent_and_preserve_specified_values() {
         let defaults = hybrid_options_or_default(None);
         assert!(matches!(
@@ -1478,6 +1572,7 @@ mod search_contract_tests {
             identity_scope: String::new(),
             owner_scope: "user:1".into(),
             native_id: "child".into(),
+            user_id: Some(1),
         };
         let inputs = vec![ThreadGroupObservationInput {
             subject: Some(subject.clone()),
@@ -1491,13 +1586,14 @@ mod search_contract_tests {
             observed_at: Some(7),
         }];
 
-        let mapped = observation_batch_from_proto(Some(&subject), &inputs, 100);
-        assert_eq!(mapped.subject, endpoint_from_proto(Some(&subject)));
+        let mapped = observation_batch_from_proto(Some(&subject), &inputs, 100)
+            .expect("valid typed endpoints");
+        assert_eq!(mapped.subject, endpoint_from_proto(Some(&subject)).unwrap());
         assert_eq!(
             mapped.observations,
             inputs
                 .iter()
-                .map(|input| observation_input_from_proto(input, 100))
+                .map(|input| observation_input_from_proto(input, 100).unwrap())
                 .collect::<Vec<_>>()
         );
     }
@@ -1593,11 +1689,11 @@ mod search_contract_tests {
             child_thread_id: Some(22),
             parent_thread_canonical_key: "parent".into(),
             child_thread_canonical_key: "child".into(),
-            parent_owner_scope: "owner".into(),
+            parent_user_id: 1,
             parent_source: Some("codex".into()),
             parent_identity_scope: None,
             parent_native_id: None,
-            child_owner_scope: "owner".into(),
+            child_user_id: 1,
             child_source: Some("codex".into()),
             child_identity_scope: None,
             child_native_id: None,
@@ -1650,18 +1746,37 @@ mod tests {
             identity_scope: String::new(),
             owner_scope: "user:1".into(),
             native_id: "s1".into(),
-        }));
+            user_id: None,
+        }))
+        .expect("legacy owner scope is accepted");
         assert_eq!(known.identity_scope, IdentityScope::known(""));
-        assert_eq!(known.owner_scope, "user:1");
+        assert_eq!(known.user_id, 1);
 
         let unknown = endpoint_from_proto(Some(&ThreadGroupEndpoint {
             source: "codex".into(),
             identity_scope_known: false,
             identity_scope: "ignored".into(),
+            owner_scope: String::new(),
+            native_id: "s1".into(),
+            user_id: Some(1),
+        }))
+        .expect("typed owner is accepted");
+        assert_eq!(unknown.identity_scope, IdentityScope::unknown());
+        assert_eq!(unknown.user_id, 1);
+    }
+
+    #[test]
+    fn endpoint_owner_fields_reject_disagreement() {
+        let error = endpoint_from_proto(Some(&ThreadGroupEndpoint {
+            source: "codex".into(),
+            identity_scope_known: true,
+            identity_scope: String::new(),
             owner_scope: "user:1".into(),
             native_id: "s1".into(),
-        }));
-        assert_eq!(unknown.identity_scope, IdentityScope::unknown());
+            user_id: Some(2),
+        }))
+        .expect_err("conflicting owner representations are rejected");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
 
     #[test]
@@ -1673,6 +1788,7 @@ mod tests {
                 identity_scope: String::new(),
                 owner_scope: "user:1".into(),
                 native_id: "child".into(),
+                user_id: Some(1),
             }),
             candidate_parent: Some(ThreadGroupEndpoint {
                 source: "codex".into(),
@@ -1680,6 +1796,7 @@ mod tests {
                 identity_scope: String::new(),
                 owner_scope: "user:1".into(),
                 native_id: "parent".into(),
+                user_id: Some(1),
             }),
             relation_kind: Some("delegated".into()),
             evidence_kind: ThreadEvidenceKind::SourceField as i32,
@@ -1689,7 +1806,7 @@ mod tests {
             source_record_ref: "codex:session_meta:subagent".into(),
             observed_at: Some(7),
         };
-        let mapped = observation_input_from_proto(&input, 100);
+        let mapped = observation_input_from_proto(&input, 100).expect("valid typed endpoints");
         assert_eq!(mapped.evidence_kind, "source_field");
         assert_eq!(mapped.polarity, "supports");
         assert_eq!(mapped.source_confidence.as_deref(), Some("exact"));

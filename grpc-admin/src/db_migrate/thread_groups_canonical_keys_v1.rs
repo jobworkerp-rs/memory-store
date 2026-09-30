@@ -23,13 +23,16 @@ use super::{
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use common::thread_group_key::{IdentityScope, SourceIdentity, source_thread_canonical_key};
+use common::thread_group_key::{
+    IdentityScope, SourceIdentity, parse_legacy_owner_scope, source_thread_canonical_key,
+};
 use infra_utils::infra::rdb::{RdbPool, RdbTransaction};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-const CHECKPOINT_FORMAT: &str = "thread-groups-canonical-keys-v1@1/checkpoint-v1";
+const CHECKPOINT_FORMAT_V1: &str = "thread-groups-canonical-keys-v1@1/checkpoint-v1";
+const CHECKPOINT_FORMAT_V2: &str = "thread-groups-canonical-keys-v1@2/checkpoint-v2";
 const DEFAULT_BATCH_SIZE: i64 = 500;
 const DEFAULT_LEASE_MS: i64 = 120_000;
 const KEY_ORIGIN_SOURCE_IDENTITY: &str = "source_identity";
@@ -205,6 +208,18 @@ impl ThreadGroupsCanonicalKeysV1Task {
         })
     }
 
+    fn is_replacement_generation(&self) -> bool {
+        self.catalog.identity() == "thread-groups-canonical-keys-v1@2"
+    }
+
+    fn checkpoint_format(&self) -> &'static str {
+        if self.is_replacement_generation() {
+            CHECKPOINT_FORMAT_V2
+        } else {
+            CHECKPOINT_FORMAT_V1
+        }
+    }
+
     #[cfg(all(test, not(feature = "postgres")))]
     fn with_batch_size(mut self, batch_size: i64) -> Self {
         self.batch_size = batch_size;
@@ -298,7 +313,11 @@ impl ThreadGroupsCanonicalKeysV1Task {
         )
         .await?;
         let run = async {
-            let result = self.apply_with_lease(&lease).await?;
+            let result = if self.is_replacement_generation() {
+                self.apply_replacement_with_lease(&lease).await?
+            } else {
+                self.apply_with_lease(&lease).await?
+            };
             self.verify_with_lease(&lease).await?;
             Ok(result)
         }
@@ -395,18 +414,26 @@ impl ThreadGroupsCanonicalKeysV1Task {
                     bail!("thread {thread_id} key row has no origin");
                 };
                 if origin == KEY_ORIGIN_SOURCE_IDENTITY {
-                    let thread_mappings = mappings.get(thread_id).with_context(|| {
-                        format!(
-                            "thread {thread_id} has a source_identity key but no resolved source identity mapping"
-                        )
-                    })?;
-                    let derived =
-                        derive_source_backed_key(&thread_mappings[0]).with_context(|| {
-                            format!("deriving the canonical key of thread {thread_id}")
+                    // A persisted key is the immutable correspondence record. The
+                    // replacement generation must not invalidate it when source
+                    // mappings are removed or rebound after assignment.
+                    let matches = if self.is_replacement_generation() {
+                        true
+                    } else {
+                        let thread_mappings = mappings.get(thread_id).with_context(|| {
+                            format!(
+                                "thread {thread_id} has a source_identity key but no resolved source identity mapping"
+                            )
                         })?;
-                    if derived != *key {
+                        let derived =
+                            derive_source_backed_key(&thread_mappings[0]).with_context(|| {
+                                format!("deriving the canonical key of thread {thread_id}")
+                            })?;
+                        derived == *key
+                    };
+                    if !matches {
                         bail!(
-                            "thread {thread_id} canonical key does not match its resolved source identity mapping"
+                            "thread {thread_id} saved canonical key does not match any resolved source identity mapping"
                         );
                     }
                 }
@@ -420,6 +447,19 @@ impl ThreadGroupsCanonicalKeysV1Task {
         let mut checkpoint = self.load_checkpoint().await?;
         let source_backed_assigned = self
             .assign_source_backed_keys(lease, &mut checkpoint)
+            .await?;
+        let manual_assigned = self.assign_manual_keys(lease, &mut checkpoint).await?;
+        Ok(RunResult {
+            source_backed_assigned,
+            manual_assigned,
+            outcome: "assigned".to_string(),
+        })
+    }
+
+    async fn apply_replacement_with_lease(&self, lease: &TaskLease) -> Result<RunResult> {
+        let mut checkpoint = self.load_checkpoint().await?;
+        let source_backed_assigned = self
+            .assign_source_backed_keys_replacement(lease, &mut checkpoint)
             .await?;
         let manual_assigned = self.assign_manual_keys(lease, &mut checkpoint).await?;
         Ok(RunResult {
@@ -450,6 +490,39 @@ impl ThreadGroupsCanonicalKeysV1Task {
                 bail!("canonical key preflight failed: malformed key row (origin={origin})");
             }
         }
+        if self.is_replacement_generation() {
+            self.validate_referenced_thread_owners().await?;
+        }
+        Ok(())
+    }
+
+    async fn validate_referenced_thread_owners(&self) -> Result<()> {
+        for (sql, field) in [
+            (
+                "SELECT identity.owner_scope, thread.user_id \
+                 FROM source_thread_identity identity JOIN thread ON thread.id = identity.thread_id",
+                "source identity",
+            ),
+            (
+                "SELECT canonical.owner_scope, thread.user_id \
+                 FROM thread_canonical_key canonical JOIN thread ON thread.id = canonical.thread_id",
+                "canonical key",
+            ),
+        ] {
+            let rows: Vec<(String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+                .fetch_all(&self.pool)
+                .await
+                .with_context(|| format!("checking {field} owner against Thread owner"))?;
+            for (owner_scope, thread_user_id) in rows {
+                let parsed = parse_legacy_owner_scope(&owner_scope)
+                    .with_context(|| format!("{field} has invalid owner scope"))?;
+                if parsed != thread_user_id {
+                    bail!(
+                        "{field} owner mismatch: owner {parsed} does not match referenced Thread owner {thread_user_id}"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -469,7 +542,7 @@ impl ThreadGroupsCanonicalKeysV1Task {
         };
         let envelope: TaskCheckpointEnvelope<Checkpoint> =
             serde_json::from_str(&raw).context("parsing thread canonical keys checkpoint")?;
-        if envelope.format != CHECKPOINT_FORMAT
+        if envelope.format != self.checkpoint_format()
             || envelope.task_identity != self.catalog.identity()
             || envelope.canonical_definition_digest != self.catalog.canonical_definition_digest
         {
@@ -505,7 +578,7 @@ impl ThreadGroupsCanonicalKeysV1Task {
     ) -> Result<()> {
         checkpoint.validate()?;
         let envelope = TaskCheckpointEnvelope {
-            format: CHECKPOINT_FORMAT.to_owned(),
+            format: self.checkpoint_format().to_owned(),
             task_identity: self.catalog.identity(),
             canonical_definition_digest: self.catalog.canonical_definition_digest.clone(),
             payload: checkpoint.clone(),
@@ -587,6 +660,79 @@ impl ThreadGroupsCanonicalKeysV1Task {
                     KEY_ORIGIN_SOURCE_IDENTITY,
                 )
                 .await?;
+                assigned += 1;
+            }
+            checkpoint.source_backed_last_thread_id = ids.last().copied();
+            self.save_checkpoint_tx(&mut tx, lease, checkpoint).await?;
+            tx.commit().await?;
+            self.note_batch_committed();
+            self.interrupt_if_requested()?;
+        }
+        checkpoint.phase = KeyPhase::Manual;
+        checkpoint.source_backed_last_thread_id = None;
+        let mut tx = self.pool.begin().await?;
+        self.save_checkpoint_tx(&mut tx, lease, checkpoint).await?;
+        tx.commit().await?;
+        Ok(assigned)
+    }
+
+    async fn assign_source_backed_keys_replacement(
+        &self,
+        lease: &TaskLease,
+        checkpoint: &mut Checkpoint,
+    ) -> Result<u64> {
+        if checkpoint.phase == KeyPhase::Manual || checkpoint.phase == KeyPhase::Verified {
+            return Ok(0);
+        }
+        if checkpoint.phase == KeyPhase::Pending {
+            checkpoint.phase = KeyPhase::SourceBacked;
+            let mut tx = self.pool.begin().await?;
+            self.save_checkpoint_tx(&mut tx, lease, checkpoint).await?;
+            tx.commit().await?;
+        }
+        let mut assigned = 0_u64;
+        loop {
+            let ids = self
+                .fetch_pending_ids(
+                    SOURCE_BACKED_IDS_BASE_SQL,
+                    checkpoint.source_backed_last_thread_id,
+                )
+                .await?;
+            if ids.is_empty() {
+                break;
+            }
+            let mut tx = self.pool.begin().await?;
+            self.renew_lease_tx(&mut tx, lease).await?;
+            for thread_id in &ids {
+                if self.thread_has_key_tx(&mut tx, *thread_id).await? {
+                    continue;
+                }
+                let mappings = self
+                    .resolved_mappings_for_thread_tx(&mut tx, *thread_id)
+                    .await?;
+                let owner_user_id: i64 = sqlx::query_scalar(THREAD_USER_ID_SQL)
+                    .bind(thread_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .with_context(|| format!("reading owner of thread {thread_id}"))?;
+                let owner_scope = format!("user:{owner_user_id}");
+                let (key, origin) = if let [mapping] = mappings.as_slice() {
+                    if mapping.owner_scope != owner_scope {
+                        bail!(
+                            "source identity owner mismatch for thread {thread_id}: {} does not match {owner_scope}",
+                            mapping.owner_scope
+                        );
+                    }
+                    (
+                        derive_source_backed_key(mapping)
+                            .with_context(|| format!("deriving key for thread {thread_id}"))?,
+                        KEY_ORIGIN_SOURCE_IDENTITY,
+                    )
+                } else {
+                    (random_key(), KEY_ORIGIN_BACKFILL_MAPPING)
+                };
+                self.assign_key_tx(&mut tx, *thread_id, &owner_scope, &key, origin)
+                    .await?;
                 assigned += 1;
             }
             checkpoint.source_backed_last_thread_id = ids.last().copied();
@@ -708,6 +854,23 @@ impl ThreadGroupsCanonicalKeysV1Task {
             })
     }
 
+    async fn resolved_mappings_for_thread_tx(
+        &self,
+        tx: &mut RdbTransaction<'_>,
+        thread_id: i64,
+    ) -> Result<Vec<ResolvedMapping>> {
+        let sql = format!(
+            "SELECT owner_scope, source, identity_scope, native_id FROM source_thread_identity \
+             WHERE thread_id = {} ORDER BY owner_scope ASC, source ASC, identity_scope ASC, native_id ASC",
+            placeholder(1)
+        );
+        sqlx::query_as::<_, ResolvedMapping>(sqlx::AssertSqlSafe(sql))
+            .bind(thread_id)
+            .fetch_all(&mut **tx)
+            .await
+            .with_context(|| format!("reading resolved identities for thread {thread_id}"))
+    }
+
     async fn resolved_mappings_for(
         &self,
         thread_ids: &[i64],
@@ -788,8 +951,10 @@ struct ResolvedMapping {
 /// resolved identity tuple; every resolved mapping carries a concrete
 /// `identity_scope` value, so derivation always succeeds here.
 fn derive_source_backed_key(mapping: &ResolvedMapping) -> Result<String> {
+    let user_id = parse_legacy_owner_scope(&mapping.owner_scope)
+        .context("resolved source identity mapping has an invalid legacy owner scope")?;
     source_thread_canonical_key(&SourceIdentity::new(
-        mapping.owner_scope.clone(),
+        user_id,
         mapping.source.clone(),
         IdentityScope::known(mapping.identity_scope.clone()),
         mapping.native_id.clone(),
@@ -849,9 +1014,83 @@ impl DataMigrationTask for ThreadGroupsCanonicalKeysV1Task {
     }
 }
 
+/// Replacement contract for canonical-key verification and new assignments.
+/// The previous generation remains available only as an immutable history
+/// entry; this generation scans past legacy checkpoints and keeps every key
+/// already persisted by the old task.
+pub struct ThreadGroupsCanonicalKeysV2Task {
+    inner: ThreadGroupsCanonicalKeysV1Task,
+}
+
+impl ThreadGroupsCanonicalKeysV2Task {
+    pub fn new(pool: RdbPool, catalog: TaskCatalogEntry) -> Result<Self> {
+        if catalog.identity() != "thread-groups-canonical-keys-v1@2" {
+            bail!(
+                "unexpected replacement task catalog identity: {}",
+                catalog.identity()
+            );
+        }
+        Ok(Self {
+            inner: ThreadGroupsCanonicalKeysV1Task::new(pool, catalog)?,
+        })
+    }
+
+    pub async fn apply(&self, execution_id: &str, holder_id: &str) -> Result<RunResult> {
+        self.inner.apply(execution_id, holder_id).await
+    }
+
+    pub async fn verify(&self) -> Result<()> {
+        self.inner.verify().await
+    }
+
+    #[cfg(all(test, not(feature = "postgres")))]
+    fn with_batch_size(mut self, batch_size: i64) -> Self {
+        self.inner = self.inner.with_batch_size(batch_size);
+        self
+    }
+
+    #[cfg(all(test, not(feature = "postgres")))]
+    fn interrupt_after_batches(mut self, batches: u32) -> Self {
+        self.inner = self.inner.interrupt_after_batches(batches);
+        self
+    }
+}
+
+#[async_trait]
+impl DataMigrationTask for ThreadGroupsCanonicalKeysV2Task {
+    fn task_identity(&self) -> String {
+        self.inner.task_identity()
+    }
+
+    async fn inspect(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(
+            ThreadGroupsCanonicalKeysV1Task::inspect(&self.inner).await?,
+        )?)
+    }
+
+    async fn dry_run(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(
+            ThreadGroupsCanonicalKeysV1Task::dry_run(&self.inner).await?,
+        )?)
+    }
+
+    async fn apply(&self, execution_id: &str, holder_id: &str) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(
+            ThreadGroupsCanonicalKeysV1Task::apply(&self.inner, execution_id, holder_id).await?,
+        )?)
+    }
+
+    async fn verify(&self) -> Result<()> {
+        self.inner.verify().await
+    }
+}
+
 #[cfg(all(test, not(feature = "postgres")))]
 mod tests {
-    use super::{Checkpoint, KeyPhase, ThreadGroupsCanonicalKeysV1Task};
+    use super::{
+        Checkpoint, KeyPhase, ResolvedMapping, ThreadGroupsCanonicalKeysV1Task,
+        ThreadGroupsCanonicalKeysV2Task, derive_source_backed_key,
+    };
     use crate::db_migrate::{catalog, state, task_from_catalog};
     use common::thread_group_key::{IdentityScope, SourceIdentity, source_thread_canonical_key};
     use infra_utils::infra::rdb::RdbPool;
@@ -897,6 +1136,35 @@ mod tests {
             catalog::thread_groups_canonical_keys_v1().unwrap(),
         )
         .unwrap()
+    }
+
+    fn replacement_task(pool: RdbPool) -> ThreadGroupsCanonicalKeysV2Task {
+        ThreadGroupsCanonicalKeysV2Task::new(
+            pool,
+            catalog::thread_groups_canonical_keys_v2().unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn prepare_task_state(pool: &RdbPool) {
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS memories_data_migration_task_state (\
+               task_identity TEXT PRIMARY KEY, canonical_definition_digest TEXT NOT NULL, state TEXT NOT NULL,\
+               execution_id TEXT, holder_id TEXT, fencing_token BIGINT NOT NULL, heartbeat_at BIGINT,\
+               lease_expires_at BIGINT, attempt_count BIGINT NOT NULL, checkpoint TEXT,\
+               failure_classification TEXT, started_at BIGINT, updated_at BIGINT NOT NULL, completed_at BIGINT\
+             )",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "DELETE FROM memories_data_migration_task_state \
+             WHERE task_identity IN ('thread-groups-canonical-keys-v1@1', 'thread-groups-canonical-keys-v1@2')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     async fn insert_thread(pool: &RdbPool, id: i64, user_id: i64) {
@@ -1021,14 +1289,14 @@ mod tests {
             let rows = key_rows(&pool).await;
             assert_eq!(rows.len(), 3);
             let expected_codex = source_thread_canonical_key(&SourceIdentity::new(
-                "user:1",
+                1,
                 "codex",
                 IdentityScope::known(""),
                 "session-1",
             ))
             .unwrap();
             let expected_claude = source_thread_canonical_key(&SourceIdentity::new(
-                "user:7",
+                7,
                 "claude_code",
                 IdentityScope::known("project-x"),
                 "sess-9",
@@ -1136,6 +1404,165 @@ mod tests {
             assert_eq!(rows[1].3, "backfill_mapping");
             assert_eq!(rows[2].3, "backfill_mapping");
             task(pool.clone()).verify().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn replacement_verify_keeps_a_completed_v1_key_after_a_smaller_alias_arrives() {
+        TEST_RUNTIME.block_on(async {
+            let pool = test_pool().await;
+            insert_thread(&pool, 1, 1).await;
+            resolve_mapping(&pool, 1, "user:1", "codex", "", "z-session").await;
+            task(pool.clone())
+                .apply("legacy-completed", "test")
+                .await
+                .unwrap();
+            let saved = key_rows(&pool).await[0].2.clone();
+
+            resolve_mapping(&pool, 1, "user:1", "codex", "", "a-alias").await;
+            assert!(
+                task(pool.clone()).verify().await.is_err(),
+                "the retired generation exposes why it must no longer be re-run"
+            );
+
+            replacement_task(pool.clone())
+                .apply("replacement-after-alias", "test")
+                .await
+                .unwrap();
+            replacement_task(pool.clone()).verify().await.unwrap();
+            assert_eq!(key_rows(&pool).await[0].2, saved);
+        });
+    }
+
+    #[test]
+    fn replacement_verification_treats_saved_key_as_authoritative_after_identity_rebinding() {
+        TEST_RUNTIME.block_on(async {
+            let pool = test_pool().await;
+            insert_thread(&pool, 1, 1).await;
+            resolve_mapping(&pool, 1, "user:1", "codex", "", "original-session").await;
+            task(pool.clone())
+                .apply("legacy-before-rebinding", "test")
+                .await
+                .unwrap();
+            let saved_key = key_rows(&pool).await[0].2.clone();
+
+            sqlx::query("DELETE FROM source_thread_identity WHERE thread_id = ?")
+                .bind(1_i64)
+                .execute(&pool)
+                .await
+                .unwrap();
+            resolve_mapping(&pool, 1, "user:1", "codex", "", "rebound-session").await;
+
+            replacement_task(pool.clone())
+                .apply("replacement-after-rebinding", "test")
+                .await
+                .unwrap();
+            replacement_task(pool.clone()).verify().await.unwrap();
+            assert_eq!(key_rows(&pool).await[0].2, saved_key);
+        });
+    }
+
+    #[test]
+    fn replacement_uses_opaque_keys_for_multiple_new_mappings_and_legacy_run_cannot_replace_them() {
+        TEST_RUNTIME.block_on(async {
+            let pool = test_pool().await;
+            insert_thread(&pool, 1, 1).await;
+            resolve_mapping(&pool, 1, "user:1", "codex", "", "session-a").await;
+            resolve_mapping(&pool, 1, "user:1", "codex", "", "session-b").await;
+
+            replacement_task(pool.clone())
+                .apply("replacement-multiple-mappings", "test")
+                .await
+                .unwrap();
+            let saved = key_rows(&pool).await[0].clone();
+            assert_eq!(saved.3, "backfill_mapping");
+            let derived_keys = ["session-a", "session-b"].map(|native_id| {
+                derive_source_backed_key(&ResolvedMapping {
+                    owner_scope: "user:1".to_string(),
+                    source: "codex".to_string(),
+                    identity_scope: String::new(),
+                    native_id: native_id.to_string(),
+                })
+                .unwrap()
+            });
+            assert!(derived_keys.iter().all(|derived| derived != &saved.2));
+
+            task(pool.clone())
+                .apply("legacy-after-replacement", "test")
+                .await
+                .unwrap();
+            assert_eq!(key_rows(&pool).await[0], saved);
+            replacement_task(pool.clone()).verify().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn replacement_hands_off_from_an_unfinished_v1_checkpoint_and_resumes_opaque_keys() {
+        TEST_RUNTIME.block_on(async {
+            let pool = test_pool().await;
+            insert_thread(&pool, 1, 1).await;
+            insert_thread(&pool, 2, 1).await;
+            resolve_mapping(&pool, 1, "user:1", "codex", "", "session-1").await;
+            resolve_mapping(&pool, 2, "user:1", "codex", "", "session-2").await;
+            resolve_mapping(&pool, 2, "user:1", "codex", "", "session-2-alias").await;
+
+            let interrupted = task(pool.clone())
+                .with_batch_size(1)
+                .interrupt_after_batches(1)
+                .apply("legacy-interrupted", "test")
+                .await;
+            assert!(interrupted.is_err());
+            let legacy_state = state::load(&pool, "thread-groups-canonical-keys-v1@1")
+                .await
+                .unwrap()
+                .unwrap();
+            let legacy_checkpoint = legacy_state.checkpoint.clone();
+            assert_eq!(key_rows(&pool).await.len(), 1);
+
+            assert!(
+                replacement_task(pool.clone())
+                    .with_batch_size(1)
+                    .interrupt_after_batches(1)
+                    .apply("replacement-interrupted", "test")
+                    .await
+                    .is_err()
+            );
+            let after_handoff = key_rows(&pool).await;
+            assert_eq!(after_handoff.len(), 2);
+            assert_eq!(after_handoff[0].3, "source_identity");
+            assert_eq!(after_handoff[1].3, "backfill_mapping");
+            let opaque_key = after_handoff[1].2.clone();
+            assert_eq!(
+                state::load(&pool, "thread-groups-canonical-keys-v1@1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .checkpoint,
+                legacy_checkpoint,
+                "the replacement must not rewrite the old task checkpoint"
+            );
+
+            replacement_task(pool.clone())
+                .apply("replacement-resumed", "test")
+                .await
+                .unwrap();
+            replacement_task(pool.clone()).verify().await.unwrap();
+            let rows = key_rows(&pool).await;
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[1].2, opaque_key);
+        });
+    }
+
+    #[test]
+    fn replacement_verifies_an_empty_full_atlas_schema_fixture() {
+        TEST_RUNTIME.block_on(async {
+            let pool = infra::infra::thread_group::test_support::setup_thread_group_pool().await;
+            prepare_task_state(pool).await;
+            replacement_task(pool.clone())
+                .apply("replacement-empty-atlas", "test")
+                .await
+                .unwrap();
+            replacement_task(pool.clone()).verify().await.unwrap();
         });
     }
 

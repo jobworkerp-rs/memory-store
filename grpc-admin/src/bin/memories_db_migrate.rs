@@ -1853,12 +1853,26 @@ mod tests {
                 "--id",
                 "thread-groups-canonical-keys-v1",
                 "--generation",
-                "1",
+                "2",
                 "--maintenance-window-ack",
             ])
             .await?;
         assert!(output.contains(
-            "post_migrate_run task_identity=thread-groups-canonical-keys-v1@1 status=completed"
+            "post_migrate_run task_identity=thread-groups-canonical-keys-v1@2 status=completed"
+        ));
+        let output = command
+            .run(&[
+                "post-migrate",
+                "run",
+                "--id",
+                "thread-groups-user-ids-v1",
+                "--generation",
+                "2",
+                "--maintenance-window-ack",
+            ])
+            .await?;
+        assert!(output.contains(
+            "post_migrate_run task_identity=thread-groups-user-ids-v1@2 status=completed"
         ));
 
         let migrated =
@@ -1876,10 +1890,13 @@ mod tests {
         assert_eq!(row.content, "fixture");
         assert_eq!(row.embedding, vec![0.1, 0.2, 0.3, 0.4]);
         let output = command.run(&["schema", "verify"]).await?;
-        assert!(output.contains("verify status=verified version=20260926000001"));
+        assert!(output.contains("verify status=verified version=20260930000001"));
         let output = command.run(&["post-migrate", "verify"]).await?;
         assert!(output.contains(
-            "post_migrate_verify task_identity=thread-groups-canonical-keys-v1@1 status=verified"
+            "post_migrate_verify task_identity=thread-groups-canonical-keys-v1@2 status=verified"
+        ));
+        assert!(output.contains(
+            "post_migrate_verify task_identity=thread-groups-user-ids-v1@2 status=verified"
         ));
         assert!(output.contains(
             "post_migrate_verify task_identity=thread-message-times-v1@1 status=verified"
@@ -1931,7 +1948,7 @@ mod tests {
             "baseline status=completed baseline_version={candidate_version}"
         )));
         let output = command.run(&["schema", "verify"]).await?;
-        assert!(output.contains("verify status=verified version=20260926000001"));
+        assert!(output.contains("verify status=verified version=20260930000001"));
 
         let pool = sqlx::Pool::<Rdb>::connect(database_url).await?;
         assert_eq!(schema_state(&pool).await?, SchemaState::Managed);
@@ -1940,7 +1957,7 @@ mod tests {
         )
         .fetch_one(&pool)
         .await?;
-        assert_eq!(contract, "20260926000001");
+        assert_eq!(contract, "20260930000001");
         Ok(())
     }
 
@@ -1982,15 +1999,15 @@ mod tests {
     fn baseline_applies_every_migration_after_the_selected_candidate() {
         assert_eq!(
             remaining_migration_count_after_baseline("20260803000001").unwrap(),
-            4
+            5
         );
         assert_eq!(
             remaining_migration_count_after_baseline("20260803000002").unwrap(),
-            3
+            4
         );
         assert_eq!(
             remaining_migration_count_after_baseline("20260803000003").unwrap(),
-            2
+            3
         );
     }
 
@@ -2081,14 +2098,24 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].identity(), "thread-message-times-v1@1");
         let latest_tasks = selected_tasks_for_schema_version("20260920000001", "sqlite").unwrap();
-        assert_eq!(latest_tasks.len(), 2);
+        assert_eq!(latest_tasks.len(), 1);
         assert_eq!(
             latest_tasks
                 .iter()
                 .map(|task| task.identity())
                 .collect::<Vec<_>>(),
+            vec!["thread-message-times-v1@1"]
+        );
+        let typed_owner_tasks =
+            selected_tasks_for_schema_version("20260930000001", "sqlite").unwrap();
+        assert_eq!(
+            typed_owner_tasks
+                .iter()
+                .map(|task| task.identity())
+                .collect::<Vec<_>>(),
             vec![
-                "thread-groups-canonical-keys-v1@1",
+                "thread-groups-canonical-keys-v1@2",
+                "thread-groups-user-ids-v1@2",
                 "thread-message-times-v1@1"
             ]
         );
@@ -2877,7 +2904,7 @@ mod tests {
                     SchemaState::Pending { applied_count: 1 },
                     atlas_migration_versions().len()
                 ),
-                Some(4)
+                Some(5)
             );
 
             sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
@@ -2937,6 +2964,21 @@ mod tests {
                 .unwrap();
             sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
                 .bind("20260926000001")
+                .bind(ATLAS_APPLIED_REVISION_TYPE)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                schema_state(&pool).await.unwrap(),
+                SchemaState::Pending { applied_count: 5 }
+            );
+            sqlx::query("UPDATE memories_schema_contract SET version = ? WHERE contract_key = 'rdb_schema'")
+                .bind("20260930000001")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
+                .bind("20260930000001")
                 .bind(ATLAS_APPLIED_REVISION_TYPE)
                 .execute(&pool)
                 .await
@@ -3040,6 +3082,21 @@ mod tests {
                 .execute(&pool)
                 .await
                 .unwrap();
+            assert_eq!(
+                schema_state(&pool).await.unwrap(),
+                SchemaState::Pending { applied_count: 5 }
+            );
+            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
+                .bind("20260930000001")
+                .bind(ATLAS_APPLIED_REVISION_TYPE)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE memories_schema_contract SET version = ?")
+                .bind("20260930000001")
+                .execute(&pool)
+                .await
+                .unwrap();
             assert_eq!(schema_state(&pool).await.unwrap(), SchemaState::Managed);
         });
     }
@@ -3135,6 +3192,21 @@ mod tests {
                 .unwrap();
             sqlx::query("UPDATE memories_schema_contract SET version = ?")
                 .bind("20260926000001")
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                schema_state(&pool).await.unwrap(),
+                SchemaState::Pending { applied_count: 5 }
+            );
+            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
+                .bind("20260930000001")
+                .bind(ATLAS_APPLIED_REVISION_TYPE)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE memories_schema_contract SET version = ?")
+                .bind("20260930000001")
                 .execute(&pool)
                 .await
                 .unwrap();

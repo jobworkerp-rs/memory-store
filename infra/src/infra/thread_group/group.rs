@@ -18,7 +18,7 @@ use sqlx::Executor;
 
 const INSERT_SQL: &str = concat!(
     "INSERT INTO thread_group \
-     (id, group_canonical_key, title, status, grouping_authority, redirect_to_group_id, created_at, updated_at) \
+     (id, user_id, group_canonical_key, title, status, grouping_authority, redirect_to_group_id, created_at, updated_at) \
      VALUES (",
     p!(1),
     ",",
@@ -35,6 +35,8 @@ const INSERT_SQL: &str = concat!(
     p!(7),
     ",",
     p!(8),
+    ",",
+    p!(9),
     ")"
 );
 
@@ -144,6 +146,7 @@ pub trait ThreadGroupRepository: UseRdbPool + UseIdGenerator + Send + Sync {
         let (created_at, updated_at) = fill_timestamps(group.created_at, group.updated_at);
         sqlx::query::<Rdb>(INSERT_SQL)
             .bind(id)
+            .bind(group.user_id)
             .bind(&group.group_canonical_key)
             .bind(&group.title)
             .bind(&group.status)

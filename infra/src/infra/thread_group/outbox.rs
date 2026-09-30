@@ -20,7 +20,7 @@ use sqlx::Executor;
 const INSERT_SQL: &str = concat!(
     "INSERT INTO thread_group_event_outbox \
      (event_id, event_type, operation_id, policy_version, source, identity_scope, \
-      owner_scope, native_id_ref, group_id, thread_id, source_confidence, \
+      user_id, native_id_ref, group_id, thread_id, source_confidence, \
       selection_basis, operator_decision_id, polarity, payload, created_at) \
      VALUES (",
     p!(1),
@@ -60,7 +60,7 @@ const INSERT_SQL: &str = concat!(
 const INSERT_OR_IGNORE_SQL: &str = concat!(
     "INSERT INTO thread_group_event_outbox \
      (event_id, event_type, operation_id, policy_version, source, identity_scope, \
-      owner_scope, native_id_ref, group_id, thread_id, source_confidence, \
+      user_id, native_id_ref, group_id, thread_id, source_confidence, \
       selection_basis, operator_decision_id, polarity, payload, created_at) \
      VALUES (",
     p!(1),
@@ -138,7 +138,7 @@ pub trait ThreadGroupEventOutboxRepository: UseRdbPool + Send + Sync {
             .bind(&event.policy_version)
             .bind(&event.source)
             .bind(&event.identity_scope)
-            .bind(&event.owner_scope)
+            .bind(event.user_id)
             .bind(&event.native_id_ref)
             .bind(event.group_id)
             .bind(event.thread_id)
@@ -171,7 +171,7 @@ pub trait ThreadGroupEventOutboxRepository: UseRdbPool + Send + Sync {
             .bind(&event.policy_version)
             .bind(&event.source)
             .bind(&event.identity_scope)
-            .bind(&event.owner_scope)
+            .bind(event.user_id)
             .bind(&event.native_id_ref)
             .bind(event.group_id)
             .bind(event.thread_id)

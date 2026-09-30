@@ -1,7 +1,7 @@
 //! `manual_collection` + `manual_collection_member` repositories
 //! (design 5.2, second half).
 //!
-//! Reference sets owned by one `owner_scope`, deliberately orthogonal to
+//! Reference sets owned by one typed `user_id`, deliberately orthogonal to
 //! canonical lineage: attaching / detaching never touches group
 //! membership or relations, and member links are *physically* deleted on
 //! detach / collection deletion / thread deletion (the app calls
@@ -9,7 +9,7 @@
 //! re-import must not restore them).
 //!
 //! Default listing sort is `updated_at DESC, id ASC` per the design;
-//! the composite index `(owner_scope, updated_at DESC, id)` backs it.
+//! the composite index `(user_id, updated_at DESC, id)` backs it.
 
 use super::rows::{
     MANUAL_COLLECTION_COLUMNS, MANUAL_COLLECTION_MEMBER_COLUMNS, ManualCollectionMemberRow,
@@ -24,7 +24,7 @@ use infra_utils::infra::rdb::{Rdb, RdbPool, UseRdbPool};
 use sqlx::Executor;
 
 const INSERT_SQL: &str = concat!(
-    "INSERT INTO manual_collection (id, owner_scope, title, created_at, updated_at) \
+    "INSERT INTO manual_collection (id, user_id, owner_scope, title, created_at, updated_at) \
      VALUES (",
     p!(1),
     ",",
@@ -35,6 +35,8 @@ const INSERT_SQL: &str = concat!(
     p!(4),
     ",",
     p!(5),
+    ",",
+    p!(6),
     ")"
 );
 
@@ -48,7 +50,7 @@ const FIND_BY_ID_SQL: &str = concat!(
 const LIST_BY_OWNER_SQL: &str = concat!(
     "SELECT ",
     MANUAL_COLLECTION_COLUMNS!(),
-    " FROM manual_collection WHERE owner_scope = ",
+    " FROM manual_collection WHERE user_id = ",
     p!(1),
     " ORDER BY updated_at DESC, id ASC"
 );
@@ -75,13 +77,15 @@ const DELETE_SQL: &str = concat!("DELETE FROM manual_collection WHERE id = ", p!
 // attaches a no-op on both backends (SQLite supports the conflict
 // target form since 3.24, sqlx bundles a newer engine).
 const ATTACH_MEMBER_SQL: &str = concat!(
-    "INSERT INTO manual_collection_member (collection_id, thread_id, owner_scope) \
+    "INSERT INTO manual_collection_member (collection_id, thread_id, user_id, owner_scope) \
      VALUES (",
     p!(1),
     ",",
     p!(2),
     ",",
     p!(3),
+    ",",
+    p!(4),
     ") ON CONFLICT (collection_id, thread_id) DO NOTHING"
 );
 
@@ -128,7 +132,10 @@ pub trait ManualCollectionRepository: UseRdbPool + UseIdGenerator + Send + Sync 
             fill_timestamps(collection.created_at, collection.updated_at);
         sqlx::query::<Rdb>(INSERT_SQL)
             .bind(id)
-            .bind(&collection.owner_scope)
+            .bind(collection.user_id)
+            .bind(common::thread_group_key::legacy_owner_scope(
+                collection.user_id,
+            ))
             .bind(&collection.title)
             .bind(created_at)
             .bind(updated_at)
@@ -149,7 +156,7 @@ pub trait ManualCollectionRepository: UseRdbPool + UseIdGenerator + Send + Sync 
     /// Default owner listing, `updated_at DESC, id ASC`.
     async fn list_by_owner(
         &self,
-        owner_scope: &str,
+        user_id: i64,
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<Vec<ManualCollectionRow>> {
@@ -164,7 +171,7 @@ pub trait ManualCollectionRepository: UseRdbPool + UseIdGenerator + Send + Sync 
             sql.push_str(&format!(" OFFSET {}", dyn_placeholder(next)));
         }
         let mut query =
-            sqlx::query_as::<Rdb, ManualCollectionRow>(sqlx::AssertSqlSafe(sql)).bind(owner_scope);
+            sqlx::query_as::<Rdb, ManualCollectionRow>(sqlx::AssertSqlSafe(sql)).bind(user_id);
         if let Some(limit) = limit {
             query = query.bind(limit);
         }
@@ -225,7 +232,7 @@ pub trait ManualCollectionRepository: UseRdbPool + UseIdGenerator + Send + Sync 
     }
 
     /// Idempotent attach. Returns true when a new link was created
-    /// (false = already attached). `owner_scope` is the collection's
+    /// (false = already attached). `user_id` is the collection's
     /// owner; cross-owner threads are admitted by the trusted caller
     /// upstream, not validated here.
     async fn attach_member_tx<'c, E: Executor<'c, Database = Rdb>>(
@@ -233,12 +240,13 @@ pub trait ManualCollectionRepository: UseRdbPool + UseIdGenerator + Send + Sync 
         tx: E,
         collection_id: i64,
         thread_id: i64,
-        owner_scope: &str,
+        user_id: i64,
     ) -> Result<bool> {
         let res = sqlx::query::<Rdb>(ATTACH_MEMBER_SQL)
             .bind(collection_id)
             .bind(thread_id)
-            .bind(owner_scope)
+            .bind(user_id)
+            .bind(common::thread_group_key::legacy_owner_scope(user_id))
             .execute(tx)
             .await
             .map_err(LlmMemoryError::DBError)?;
@@ -357,16 +365,16 @@ mod tests {
         newer.updated_at = T0 + 10;
         let c_old = repo.create_tx(pool, &older).await?;
         let c_new = repo.create_tx(pool, &newer).await?;
-        let listed = repo.list_by_owner("user:1", None, None).await?;
+        let listed = repo.list_by_owner(1, None, None).await?;
         assert_eq!(
             listed.iter().map(|c| c.id).collect::<Vec<_>>(),
             vec![c_new, c_old]
         );
 
         // Attach is idempotent on (collection_id, thread_id).
-        assert!(repo.attach_member_tx(pool, c_new, 1234, "user:1").await?);
-        assert!(!repo.attach_member_tx(pool, c_new, 1234, "user:1").await?);
-        assert!(repo.attach_member_tx(pool, c_new, 4321, "user:1").await?);
+        assert!(repo.attach_member_tx(pool, c_new, 1234, 1).await?);
+        assert!(!repo.attach_member_tx(pool, c_new, 1234, 1).await?);
+        assert!(repo.attach_member_tx(pool, c_new, 4321, 1).await?);
         assert_eq!(repo.list_members(c_new).await?.len(), 2);
         assert_eq!(repo.list_collection_ids_by_thread(1234).await?, vec![c_new]);
 
@@ -376,7 +384,7 @@ mod tests {
 
         // touch bumps recency so the default sort flips.
         assert!(repo.touch_tx(pool, c_old, T0 + 99).await?);
-        let listed = repo.list_by_owner("user:1", Some(1), None).await?;
+        let listed = repo.list_by_owner(1, Some(1), None).await?;
         assert_eq!(listed[0].id, c_old);
 
         // rename + paging.
@@ -385,22 +393,19 @@ mod tests {
             repo.find_by_id(c_old).await?.context("renamed")?.title,
             "renamed"
         );
-        assert_eq!(
-            repo.list_by_owner("user:1", Some(1), Some(1)).await?.len(),
-            1
-        );
+        assert_eq!(repo.list_by_owner(1, Some(1), Some(1)).await?.len(), 1);
 
         // Thread deletion contract: drop all links of the thread in the
         // same transaction, before the thread row goes away.
-        assert!(repo.attach_member_tx(pool, c_new, 5555, "user:1").await?);
-        assert!(repo.attach_member_tx(pool, c_old, 5555, "user:1").await?);
+        assert!(repo.attach_member_tx(pool, c_new, 5555, 1).await?);
+        assert!(repo.attach_member_tx(pool, c_old, 5555, 1).await?);
         let mut tx = pool.begin().await?;
         assert_eq!(repo.detach_all_by_thread_tx(&mut *tx, 5555).await?, 2);
         tx.commit().await?;
         assert!(repo.list_collection_ids_by_thread(5555).await?.is_empty());
 
         // Collection deletion removes links separately, then the row.
-        assert!(repo.attach_member_tx(pool, c_new, 6666, "user:1").await?);
+        assert!(repo.attach_member_tx(pool, c_new, 6666, 1).await?);
         let mut tx = pool.begin().await?;
         assert_eq!(repo.detach_all_members_tx(&mut *tx, c_new).await?, 2);
         assert!(repo.delete_tx(&mut *tx, c_new).await?);

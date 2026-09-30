@@ -6,6 +6,7 @@
 
 CREATE TABLE thread_group (
     id BIGINT NOT NULL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
     group_canonical_key CHAR(64) NOT NULL,
     title TEXT,
     status TEXT NOT NULL CHECK (status IN ('active', 'redirected', 'split')),
@@ -24,12 +25,14 @@ CREATE TABLE thread_group (
 CREATE UNIQUE INDEX thread_group_active_canonical_key
     ON thread_group (group_canonical_key) WHERE status = 'active';
 CREATE INDEX thread_group_status ON thread_group (status);
+CREATE INDEX thread_group_user_status_created ON thread_group (user_id, status, created_at DESC, id ASC);
 CREATE INDEX thread_group_redirect_to_group_id ON thread_group (redirect_to_group_id);
 
 CREATE TABLE thread_group_member (
     group_id BIGINT NOT NULL,
     thread_id BIGINT,
     thread_canonical_key CHAR(64) NOT NULL,
+    user_id BIGINT NOT NULL,
     owner_scope TEXT NOT NULL,
     source TEXT,
     identity_scope TEXT,
@@ -58,6 +61,7 @@ CREATE UNIQUE INDEX thread_group_member_current_canonical_key
 CREATE INDEX thread_group_member_group_id_state ON thread_group_member (group_id, state);
 CREATE INDEX thread_group_member_thread_id ON thread_group_member (thread_id);
 CREATE INDEX thread_group_member_owner_scope ON thread_group_member (owner_scope);
+CREATE INDEX thread_group_member_user_id ON thread_group_member (user_id);
 
 CREATE TABLE thread_relation (
     id BIGINT NOT NULL PRIMARY KEY,
@@ -65,10 +69,12 @@ CREATE TABLE thread_relation (
     child_thread_id BIGINT,
     parent_thread_canonical_key CHAR(64) NOT NULL,
     child_thread_canonical_key CHAR(64) NOT NULL,
+    parent_user_id BIGINT NOT NULL,
     parent_owner_scope TEXT NOT NULL,
     parent_source TEXT,
     parent_identity_scope TEXT,
     parent_native_id TEXT,
+    child_user_id BIGINT NOT NULL,
     child_owner_scope TEXT NOT NULL,
     child_source TEXT,
     child_identity_scope TEXT,
@@ -116,12 +122,14 @@ CREATE TABLE thread_observation (
     subject_source TEXT NOT NULL,
     subject_identity_scope_known BOOLEAN NOT NULL,
     subject_identity_scope_value TEXT NOT NULL DEFAULT '',
+    subject_user_id BIGINT NOT NULL,
     subject_owner_scope TEXT NOT NULL,
     subject_native_id TEXT NOT NULL,
     candidate_parent_present BOOLEAN NOT NULL,
     candidate_parent_source TEXT NOT NULL DEFAULT '',
     candidate_parent_identity_scope_known BOOLEAN NOT NULL DEFAULT FALSE,
     candidate_parent_identity_scope_value TEXT NOT NULL DEFAULT '',
+    candidate_parent_user_id BIGINT,
     candidate_parent_owner_scope TEXT NOT NULL DEFAULT '',
     candidate_parent_native_id TEXT NOT NULL DEFAULT '',
     relation_kind TEXT,
@@ -152,9 +160,9 @@ CREATE TABLE thread_observation (
 -- fingerprint; mutable state is excluded from the key.
 CREATE UNIQUE INDEX thread_observation_identity_evidence_key ON thread_observation (
     subject_source, subject_identity_scope_known, subject_identity_scope_value,
-    subject_owner_scope, subject_native_id, candidate_parent_present,
+    subject_user_id, subject_native_id, candidate_parent_present,
     candidate_parent_source, candidate_parent_identity_scope_known,
-    candidate_parent_identity_scope_value, candidate_parent_owner_scope,
+    candidate_parent_identity_scope_value, candidate_parent_user_id,
     candidate_parent_native_id, evidence_kind, evidence_fingerprint
 );
 CREATE INDEX thread_observation_state ON thread_observation (state);
@@ -165,6 +173,7 @@ CREATE TABLE thread_group_candidate_association (
     subject_source TEXT NOT NULL,
     subject_identity_scope_known BOOLEAN NOT NULL,
     subject_identity_scope_value TEXT NOT NULL DEFAULT '',
+    subject_user_id BIGINT NOT NULL,
     subject_owner_scope TEXT NOT NULL,
     subject_native_id TEXT NOT NULL,
     candidate_group_id BIGINT,
@@ -175,7 +184,7 @@ CREATE TABLE thread_group_candidate_association (
     updated_at BIGINT NOT NULL
 );
 CREATE INDEX thread_group_candidate_association_subject_identity
-    ON thread_group_candidate_association (subject_owner_scope, subject_source, subject_identity_scope_value, subject_native_id);
+    ON thread_group_candidate_association (subject_user_id, subject_source, subject_identity_scope_value, subject_native_id);
 CREATE INDEX thread_group_candidate_association_subject_thread_id ON thread_group_candidate_association (subject_thread_id);
 CREATE INDEX thread_group_candidate_association_candidate_group_id ON thread_group_candidate_association (candidate_group_id);
 CREATE INDEX thread_group_candidate_association_parent_thread_id ON thread_group_candidate_association (candidate_parent_thread_id);
@@ -185,6 +194,7 @@ CREATE INDEX thread_group_candidate_association_state ON thread_group_candidate_
 -- Resolved owner-local mapping only: pending / ambiguous / unresolved
 -- identities stay in observations and candidate associations, never here.
 CREATE TABLE source_thread_identity (
+    user_id BIGINT NOT NULL,
     owner_scope TEXT NOT NULL,
     source TEXT NOT NULL,
     identity_scope TEXT NOT NULL,
@@ -193,12 +203,14 @@ CREATE TABLE source_thread_identity (
     resolution_state TEXT NOT NULL CHECK (resolution_state = 'resolved'),
     first_seen_at BIGINT NOT NULL,
     last_seen_at BIGINT NOT NULL,
-    PRIMARY KEY (owner_scope, source, identity_scope, native_id)
+    PRIMARY KEY (user_id, source, identity_scope, native_id)
 );
 CREATE INDEX source_thread_identity_thread_id ON source_thread_identity (thread_id);
+CREATE UNIQUE INDEX source_thread_identity_legacy_key ON source_thread_identity (owner_scope, source, identity_scope, native_id);
 
 CREATE TABLE thread_canonical_key (
     thread_id BIGINT NOT NULL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
     owner_scope TEXT NOT NULL,
     key CHAR(64) NOT NULL,
     origin TEXT NOT NULL CHECK (origin IN ('source_identity', 'creation_uuid', 'backfill_mapping')),
@@ -207,6 +219,7 @@ CREATE TABLE thread_canonical_key (
 CREATE UNIQUE INDEX thread_canonical_key_key ON thread_canonical_key (key);
 
 CREATE TABLE thread_deletion_marker (
+    user_id BIGINT NOT NULL,
     owner_scope TEXT NOT NULL,
     source TEXT NOT NULL,
     identity_scope TEXT NOT NULL,
@@ -216,11 +229,13 @@ CREATE TABLE thread_deletion_marker (
     actor_id TEXT NOT NULL,
     reason TEXT,
     deleted_at BIGINT NOT NULL,
-    PRIMARY KEY (owner_scope, source, identity_scope, native_id)
+    thread_canonical_key CHAR(64),
+    PRIMARY KEY (user_id, source, identity_scope, native_id)
 );
 
 CREATE TABLE operator_decision (
     id BIGINT NOT NULL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
     owner_scope TEXT NOT NULL,
     candidate_association_id BIGINT NOT NULL,
     actor_id TEXT NOT NULL,
@@ -234,16 +249,19 @@ CREATE INDEX operator_decision_candidate_association_id ON operator_decision (ca
 
 CREATE TABLE manual_collection (
     id BIGINT NOT NULL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
     owner_scope TEXT NOT NULL,
     title TEXT NOT NULL,
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL
 );
 CREATE INDEX manual_collection_owner_updated ON manual_collection (owner_scope, updated_at DESC, id);
+CREATE INDEX manual_collection_user_updated ON manual_collection (user_id, updated_at DESC, id);
 
 CREATE TABLE manual_collection_member (
     collection_id BIGINT NOT NULL,
     thread_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
     owner_scope TEXT NOT NULL,
     PRIMARY KEY (collection_id, thread_id)
 );
@@ -265,6 +283,7 @@ CREATE TABLE thread_group_event_outbox (
     policy_version TEXT NOT NULL,
     source TEXT,
     identity_scope TEXT,
+    user_id BIGINT,
     owner_scope TEXT,
     native_id_ref TEXT,
     group_id BIGINT,

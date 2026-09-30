@@ -7,6 +7,18 @@
     {
       "identity": "thread-groups-canonical-keys-v1@1",
       "canonical_definition_digest": "a4ce2f4dd2cffbd303f6393fcdfa567ba87111f0e9d99ab3207e160bd1e36bf2"
+    },
+    {
+      "identity": "thread-groups-user-ids-v1@1",
+      "canonical_definition_digest": "87f3dfc9787f04ae0c50de5d9b322e68439fd666762597f9f7b81b3424d78947"
+    },
+    {
+      "identity": "thread-groups-canonical-keys-v1@2",
+      "canonical_definition_digest": "ad2a56fbae48549f6a7af61182b4358eb1e3ece4fb12f4b1da1d0904044312b2"
+    },
+    {
+      "identity": "thread-groups-user-ids-v1@2",
+      "canonical_definition_digest": "10e7708f257570259affdae26080118164c9cb6980c2ba0f0c3f6bd119df353b"
     }
   ],
   "lifecycle_transitions": [
@@ -15,8 +27,38 @@
       "canonical_definition_digest": "a4ce2f4dd2cffbd303f6393fcdfa567ba87111f0e9d99ab3207e160bd1e36bf2",
       "kind": "registered",
       "previous_history_digest": "fdd741d1743b0aa74fc9da8c5b916ce6e2940dc6206b3a854a8434ea20e37255"
+    },
+    {
+      "identity": "thread-groups-user-ids-v1@1",
+      "canonical_definition_digest": "87f3dfc9787f04ae0c50de5d9b322e68439fd666762597f9f7b81b3424d78947",
+      "kind": "registered",
+      "previous_history_digest": "ae0a736e15adf1c877ac63f0caed7acd35d92321d997287e20d6c628f3a745a0"
+    },
+    {
+      "identity": "thread-groups-canonical-keys-v1@1",
+      "canonical_definition_digest": "a4ce2f4dd2cffbd303f6393fcdfa567ba87111f0e9d99ab3207e160bd1e36bf2",
+      "kind": "retired",
+      "previous_history_digest": "136b3a6ea42fef9ddf91ccd285f4d2b6b0c0d84a3680647898b98cec2497c1b8"
+    },
+    {
+      "identity": "thread-groups-user-ids-v1@1",
+      "canonical_definition_digest": "87f3dfc9787f04ae0c50de5d9b322e68439fd666762597f9f7b81b3424d78947",
+      "kind": "retired",
+      "previous_history_digest": "6bdddd8fe70b708e48c5d75d94a70d0821a1da60c884402829d560808e6ce27e"
+    },
+    {
+      "identity": "thread-groups-canonical-keys-v1@2",
+      "canonical_definition_digest": "ad2a56fbae48549f6a7af61182b4358eb1e3ece4fb12f4b1da1d0904044312b2",
+      "kind": "registered",
+      "previous_history_digest": "f201d37aa02d05ea771d0ead0571533c860bd38d6ec7da99b64a422c9bb1dba7"
+    },
+    {
+      "identity": "thread-groups-user-ids-v1@2",
+      "canonical_definition_digest": "10e7708f257570259affdae26080118164c9cb6980c2ba0f0c3f6bd119df353b",
+      "kind": "registered",
+      "previous_history_digest": "1fa2e4f240f526fb45e13c4f84d2bcba6e6adb28cf0a6e35bf8f72d78aeff77e"
     }
   ],
-  "previous_history_digest": "fdd741d1743b0aa74fc9da8c5b916ce6e2940dc6206b3a854a8434ea20e37255",
-  "history_digest": "ae0a736e15adf1c877ac63f0caed7acd35d92321d997287e20d6c628f3a745a0"
+  "previous_history_digest": "1fa2e4f240f526fb45e13c4f84d2bcba6e6adb28cf0a6e35bf8f72d78aeff77e",
+  "history_digest": "b09c000d4461d4692f5656035c8357d34fac92dcda756d7228f916c59645e0c0"
 }

@@ -18,7 +18,7 @@ use infra_utils::infra::rdb::{Rdb, RdbPool, UseRdbPool};
 use sqlx::Executor;
 
 const INSERT_SQL: &str = concat!(
-    "INSERT INTO thread_canonical_key (thread_id, owner_scope, key, origin, assigned_at) \
+    "INSERT INTO thread_canonical_key (thread_id, user_id, owner_scope, key, origin, assigned_at) \
      VALUES (",
     p!(1),
     ",",
@@ -29,6 +29,8 @@ const INSERT_SQL: &str = concat!(
     p!(4),
     ",",
     p!(5),
+    ",",
+    p!(6),
     ")"
 );
 
@@ -57,7 +59,7 @@ pub trait ThreadCanonicalKeyRepository: UseRdbPool + Send + Sync {
         &self,
         tx: E,
         thread_id: i64,
-        owner_scope: &str,
+        user_id: i64,
         key: &str,
         origin: &str,
         assigned_at: i64,
@@ -65,7 +67,8 @@ pub trait ThreadCanonicalKeyRepository: UseRdbPool + Send + Sync {
         let (assigned_at, _) = fill_timestamps(assigned_at, assigned_at);
         sqlx::query::<Rdb>(INSERT_SQL)
             .bind(thread_id)
-            .bind(owner_scope)
+            .bind(user_id)
+            .bind(common::thread_group_key::legacy_owner_scope(user_id))
             .bind(key)
             .bind(origin)
             .bind(assigned_at)
@@ -136,20 +139,13 @@ pub trait ThreadCanonicalKeyRepository: UseRdbPool + Send + Sync {
     async fn assign_or_find(
         &self,
         thread_id: i64,
-        owner_scope: &str,
+        user_id: i64,
         key: &str,
         origin: &str,
         assigned_at: i64,
     ) -> Result<(ThreadCanonicalKeyRow, bool)> {
         let insert_err = match self
-            .assign_tx(
-                self.db_pool(),
-                thread_id,
-                owner_scope,
-                key,
-                origin,
-                assigned_at,
-            )
+            .assign_tx(self.db_pool(), thread_id, user_id, key, origin, assigned_at)
             .await
         {
             Ok(()) => {
@@ -228,7 +224,7 @@ mod tests {
         repo.assign_tx(
             pool,
             thread_a,
-            "user:1",
+            1,
             &k,
             values::canonical_key_origin::CREATION_UUID,
             T0,
@@ -239,7 +235,7 @@ mod tests {
             repo.assign_tx(
                 pool,
                 thread_a,
-                "user:1",
+                1,
                 &key(32),
                 values::canonical_key_origin::CREATION_UUID,
                 T0
@@ -253,7 +249,7 @@ mod tests {
             repo.assign_tx(
                 pool,
                 thread_b,
-                "user:1",
+                1,
                 &k,
                 values::canonical_key_origin::SOURCE_IDENTITY,
                 T0
@@ -267,7 +263,7 @@ mod tests {
         let (row, created) = repo
             .assign_or_find(
                 thread_a,
-                "user:1",
+                1,
                 &k,
                 values::canonical_key_origin::CREATION_UUID,
                 T0,
@@ -282,7 +278,7 @@ mod tests {
         let (owner, created) = repo
             .assign_or_find(
                 thread_b,
-                "user:1",
+                1,
                 &k,
                 values::canonical_key_origin::SOURCE_IDENTITY,
                 T0,

@@ -85,6 +85,9 @@ _Avoid_: target RDB、migration history
 **ThreadGroup**:
 複数の Thread を一つの作業・調査・変更単位としてまとめる primary な論理コンテナ。一つの active Thread は最大一つの primary ThreadGroup に所属する。
 
+**group owner**:
+ThreadGroup の所有者。member Thread 個々の所有者とは独立し、認可された group owner は異なる所有者の member を含む group 全体を参照できる。表示 root や操作主体を意味しない。
+
 **membership**:
 Thread と primary ThreadGroup の所属を表す link metadata。Thread やチャット本文のコピーではない。active な所属のほか、merge または split 前の所属を示す `redirected`、Thread 削除後の `deleted` placeholder を履歴として保持できる。
 
@@ -98,7 +101,7 @@ Thread 間の関係の種別。`delegated` は委譲、`fork` は分岐、`conti
 関係候補を支持する観測と、その保証レベル。`exact` は明示的根拠、`strong` は複数根拠による強い裏付け、`heuristic` は候補に留まる推測、`unsupported` は安全に識別できないため正規 relation に使用しない状態を表す。
 
 **identity key parts**:
-Thread の source identity を構成する `(owner_scope, source, identity_scope, native_id)` の四つ組。
+Thread の source identity を構成する `(user_id, source, identity_scope, native_id)` の四つ組。ここでの user は Thread の所有者であり、group owner とは区別する。
 
 **source token**:
 source identity の `source` に使う、importer の canonical な識別子。Codex は `codex`、OpenCode は `opencode`、Claude Code は `claude_code` とする。
@@ -113,7 +116,7 @@ primary ThreadGroup の配置を決めた主体。手動指定された所属は
 merge で吸収された旧 ThreadGroup ID から target group への alias。target が後に分割された場合は一つの group ではなく分割結果を指す。
 
 **manual collection**:
-primary ThreadGroup と独立した、作成者の owner_scope に属する任意分類。同じ Thread を複数 collection に所属させられ、canonical relation、root、primary membership を変更しない。Thread データを複製せず参照だけを保持し、link の削除または Thread 削除で所属は失われ、通常または明示 override 付き reimport で復元されない。可視性は前段の client / proxy が制御する。
+primary ThreadGroup と独立した、作成者の user_id に属する任意分類。同じ Thread を複数 collection に所属させられ、canonical relation、root、primary membership を変更しない。Thread データを複製せず参照だけを保持し、link の削除または Thread 削除で所属は失われ、通常または明示 override 付き reimport で復元されない。可視性は前段の client / proxy が制御する。
 
 **placeholder member**:
 削除された Thread の canonical key、所属、削除時刻を保持する系譜上の node。source の有無や再 import 許可にかかわらず保持し、本文・概要は含まない。

@@ -18,7 +18,7 @@ use sqlx::Executor;
 
 const INSERT_SQL: &str = concat!(
     "INSERT INTO operator_decision \
-     (id, owner_scope, candidate_association_id, actor_id, decision, reason, \
+     (id, user_id, owner_scope, candidate_association_id, actor_id, decision, reason, \
       input_evidence_fingerprint, policy_version, created_at) \
      VALUES (",
     p!(1),
@@ -38,6 +38,8 @@ const INSERT_SQL: &str = concat!(
     p!(8),
     ",",
     p!(9),
+    ",",
+    p!(10),
     ")"
 );
 
@@ -72,7 +74,10 @@ pub trait OperatorDecisionRepository: UseRdbPool + UseIdGenerator + Send + Sync 
         let (created_at, _) = fill_timestamps(decision.created_at, decision.created_at);
         sqlx::query::<Rdb>(INSERT_SQL)
             .bind(id)
-            .bind(&decision.owner_scope)
+            .bind(decision.user_id)
+            .bind(common::thread_group_key::legacy_owner_scope(
+                decision.user_id,
+            ))
             .bind(decision.candidate_association_id)
             .bind(&decision.actor_id)
             .bind(&decision.decision)

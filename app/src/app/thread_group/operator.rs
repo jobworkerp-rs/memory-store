@@ -133,7 +133,7 @@ impl ThreadGroupOperatorService {
                         group_id: target_group_id,
                         thread_id: member.thread_id,
                         thread_canonical_key: member.thread_canonical_key.clone(),
-                        owner_scope: member.owner_scope.clone(),
+                        user_id: member.user_id,
                         source: member.source.clone(),
                         identity_scope: member.identity_scope.clone(),
                         native_id: member.native_id.clone(),
@@ -290,6 +290,7 @@ impl ThreadGroupOperatorService {
                 .create_tx(
                     &mut *tx,
                     &NewThreadGroup {
+                        user_id: source.user_id,
                         group_canonical_key: successor.canonical_key.clone(),
                         title: source.title.clone(),
                         status: values::group_status::ACTIVE.to_string(),
@@ -313,7 +314,7 @@ impl ThreadGroupOperatorService {
                             group_id,
                             thread_id: row.thread_id,
                             thread_canonical_key: membership.thread_canonical_key.clone(),
-                            owner_scope: row.owner_scope.clone(),
+                            user_id: row.user_id,
                             source: row.source.clone(),
                             identity_scope: row.identity_scope.clone(),
                             native_id: row.native_id.clone(),
@@ -387,8 +388,8 @@ impl ThreadGroupOperatorService {
                     group_id,
                     thread_id: Some(thread_id),
                     thread_canonical_key: thread_canonical_key.to_string(),
-                    owner_scope: endpoint
-                        .map(|endpoint| endpoint.owner_scope.clone())
+                    user_id: endpoint
+                        .map(|endpoint| endpoint.user_id)
                         .unwrap_or_default(),
                     source: endpoint.map(|endpoint| endpoint.source.clone()),
                     identity_scope: endpoint
@@ -417,7 +418,7 @@ impl ThreadGroupOperatorService {
 
     pub async fn create_manual_collection(
         &self,
-        owner_scope: &str,
+        user_id: i64,
         title: &str,
         now: i64,
     ) -> anyhow::Result<i64> {
@@ -428,7 +429,7 @@ impl ThreadGroupOperatorService {
             .create_tx(
                 &mut *tx,
                 &NewManualCollection {
-                    owner_scope: owner_scope.to_string(),
+                    user_id,
                     title: title.to_string(),
                     created_at: now,
                     updated_at: now,
@@ -441,22 +442,27 @@ impl ThreadGroupOperatorService {
 
     pub async fn list_manual_collections(
         &self,
-        owner_scope: &str,
+        user_id: i64,
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> anyhow::Result<Vec<ManualCollectionRow>> {
-        self.collections
-            .list_by_owner(owner_scope, limit, offset)
-            .await
+        self.collections.list_by_owner(user_id, limit, offset).await
     }
 
     pub async fn rename_manual_collection(
         &self,
         collection_id: i64,
+        owner_user_id: Option<i64>,
         title: &str,
         now: i64,
     ) -> anyhow::Result<bool> {
         ensure_thread_group_writes()?;
+        let Some(collection) = self.collections.find_by_id(collection_id).await? else {
+            return Ok(false);
+        };
+        if owner_user_id.is_some_and(|user_id| user_id != collection.user_id) {
+            return Ok(false);
+        }
         let mut tx = self.pool.begin().await?;
         let renamed = self
             .collections
@@ -468,8 +474,18 @@ impl ThreadGroupOperatorService {
 
     /// Delete a collection and its member links only. Threads, Memory,
     /// and primary lineage are untouched.
-    pub async fn delete_manual_collection(&self, collection_id: i64) -> anyhow::Result<bool> {
+    pub async fn delete_manual_collection(
+        &self,
+        collection_id: i64,
+        owner_user_id: Option<i64>,
+    ) -> anyhow::Result<bool> {
         ensure_thread_group_writes()?;
+        let Some(collection) = self.collections.find_by_id(collection_id).await? else {
+            return Ok(false);
+        };
+        if owner_user_id.is_some_and(|user_id| user_id != collection.user_id) {
+            return Ok(false);
+        }
         let mut tx = self.pool.begin().await?;
         self.collections
             .detach_all_members_tx(&mut *tx, collection_id)
@@ -483,14 +499,20 @@ impl ThreadGroupOperatorService {
         &self,
         collection_id: i64,
         thread_id: i64,
-        owner_scope: &str,
+        user_id: i64,
         now: i64,
     ) -> anyhow::Result<bool> {
         ensure_thread_group_writes()?;
+        let Some(collection) = self.collections.find_by_id(collection_id).await? else {
+            return Ok(false);
+        };
+        if collection.user_id != user_id {
+            return Ok(false);
+        }
         let mut tx = self.pool.begin().await?;
         let attached = self
             .collections
-            .attach_member_tx(&mut *tx, collection_id, thread_id, owner_scope)
+            .attach_member_tx(&mut *tx, collection_id, thread_id, user_id)
             .await?;
         if attached {
             self.collections
@@ -505,9 +527,16 @@ impl ThreadGroupOperatorService {
         &self,
         collection_id: i64,
         thread_id: i64,
+        owner_user_id: Option<i64>,
         now: i64,
     ) -> anyhow::Result<bool> {
         ensure_thread_group_writes()?;
+        let Some(collection) = self.collections.find_by_id(collection_id).await? else {
+            return Ok(false);
+        };
+        if owner_user_id.is_some_and(|user_id| user_id != collection.user_id) {
+            return Ok(false);
+        }
         let mut tx = self.pool.begin().await?;
         let detached = self
             .collections
@@ -525,7 +554,14 @@ impl ThreadGroupOperatorService {
     pub async fn list_manual_collection_members(
         &self,
         collection_id: i64,
+        owner_user_id: Option<i64>,
     ) -> anyhow::Result<Vec<ManualCollectionMemberRow>> {
+        let Some(collection) = self.collections.find_by_id(collection_id).await? else {
+            return Ok(Vec::new());
+        };
+        if owner_user_id.is_some_and(|user_id| user_id != collection.user_id) {
+            return Ok(Vec::new());
+        }
         self.collections.list_members(collection_id).await
     }
 }

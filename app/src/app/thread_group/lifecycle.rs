@@ -144,7 +144,7 @@ impl ThreadGroupPurgeService {
                     member.state,
                     member.role,
                     member.provenance,
-                    member.owner_scope,
+                    member.user_id,
                     member.source,
                     member.identity_scope,
                     member.native_id,
@@ -201,7 +201,7 @@ impl ThreadGroupPurgeService {
             };
             let scope = member.identity_scope.as_deref().unwrap_or_default();
             let key = SourceIdentityKey {
-                owner_scope: &member.owner_scope,
+                user_id: member.user_id,
                 source,
                 identity_scope: scope,
                 native_id,
@@ -210,11 +210,11 @@ impl ThreadGroupPurgeService {
                 continue;
             }
             let identity =
-                serde_json::json!([member.owner_scope, source, scope, native_id,]).to_string();
+                serde_json::json!([member.user_id, source, scope, native_id,]).to_string();
             if self
                 .members
                 .exists_source_identity_outside_group(
-                    &member.owner_scope,
+                    member.user_id,
                     source,
                     scope,
                     native_id,
@@ -672,7 +672,7 @@ impl ThreadGroupPurgeService {
             };
             let scope = member.identity_scope.as_deref().unwrap_or_default();
             let key = SourceIdentityKey {
-                owner_scope: &member.owner_scope,
+                user_id: member.user_id,
                 source,
                 identity_scope: scope,
                 native_id,
@@ -684,7 +684,7 @@ impl ThreadGroupPurgeService {
                 .members
                 .exists_source_identity_outside_group_tx(
                     &mut *tx,
-                    &member.owner_scope,
+                    member.user_id,
                     source,
                     scope,
                     native_id,

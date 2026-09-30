@@ -29,6 +29,7 @@ use protobuf::llm_memory::service::{
     FindThreadListByUserIdRequest, MemoryCountCondition, MemoryListEntry,
     PreviewThreadGroupImportRequest, PreviewThreadGroupImportResponse,
     RecordThreadGroupObservationsRequest, RecordThreadGroupObservationsResponse, RegisterRequest,
+    ThreadGroupCapabilitiesRequest, ThreadGroupCapabilitiesResponse,
     ThreadGroupReconciliationReport, UpdateMemoryParentsRequest, UpdateMemoryParentsResponse,
     UploadHeader, UploadRequest,
 };
@@ -65,6 +66,13 @@ pub struct RegisterMediaUrl {
 
 #[async_trait]
 pub trait ImportClient: Send + Sync {
+    /// Group owner for observations created during this import. Older and
+    /// test clients preserve the historical same-owner default; live imports
+    /// can supply an independent configured owner.
+    fn group_owner_user_id(&self, source_user_id: i64) -> i64 {
+        source_user_id
+    }
+
     async fn add_memories_batch(
         &self,
         request: AddMemoriesBatchRequest,
@@ -160,6 +168,9 @@ pub struct LiveGrpcImportClientConfig {
     pub timeout: Duration,
     pub tls_ca_path: Option<std::path::PathBuf>,
     pub auth_token: Option<String>,
+    /// Owner used for new ThreadGroups. `None` preserves the source owner's
+    /// historical default while the RPC always carries an explicit value.
+    pub group_owner_user_id: Option<i64>,
     /// Per-RPC retry policy. `RetryPolicy::no_retry()` issues a single
     /// attempt and gives up on the first failure. The default
     /// (3 attempts, 1s base / 30s cap with 25% jitter) gives cnpg
@@ -234,6 +245,7 @@ pub struct LiveGrpcImportClient {
     channel: Channel,
     auth_token: Option<Arc<String>>,
     retry: RetryPolicy,
+    group_owner_user_id: Option<i64>,
     /// One-shot snapshot cache of `channel -> thread_id` for a single
     /// user, filled by the first OpenCode thread resolution so
     /// `--all-sessions` does not re-scan all user threads per session.
@@ -277,11 +289,26 @@ impl LiveGrpcImportClient {
             channel,
             auth_token: config.auth_token.map(Arc::new),
             retry: config.retry,
+            group_owner_user_id: config.group_owner_user_id,
             thread_channel_cache: tokio::sync::Mutex::new(None),
             preview_only: config.preview_only,
             preview: std::sync::Mutex::new(ThreadGroupImportPreviewReport::default()),
             preview_media_counter: std::sync::atomic::AtomicI64::new(0),
         })
+    }
+
+    /// Fail before owner-aware import work if the connected server cannot
+    /// preserve the independent ThreadGroup owner contract.
+    pub async fn ensure_thread_group_owner_capability(&self) -> Result<()> {
+        let response = retry_status(&self.retry, "get_thread_group_capabilities", || {
+            let mut client = self.build_thread_group_client();
+            let request = self.attach_auth(tonic::Request::new(ThreadGroupCapabilitiesRequest {}));
+            async move { client.get_thread_group_capabilities(request).await }
+        })
+        .await
+        .map(|response| response.into_inner());
+
+        validate_thread_group_owner_capability(response)
     }
 
     /// Snapshot of the accumulated connected dry-run report.
@@ -322,6 +349,7 @@ impl LiveGrpcImportClient {
             subject: request.subject.clone(),
             observations: request.observations.clone(),
             explicit_override: false,
+            group_owner_user_id: request.group_owner_user_id,
         };
         let response = retry_status(&self.retry, "preview_thread_group_import", || {
             let mut client = self.build_thread_group_client();
@@ -346,6 +374,10 @@ impl LiveGrpcImportClient {
 
 #[async_trait]
 impl ImportClient for LiveGrpcImportClient {
+    fn group_owner_user_id(&self, source_user_id: i64) -> i64 {
+        self.group_owner_user_id.unwrap_or(source_user_id)
+    }
+
     async fn add_memories_batch(
         &self,
         request: AddMemoriesBatchRequest,
@@ -764,6 +796,22 @@ fn map_status(status: Status) -> anyhow::Error {
     )
 }
 
+fn validate_thread_group_owner_capability(
+    response: Result<ThreadGroupCapabilitiesResponse, Status>,
+) -> Result<()> {
+    match response {
+        Ok(response) if response.supports_independent_group_owner_scope => Ok(()),
+        Ok(_) => Err(anyhow!(
+            "connected Memories server does not support independent ThreadGroup group ownership; upgrade the server before importing"
+        )),
+        Err(status) if status.code() == tonic::Code::Unimplemented => Err(anyhow!(
+            "connected Memories server does not support independent ThreadGroup group ownership (UNIMPLEMENTED: {}); upgrade the server before importing",
+            status.message()
+        )),
+        Err(status) => Err(map_status(status)),
+    }
+}
+
 // PostgreSQL SQLSTATEs we treat as transient when the server wraps
 // them into `tonic::Status::internal`. We match against the message
 // text because tonic does not surface the SQLSTATE as a typed field;
@@ -870,6 +918,38 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use tonic::{Code, Status};
+
+    #[test]
+    fn owner_scope_capability_gate_accepts_supported_server() {
+        let response = protobuf::llm_memory::service::ThreadGroupCapabilitiesResponse {
+            supports_independent_group_owner_scope: true,
+        };
+
+        assert!(validate_thread_group_owner_capability(Ok(response)).is_ok());
+    }
+
+    #[test]
+    fn owner_scope_capability_gate_rejects_legacy_unimplemented_server_explicitly() {
+        let error =
+            validate_thread_group_owner_capability(Err(Status::unimplemented("unknown RPC")))
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("does not support independent ThreadGroup group ownership"));
+        assert!(error.contains("UNIMPLEMENTED"));
+    }
+
+    #[test]
+    fn owner_scope_capability_gate_rejects_missing_server_capability() {
+        let response = protobuf::llm_memory::service::ThreadGroupCapabilitiesResponse {
+            supports_independent_group_owner_scope: false,
+        };
+
+        let error = validate_thread_group_owner_capability(Ok(response))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not support independent ThreadGroup group ownership"));
+    }
 
     #[test]
     fn is_retryable_status_covers_transient_codes() {
@@ -1150,6 +1230,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             tls_ca_path: None,
             auth_token: None,
+            group_owner_user_id: None,
             retry: RetryPolicy::no_retry(),
             preview_only: false,
         })
@@ -1202,6 +1283,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             tls_ca_path: None,
             auth_token: None,
+            group_owner_user_id: None,
             retry: RetryPolicy::no_retry(),
             preview_only: false,
         })

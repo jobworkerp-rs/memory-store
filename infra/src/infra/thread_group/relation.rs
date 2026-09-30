@@ -21,8 +21,8 @@ use sqlx::Executor;
 const INSERT_SQL: &str = concat!(
     "INSERT INTO thread_relation \
      (id, parent_thread_id, child_thread_id, parent_thread_canonical_key, child_thread_canonical_key, \
-      parent_owner_scope, parent_source, parent_identity_scope, parent_native_id, \
-      child_owner_scope, child_source, child_identity_scope, child_native_id, \
+      parent_user_id, parent_owner_scope, parent_source, parent_identity_scope, parent_native_id, \
+      child_user_id, child_owner_scope, child_source, child_identity_scope, child_native_id, \
       relation_type, state, selection_basis, source_confidence, \
       selected_observation_id, selected_operator_decision_id, created_at, updated_at) \
      VALUES (",
@@ -67,6 +67,10 @@ const INSERT_SQL: &str = concat!(
     p!(20),
     ",",
     p!(21),
+    ",",
+    p!(22),
+    ",",
+    p!(23),
     ")"
 );
 
@@ -185,11 +189,17 @@ pub trait ThreadRelationRepository: UseRdbPool + UseIdGenerator + Send + Sync {
             .bind(relation.child_thread_id)
             .bind(&relation.parent_thread_canonical_key)
             .bind(&relation.child_thread_canonical_key)
-            .bind(&relation.parent_owner_scope)
+            .bind(relation.parent_user_id)
+            .bind(common::thread_group_key::legacy_owner_scope(
+                relation.parent_user_id,
+            ))
             .bind(&relation.parent_source)
             .bind(&relation.parent_identity_scope)
             .bind(&relation.parent_native_id)
-            .bind(&relation.child_owner_scope)
+            .bind(relation.child_user_id)
+            .bind(common::thread_group_key::legacy_owner_scope(
+                relation.child_user_id,
+            ))
             .bind(&relation.child_source)
             .bind(&relation.child_identity_scope)
             .bind(&relation.child_native_id)

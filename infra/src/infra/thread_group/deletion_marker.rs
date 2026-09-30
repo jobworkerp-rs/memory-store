@@ -23,8 +23,8 @@ use sqlx::Executor;
 // statement single-round-trip on both backends.
 const PUT_SQL: &str = concat!(
     "INSERT INTO thread_deletion_marker \
-     (owner_scope, source, identity_scope, native_id, forbid_reimport, recursive, \
-      actor_id, reason, deleted_at) \
+     (user_id, owner_scope, source, identity_scope, native_id, forbid_reimport, recursive, \
+      actor_id, reason, deleted_at, thread_canonical_key) \
      VALUES (",
     p!(1),
     ",",
@@ -43,18 +43,23 @@ const PUT_SQL: &str = concat!(
     p!(8),
     ",",
     p!(9),
-    ") ON CONFLICT (owner_scope, source, identity_scope, native_id) DO UPDATE SET \
+    ",",
+    p!(10),
+    ",",
+    p!(11),
+    ") ON CONFLICT (user_id, source, identity_scope, native_id) DO UPDATE SET \
        forbid_reimport = excluded.forbid_reimport, \
        recursive = excluded.recursive, \
        actor_id = excluded.actor_id, \
        reason = excluded.reason, \
-       deleted_at = excluded.deleted_at"
+       deleted_at = excluded.deleted_at, \
+       thread_canonical_key = COALESCE(excluded.thread_canonical_key, thread_deletion_marker.thread_canonical_key)"
 );
 
 const FIND_SQL: &str = concat!(
     "SELECT ",
     THREAD_DELETION_MARKER_COLUMNS!(),
-    " FROM thread_deletion_marker WHERE owner_scope = ",
+    " FROM thread_deletion_marker WHERE user_id = ",
     p!(1),
     " AND source = ",
     p!(2),
@@ -65,7 +70,7 @@ const FIND_SQL: &str = concat!(
 );
 
 const EXISTS_SQL: &str = concat!(
-    "SELECT 1 FROM thread_deletion_marker WHERE owner_scope = ",
+    "SELECT 1 FROM thread_deletion_marker WHERE user_id = ",
     p!(1),
     " AND source = ",
     p!(2),
@@ -76,7 +81,7 @@ const EXISTS_SQL: &str = concat!(
 );
 
 const DELETE_SQL: &str = concat!(
-    "DELETE FROM thread_deletion_marker WHERE owner_scope = ",
+    "DELETE FROM thread_deletion_marker WHERE user_id = ",
     p!(1),
     " AND source = ",
     p!(2),
@@ -89,7 +94,7 @@ const DELETE_SQL: &str = concat!(
 const LIST_BY_OWNER_SQL: &str = concat!(
     "SELECT ",
     THREAD_DELETION_MARKER_COLUMNS!(),
-    " FROM thread_deletion_marker WHERE owner_scope = ",
+    " FROM thread_deletion_marker WHERE user_id = ",
     p!(1),
     " ORDER BY deleted_at DESC, source, identity_scope, native_id"
 );
@@ -104,7 +109,10 @@ pub trait ThreadDeletionMarkerRepository: UseRdbPool + Send + Sync {
         marker: &NewThreadDeletionMarker<'_>,
     ) -> Result<()> {
         sqlx::query::<Rdb>(PUT_SQL)
-            .bind(marker.identity.owner_scope)
+            .bind(marker.identity.user_id)
+            .bind(common::thread_group_key::legacy_owner_scope(
+                marker.identity.user_id,
+            ))
             .bind(marker.identity.source)
             .bind(marker.identity.identity_scope)
             .bind(marker.identity.native_id)
@@ -113,6 +121,7 @@ pub trait ThreadDeletionMarkerRepository: UseRdbPool + Send + Sync {
             .bind(&marker.actor_id)
             .bind(&marker.reason)
             .bind(marker.deleted_at)
+            .bind(&marker.thread_canonical_key)
             .execute(tx)
             .await
             .map_err(LlmMemoryError::DBError)?;
@@ -124,7 +133,7 @@ pub trait ThreadDeletionMarkerRepository: UseRdbPool + Send + Sync {
         identity: &SourceIdentityKey<'_>,
     ) -> Result<Option<ThreadDeletionMarkerRow>> {
         Ok(sqlx::query_as::<Rdb, ThreadDeletionMarkerRow>(FIND_SQL)
-            .bind(identity.owner_scope)
+            .bind(identity.user_id)
             .bind(identity.source)
             .bind(identity.identity_scope)
             .bind(identity.native_id)
@@ -141,7 +150,7 @@ pub trait ThreadDeletionMarkerRepository: UseRdbPool + Send + Sync {
         identity: &SourceIdentityKey<'_>,
     ) -> Result<Option<ThreadDeletionMarkerRow>> {
         Ok(sqlx::query_as::<Rdb, ThreadDeletionMarkerRow>(FIND_SQL)
-            .bind(identity.owner_scope)
+            .bind(identity.user_id)
             .bind(identity.source)
             .bind(identity.identity_scope)
             .bind(identity.native_id)
@@ -156,7 +165,7 @@ pub trait ThreadDeletionMarkerRepository: UseRdbPool + Send + Sync {
         identity: &SourceIdentityKey<'_>,
     ) -> Result<bool> {
         let found = sqlx::query::<Rdb>(EXISTS_SQL)
-            .bind(identity.owner_scope)
+            .bind(identity.user_id)
             .bind(identity.source)
             .bind(identity.identity_scope)
             .bind(identity.native_id)
@@ -175,7 +184,7 @@ pub trait ThreadDeletionMarkerRepository: UseRdbPool + Send + Sync {
         identity: &SourceIdentityKey<'_>,
     ) -> Result<bool> {
         let res = sqlx::query::<Rdb>(DELETE_SQL)
-            .bind(identity.owner_scope)
+            .bind(identity.user_id)
             .bind(identity.source)
             .bind(identity.identity_scope)
             .bind(identity.native_id)
@@ -189,7 +198,7 @@ pub trait ThreadDeletionMarkerRepository: UseRdbPool + Send + Sync {
     /// first.
     async fn list_by_owner(
         &self,
-        owner_scope: &str,
+        user_id: i64,
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<Vec<ThreadDeletionMarkerRow>> {
@@ -203,8 +212,8 @@ pub trait ThreadDeletionMarkerRepository: UseRdbPool + Send + Sync {
         if offset.is_some() {
             sql.push_str(&format!(" OFFSET {}", dyn_placeholder(next)));
         }
-        let mut query = sqlx::query_as::<Rdb, ThreadDeletionMarkerRow>(sqlx::AssertSqlSafe(sql))
-            .bind(owner_scope);
+        let mut query =
+            sqlx::query_as::<Rdb, ThreadDeletionMarkerRow>(sqlx::AssertSqlSafe(sql)).bind(user_id);
         if let Some(limit) = limit {
             query = query.bind(limit);
         }
@@ -263,7 +272,7 @@ mod tests {
         let marker = repo.find(&ident).await?.context("overwritten")?;
         assert!(!marker.forbid_reimport);
         assert_eq!(marker.actor_id, "operator-b");
-        assert_eq!(repo.list_by_owner("user:2", Some(10), None).await?.len(), 1);
+        assert_eq!(repo.list_by_owner(2, Some(10), None).await?.len(), 1);
 
         // Consumption is atomic with the re-import transaction.
         let mut tx = pool.begin().await?;

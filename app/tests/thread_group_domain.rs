@@ -51,7 +51,11 @@ use infra::infra::thread_group::relation::{
 };
 use infra::infra::thread_group::rows::values;
 use infra::infra::thread_group::rows::{
-    NewGroupAuditMerge, NewThreadDeletionMarker, NewThreadRelation, SourceIdentityKey,
+    NewGroupAuditMerge, NewThreadDeletionMarker, NewThreadGroupMember, NewThreadRelation,
+    SourceIdentityKey,
+};
+use infra::infra::thread_group::source_identity::{
+    SourceThreadIdentityRepository, SourceThreadIdentityRepositoryImpl,
 };
 use infra::infra::thread_group::test_support::{
     insert_thread, key, new_group, new_member, setup_thread_group_pool,
@@ -289,7 +293,7 @@ fn endpoint(source: &str, scope: IdentityScope, native_id: &str) -> ObservedEndp
     ObservedEndpoint {
         source: source.into(),
         identity_scope: scope,
-        owner_scope: "user:1".into(),
+        user_id: 1,
         native_id: native_id.into(),
     }
 }
@@ -498,14 +502,14 @@ fn recon_endpoint(native_id: &str) -> ObservedEndpoint {
     ObservedEndpoint {
         source: "codex".into(),
         identity_scope: IdentityScope::known(""),
-        owner_scope: "user:1".into(),
+        user_id: 1,
         native_id: native_id.into(),
     }
 }
 
 fn key_of(endpoint: &ObservedEndpoint) -> String {
     source_thread_canonical_key(&common::thread_group_key::SourceIdentity::new(
-        endpoint.owner_scope.clone(),
+        endpoint.user_id,
         endpoint.source.clone(),
         endpoint.identity_scope.clone(),
         endpoint.native_id.clone(),
@@ -522,7 +526,7 @@ async fn candidate_rows_for(
         pool,
     )
     .list_by_subject_identity(
-        &subject.owner_scope,
+        subject.user_id,
         &subject.source,
         matches!(&subject.identity_scope, &IdentityScope::Known(_)),
         match &subject.identity_scope {
@@ -696,7 +700,7 @@ fn late_parent_discovery_reconciles_all_pending_children() {
             active_before - 1,
             "the new parent group replaces both former active singleton groups"
         );
-        let visible = read.list_groups(false, None, None).await.unwrap();
+        let visible = read.list_groups(false, None, None, None).await.unwrap();
         assert!(visible.iter().any(|group| group.id == target_group));
         for old_group_id in singleton_group_ids {
             assert!(visible.iter().all(|group| group.id != old_group_id));
@@ -947,7 +951,7 @@ fn selected_relation_replay_resolves_only_matching_stale_pending_evidence() {
             .unwrap();
         let mut stale = infra::infra::thread_group::test_support::new_candidate(26_041);
         stale.subject_thread_id = Some(26_042);
-        stale.subject_owner_scope = child.owner_scope.clone();
+        stale.subject_user_id = child.user_id;
         stale.subject_source = child.source.clone();
         stale.subject_native_id = child.native_id.clone();
         stale.selected_observation_id = first.observation_ids.first().copied();
@@ -958,7 +962,7 @@ fn selected_relation_replay_resolves_only_matching_stale_pending_evidence() {
         candidates.insert_tx(pool, &stale).await.unwrap();
         let mut unrelated = infra::infra::thread_group::test_support::new_candidate(26_042);
         unrelated.subject_thread_id = Some(26_042);
-        unrelated.subject_owner_scope = child.owner_scope.clone();
+        unrelated.subject_user_id = child.user_id;
         unrelated.subject_source = child.source.clone();
         unrelated.subject_native_id = child.native_id.clone();
         candidates.insert_tx(pool, &unrelated).await.unwrap();
@@ -1226,7 +1230,7 @@ fn late_parent_discovery_respects_deletion_marker() {
             .unwrap();
 
         let identity = SourceIdentityKey {
-            owner_scope: &parent.owner_scope,
+            user_id: parent.user_id,
             source: &parent.source,
             identity_scope: "",
             native_id: &parent.native_id,
@@ -1241,6 +1245,7 @@ fn late_parent_discovery_respects_deletion_marker() {
                     actor_id: "operator".into(),
                     reason: Some("deleted parent".into()),
                     deleted_at: 1_502,
+                    thread_canonical_key: None,
                 },
             )
             .await
@@ -1286,7 +1291,7 @@ fn imported_subject_registration_rejects_forbidden_marker_without_creating_membe
                 pool,
                 &NewThreadDeletionMarker {
                     identity: SourceIdentityKey {
-                        owner_scope: &subject.owner_scope,
+                        user_id: subject.user_id,
                         source: &subject.source,
                         identity_scope: "",
                         native_id: &subject.native_id,
@@ -1296,6 +1301,7 @@ fn imported_subject_registration_rejects_forbidden_marker_without_creating_membe
                     actor_id: "operator".into(),
                     reason: None,
                     deleted_at: 1_700,
+                    thread_canonical_key: None,
                 },
             )
             .await
@@ -1306,7 +1312,7 @@ fn imported_subject_registration_rejects_forbidden_marker_without_creating_membe
         );
         assert!(
             service
-                .reconcile_imported_subject(26_018, &subject, &[], "import-guard", 1_701)
+                .reconcile_imported_subject(26_018, &subject, &[], 1, "import-guard", 1_701)
                 .await
                 .is_err()
         );
@@ -1332,16 +1338,16 @@ fn imported_subject_registration_checks_owner_and_existing_identity() {
         insert_thread(pool, 26_019, None).await;
         insert_thread(pool, 26_020, None).await;
         let mut other_owner = subject.clone();
-        other_owner.owner_scope = "user:2".into();
+        other_owner.user_id = 2;
         assert!(
             service
-                .reconcile_imported_subject(26_019, &other_owner, &[], "import-owner", 1_702)
+                .reconcile_imported_subject(26_019, &other_owner, &[], 1, "import-owner", 1_702)
                 .await
                 .is_err()
         );
         assert!(
             service
-                .reconcile_imported_subject(26_019, &subject, &[], "import-owner", 1_703)
+                .reconcile_imported_subject(26_019, &subject, &[], 1, "import-owner", 1_703)
                 .await
                 .unwrap()
                 .group_id
@@ -1349,7 +1355,7 @@ fn imported_subject_registration_checks_owner_and_existing_identity() {
         );
         assert!(
             service
-                .reconcile_imported_subject(26_020, &subject, &[], "import-owner", 1_704)
+                .reconcile_imported_subject(26_020, &subject, &[], 1, "import-owner", 1_704)
                 .await
                 .is_err()
         );
@@ -1382,6 +1388,7 @@ fn unknown_scope_import_keeps_evidence_without_promoting_identity() {
                 26_021,
                 &subject,
                 &[observation(subject.clone(), Some(parent))],
+                1,
                 "unknown-fork",
                 1_705,
             )
@@ -1850,11 +1857,11 @@ fn manual_collection_lifecycle_does_not_touch_lineage() {
             infra::test_helper::shared_id_generator(),
         );
         let collection = operator
-            .create_manual_collection("user:1", "favorites", 2_400)
+            .create_manual_collection(1, "favorites", 2_400)
             .await
             .unwrap();
         let listed = operator
-            .list_manual_collections("user:1", None, None)
+            .list_manual_collections(1, None, None)
             .await
             .unwrap();
         assert!(listed.iter().any(|row| row.id == collection));
@@ -1862,41 +1869,77 @@ fn manual_collection_lifecycle_does_not_touch_lineage() {
 
         assert!(
             operator
-                .attach_manual_collection_member(collection, 20_401, "user:1", 2_401)
+                .attach_manual_collection_member(collection, 20_401, 1, 2_401)
                 .await
                 .unwrap()
         );
         assert!(
             !operator
-                .attach_manual_collection_member(collection, 20_401, "user:1", 2_402)
+                .attach_manual_collection_member(collection, 20_401, 1, 2_402)
                 .await
                 .unwrap()
         );
         assert_eq!(
             operator
-                .list_manual_collection_members(collection)
+                .list_manual_collection_members(collection, Some(1))
                 .await
                 .unwrap()
                 .len(),
             1
         );
         assert!(
-            operator
-                .detach_manual_collection_member(collection, 20_401, 2_403)
+            !operator
+                .attach_manual_collection_member(collection, 20_401, 2, 2_402)
                 .await
                 .unwrap()
         );
         assert!(
             operator
-                .list_manual_collection_members(collection)
+                .list_manual_collection_members(collection, Some(2))
                 .await
                 .unwrap()
                 .is_empty()
         );
-        assert!(operator.delete_manual_collection(collection).await.unwrap());
+        assert!(
+            !operator
+                .rename_manual_collection(collection, Some(2), "wrong-owner", 2_402)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !operator
+                .detach_manual_collection_member(collection, 20_401, Some(2), 2_403)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !operator
+                .delete_manual_collection(collection, Some(2))
+                .await
+                .unwrap()
+        );
         assert!(
             operator
-                .list_manual_collections("user:1", None, None)
+                .detach_manual_collection_member(collection, 20_401, Some(1), 2_403)
+                .await
+                .unwrap()
+        );
+        assert!(
+            operator
+                .list_manual_collection_members(collection, Some(1))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            operator
+                .delete_manual_collection(collection, Some(1))
+                .await
+                .unwrap()
+        );
+        assert!(
+            operator
+                .list_manual_collections(1, None, None)
                 .await
                 .unwrap()
                 .iter()
@@ -2048,13 +2091,154 @@ async fn setup_conflict_candidates(
         infra::test_helper::shared_id_generator(),
         pool,
     )
-    .list_by_subject_identity("user:1", "codex", true, "", child_native)
+    .list_by_subject_identity(1, "codex", true, "", child_native)
     .await
     .unwrap()
     .into_iter()
     .filter(|row| row.state == values::candidate_state::CONFLICT)
     .map(|row| row.id)
     .collect()
+}
+
+async fn replace_candidate_subject_with_alias(
+    pool: &'static infra_utils::infra::rdb::RdbPool,
+    candidate_id: i64,
+    thread_id: i64,
+    alias_native_id: &str,
+) {
+    let alias = SourceIdentityKey {
+        user_id: 1,
+        source: "codex",
+        identity_scope: "",
+        native_id: alias_native_id,
+    };
+    SourceThreadIdentityRepositoryImpl::new(pool)
+        .upsert_resolved_tx(pool, &alias, thread_id, 5_050)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE thread_group_candidate_association SET subject_native_id = ? WHERE id = ?")
+        .bind(alias_native_id)
+        .bind(candidate_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn remove_group_for_thread(pool: &'static infra_utils::infra::rdb::RdbPool, thread_id: i64) {
+    let canonical_key: String =
+        sqlx::query_scalar("SELECT key FROM thread_canonical_key WHERE thread_id = ?")
+            .bind(thread_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let group_id: Option<i64> = sqlx::query_scalar(
+        "SELECT group_id FROM thread_group_member \
+         WHERE thread_canonical_key = ? AND state IN ('active', 'deleted')",
+    )
+    .bind(canonical_key)
+    .fetch_optional(pool)
+    .await
+    .unwrap();
+    if let Some(group_id) = group_id {
+        sqlx::query("DELETE FROM thread_group_member WHERE group_id = ?")
+            .bind(group_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM thread_group WHERE id = ?")
+            .bind(group_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+}
+
+async fn save_subject_group_owner(
+    pool: &'static infra_utils::infra::rdb::RdbPool,
+    thread_id: i64,
+    user_id: i64,
+    group_key_seed: u64,
+    native_id: &str,
+) -> i64 {
+    let canonical_key: String =
+        sqlx::query_scalar("SELECT key FROM thread_canonical_key WHERE thread_id = ?")
+            .bind(thread_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let members = ThreadGroupMemberRepositoryImpl::new(pool);
+    if let Some(member) = members
+        .find_current_by_thread_canonical_key(&canonical_key)
+        .await
+        .unwrap()
+    {
+        sqlx::query("UPDATE thread_group SET user_id = ? WHERE id = ?")
+            .bind(user_id)
+            .bind(member.group_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE thread_group_member SET provenance = 'reconciler' WHERE group_id = ?")
+            .bind(member.group_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        return member.group_id;
+    }
+
+    let groups = ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+    let mut group = new_group(group_key_seed);
+    group.user_id = user_id;
+    let group_id = groups.create_tx(pool, &group).await.unwrap();
+    let member = NewThreadGroupMember {
+        group_id,
+        thread_id: Some(thread_id),
+        thread_canonical_key: canonical_key,
+        user_id: 1,
+        source: Some("codex".into()),
+        identity_scope: Some(String::new()),
+        native_id: Some(native_id.into()),
+        role: values::member_role::MEMBER.into(),
+        state: values::member_state::ACTIVE.into(),
+        provenance: values::grouping_authority::RECONCILER.into(),
+        deleted_at: None,
+        created_at: 5_060,
+        updated_at: 5_060,
+    };
+    members.insert_tx(pool, &member).await.unwrap();
+    group_id
+}
+
+async fn rebind_candidate_subject(
+    pool: &'static infra_utils::infra::rdb::RdbPool,
+    reconcile: &ThreadGroupReconciliationService,
+    candidate_id: i64,
+    new_thread_id: i64,
+) {
+    let (user_id, source, identity_scope, native_id): (i64, String, String, String) =
+        sqlx::query_as(
+            "SELECT subject_user_id, subject_source, subject_identity_scope_value, subject_native_id \
+             FROM thread_group_candidate_association WHERE id = ?",
+        )
+        .bind(candidate_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    insert_thread(pool, new_thread_id, None).await;
+    reconcile
+        .ensure_thread_canonical_key(new_thread_id, user_id, 5_080)
+        .await
+        .unwrap();
+    let identity = SourceIdentityKey {
+        user_id,
+        source: &source,
+        identity_scope: &identity_scope,
+        native_id: &native_id,
+    };
+    SourceThreadIdentityRepositoryImpl::new(pool)
+        .upsert_resolved_tx(pool, &identity, new_thread_id, 5_081)
+        .await
+        .unwrap();
 }
 
 #[test]
@@ -2075,6 +2259,7 @@ fn operator_confirmation_adopts_and_retraction_revokes() {
         )
         .await;
         assert_eq!(candidates.len(), 2);
+        replace_candidate_subject_with_alias(pool, candidates[0], 20_603, "op-child-alias").await;
 
         let outcome = reconcile
             .record_operator_decision(candidates[0], "confirm", "operator-a", "reviewed", 5_100)
@@ -2094,6 +2279,13 @@ fn operator_confirmation_adopts_and_retraction_revokes() {
             relation.selection_basis,
             values::selection_basis::OPERATOR_CONFIRMATION
         );
+        let saved_child_key: String =
+            sqlx::query_scalar("SELECT key FROM thread_canonical_key WHERE thread_id = ?")
+                .bind(20_603)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(relation.child_thread_canonical_key, saved_child_key);
         assert!(relation.selected_operator_decision_id.is_some());
 
         // Identical replay does not append a second decision.
@@ -2122,6 +2314,376 @@ fn operator_confirmation_adopts_and_retraction_revokes() {
                 .unwrap();
         assert_eq!(retracted.state, values::relation_state::RETRACTED);
         let _ = child_key;
+    });
+}
+
+#[test]
+fn operator_confirmation_checks_cycles_using_alias_threads_saved_key() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let reconcile = ThreadGroupReconciliationService::with_id_generator(
+            pool,
+            infra::test_helper::shared_id_generator(),
+        );
+        let candidates = setup_conflict_candidates(
+            pool,
+            &reconcile,
+            "op-cycle-child",
+            20_623,
+            "op-cycle-parent-a",
+            "op-cycle-parent-b",
+        )
+        .await;
+        replace_candidate_subject_with_alias(pool, candidates[0], 20_623, "op-cycle-child-alias")
+            .await;
+
+        let child = recon_endpoint("op-cycle-child");
+        let parent_thread_id: i64 = sqlx::query_scalar(
+            "SELECT candidate_parent_thread_id \
+             FROM thread_group_candidate_association WHERE id = ?",
+        )
+        .bind(candidates[0])
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let parent_native_id: String = sqlx::query_scalar(
+            "SELECT native_id FROM source_thread_identity WHERE thread_id = ? \
+             ORDER BY native_id LIMIT 1",
+        )
+        .bind(parent_thread_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let parent = recon_endpoint(&parent_native_id);
+        reconcile
+            .reconcile_subject(
+                parent_thread_id,
+                &parent,
+                &[observation(parent.clone(), Some(child))],
+                "op",
+                5_060,
+            )
+            .await
+            .unwrap();
+
+        let error = reconcile
+            .record_operator_decision(candidates[0], "confirm", "operator-a", "cycle", 5_061)
+            .await
+            .expect_err("an alias must not bypass the canonical-key cycle check");
+        assert!(
+            format!("{error:#}").contains("would create a cycle"),
+            "unexpected operator-decision failure: {error:#}"
+        );
+    });
+}
+
+#[test]
+fn operator_confirmation_preserves_parent_owner_when_identity_mapping_is_missing() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let reconcile = ThreadGroupReconciliationService::with_id_generator(
+            pool,
+            infra::test_helper::shared_id_generator(),
+        );
+        let candidates = setup_conflict_candidates(
+            pool,
+            &reconcile,
+            "op-missing-parent-map-child",
+            20_643,
+            "op-missing-parent-map-a",
+            "op-missing-parent-map-b",
+        )
+        .await;
+        let parent_thread_id: i64 = sqlx::query_scalar(
+            "SELECT candidate_parent_thread_id \
+             FROM thread_group_candidate_association WHERE id = ?",
+        )
+        .bind(candidates[0])
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM source_thread_identity WHERE thread_id = ?")
+            .bind(parent_thread_id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let outcome = reconcile
+            .record_operator_decision(
+                candidates[0],
+                "confirm",
+                "operator-a",
+                "mapping was removed",
+                5_070,
+            )
+            .await
+            .unwrap();
+        let relation_id = outcome.relation_id.unwrap();
+        let parent_identity: (i64, Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT parent_user_id, parent_source, parent_identity_scope, parent_native_id \
+                 FROM thread_relation WHERE id = ?",
+            )
+            .bind(relation_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(parent_identity.0, 1);
+        assert_eq!(
+            (parent_identity.1, parent_identity.2, parent_identity.3),
+            (None, None, None),
+            "an unresolved parent keeps its owner without fabricating a partial identity"
+        );
+    });
+}
+
+#[test]
+fn operator_confirm_and_retract_reject_rebound_or_missing_subject_identity_without_changes() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let reconcile = ThreadGroupReconciliationService::with_id_generator(
+            pool,
+            infra::test_helper::shared_id_generator(),
+        );
+
+        for (index, decision) in ["confirm", "retract"].into_iter().enumerate() {
+            for (missing_mapping, suffix) in [(false, "rebound"), (true, "missing")] {
+                let child_thread_id =
+                    30_000 + (index as i64 * 100) + if missing_mapping { 10 } else { 0 };
+                let subject_native = format!("stale-subject-{decision}-{suffix}");
+                let candidates = setup_conflict_candidates(
+                    pool,
+                    &reconcile,
+                    &subject_native,
+                    child_thread_id,
+                    &format!("stale-parent-a-{decision}-{suffix}"),
+                    &format!("stale-parent-b-{decision}-{suffix}"),
+                )
+                .await;
+                let candidate_id = candidates[0];
+                let existing_relation_id = if decision == "retract" {
+                    Some(
+                        reconcile
+                            .record_operator_decision(
+                                candidate_id,
+                                "confirm",
+                                "operator-prior",
+                                "create relation for stale retract test",
+                                5_085 + child_thread_id,
+                            )
+                            .await
+                            .unwrap()
+                            .relation_id
+                            .expect("test setup creates an operator relation"),
+                    )
+                } else {
+                    None
+                };
+                let decisions_before: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM operator_decision WHERE candidate_association_id = ?",
+                )
+                .bind(candidate_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                let candidate_state_before: String = sqlx::query_scalar(
+                    "SELECT state FROM thread_group_candidate_association WHERE id = ?",
+                )
+                .bind(candidate_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                if missing_mapping {
+                    let identity = SourceIdentityKey {
+                        user_id: 1,
+                        source: "codex",
+                        identity_scope: "",
+                        native_id: &subject_native,
+                    };
+                    SourceThreadIdentityRepositoryImpl::new(pool)
+                        .delete_tx(pool, &identity)
+                        .await
+                        .unwrap();
+                } else {
+                    rebind_candidate_subject(pool, &reconcile, candidate_id, child_thread_id + 50)
+                        .await;
+                }
+
+                let error = reconcile
+                    .record_operator_decision(
+                        candidate_id,
+                        decision,
+                        "operator-stale",
+                        "stale candidate must not mutate",
+                        5_090 + child_thread_id,
+                    )
+                    .await
+                    .expect_err("stale candidate subjects must be rejected");
+                assert!(
+                    format!("{error:#}").contains("candidate subject"),
+                    "unexpected stale-subject error: {error:#}"
+                );
+
+                let decision_count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM operator_decision \
+                     WHERE candidate_association_id = ?",
+                )
+                .bind(candidate_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                let candidate_state: String = sqlx::query_scalar(
+                    "SELECT state FROM thread_group_candidate_association WHERE id = ?",
+                )
+                .bind(candidate_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                assert_eq!(
+                    decision_count, decisions_before,
+                    "stale decision audit must not be written"
+                );
+                assert_eq!(candidate_state, candidate_state_before);
+                if let Some(relation_id) = existing_relation_id {
+                    let relation = ThreadRelationRepositoryImpl::new(
+                        infra::test_helper::shared_id_generator(),
+                        pool,
+                    )
+                    .find_by_id(relation_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(relation.state, values::relation_state::ACTIVE);
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn operator_confirmation_inherits_saved_group_owner_for_an_ungrouped_parent() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let reconcile = ThreadGroupReconciliationService::with_id_generator(
+            pool,
+            infra::test_helper::shared_id_generator(),
+        );
+        let subject_native = "operator-independent-group-owner";
+        let child_thread_id = 30_500;
+        let candidates = setup_conflict_candidates(
+            pool,
+            &reconcile,
+            subject_native,
+            child_thread_id,
+            "operator-owner-parent-a",
+            "operator-owner-parent-b",
+        )
+        .await;
+        let candidate_id = candidates[0];
+        let parent_thread_id: i64 = sqlx::query_scalar(
+            "SELECT candidate_parent_thread_id FROM thread_group_candidate_association WHERE id = ?",
+        )
+        .bind(candidate_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        remove_group_for_thread(pool, parent_thread_id).await;
+        let subject_group_id =
+            save_subject_group_owner(pool, child_thread_id, 7, 92_751, subject_native).await;
+
+        let outcome = reconcile
+            .record_operator_decision(
+                candidate_id,
+                "confirm",
+                "operator-owner",
+                "inherit saved group owner",
+                5_100,
+            )
+            .await
+            .expect("confirmation uses the subject's saved group owner");
+        assert!(outcome.relation_id.is_some());
+
+        let subject_key: String =
+            sqlx::query_scalar("SELECT key FROM thread_canonical_key WHERE thread_id = ?")
+                .bind(child_thread_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let member = ThreadGroupMemberRepositoryImpl::new(pool)
+            .find_current_by_thread_canonical_key(&subject_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let group = ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool)
+            .find_by_id(member.group_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(group.user_id, 7);
+        assert_ne!(
+            member.group_id, subject_group_id,
+            "the new parent anchor owns the group"
+        );
+    });
+}
+
+#[test]
+fn operator_confirmation_without_saved_group_owner_does_not_create_a_group() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let reconcile = ThreadGroupReconciliationService::with_id_generator(
+            pool,
+            infra::test_helper::shared_id_generator(),
+        );
+        let child_thread_id = 30_600;
+        let candidates = setup_conflict_candidates(
+            pool,
+            &reconcile,
+            "operator-no-saved-group-owner",
+            child_thread_id,
+            "operator-no-owner-parent-a",
+            "operator-no-owner-parent-b",
+        )
+        .await;
+        let candidate_id = candidates[0];
+        let parent_thread_id: i64 = sqlx::query_scalar(
+            "SELECT candidate_parent_thread_id FROM thread_group_candidate_association WHERE id = ?",
+        )
+        .bind(candidate_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        remove_group_for_thread(pool, parent_thread_id).await;
+        remove_group_for_thread(pool, child_thread_id).await;
+        let groups_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thread_group")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+
+        let error = reconcile
+            .record_operator_decision(
+                candidate_id,
+                "confirm",
+                "operator-no-owner",
+                "owner must not be guessed",
+                5_101,
+            )
+            .await
+            .expect_err("confirmation must not infer group owner from Thread owner");
+        assert!(format!("{error:#}").contains("saved subject ThreadGroup owner"));
+        let groups_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thread_group")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let decisions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM operator_decision WHERE candidate_association_id = ?",
+        )
+        .bind(candidate_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(groups_after, groups_before);
+        assert_eq!(decisions, 0);
     });
 }
 
@@ -2166,10 +2728,50 @@ fn root_member_is_the_parentless_group_member() {
         let root = read.root_member(group).await.unwrap().expect("root");
         assert_eq!(root.thread_canonical_key, parent_key);
         assert_ne!(root.thread_canonical_key, child_key);
-        let view = read.get_lineage(group).await.unwrap().unwrap().group;
+        let view = read.get_lineage(group, None).await.unwrap().unwrap().group;
         assert_eq!(
             view.root_thread_canonical_key.as_deref(),
             Some(parent_key.as_str())
+        );
+    });
+}
+
+#[test]
+fn owner_filter_selects_groups_but_keeps_mixed_owner_group_contents() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let groups =
+            ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let owned_group = groups.create_tx(pool, &new_group(24_901)).await.unwrap();
+        let mut other_owner_group = new_group(24_902);
+        other_owner_group.user_id = 2;
+        let other_group = groups.create_tx(pool, &other_owner_group).await.unwrap();
+
+        insert_thread(pool, 24_901, None).await;
+        let mut member = new_member(owned_group, Some(24_901), key(24_901));
+        member.user_id = 2;
+        ThreadGroupMemberRepositoryImpl::new(pool)
+            .insert_tx(pool, &member)
+            .await
+            .unwrap();
+
+        let read = ThreadGroupReadService::new(pool);
+        let owned = read.list_groups(false, None, None, Some(1)).await.unwrap();
+        assert!(owned.iter().any(|group| group.id == owned_group));
+        assert!(owned.iter().all(|group| group.id != other_group));
+
+        let lineage = read
+            .get_lineage(owned_group, Some(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lineage.members.len(), 1);
+        assert_eq!(lineage.members[0].user_id, 2);
+        assert!(
+            read.get_lineage(owned_group, Some(2))
+                .await
+                .unwrap()
+                .is_none()
         );
     });
 }
@@ -2208,7 +2810,7 @@ fn group_read_model_contains_live_and_deleted_display_information() {
 
         let read = ThreadGroupReadService::new(pool);
         let view = read
-            .list_groups(false, None, None)
+            .list_groups(false, None, None, None)
             .await
             .unwrap()
             .into_iter()
@@ -2225,7 +2827,7 @@ fn group_read_model_contains_live_and_deleted_display_information() {
         );
         assert!(!view.membership_snapshot_digest.is_empty());
 
-        let lineage = read.get_lineage(group_id).await.unwrap().unwrap();
+        let lineage = read.get_lineage(group_id, None).await.unwrap().unwrap();
         let deleted_display = lineage
             .member_displays
             .iter()
@@ -2296,7 +2898,7 @@ fn lineage_and_group_view_count_the_same_unresolved_candidates() {
             candidates.insert_tx(pool, &outside).await.unwrap();
         }
         let read = ThreadGroupReadService::new(pool);
-        let lineage = read.get_lineage(group_id).await.unwrap().unwrap();
+        let lineage = read.get_lineage(group_id, None).await.unwrap().unwrap();
         assert_eq!(lineage.unresolved.len(), 6);
         assert_eq!(lineage.group.unresolved_count, 6);
     });
@@ -2347,7 +2949,7 @@ fn lineage_returns_only_active_relations_for_tree_data() {
         let active_id = relations.insert_tx(pool, &historical).await.unwrap();
 
         let lineage = ThreadGroupReadService::new(pool)
-            .get_lineage(group_id)
+            .get_lineage(group_id, None)
             .await
             .unwrap()
             .unwrap();
@@ -2374,7 +2976,7 @@ fn group_summary_lookup_and_count_use_the_group_summary_kind() {
             .await
             .unwrap();
         let read = ThreadGroupReadService::new(pool);
-        let before = read.count_group_summaries().await.unwrap();
+        let before = read.count_group_summaries(None).await.unwrap();
 
         let memories = MemoryRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
         memories
@@ -2393,7 +2995,7 @@ fn group_summary_lookup_and_count_use_the_group_summary_kind() {
             .unwrap();
 
         let summary = read
-            .find_group_summary(group_id)
+            .find_group_summary(group_id, None)
             .await
             .unwrap()
             .expect("group summary");
@@ -2401,7 +3003,63 @@ fn group_summary_lookup_and_count_use_the_group_summary_kind() {
             summary.data.unwrap().memory_kind,
             protobuf::llm_memory::data::MemoryKind::DerivedSummary as i32
         );
-        assert_eq!(read.count_group_summaries().await.unwrap(), before + 1);
+        assert_eq!(read.count_group_summaries(None).await.unwrap(), before + 1);
+    });
+}
+
+#[test]
+fn summary_lookup_and_count_are_scoped_by_group_owner() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let read = ThreadGroupReadService::new(pool);
+        let owner_one_summary_count = read.count_group_summaries(Some(1)).await.unwrap();
+        let owner_two_summary_count = read.count_group_summaries(Some(2)).await.unwrap();
+        let groups =
+            ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        let mut group = new_group(92_002);
+        group.user_id = 2;
+        let group_id = groups.create_tx(pool, &group).await.unwrap();
+        insert_thread(pool, 92_002, None).await;
+        ThreadGroupMemberRepositoryImpl::new(pool)
+            .insert_tx(pool, &new_member(group_id, Some(92_002), key(92_002)))
+            .await
+            .unwrap();
+        let memories = MemoryRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+        memories
+            .create(
+                pool,
+                &protobuf::llm_memory::data::MemoryData {
+                    user_id: Some(protobuf::llm_memory::data::UserId { value: 2 }),
+                    content: "other owner summary".into(),
+                    content_type: protobuf::llm_memory::data::ContentType::Text as i32,
+                    external_id: Some(format!("thread-group-summary:{group_id}")),
+                    memory_kind: protobuf::llm_memory::data::MemoryKind::DerivedSummary as i32,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            read.find_group_summary(group_id, Some(1))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read.find_group_summary(group_id, Some(2))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            read.count_group_summaries(Some(1)).await.unwrap(),
+            owner_one_summary_count
+        );
+        assert_eq!(
+            read.count_group_summaries(Some(2)).await.unwrap(),
+            owner_two_summary_count + 1
+        );
     });
 }
 
@@ -3952,9 +4610,7 @@ fn write_gate_blocks_operator_mutations() {
             infra::test_helper::shared_id_generator(),
         );
         app::app::thread_group::set_thread_group_writes_enabled_override(Some(false));
-        let blocked = operator
-            .create_manual_collection("user:1", "blocked", 1)
-            .await;
+        let blocked = operator.create_manual_collection(1, "blocked", 1).await;
         app::app::thread_group::set_thread_group_writes_enabled_override(None);
         assert!(
             blocked.is_err(),
@@ -4063,7 +4719,7 @@ fn purge_removes_eligible_deletion_markers() {
                 .await
                 .unwrap();
             let key = SourceIdentityKey {
-                owner_scope: &member.owner_scope,
+                user_id: member.user_id,
                 source: member.source.as_deref().unwrap_or(""),
                 identity_scope: member.identity_scope.as_deref().unwrap_or(""),
                 native_id: member.native_id.as_deref().unwrap_or(""),
@@ -4078,6 +4734,7 @@ fn purge_removes_eligible_deletion_markers() {
                         actor_id: "operator".to_string(),
                         reason: Some("privacy".to_string()),
                         deleted_at: 9_000,
+                        thread_canonical_key: Some(member.thread_canonical_key.clone()),
                     },
                 )
                 .await
@@ -4094,7 +4751,7 @@ fn purge_removes_eligible_deletion_markers() {
         assert!(purge.preview(group).await.unwrap().is_none());
         for member in &members {
             let key = SourceIdentityKey {
-                owner_scope: &member.owner_scope,
+                user_id: member.user_id,
                 source: member.source.as_deref().unwrap_or(""),
                 identity_scope: member.identity_scope.as_deref().unwrap_or(""),
                 native_id: member.native_id.as_deref().unwrap_or(""),
@@ -4144,7 +4801,7 @@ fn preview_import_plans_without_writing() {
         // A forbidden marker makes the preview report suppression.
         let marker_repo = ThreadDeletionMarkerRepositoryImpl::new(pool);
         let child_identity = SourceIdentityInput {
-            owner_scope: "user:1".into(),
+            user_id: 1,
             source: "codex".into(),
             identity_scope: IdentityScope::known(String::new()),
             native_id: "preview-child".into(),
@@ -4160,6 +4817,7 @@ fn preview_import_plans_without_writing() {
                     actor_id: "operator".into(),
                     reason: Some("privacy".into()),
                     deleted_at: 2_000,
+                    thread_canonical_key: None,
                 },
             )
             .await
@@ -4170,6 +4828,61 @@ fn preview_import_plans_without_writing() {
             .unwrap();
         assert!(suppressed.suppressed);
         assert_eq!(suppressed.planned_relations, 0);
+    });
+}
+
+#[test]
+fn alias_identity_reuses_the_threads_assigned_canonical_key() {
+    run(async {
+        let pool = setup_thread_group_pool().await;
+        let thread_id = 92_701;
+        insert_thread(pool, thread_id, None).await;
+        let reconcile = ThreadGroupReconciliationService::with_id_generator(
+            pool,
+            infra::test_helper::shared_id_generator(),
+        );
+        let original = recon_endpoint("alias-original");
+        let original_key = key_of(&original);
+        let initial = reconcile
+            .reconcile_subject(thread_id, &original, &[], "alias-op", 1_000)
+            .await
+            .unwrap();
+        let group_id = initial
+            .group_id
+            .expect("the first identity creates a group");
+
+        let alias = recon_endpoint("alias-second");
+        reconcile
+            .reconcile_subject(thread_id, &alias, &[], "alias-op", 1_001)
+            .await
+            .unwrap();
+        let members = ThreadGroupMemberRepositoryImpl::new(pool)
+            .list_current_by_group_id(group_id)
+            .await
+            .unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].thread_canonical_key, original_key);
+        let active_memberships: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM thread_group_member WHERE thread_id = ? AND state = 'active'",
+        )
+        .bind(thread_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(active_memberships, 1);
+
+        let alias_identity = SourceIdentityKey {
+            user_id: alias.user_id,
+            source: &alias.source,
+            identity_scope: "",
+            native_id: &alias.native_id,
+        };
+        let mapping = SourceThreadIdentityRepositoryImpl::new(pool)
+            .find_resolved(&alias_identity)
+            .await
+            .unwrap()
+            .expect("the alias identity is mapped to the live thread");
+        assert_eq!(mapping.thread_id, thread_id);
     });
 }
 
@@ -4362,7 +5075,7 @@ fn conflicting_later_parent_retracts_without_superseding() {
 
         let observations =
             ThreadObservationRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool)
-                .list_by_subject("user:1", "codex", true, "", "cf-child")
+                .list_by_subject(1, "codex", true, "", "cf-child")
                 .await
                 .unwrap();
         assert!(
@@ -4477,11 +5190,11 @@ fn purge_preserves_cross_group_inactive_relation() {
             child_thread_id: Some(24_202),
             parent_thread_canonical_key: a_parent.clone(),
             child_thread_canonical_key: a_child.clone(),
-            parent_owner_scope: "user:1".into(),
+            parent_user_id: 1,
             parent_source: Some("codex".into()),
             parent_identity_scope: Some(String::new()),
             parent_native_id: Some("px-a-parent".into()),
-            child_owner_scope: "user:1".into(),
+            child_user_id: 1,
             child_source: Some("codex".into()),
             child_identity_scope: Some(String::new()),
             child_native_id: Some("px-a-child".into()),

@@ -27,7 +27,7 @@ fn endpoint(native_id: &str) -> ObservedEndpoint {
     ObservedEndpoint {
         source: "codex".to_string(),
         identity_scope: IdentityScope::known(String::new()),
-        owner_scope: "user:1".to_string(),
+        user_id: 1,
         native_id: native_id.to_string(),
     }
 }
@@ -35,7 +35,7 @@ fn endpoint(native_id: &str) -> ObservedEndpoint {
 fn key_of(native_id: &str) -> String {
     common::thread_group_key::source_thread_canonical_key(
         &common::thread_group_key::SourceIdentity::new(
-            "user:1",
+            1,
             "codex",
             IdentityScope::known(String::new()),
             native_id,
@@ -108,7 +108,7 @@ fn pg_concurrent_same_parent_converges_to_one_edge() {
 
         let child_key = common::thread_group_key::source_thread_canonical_key(
             &common::thread_group_key::SourceIdentity::new(
-                "user:1",
+                1,
                 "codex",
                 IdentityScope::known(String::new()),
                 "pg-cc-child",
@@ -164,7 +164,7 @@ fn pg_concurrent_distinct_parents_never_leave_two_active_parents() {
 
         let child_key = common::thread_group_key::source_thread_canonical_key(
             &common::thread_group_key::SourceIdentity::new(
-                "user:1",
+                1,
                 "codex",
                 IdentityScope::known(String::new()),
                 "pg-cd-child",
@@ -239,7 +239,7 @@ fn pg_concurrent_siblings_do_not_leave_an_empty_active_group() {
                     group_id: old_group,
                     thread_id: b_member.thread_id,
                     thread_canonical_key: b_member.thread_canonical_key.clone(),
-                    owner_scope: b_member.owner_scope,
+                    user_id: b_member.user_id,
                     source: b_member.source,
                     identity_scope: b_member.identity_scope,
                     native_id: b_member.native_id,

@@ -59,12 +59,15 @@ fn query(target: GroupSearchTarget, text: &str) -> ThreadGroupMemberSearchQuery 
 }
 
 async fn add_group(group_key: u64, thread_ids: &[i64]) -> i64 {
+    add_group_for_owner(group_key, thread_ids, 1).await
+}
+
+async fn add_group_for_owner(group_key: u64, thread_ids: &[i64], user_id: i64) -> i64 {
     let pool = setup_thread_group_pool().await;
     let groups = ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
-    let group_id = groups
-        .create_tx(pool, &new_group(group_key))
-        .await
-        .expect("group");
+    let mut group = new_group(group_key);
+    group.user_id = user_id;
+    let group_id = groups.create_tx(pool, &group).await.expect("group");
     let members = ThreadGroupMemberRepositoryImpl::new(pool);
     for thread_id in thread_ids {
         insert_thread(pool, *thread_id, Some(*thread_id)).await;
@@ -98,13 +101,13 @@ fn all_predicates_default_to_one_member_and_cross_member_is_explicit() {
         ];
 
         let same_member = read
-            .search_groups(&provider, &predicates, false, 10, None, None)
+            .search_groups(&provider, &predicates, false, 10, None, None, None)
             .await
             .expect("same-member search");
         assert!(same_member.results.is_empty());
 
         let cross_member = read
-            .search_groups(&provider, &predicates, true, 10, None, None)
+            .search_groups(&provider, &predicates, true, 10, None, None, None)
             .await
             .expect("cross-member search");
         assert_eq!(cross_member.results.len(), 1);
@@ -137,6 +140,7 @@ fn group_search_uses_max_member_score_then_latest_and_canonical_ties() {
                 10,
                 None,
                 None,
+                None,
             )
             .await
             .expect("search");
@@ -165,7 +169,7 @@ fn keyset_cursor_is_opaque_and_rejects_a_changed_snapshot() {
         let predicates = [query(GroupSearchTarget::Thread, "q")];
 
         let first = read
-            .search_groups(&provider, &predicates, false, 1, None, None)
+            .search_groups(&provider, &predicates, false, 1, None, None, None)
             .await
             .expect("first page");
         let cursor = first.next_page_token.expect("next page");
@@ -173,7 +177,7 @@ fn keyset_cursor_is_opaque_and_rejects_a_changed_snapshot() {
         assert!(!cursor.contains("group_canonical_key"));
 
         let second = read
-            .search_groups(&provider, &predicates, false, 1, Some(&cursor), None)
+            .search_groups(&provider, &predicates, false, 1, Some(&cursor), None, None)
             .await
             .expect("second page");
         assert_eq!(second.results.len(), 1);
@@ -186,10 +190,71 @@ fn keyset_cursor_is_opaque_and_rejects_a_changed_snapshot() {
             .await
             .expect("update group");
         let error = read
-            .search_groups(&provider, &predicates, false, 1, Some(&cursor), None)
+            .search_groups(&provider, &predicates, false, 1, Some(&cursor), None, None)
             .await
             .expect_err("changed snapshot must reject cursor");
         assert!(error.to_string().contains("snapshot_changed"));
+    });
+}
+
+#[test]
+fn search_owner_filter_selects_groups_and_is_bound_into_the_cursor() {
+    let _database_lock = lock_test_database();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let first = add_group_for_owner(700_040, &[700_040], 1).await;
+        let second = add_group_for_owner(700_041, &[700_041], 1).await;
+        let other_owner = add_group_for_owner(700_042, &[700_042], 2).await;
+        sqlx::query("UPDATE thread_group_member SET user_id = 2 WHERE group_id = ?")
+            .bind(first)
+            .execute(setup_thread_group_pool().await)
+            .await
+            .expect("member owner differs from its group owner");
+        let read = ThreadGroupReadService::new(setup_thread_group_pool().await);
+        let mut provider = FakeSearchProvider::default();
+        provider.scores.insert(("q".into(), 700_040), 0.9);
+        provider.scores.insert(("q".into(), 700_041), 0.8);
+        provider.scores.insert(("q".into(), 700_042), 1.0);
+        let predicates = [query(GroupSearchTarget::Thread, "q")];
+
+        let page = read
+            .search_groups(&provider, &predicates, false, 1, None, None, Some(1))
+            .await
+            .expect("owner-scoped first page");
+        assert_eq!(page.results[0].group.id, first);
+        assert_eq!(page.results[0].witnesses[0].member.thread_id, Some(700_040));
+        let cursor = page.next_page_token.expect("second owned group");
+        let next = read
+            .search_groups(
+                &provider,
+                &predicates,
+                false,
+                1,
+                Some(&cursor),
+                None,
+                Some(1),
+            )
+            .await
+            .expect("owner-scoped next page");
+        assert_eq!(next.results[0].group.id, second);
+        assert_ne!(next.results[0].group.id, other_owner);
+
+        let error = read
+            .search_groups(
+                &provider,
+                &predicates,
+                false,
+                1,
+                Some(&cursor),
+                None,
+                Some(2),
+            )
+            .await
+            .expect_err("cursor from another owner must be rejected");
+        assert!(error.to_string().contains("cursor does not match"));
     });
 }
 
@@ -230,6 +295,7 @@ fn browse_cursor_search_supports_label_only_filters() {
                 10,
                 None,
                 Some(&filter),
+                None,
             )
             .await
             .expect("browse page");

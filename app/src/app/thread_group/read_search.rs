@@ -239,11 +239,11 @@ mod snapshot_digest_tests {
             child_thread_id: Some(22),
             parent_thread_canonical_key: "parent".into(),
             child_thread_canonical_key: "child".into(),
-            parent_owner_scope: "owner".into(),
+            parent_user_id: 1,
             parent_source: Some("codex".into()),
             parent_identity_scope: None,
             parent_native_id: None,
-            child_owner_scope: "owner".into(),
+            child_user_id: 1,
             child_source: Some("codex".into()),
             child_identity_scope: None,
             child_native_id: None,
@@ -261,7 +261,7 @@ mod snapshot_digest_tests {
                 group_id: 7,
                 thread_id: Some(11),
                 thread_canonical_key: "parent".into(),
-                owner_scope: "owner".into(),
+                user_id: 1,
                 source: Some("codex".into()),
                 identity_scope: None,
                 native_id: None,
@@ -276,7 +276,7 @@ mod snapshot_digest_tests {
                 group_id: 8,
                 thread_id: Some(22),
                 thread_canonical_key: "child".into(),
-                owner_scope: "owner".into(),
+                user_id: 1,
                 source: Some("codex".into()),
                 identity_scope: None,
                 native_id: None,
@@ -331,6 +331,7 @@ mod snapshot_digest_tests {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThreadGroupView {
     pub id: i64,
+    pub user_id: i64,
     pub group_canonical_key: String,
     pub title: Option<String>,
     pub status: String,
@@ -487,13 +488,14 @@ fn group_search_query_fingerprint(
     queries: &[ThreadGroupMemberSearchQuery],
     allow_cross_member: bool,
     browse_filter: Option<&ThreadSearchFilter>,
+    owner_user_id: Option<i64>,
 ) -> String {
-    let mut encoded =
-        common::thread_group_key::canonical_serialize_v2(&[Some(if allow_cross_member {
-            "cross"
-        } else {
-            "same"
-        })]);
+    let owner_user_id = owner_user_id.map(|user_id| user_id.to_string());
+    let mut encoded = common::thread_group_key::canonical_serialize_v2(&[
+        Some("group-owner"),
+        owner_user_id.as_deref(),
+        Some(if allow_cross_member { "cross" } else { "same" }),
+    ]);
     for query in queries {
         let target = match query.target {
             GroupSearchTarget::Thread => "thread",
@@ -708,6 +710,7 @@ fn cursor_is_before(cursor: &ThreadGroupSearchCursor, result: &ThreadGroupSearch
         &ThreadGroupSearchResult {
             group: ThreadGroupView {
                 id: 0,
+                user_id: 0,
                 group_canonical_key: cursor.group_canonical_key.clone(),
                 title: None,
                 status: String::new(),
@@ -784,6 +787,7 @@ impl ThreadGroupReadService {
     /// Search current groups through one-member raw Thread / Memory queries.
     /// The returned cursor is an opaque keyset token containing the query
     /// fingerprint, sort boundary, and read-model snapshot digest.
+    #[allow(clippy::too_many_arguments)]
     pub async fn search_groups<P: ThreadGroupMemberSearchProvider>(
         &self,
         provider: &P,
@@ -792,11 +796,16 @@ impl ThreadGroupReadService {
         page_size: usize,
         page_token: Option<&str>,
         browse_filter: Option<&ThreadSearchFilter>,
+        owner_user_id: Option<i64>,
     ) -> anyhow::Result<ThreadGroupSearchPage> {
         validate_group_search_request(queries, browse_filter, page_size)?;
         let page_size = page_size.clamp(1, 100);
-        let query_fingerprint =
-            group_search_query_fingerprint(queries, allow_cross_member, browse_filter);
+        let query_fingerprint = group_search_query_fingerprint(
+            queries,
+            allow_cross_member,
+            browse_filter,
+            owner_user_id,
+        );
         let snapshot = self.search_snapshot().await?;
         let cursor = page_token
             .map(decode_group_search_cursor)
@@ -827,6 +836,9 @@ impl ThreadGroupReadService {
             .await?;
         let mut matches = Vec::new();
         for row in rows {
+            if owner_user_id.is_some_and(|user_id| row.user_id != user_id) {
+                continue;
+            }
             let members = self.members.list_current_by_group_id(row.id).await?;
             let displays = self.member_displays(&members).await?;
             let (relevance_score, witnesses) = if queries.is_empty() {
@@ -1136,6 +1148,7 @@ impl ThreadGroupReadService {
         include_inactive: bool,
         limit: Option<i64>,
         offset: Option<i64>,
+        owner_user_id: Option<i64>,
     ) -> anyhow::Result<Vec<ThreadGroupView>> {
         let statuses: &[&str] = if include_inactive {
             &[
@@ -1148,7 +1161,10 @@ impl ThreadGroupReadService {
         };
         let mut views = Vec::new();
         for status in statuses {
-            for row in self.groups.list_by_status(status, limit, offset).await? {
+            for row in self.groups.list_by_status(status, None, None).await? {
+                if owner_user_id.is_some_and(|user_id| row.user_id != user_id) {
+                    continue;
+                }
                 views.push(self.view_of(row).await?);
             }
         }
@@ -1157,16 +1173,26 @@ impl ThreadGroupReadService {
                 .cmp(&a.latest_activity_at)
                 .then_with(|| a.group_canonical_key.cmp(&b.group_canonical_key))
         });
+        let offset = offset.unwrap_or_default().max(0) as usize;
+        let views = views.into_iter().skip(offset);
+        let views = match limit {
+            Some(limit) => views.take(limit.max(0) as usize).collect(),
+            None => views.collect(),
+        };
         Ok(views)
     }
 
     pub async fn get_lineage(
         &self,
         group_id: i64,
+        owner_user_id: Option<i64>,
     ) -> anyhow::Result<Option<ThreadGroupLineageView>> {
         let Some(group) = self.groups.find_by_id(group_id).await? else {
             return Ok(None);
         };
+        if owner_user_id.is_some_and(|user_id| group.user_id != user_id) {
+            return Ok(None);
+        }
         let members = self.members.list_current_by_group_id(group_id).await?;
         let member_displays = self.member_displays(&members).await?;
         let member_keys: HashSet<&str> = members
@@ -1215,7 +1241,7 @@ impl ThreadGroupReadService {
             };
             for observation in self
                 .observations
-                .list_by_subject(&member.owner_scope, source, known, scope, native_id)
+                .list_by_subject(member.user_id, source, known, scope, native_id)
                 .await?
             {
                 if seen_observations.insert(observation.id) {
@@ -1276,11 +1302,14 @@ impl ThreadGroupReadService {
     pub async fn find_group_summary(
         &self,
         group_id: i64,
+        owner_user_id: Option<i64>,
     ) -> anyhow::Result<Option<protobuf::llm_memory::data::Memory>> {
         let Some(group) = self.groups.find_by_id(group_id).await? else {
             return Ok(None);
         };
-        if group.status != values::group_status::ACTIVE {
+        if group.status != values::group_status::ACTIVE
+            || owner_user_id.is_some_and(|user_id| group.user_id != user_id)
+        {
             return Ok(None);
         }
         self.memories
@@ -1293,20 +1322,27 @@ impl ThreadGroupReadService {
 
     /// Count saved summaries for active groups that still have at least one
     /// live member. Deleted-placeholder-only groups are intentionally absent.
-    pub async fn count_group_summaries(&self) -> anyhow::Result<i64> {
+    pub async fn count_group_summaries(&self, owner_user_id: Option<i64>) -> anyhow::Result<i64> {
         let groups = self
             .groups
             .list_by_status(values::group_status::ACTIVE, None, None)
             .await?;
         let mut count = 0;
         for group in groups {
+            if owner_user_id.is_some_and(|user_id| group.user_id != user_id) {
+                continue;
+            }
             let members = self.members.list_current_by_group_id(group.id).await?;
             if !members.iter().any(|member| {
                 member.state == values::member_state::ACTIVE && member.thread_id.is_some()
             }) {
                 continue;
             }
-            if self.find_group_summary(group.id).await?.is_some() {
+            if self
+                .find_group_summary(group.id, owner_user_id)
+                .await?
+                .is_some()
+            {
                 count += 1;
             }
         }
@@ -1362,6 +1398,7 @@ impl ThreadGroupReadService {
         let snapshot_entries = self.snapshot_entries(&members).await?;
         Ok(ThreadGroupView {
             id: row.id,
+            user_id: row.user_id,
             group_canonical_key: row.group_canonical_key,
             title: row.title,
             status: row.status,

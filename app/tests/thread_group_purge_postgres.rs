@@ -28,6 +28,7 @@ fn postgres_purge_waits_for_group_writes_and_deletes_owned_memory_atomically() -
             .create_tx(
                 pool,
                 &NewThreadGroup {
+                    user_id: 1,
                     group_canonical_key: format!("{:064x}", now),
                     title: None,
                     status: "split".into(),

@@ -66,6 +66,28 @@ impl Cli {
             }
         }
     }
+
+    pub fn validate_group_owner_user_id(&self, source_user_id: i64) -> Result<i64, clap::Error> {
+        match self.global.group_owner_user_id {
+            Some(user_id) if user_id > 0 => Ok(user_id),
+            Some(_) => {
+                use clap::CommandFactory;
+                Err(Self::command().error(
+                    clap::error::ErrorKind::ValueValidation,
+                    "--group-owner-user-id must be greater than zero",
+                ))
+            }
+            None if source_user_id > 0 => Ok(source_user_id),
+            None if self.requires_user_id() => {
+                use clap::CommandFactory;
+                Err(Self::command().error(
+                    clap::error::ErrorKind::ValueValidation,
+                    "--user-id must be greater than zero when used as the default group owner",
+                ))
+            }
+            None => Ok(0),
+        }
+    }
 }
 
 /// Global options shared by every subcommand. All entries use
@@ -80,6 +102,11 @@ pub struct GlobalArgs {
     /// exit code and help-on-error match other clap arguments.
     #[arg(short = 'u', long, global = true)]
     pub user_id: Option<i64>,
+
+    /// Owner ID for groups created by imported observations. Defaults to
+    /// `--user-id`, while remaining independent when explicitly supplied.
+    #[arg(long, global = true, value_name = "USER_ID")]
+    pub group_owner_user_id: Option<i64>,
 
     /// Only import entries after this timestamp (ISO 8601)
     #[arg(short = 's', long, global = true)]
@@ -907,6 +934,36 @@ mod tests {
             }
             other => panic!("expected ClaudeCode, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn group_owner_is_an_independent_import_option() {
+        let cli = parse(&[
+            "--user-id",
+            "1",
+            "--group-owner-user-id",
+            "7",
+            "claude-code",
+            "--all-projects",
+        ])
+        .unwrap();
+        assert_eq!(cli.global.user_id, Some(1));
+        assert_eq!(cli.global.group_owner_user_id, Some(7));
+        assert_eq!(cli.validate_group_owner_user_id(1).unwrap(), 7);
+
+        let legacy = parse(&["-u", "1", "claude-code", "--all-projects"]).unwrap();
+        assert_eq!(legacy.validate_group_owner_user_id(1).unwrap(), 1);
+
+        let invalid = parse(&[
+            "-u",
+            "1",
+            "--group-owner-user-id",
+            "0",
+            "claude-code",
+            "--all-projects",
+        ])
+        .unwrap();
+        assert!(invalid.validate_group_owner_user_id(1).is_err());
     }
 
     #[test]

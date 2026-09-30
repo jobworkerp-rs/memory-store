@@ -451,12 +451,12 @@ pub trait ThreadApp:
             let now = command_utils::util::datetime::now_millis();
             let canonical_keys =
                 ThreadCanonicalKeyRepositoryImpl::new(self.thread_repository().static_pool());
-            let owner_scope = format!("user:{}", to_insert.user_id.map(|u| u.value).unwrap_or(0));
+            let user_id = to_insert.user_id.map(|u| u.value).unwrap_or(0);
             canonical_keys
                 .assign_tx(
                     &mut *tx,
                     id.value,
-                    &owner_scope,
+                    user_id,
                     &new_manual_thread_canonical_key(),
                     values::canonical_key_origin::CREATION_UUID,
                     now,
@@ -2431,11 +2431,16 @@ impl ThreadApp for ThreadAppImpl {
         // in the same section. An unreadable identity scope skips the
         // gate (no marker can exist for it).
         let marker_key = source_identity.as_ref().and_then(|identity| identity.key());
+        let mut marker_canonical_key: Option<String> = None;
+        let mut consume_deletion_marker = false;
         if let Some(key) = &marker_key {
             let lock_repo = ThreadGroupLockRepositoryImpl::new(pool);
             lock_repo.lock_source_identity_tx(&mut *tx, key).await?;
             let marker_repo = ThreadDeletionMarkerRepositoryImpl::new(pool);
             let marker = marker_repo.find_tx(&mut *tx, key).await?;
+            marker_canonical_key = marker
+                .as_ref()
+                .and_then(|row| row.thread_canonical_key.clone());
             // The emergency write gate cannot consume a marker or revive
             // a placeholder, so a marked identity fails closed rather
             // than writing content it cannot reconcile.
@@ -2463,7 +2468,7 @@ impl ThreadApp for ThreadAppImpl {
             // A permitted re-import consumes the marker whether it was a
             // revivable (forbid=false) marker or an explicit override.
             if marker.is_some() && decision != SuppressionDecision::Suppress {
-                marker_repo.consume_tx(&mut *tx, key).await?;
+                consume_deletion_marker = true;
             }
         }
         if marker_key.is_some() && crate::app::thread_group::thread_group_writes_enabled() {
@@ -2482,7 +2487,21 @@ impl ThreadApp for ThreadAppImpl {
             .await?;
         }
 
-        let (thread_id, thread_created, _target_user_id, target_memory_kind) = match thread_target {
+        let resolved_identity_thread_id = if crate::app::thread_group::thread_group_writes_enabled()
+        {
+            if let Some(identity_key) = marker_key.as_ref() {
+                SourceThreadIdentityRepositoryImpl::new(pool)
+                    .find_resolved_tx(&mut *tx, identity_key)
+                    .await?
+                    .map(|mapping| mapping.thread_id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let (thread_id, thread_created, target_user_id, target_memory_kind) = match thread_target {
             BatchThreadTarget::ExistingThreadId(tid) => {
                 let row = self
                     .thread_repository()
@@ -2491,6 +2510,14 @@ impl ThreadApp for ThreadAppImpl {
                     .ok_or_else(|| {
                         LlmMemoryError::NotFound(format!("thread not found: {}", tid.value))
                     })?;
+                if let Some(mapped_thread_id) = resolved_identity_thread_id
+                    && mapped_thread_id != tid.value
+                {
+                    anyhow::bail!(
+                        "source identity already maps to Thread {mapped_thread_id}; refusing target Thread {}",
+                        tid.value
+                    );
+                }
                 (tid, false, row.user_id, row.memory_kind.unwrap_or(0))
             }
             BatchThreadTarget::UpsertByChannel(thread_data) => {
@@ -2542,6 +2569,11 @@ impl ThreadApp for ThreadAppImpl {
                     .await?;
                 match existing.len() {
                     0 => {
+                        if let Some(mapped_thread_id) = resolved_identity_thread_id {
+                            anyhow::bail!(
+                                "source identity already maps to Thread {mapped_thread_id}; refusing to create a new channel target Thread"
+                            );
+                        }
                         // Create a new thread inside the same transaction.
                         // `default_system_memory_id` was rejected above, so
                         // the new row has no default and the junction starts
@@ -2561,6 +2593,14 @@ impl ThreadApp for ThreadAppImpl {
                                 "thread row missing id after channel lookup".to_string(),
                             )
                         })?;
+                        if let Some(mapped_thread_id) = resolved_identity_thread_id
+                            && mapped_thread_id != tid.value
+                        {
+                            anyhow::bail!(
+                                "source identity already maps to Thread {mapped_thread_id}; refusing channel target Thread {}",
+                                tid.value
+                            );
+                        }
                         // Lock the row for update so subsequent inserts
                         // observe a stable target.
                         //
@@ -2577,12 +2617,7 @@ impl ThreadApp for ThreadAppImpl {
                             .ok_or_else(|| {
                                 LlmMemoryError::NotFound(format!("thread not found: {}", tid.value))
                             })?;
-                        let creator_user_id = existing_thread
-                            .data
-                            .as_ref()
-                            .and_then(|d| d.user_id)
-                            .map(|u| u.value)
-                            .unwrap_or(user_id.value);
+                        let creator_user_id = locked.user_id;
                         let effective_stored_kind = super::memory_kind::resolve_preserved_kind(
                             thread_data.memory_kind,
                             locked.memory_kind.unwrap_or(0),
@@ -2601,6 +2636,41 @@ impl ThreadApp for ThreadAppImpl {
             }
         };
 
+        if let Some(identity) = source_identity.as_ref()
+            && identity.user_id != target_user_id
+        {
+            tx.rollback().await.map_err(LlmMemoryError::DBError)?;
+            return Err(LlmMemoryError::InvalidArgument(format!(
+                "source identity owner {} does not match target thread owner {target_user_id}",
+                identity.user_id
+            ))
+            .into());
+        }
+
+        // A channel-selected Thread is not allowed to silently replace the
+        // already resolved owner-local source identity. Likewise, a deletion
+        // marker's retained canonical key is stable identity history and may
+        // not be rebound to a different key on the selected target. Check
+        // both before consuming the marker or writing imported content.
+        if crate::app::thread_group::thread_group_writes_enabled()
+            && marker_key.is_some()
+            && let Some(marker_key) = marker_canonical_key.as_deref()
+            && let Some(target_key) = ThreadCanonicalKeyRepositoryImpl::new(pool)
+                .find_by_thread_id_tx(&mut *tx, thread_id.value)
+                .await?
+            && target_key.key != marker_key
+        {
+            anyhow::bail!(
+                "deletion marker canonical key does not match the selected target Thread canonical key"
+            );
+        }
+
+        if consume_deletion_marker && let Some(key) = &marker_key {
+            ThreadDeletionMarkerRepositoryImpl::new(pool)
+                .consume_tx(&mut *tx, key)
+                .await?;
+        }
+
         // ----- Phase 1 (cont.): revival + resolved mapping. A permitted
         // re-import attaches the freshly resolved thread to the current
         // deleted placeholder and records the owner-local mapping, all in
@@ -2612,8 +2682,32 @@ impl ThreadApp for ThreadAppImpl {
         {
             let member_repo = ThreadGroupMemberRepositoryImpl::new(pool);
             let source_repo = SourceThreadIdentityRepositoryImpl::new(pool);
+            let canonical_keys = ThreadCanonicalKeyRepositoryImpl::new(pool);
             let now = now_millis();
-            if let Some(canonical_key) = identity.canonical_key() {
+            let assigned_key = canonical_keys
+                .find_by_thread_id_tx(&mut *tx, thread_id.value)
+                .await?
+                .map(|row| row.key);
+            let canonical_key = assigned_key
+                .or(marker_canonical_key)
+                .or_else(|| identity.canonical_key());
+            if let Some(canonical_key) = canonical_key {
+                if canonical_keys
+                    .find_by_thread_id_tx(&mut *tx, thread_id.value)
+                    .await?
+                    .is_none()
+                {
+                    canonical_keys
+                        .assign_tx(
+                            &mut *tx,
+                            thread_id.value,
+                            identity.user_id,
+                            &canonical_key,
+                            values::canonical_key_origin::SOURCE_IDENTITY,
+                            now,
+                        )
+                        .await?;
+                }
                 member_repo
                     .revive_current_tx(&mut *tx, &canonical_key, thread_id.value, now)
                     .await?;
@@ -3080,14 +3174,14 @@ impl ThreadAppImpl {
         // a concurrent import cannot slip an identity or membership
         // change between the pre-read and the mutation.
         let mut canonical_key_locks: Vec<String> = Vec::new();
-        let mut initial_identity_tuples: Vec<(String, String, String, String)> = Vec::new();
+        let mut initial_identity_tuples: Vec<(i64, String, String, String)> = Vec::new();
         for &thread_id in &targets {
             if let Some(key) = canonical_keys.find_by_thread_id(thread_id).await? {
                 canonical_key_locks.push(key.key);
             }
             for identity in source_repo.list_by_thread_id(thread_id).await? {
                 initial_identity_tuples.push((
-                    identity.owner_scope,
+                    identity.user_id,
                     identity.source,
                     identity.identity_scope,
                     identity.native_id,
@@ -3110,18 +3204,18 @@ impl ThreadAppImpl {
         // Lock the pre-read identities, then re-read in-transaction and
         // lock any identity that appeared between the pre-read and the
         // lock (bounded; a stable set converges in one extra pass).
-        let mut locked_identities: HashSet<(String, String, String, String)> = HashSet::new();
+        let mut locked_identities: HashSet<(i64, String, String, String)> = HashSet::new();
         let mut pending = initial_identity_tuples;
         for _ in 0..3 {
             if pending.is_empty() {
                 break;
             }
-            for (owner_scope, source, identity_scope, native_id) in &pending {
+            for (user_id, source, identity_scope, native_id) in &pending {
                 locks
                     .lock_source_identity_tx(
                         &mut *tx,
                         &SourceIdentityKey {
-                            owner_scope,
+                            user_id: *user_id,
                             source,
                             identity_scope,
                             native_id,
@@ -3129,7 +3223,7 @@ impl ThreadAppImpl {
                     )
                     .await?;
                 locked_identities.insert((
-                    owner_scope.clone(),
+                    *user_id,
                     source.clone(),
                     identity_scope.clone(),
                     native_id.clone(),
@@ -3142,7 +3236,7 @@ impl ThreadAppImpl {
                     .await?
                 {
                     let tuple = (
-                        identity.owner_scope,
+                        identity.user_id,
                         identity.source,
                         identity.identity_scope,
                         identity.native_id,
@@ -3197,7 +3291,7 @@ impl ThreadAppImpl {
             if let Some(identities) = identities_by_thread.get(&thread_id) {
                 for identity in identities {
                     let key = SourceIdentityKey {
-                        owner_scope: &identity.owner_scope,
+                        user_id: identity.user_id,
                         source: &identity.source,
                         identity_scope: &identity.identity_scope,
                         native_id: &identity.native_id,
@@ -3212,6 +3306,7 @@ impl ThreadAppImpl {
                                 actor_id: actor_id.to_string(),
                                 reason: Some(reason.to_string()),
                                 deleted_at: now,
+                                thread_canonical_key: keys_by_thread.get(&thread_id).cloned(),
                             },
                         )
                         .await?;
@@ -7375,7 +7470,7 @@ mod test {
             let pool = infra::infra::thread_group::test_support::setup_thread_group_pool().await;
             let app = build_app(pool);
             let identity = SourceIdentityInput {
-                owner_scope: "user:1".to_string(),
+                user_id: 1,
                 source: "codex".to_string(),
                 identity_scope: IdentityScope::known(String::new()),
                 native_id: "suppress-native-1".to_string(),
@@ -7406,7 +7501,7 @@ mod test {
 
             let marker_repo = ThreadDeletionMarkerRepositoryImpl::new(pool);
             let key = SourceIdentityKey {
-                owner_scope: "user:1",
+                user_id: 1,
                 source: "codex",
                 identity_scope: "",
                 native_id: "suppress-native-1",
@@ -7421,6 +7516,7 @@ mod test {
                         actor_id: "operator".to_string(),
                         reason: Some("privacy".to_string()),
                         deleted_at: 2_000,
+                        thread_canonical_key: None,
                     },
                 )
                 .await?;
@@ -7443,6 +7539,299 @@ mod test {
 
     #[cfg(not(feature = "postgres"))]
     #[test]
+    fn run_test_batch_rejects_source_identity_with_a_different_thread_owner() -> Result<()> {
+        use common::thread_group_key::IdentityScope;
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = infra::infra::thread_group::test_support::setup_thread_group_pool().await;
+            let app = build_app(pool);
+            let error = app
+                .add_memories_batch(AddMemoriesBatchInput {
+                    thread_target: BatchThreadTarget::UpsertByChannel(Box::new(ThreadData {
+                        user_id: Some(UserId { value: 1 }),
+                        channel: Some("import:test:owner-mismatch".to_string()),
+                        memory_kind: MemoryKind::Raw as i32,
+                        ..Default::default()
+                    })),
+                    memories: vec![batch_memory_input(
+                        "eid-owner-mismatch",
+                        2,
+                        "must roll back",
+                        1_000,
+                        vec![],
+                    )],
+                    upsert_by_external_id: true,
+                    labels: vec![],
+                    source_identity: Some(SourceIdentityInput {
+                        user_id: 2,
+                        source: "codex".to_string(),
+                        identity_scope: IdentityScope::known(""),
+                        native_id: "owner-mismatch".to_string(),
+                    }),
+                    explicit_override: false,
+                })
+                .await
+                .expect_err("a source identity cannot assign ownership to another user's thread");
+
+            assert!(error.to_string().contains("source identity owner"));
+            let thread_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM thread WHERE channel = 'import:test:owner-mismatch'",
+            )
+            .fetch_one(pool)
+            .await?;
+            let memory_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM memory WHERE external_id = ?")
+                    .bind("eid-owner-mismatch")
+                    .fetch_one(pool)
+                    .await?;
+            let identity_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM source_thread_identity WHERE native_id = ?",
+            )
+            .bind("owner-mismatch")
+            .fetch_one(pool)
+            .await?;
+            let key_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM thread_canonical_key WHERE owner_scope = 'user:2'",
+            )
+            .fetch_one(pool)
+            .await?;
+            assert_eq!(thread_count, 0, "the new thread must roll back");
+            assert_eq!(memory_count, 0, "the memory write must roll back");
+            assert_eq!(
+                identity_count, 0,
+                "the identity mapping must not be written"
+            );
+            assert_eq!(key_count, 0, "the canonical key must not be assigned");
+
+            let existing_thread_id = 71_402;
+            infra::infra::thread_group::test_support::insert_thread(pool, existing_thread_id, None)
+                .await;
+            let existing_error = app
+                .add_memories_batch(AddMemoriesBatchInput {
+                    thread_target: BatchThreadTarget::ExistingThreadId(ThreadId {
+                        value: existing_thread_id,
+                    }),
+                    memories: vec![batch_memory_input(
+                        "eid-owner-mismatch-existing",
+                        2,
+                        "must roll back",
+                        1_001,
+                        vec![],
+                    )],
+                    upsert_by_external_id: true,
+                    labels: vec![],
+                    source_identity: Some(SourceIdentityInput {
+                        user_id: 2,
+                        source: "codex".to_string(),
+                        identity_scope: IdentityScope::known(""),
+                        native_id: "owner-mismatch-existing".to_string(),
+                    }),
+                    explicit_override: false,
+                })
+                .await
+                .expect_err("the persisted Thread owner is authoritative");
+            assert!(existing_error.to_string().contains("source identity owner"));
+            let existing_memory_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM memory WHERE external_id = ?")
+                    .bind("eid-owner-mismatch-existing")
+                    .fetch_one(pool)
+                    .await?;
+            let existing_identity_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM source_thread_identity WHERE native_id = ?",
+            )
+            .bind("owner-mismatch-existing")
+            .fetch_one(pool)
+            .await?;
+            assert_eq!(existing_memory_count, 0);
+            assert_eq!(existing_identity_count, 0);
+            Ok(())
+        })
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn run_test_batch_rejects_source_mapping_that_conflicts_with_channel_target() -> Result<()> {
+        use common::thread_group_key::IdentityScope;
+        use infra::infra::thread_group::source_identity::SourceThreadIdentityRepositoryImpl;
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = infra::infra::thread_group::test_support::setup_thread_group_pool().await;
+            let app = build_app(pool);
+            let identity = SourceIdentityInput {
+                user_id: 1,
+                source: "codex".into(),
+                identity_scope: IdentityScope::known(String::new()),
+                native_id: "channel-target-conflict".into(),
+            };
+            let mut initial = channel_upsert_input(
+                1,
+                "import:test:identity-original-target",
+                vec![batch_memory_input(
+                    "eid-identity-original-target",
+                    1,
+                    "original target",
+                    1_000,
+                    vec![],
+                )],
+                true,
+            );
+            initial.source_identity = Some(identity.clone());
+            let original = app.add_memories_batch(initial).await?;
+            let original_thread_id = original.thread_id.value;
+
+            let mut conflicting = channel_upsert_input(
+                1,
+                "import:test:identity-conflicting-target",
+                vec![batch_memory_input(
+                    "eid-identity-conflicting-target",
+                    1,
+                    "must roll back",
+                    1_001,
+                    vec![],
+                )],
+                true,
+            );
+            conflicting.source_identity = Some(identity.clone());
+            let error = app
+                .add_memories_batch(conflicting)
+                .await
+                .expect_err("a channel target must not rebind a persisted identity");
+            assert!(error.to_string().contains("already maps to Thread"));
+
+            let identity_key = SourceIdentityKey {
+                user_id: 1,
+                source: "codex",
+                identity_scope: "",
+                native_id: "channel-target-conflict",
+            };
+            let mapping = SourceThreadIdentityRepositoryImpl::new(pool)
+                .find_resolved(&identity_key)
+                .await?
+                .context("original identity mapping survives rollback")?;
+            assert_eq!(mapping.thread_id, original_thread_id);
+            let target_thread_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM thread WHERE channel = 'import:test:identity-conflicting-target'",
+            )
+            .fetch_one(pool)
+            .await?;
+            assert_eq!(target_thread_count, 0, "conflicting import must not create its channel target");
+            let imported_memory_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM memory WHERE external_id = 'eid-identity-conflicting-target'",
+            )
+            .fetch_one(pool)
+            .await?;
+            assert_eq!(imported_memory_count, 0);
+            Ok(())
+        })
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn run_test_batch_rejects_deletion_marker_key_mismatch_without_consuming_marker() -> Result<()>
+    {
+        use common::thread_group_key::IdentityScope;
+        use infra::infra::thread_group::canonical_key::{
+            ThreadCanonicalKeyRepository, ThreadCanonicalKeyRepositoryImpl,
+        };
+        use infra::infra::thread_group::deletion_marker::{
+            ThreadDeletionMarkerRepository, ThreadDeletionMarkerRepositoryImpl,
+        };
+        use infra::infra::thread_group::rows::SourceIdentityKey;
+        use infra::infra::thread_group::test_support::key;
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = infra::infra::thread_group::test_support::setup_thread_group_pool().await;
+            let app = build_app(pool);
+            let target_thread = app
+                .create_thread(&ThreadData {
+                    user_id: Some(UserId { value: 1 }),
+                    channel: Some("import:test:marker-key-target".into()),
+                    memory_kind: MemoryKind::Raw as i32,
+                    ..Default::default()
+                })
+                .await?;
+            let canonical_keys = ThreadCanonicalKeyRepositoryImpl::new(pool);
+            let saved_target_key = canonical_keys
+                .find_by_thread_id(target_thread.value)
+                .await?
+                .context("target thread key")?
+                .key;
+            let marker_key = key(99_300_001);
+            assert_ne!(saved_target_key, marker_key);
+            let identity_key = SourceIdentityKey {
+                user_id: 1,
+                source: "codex",
+                identity_scope: "",
+                native_id: "marker-key-target",
+            };
+            let markers = ThreadDeletionMarkerRepositoryImpl::new(pool);
+            markers
+                .put_tx(
+                    pool,
+                    &NewThreadDeletionMarker {
+                        identity: identity_key,
+                        forbid_reimport: false,
+                        recursive: false,
+                        actor_id: "operator".into(),
+                        reason: Some("retained identity key".into()),
+                        deleted_at: 2_000,
+                        thread_canonical_key: Some(marker_key.clone()),
+                    },
+                )
+                .await?;
+
+            let mut input = channel_upsert_input(
+                1,
+                "import:test:marker-key-target",
+                vec![batch_memory_input(
+                    "eid-marker-key-mismatch",
+                    1,
+                    "must roll back",
+                    1_001,
+                    vec![],
+                )],
+                true,
+            );
+            input.source_identity = Some(SourceIdentityInput {
+                user_id: 1,
+                source: "codex".into(),
+                identity_scope: IdentityScope::known(String::new()),
+                native_id: "marker-key-target".into(),
+            });
+            let error = app
+                .add_memories_batch(input)
+                .await
+                .expect_err("a deletion marker cannot be rebound to a different saved key");
+            assert!(error.to_string().contains("deletion marker canonical key"));
+
+            let marker = markers
+                .find(&identity_key)
+                .await?
+                .context("marker survives rollback")?;
+            assert_eq!(
+                marker.thread_canonical_key.as_deref(),
+                Some(marker_key.as_str())
+            );
+            assert_eq!(
+                canonical_keys
+                    .find_by_thread_id(target_thread.value)
+                    .await?
+                    .unwrap()
+                    .key,
+                saved_target_key
+            );
+            let memory_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM memory WHERE external_id = 'eid-marker-key-mismatch'",
+            )
+            .fetch_one(pool)
+            .await?;
+            assert_eq!(memory_count, 0);
+            Ok(())
+        })
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
     fn run_test_delete_with_policy_placeholder_marker_and_revival() -> Result<()> {
         use crate::app::thread_group::{ObservedEndpoint, ThreadGroupReconciliationService};
         use common::thread_group_key::IdentityScope;
@@ -7451,10 +7840,14 @@ mod test {
             let pool = infra::infra::thread_group::test_support::setup_thread_group_pool().await;
             let app = build_app(pool);
             let identity = SourceIdentityInput {
-                owner_scope: "user:1".to_string(),
+                user_id: 1,
                 source: "codex".to_string(),
                 identity_scope: IdentityScope::known(String::new()),
                 native_id: "del-native".to_string(),
+            };
+            let alias = SourceIdentityInput {
+                native_id: "del-native-alias".to_string(),
+                ..identity.clone()
             };
             let batch = |explicit_override: bool| AddMemoriesBatchInput {
                 thread_target: BatchThreadTarget::UpsertByChannel(Box::new(ThreadData {
@@ -7469,13 +7862,28 @@ mod test {
                 source_identity: Some(identity.clone()),
                 explicit_override,
             };
+            let alias_batch = |explicit_override: bool| AddMemoriesBatchInput {
+                thread_target: BatchThreadTarget::UpsertByChannel(Box::new(ThreadData {
+                    user_id: Some(UserId { value: 1 }),
+                    channel: Some("import:test:del".to_string()),
+                    memory_kind: MemoryKind::Raw as i32,
+                    ..Default::default()
+                })),
+                memories: vec![batch_memory_input("eid-del-alias", 1, "hi", 1_000, vec![])],
+                upsert_by_external_id: true,
+                labels: vec![],
+                source_identity: Some(alias.clone()),
+                explicit_override,
+            };
 
             let first = app.add_memories_batch(batch(false)).await?;
             let thread_id = first.thread_id.value;
+            let alias_import = app.add_memories_batch(alias_batch(false)).await?;
+            assert_eq!(alias_import.thread_id.value, thread_id);
             let subject = ObservedEndpoint {
                 source: "codex".to_string(),
                 identity_scope: IdentityScope::known(String::new()),
-                owner_scope: "user:1".to_string(),
+                user_id: 1,
                 native_id: "del-native".to_string(),
             };
             ThreadGroupReconciliationService::new(pool)
@@ -7514,7 +7922,9 @@ mod test {
             assert!(app.add_memories_batch(batch(false)).await?.suppressed);
 
             // Explicit override revives the placeholder and consumes the marker.
-            let revived = app.add_memories_batch(batch(true)).await?;
+            let alias_marker_key = alias.key().expect("known alias identity");
+            assert!(marker_repo.find(&alias_marker_key).await?.is_some());
+            let revived = app.add_memories_batch(alias_batch(true)).await?;
             assert!(!revived.suppressed);
             let revived_member = member_repo
                 .find_current_by_thread_canonical_key(&key)
@@ -7525,7 +7935,16 @@ mod test {
                 infra::infra::thread_group::rows::values::member_state::ACTIVE
             );
             assert!(revived_member.thread_id.is_some());
-            assert!(marker_repo.find(&marker_key).await?.is_none());
+            assert_eq!(
+                marker_repo
+                    .find(&marker_key)
+                    .await?
+                    .expect("the untouched original identity marker")
+                    .thread_canonical_key
+                    .as_deref(),
+                Some(key.as_str())
+            );
+            assert!(marker_repo.find(&alias_marker_key).await?.is_none());
             Ok(())
         })
     }
@@ -7542,7 +7961,7 @@ mod test {
             let pool = infra::infra::thread_group::test_support::setup_thread_group_pool().await;
             let app = build_app(pool);
             let identity = |native: &str| SourceIdentityInput {
-                owner_scope: "user:1".to_string(),
+                user_id: 1,
                 source: "codex".to_string(),
                 identity_scope: IdentityScope::known(String::new()),
                 native_id: native.to_string(),
@@ -7550,7 +7969,7 @@ mod test {
             let endpoint = |native: &str| ObservedEndpoint {
                 source: "codex".to_string(),
                 identity_scope: IdentityScope::known(String::new()),
-                owner_scope: "user:1".to_string(),
+                user_id: 1,
                 native_id: native.to_string(),
             };
             let observation = |child: &str, parent: &str| ObservationInput {
@@ -7671,11 +8090,11 @@ mod test {
             let endpoint = |native: &str| ObservedEndpoint {
                 source: "codex".to_string(),
                 identity_scope: IdentityScope::known(String::new()),
-                owner_scope: "user:1".to_string(),
+                user_id: 1,
                 native_id: native.to_string(),
             };
             let identity = |native: &str| SourceIdentityInput {
-                owner_scope: "user:1".to_string(),
+                user_id: 1,
                 source: "codex".to_string(),
                 identity_scope: IdentityScope::known(String::new()),
                 native_id: native.to_string(),
@@ -7791,11 +8210,11 @@ mod test {
             let endpoint = |native: &str| ObservedEndpoint {
                 source: "codex".to_string(),
                 identity_scope: IdentityScope::known(String::new()),
-                owner_scope: "user:1".to_string(),
+                user_id: 1,
                 native_id: native.to_string(),
             };
             let identity = |native: &str| SourceIdentityInput {
-                owner_scope: "user:1".to_string(),
+                user_id: 1,
                 source: "codex".to_string(),
                 identity_scope: IdentityScope::known(String::new()),
                 native_id: native.to_string(),
@@ -7908,23 +8327,23 @@ mod test {
                 .await?
                 .expect("manual key assigned at creation");
             assert_eq!(row.origin, values::canonical_key_origin::CREATION_UUID);
-            assert_eq!(row.owner_scope, "user:1");
+            assert_eq!(row.user_id, 1);
             assert_eq!(row.key.len(), 64);
 
             // `ensure_thread_canonical_key` is stable and generates only
             // when missing (a legacy thread row inserted without a key).
             let reconcile = crate::app::thread_group::ThreadGroupReconciliationService::new(pool);
             let first = reconcile
-                .ensure_thread_canonical_key(thread_id.value, "user:1", 1_000)
+                .ensure_thread_canonical_key(thread_id.value, 1, 1_000)
                 .await?;
             assert_eq!(first, row.key);
             infra::infra::thread_group::test_support::insert_thread(pool, 31_001, None).await;
             let generated = reconcile
-                .ensure_thread_canonical_key(31_001, "user:1", 1_000)
+                .ensure_thread_canonical_key(31_001, 1, 1_000)
                 .await?;
             assert_eq!(generated.len(), 64);
             let again = reconcile
-                .ensure_thread_canonical_key(31_001, "user:1", 1_001)
+                .ensure_thread_canonical_key(31_001, 1, 1_001)
                 .await?;
             assert_eq!(generated, again, "key must be stable after generation");
             Ok(())
@@ -7950,7 +8369,7 @@ mod test {
                 let native = format!("race-native-{iteration}");
                 let channel = format!("race:chan:{iteration}");
                 let identity = SourceIdentityInput {
-                    owner_scope: "user:1".to_string(),
+                    user_id: 1,
                     source: "codex".to_string(),
                     identity_scope: IdentityScope::known(String::new()),
                     native_id: native.clone(),
@@ -7979,7 +8398,7 @@ mod test {
                         &ObservedEndpoint {
                             source: "codex".to_string(),
                             identity_scope: IdentityScope::known(String::new()),
-                            owner_scope: "user:1".to_string(),
+                            user_id: 1,
                             native_id: native.clone(),
                         },
                         &[],

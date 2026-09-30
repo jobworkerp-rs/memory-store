@@ -27,29 +27,25 @@ fn canonical_v2_distinguishes_null_empty_separator_and_normalizes_nfc() {
 #[test]
 fn source_thread_key_is_owner_local_and_requires_known_scope() {
     let identity = SourceIdentity::new(
-        "user:1",
+        1,
         "claude_code",
         IdentityScope::known("project-é"),
         "session-1",
     );
     let same_normalized = SourceIdentity::new(
-        "user:1",
+        1,
         "claude_code",
         IdentityScope::known("project-e\u{301}"),
         "session-1",
     );
     let other_owner = SourceIdentity::new(
-        "user:2",
+        2,
         "claude_code",
         IdentityScope::known("project-é"),
         "session-1",
     );
-    let unknown_scope = SourceIdentity::new(
-        "user:1",
-        "claude_code",
-        IdentityScope::unknown(),
-        "session-1",
-    );
+    let unknown_scope =
+        SourceIdentity::new(1, "claude_code", IdentityScope::unknown(), "session-1");
 
     assert_eq!(
         source_thread_canonical_key(&identity),
@@ -84,11 +80,10 @@ fn group_keys_are_stable_and_split_partition_order_is_irrelevant() {
 
 #[test]
 fn evidence_fingerprint_preserves_unknown_scope_and_parent_presence() {
-    let subject = SourceIdentity::new("user:1", "codex", IdentityScope::known(""), "child");
-    let unknown_parent = SourceIdentity::new("user:1", "codex", IdentityScope::unknown(), "parent");
-    let known_empty_parent =
-        SourceIdentity::new("user:1", "codex", IdentityScope::known(""), "parent");
-    let unknown_subject = SourceIdentity::new("user:1", "codex", IdentityScope::unknown(), "child");
+    let subject = SourceIdentity::new(1, "codex", IdentityScope::known(""), "child");
+    let unknown_parent = SourceIdentity::new(1, "codex", IdentityScope::unknown(), "parent");
+    let known_empty_parent = SourceIdentity::new(1, "codex", IdentityScope::known(""), "parent");
+    let unknown_subject = SourceIdentity::new(1, "codex", IdentityScope::unknown(), "child");
 
     assert_ne!(
         evidence_fingerprint(

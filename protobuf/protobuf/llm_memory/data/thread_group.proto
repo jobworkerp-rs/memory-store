@@ -10,6 +10,7 @@ package llm_memory.data;
 
 message ThreadGroupId {
     int64 value = 1;
+    optional int64 user_id = 2;
 }
 
 // A Memory can be related to a group without being owned by that group.
@@ -148,6 +149,7 @@ message ThreadGroup {
     int64 deleted_member_count = 12;
     int64 unresolved_count = 13;
     string membership_snapshot_digest = 14;
+    optional int64 user_id = 15;
 }
 
 message ThreadGroupMember {
@@ -163,6 +165,7 @@ message ThreadGroupMember {
     ThreadGroupingAuthority provenance = 10;
     optional int64 deleted_at = 11;
     optional ThreadGroupThreadDisplay display = 12;
+    optional int64 user_id = 13;
 }
 
 message ThreadRelation {
@@ -183,6 +186,8 @@ message ThreadRelation {
     optional int64 child_group_id = 13;
     optional ThreadGroupThreadDisplay parent_display = 14;
     optional ThreadGroupThreadDisplay child_display = 15;
+    optional int64 parent_user_id = 16;
+    optional int64 child_user_id = 17;
 }
 
 message ThreadObservation {
@@ -206,6 +211,8 @@ message ThreadObservation {
     string adapter_version = 18;
     string source_record_ref = 19;
     int64 observed_at = 20;
+    optional int64 subject_user_id = 21;
+    optional int64 candidate_parent_user_id = 22;
 }
 
 message ThreadGroupCandidateAssociation {
@@ -220,6 +227,7 @@ message ThreadGroupCandidateAssociation {
     optional int64 candidate_parent_thread_id = 9;
     ThreadCandidateState state = 10;
     optional int64 selected_observation_id = 11;
+    optional int64 subject_user_id = 12;
 }
 
 // Owner-local source identity endpoint as produced by the adapter. The
@@ -230,6 +238,7 @@ message ThreadGroupEndpoint {
     string identity_scope = 3;
     string owner_scope = 4;
     string native_id = 5;
+    optional int64 user_id = 6;
 }
 
 message ThreadGroupObservationInput {
@@ -252,12 +261,14 @@ message ManualCollection {
     string title = 3;
     int64 created_at = 4;
     int64 updated_at = 5;
+    optional int64 user_id = 6;
 }
 
 message ManualCollectionMember {
     int64 collection_id = 1;
     int64 thread_id = 2;
     string owner_scope = 3;
+    optional int64 user_id = 4;
 }
 
 // Lineage read model: current memberships (active + deleted placeholder)

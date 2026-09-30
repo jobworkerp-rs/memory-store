@@ -6,6 +6,7 @@ edition = "2024"
 
 [dependencies]
 
+common = { path = "../common" }
 protobuf = { path = "../protobuf" }
 command-utils = { path = "../modules/command-utils" }
 infra-utils = { path = "../modules/infra-utils" }

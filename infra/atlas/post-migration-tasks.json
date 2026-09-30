@@ -5,7 +5,10 @@
       "generation": 1,
       "description": "thread の会話時刻を補完し、既存 ThreadVector row の時刻 scalar を同期する",
       "canonical_definition": {
-        "backends": ["postgres", "sqlite"],
+        "backends": [
+          "postgres",
+          "sqlite"
+        ],
         "checkpoint_format": "thread-message-times-v1@1/checkpoint-v1",
         "completion_required_by_schema_version": "20260803000003",
         "dependencies": [],
@@ -16,7 +19,10 @@
         "state_contract": "rdb-keyset-and-vector-staging-v1"
       },
       "canonical_definition_digest": "d2fe9980cf1048115967a8ab019a53c4422b284f3a8cf185ce2c55988506ed1d",
-      "backends": ["postgres", "sqlite"],
+      "backends": [
+        "postgres",
+        "sqlite"
+      ],
       "introduced_by_schema_version": "20260803000003",
       "completion_required_by_schema_version": "20260803000003",
       "dependencies": [],
@@ -29,7 +35,10 @@
       "generation": 1,
       "description": "既存 Thread に不変な canonical key を割り当てる: resolved mapping から source-backed key を決定的に導出し、manual / non-source Thread には安定対応表へ一度だけ割り当てる",
       "canonical_definition": {
-        "backends": ["postgres", "sqlite"],
+        "backends": [
+          "postgres",
+          "sqlite"
+        ],
         "checkpoint_format": "thread-groups-canonical-keys-v1@1/checkpoint-v1",
         "completion_required_by_schema_version": "20260920000001",
         "dependencies": [],
@@ -40,12 +49,113 @@
         "state_contract": "rdb-canonical-keyset-v1"
       },
       "canonical_definition_digest": "a4ce2f4dd2cffbd303f6393fcdfa567ba87111f0e9d99ab3207e160bd1e36bf2",
-      "backends": ["postgres", "sqlite"],
+      "backends": [
+        "postgres",
+        "sqlite"
+      ],
       "introduced_by_schema_version": "20260920000001",
       "completion_required_by_schema_version": "20260920000001",
       "dependencies": [],
       "maintenance_window_required": true,
       "implementation": "thread_groups_canonical_keys_v1::ThreadGroupsCanonicalKeysV1Task",
+      "lifecycle": "retired"
+    },
+    {
+      "id": "thread-groups-user-ids-v1",
+      "generation": 1,
+      "description": "ThreadGroup の旧 owner_scope を検証し、対応する typed user_id を一度だけ backfill する",
+      "canonical_definition": {
+        "backends": [
+          "postgres",
+          "sqlite"
+        ],
+        "checkpoint_format": "thread-groups-user-ids-v1@1/atomic",
+        "completion_required_by_schema_version": "20260930000001",
+        "dependencies": [
+          "thread-groups-canonical-keys-v1@1"
+        ],
+        "id": "thread-groups-user-ids-v1",
+        "implementation": "thread_groups_user_ids_v1::ThreadGroupsUserIdsV1Task",
+        "introduced_by_schema_version": "20260930000001",
+        "maintenance_window_required": true,
+        "state_contract": "rdb-typed-owner-backfill-v1"
+      },
+      "canonical_definition_digest": "87f3dfc9787f04ae0c50de5d9b322e68439fd666762597f9f7b81b3424d78947",
+      "backends": [
+        "postgres",
+        "sqlite"
+      ],
+      "introduced_by_schema_version": "20260930000001",
+      "completion_required_by_schema_version": "20260930000001",
+      "dependencies": [
+        "thread-groups-canonical-keys-v1@1"
+      ],
+      "maintenance_window_required": true,
+      "implementation": "thread_groups_user_ids_v1::ThreadGroupsUserIdsV1Task",
+      "lifecycle": "retired"
+    },
+    {
+      "id": "thread-groups-canonical-keys-v1",
+      "generation": 2,
+      "description": "既存 canonical key を不変の正本として検証し、未割当 Thread は一意 identity の場合だけ導出、多重 identity は一度だけ opaque key を割り当てる",
+      "canonical_definition": {
+        "backends": [
+          "postgres",
+          "sqlite"
+        ],
+        "checkpoint_format": "thread-groups-canonical-keys-v1@2/checkpoint-v2",
+        "completion_required_by_schema_version": "20260930000001",
+        "dependencies": [],
+        "id": "thread-groups-canonical-keys-v1",
+        "implementation": "thread_groups_canonical_keys_v2::ThreadGroupsCanonicalKeysV2Task",
+        "introduced_by_schema_version": "20260930000001",
+        "maintenance_window_required": true,
+        "state_contract": "rdb-canonical-keyset-v2-preserve-saved-key"
+      },
+      "canonical_definition_digest": "ad2a56fbae48549f6a7af61182b4358eb1e3ece4fb12f4b1da1d0904044312b2",
+      "backends": [
+        "postgres",
+        "sqlite"
+      ],
+      "introduced_by_schema_version": "20260930000001",
+      "completion_required_by_schema_version": "20260930000001",
+      "dependencies": [],
+      "maintenance_window_required": true,
+      "implementation": "thread_groups_canonical_keys_v2::ThreadGroupsCanonicalKeysV2Task",
+      "lifecycle": "active"
+    },
+    {
+      "id": "thread-groups-user-ids-v1",
+      "generation": 2,
+      "description": "ThreadGroup の owner scope と参照 Thread owner の整合を検証し、typed user_id を再開可能に backfill する",
+      "canonical_definition": {
+        "backends": [
+          "postgres",
+          "sqlite"
+        ],
+        "checkpoint_format": "thread-groups-user-ids-v1@2/atomic",
+        "completion_required_by_schema_version": "20260930000001",
+        "dependencies": [
+          "thread-groups-canonical-keys-v1@2"
+        ],
+        "id": "thread-groups-user-ids-v1",
+        "implementation": "thread_groups_user_ids_v2::ThreadGroupsUserIdsV2Task",
+        "introduced_by_schema_version": "20260930000001",
+        "maintenance_window_required": true,
+        "state_contract": "rdb-typed-owner-backfill-v2-thread-owner-preflight"
+      },
+      "canonical_definition_digest": "10e7708f257570259affdae26080118164c9cb6980c2ba0f0c3f6bd119df353b",
+      "backends": [
+        "postgres",
+        "sqlite"
+      ],
+      "introduced_by_schema_version": "20260930000001",
+      "completion_required_by_schema_version": "20260930000001",
+      "dependencies": [
+        "thread-groups-canonical-keys-v1@2"
+      ],
+      "maintenance_window_required": true,
+      "implementation": "thread_groups_user_ids_v2::ThreadGroupsUserIdsV2Task",
       "lifecycle": "active"
     }
   ]

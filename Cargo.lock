@@ -4245,6 +4245,7 @@ dependencies = [
  "base64",
  "bytes",
  "command-utils 0.1.0",
+ "common",
  "datafusion-common",
  "datafusion-expr",
  "envy",

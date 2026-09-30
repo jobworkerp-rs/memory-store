@@ -146,7 +146,7 @@ pub mod values {
 /// for lookup / delete / lock calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceIdentityKey<'a> {
-    pub owner_scope: &'a str,
+    pub user_id: i64,
     pub source: &'a str,
     pub identity_scope: &'a str,
     pub native_id: &'a str,
@@ -155,6 +155,7 @@ pub struct SourceIdentityKey<'a> {
 #[derive(sqlx::FromRow, Debug, Clone)]
 pub struct ThreadGroupRow {
     pub id: i64,
+    pub user_id: i64,
     pub group_canonical_key: String,
     pub title: Option<String>,
     pub status: String,
@@ -169,6 +170,7 @@ pub struct ThreadGroupRow {
 /// now).
 #[derive(Debug, Clone)]
 pub struct NewThreadGroup {
+    pub user_id: i64,
     pub group_canonical_key: String,
     pub title: Option<String>,
     pub status: String,
@@ -183,7 +185,7 @@ pub struct ThreadGroupMemberRow {
     pub group_id: i64,
     pub thread_id: Option<i64>,
     pub thread_canonical_key: String,
-    pub owner_scope: String,
+    pub user_id: i64,
     pub source: Option<String>,
     pub identity_scope: Option<String>,
     pub native_id: Option<String>,
@@ -205,7 +207,7 @@ pub struct NewThreadGroupMember {
     pub group_id: i64,
     pub thread_id: Option<i64>,
     pub thread_canonical_key: String,
-    pub owner_scope: String,
+    pub user_id: i64,
     pub source: Option<String>,
     pub identity_scope: Option<String>,
     pub native_id: Option<String>,
@@ -224,11 +226,11 @@ pub struct ThreadRelationRow {
     pub child_thread_id: Option<i64>,
     pub parent_thread_canonical_key: String,
     pub child_thread_canonical_key: String,
-    pub parent_owner_scope: String,
+    pub parent_user_id: i64,
     pub parent_source: Option<String>,
     pub parent_identity_scope: Option<String>,
     pub parent_native_id: Option<String>,
-    pub child_owner_scope: String,
+    pub child_user_id: i64,
     pub child_source: Option<String>,
     pub child_identity_scope: Option<String>,
     pub child_native_id: Option<String>,
@@ -252,11 +254,11 @@ pub struct NewThreadRelation {
     pub child_thread_id: Option<i64>,
     pub parent_thread_canonical_key: String,
     pub child_thread_canonical_key: String,
-    pub parent_owner_scope: String,
+    pub parent_user_id: i64,
     pub parent_source: Option<String>,
     pub parent_identity_scope: Option<String>,
     pub parent_native_id: Option<String>,
-    pub child_owner_scope: String,
+    pub child_user_id: i64,
     pub child_source: Option<String>,
     pub child_identity_scope: Option<String>,
     pub child_native_id: Option<String>,
@@ -276,13 +278,13 @@ pub struct ThreadObservationRow {
     pub subject_source: String,
     pub subject_identity_scope_known: bool,
     pub subject_identity_scope_value: String,
-    pub subject_owner_scope: String,
+    pub subject_user_id: i64,
     pub subject_native_id: String,
     pub candidate_parent_present: bool,
     pub candidate_parent_source: String,
     pub candidate_parent_identity_scope_known: bool,
     pub candidate_parent_identity_scope_value: String,
-    pub candidate_parent_owner_scope: String,
+    pub candidate_parent_user_id: Option<i64>,
     pub candidate_parent_native_id: String,
     pub relation_kind: Option<String>,
     pub origin: String,
@@ -307,13 +309,13 @@ pub struct NewThreadObservation {
     pub subject_source: String,
     pub subject_identity_scope_known: bool,
     pub subject_identity_scope_value: String,
-    pub subject_owner_scope: String,
+    pub subject_user_id: i64,
     pub subject_native_id: String,
     pub candidate_parent_present: bool,
     pub candidate_parent_source: String,
     pub candidate_parent_identity_scope_known: bool,
     pub candidate_parent_identity_scope_value: String,
-    pub candidate_parent_owner_scope: String,
+    pub candidate_parent_user_id: Option<i64>,
     pub candidate_parent_native_id: String,
     pub relation_kind: Option<String>,
     pub origin: String,
@@ -338,13 +340,13 @@ pub struct ObservationIdentity<'a> {
     pub subject_source: &'a str,
     pub subject_identity_scope_known: bool,
     pub subject_identity_scope_value: &'a str,
-    pub subject_owner_scope: &'a str,
+    pub subject_user_id: i64,
     pub subject_native_id: &'a str,
     pub candidate_parent_present: bool,
     pub candidate_parent_source: &'a str,
     pub candidate_parent_identity_scope_known: bool,
     pub candidate_parent_identity_scope_value: &'a str,
-    pub candidate_parent_owner_scope: &'a str,
+    pub candidate_parent_user_id: Option<i64>,
     pub candidate_parent_native_id: &'a str,
     pub evidence_kind: &'a str,
     pub evidence_fingerprint: &'a str,
@@ -357,7 +359,7 @@ pub struct ThreadGroupCandidateAssociationRow {
     pub subject_source: String,
     pub subject_identity_scope_known: bool,
     pub subject_identity_scope_value: String,
-    pub subject_owner_scope: String,
+    pub subject_user_id: i64,
     pub subject_native_id: String,
     pub candidate_group_id: Option<i64>,
     pub candidate_parent_thread_id: Option<i64>,
@@ -373,7 +375,7 @@ pub struct NewThreadGroupCandidateAssociation {
     pub subject_source: String,
     pub subject_identity_scope_known: bool,
     pub subject_identity_scope_value: String,
-    pub subject_owner_scope: String,
+    pub subject_user_id: i64,
     pub subject_native_id: String,
     pub candidate_group_id: Option<i64>,
     pub candidate_parent_thread_id: Option<i64>,
@@ -385,7 +387,7 @@ pub struct NewThreadGroupCandidateAssociation {
 
 #[derive(sqlx::FromRow, Debug, Clone)]
 pub struct SourceThreadIdentityRow {
-    pub owner_scope: String,
+    pub user_id: i64,
     pub source: String,
     pub identity_scope: String,
     pub native_id: String,
@@ -398,7 +400,7 @@ pub struct SourceThreadIdentityRow {
 #[derive(sqlx::FromRow, Debug, Clone)]
 pub struct ThreadCanonicalKeyRow {
     pub thread_id: i64,
-    pub owner_scope: String,
+    pub user_id: i64,
     pub key: String,
     pub origin: String,
     pub assigned_at: i64,
@@ -406,7 +408,7 @@ pub struct ThreadCanonicalKeyRow {
 
 #[derive(sqlx::FromRow, Debug, Clone)]
 pub struct ThreadDeletionMarkerRow {
-    pub owner_scope: String,
+    pub user_id: i64,
     pub source: String,
     pub identity_scope: String,
     pub native_id: String,
@@ -415,6 +417,7 @@ pub struct ThreadDeletionMarkerRow {
     pub actor_id: String,
     pub reason: Option<String>,
     pub deleted_at: i64,
+    pub thread_canonical_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -425,12 +428,13 @@ pub struct NewThreadDeletionMarker<'a> {
     pub actor_id: String,
     pub reason: Option<String>,
     pub deleted_at: i64,
+    pub thread_canonical_key: Option<String>,
 }
 
 #[derive(sqlx::FromRow, Debug, Clone)]
 pub struct OperatorDecisionRow {
     pub id: i64,
-    pub owner_scope: String,
+    pub user_id: i64,
     pub candidate_association_id: i64,
     pub actor_id: String,
     pub decision: String,
@@ -442,7 +446,7 @@ pub struct OperatorDecisionRow {
 
 #[derive(Debug, Clone)]
 pub struct NewOperatorDecision {
-    pub owner_scope: String,
+    pub user_id: i64,
     pub candidate_association_id: i64,
     pub actor_id: String,
     pub decision: String,
@@ -455,7 +459,7 @@ pub struct NewOperatorDecision {
 #[derive(sqlx::FromRow, Debug, Clone)]
 pub struct ManualCollectionRow {
     pub id: i64,
-    pub owner_scope: String,
+    pub user_id: i64,
     pub title: String,
     pub created_at: i64,
     pub updated_at: i64,
@@ -463,7 +467,7 @@ pub struct ManualCollectionRow {
 
 #[derive(Debug, Clone)]
 pub struct NewManualCollection {
-    pub owner_scope: String,
+    pub user_id: i64,
     pub title: String,
     pub created_at: i64,
     pub updated_at: i64,
@@ -473,7 +477,7 @@ pub struct NewManualCollection {
 pub struct ManualCollectionMemberRow {
     pub collection_id: i64,
     pub thread_id: i64,
-    pub owner_scope: String,
+    pub user_id: i64,
 }
 
 #[derive(sqlx::FromRow, Debug, Clone)]
@@ -484,7 +488,7 @@ pub struct ThreadGroupEventOutboxRow {
     pub policy_version: String,
     pub source: Option<String>,
     pub identity_scope: Option<String>,
-    pub owner_scope: Option<String>,
+    pub user_id: Option<i64>,
     pub native_id_ref: Option<String>,
     pub group_id: Option<i64>,
     pub thread_id: Option<i64>,
@@ -508,7 +512,7 @@ pub struct NewThreadGroupEvent {
     pub policy_version: String,
     pub source: Option<String>,
     pub identity_scope: Option<String>,
-    pub owner_scope: Option<String>,
+    pub user_id: Option<i64>,
     pub native_id_ref: Option<String>,
     pub group_id: Option<i64>,
     pub thread_id: Option<i64>,
@@ -588,26 +592,26 @@ macro_rules! define_columns {
 
 define_columns!(
     THREAD_GROUP_COLUMNS,
-    "id, group_canonical_key, title, status, grouping_authority, redirect_to_group_id, created_at, updated_at",
-    "id, group_canonical_key, title, status, grouping_authority, redirect_to_group_id, created_at, updated_at"
+    "id, user_id, group_canonical_key, title, status, grouping_authority, redirect_to_group_id, created_at, updated_at",
+    "id, user_id, group_canonical_key, title, status, grouping_authority, redirect_to_group_id, created_at, updated_at"
 );
 
 define_columns!(
     THREAD_GROUP_MEMBER_COLUMNS,
-    "group_id, thread_id, thread_canonical_key, owner_scope, source, identity_scope, native_id, role, state, provenance, deleted_at, created_at, updated_at",
-    "group_id, thread_id, thread_canonical_key, owner_scope, source, identity_scope, native_id, role, state, provenance, deleted_at, created_at, updated_at"
+    "group_id, thread_id, thread_canonical_key, user_id, source, identity_scope, native_id, role, state, provenance, deleted_at, created_at, updated_at",
+    "group_id, thread_id, thread_canonical_key, user_id, source, identity_scope, native_id, role, state, provenance, deleted_at, created_at, updated_at"
 );
 
 define_columns!(
     THREAD_RELATION_COLUMNS,
     "id, parent_thread_id, child_thread_id, parent_thread_canonical_key, child_thread_canonical_key, \
-     parent_owner_scope, parent_source, parent_identity_scope, parent_native_id, \
-     child_owner_scope, child_source, child_identity_scope, child_native_id, \
+     parent_user_id, parent_source, parent_identity_scope, parent_native_id, \
+     child_user_id, child_source, child_identity_scope, child_native_id, \
      relation_type, state, selection_basis, source_confidence, \
      selected_observation_id, selected_operator_decision_id, created_at, updated_at",
     "id, parent_thread_id, child_thread_id, parent_thread_canonical_key, child_thread_canonical_key, \
-     parent_owner_scope, parent_source, parent_identity_scope, parent_native_id, \
-     child_owner_scope, child_source, child_identity_scope, child_native_id, \
+     parent_user_id, parent_source, parent_identity_scope, parent_native_id, \
+     child_user_id, child_source, child_identity_scope, child_native_id, \
      relation_type, state, selection_basis, source_confidence, \
      selected_observation_id, selected_operator_decision_id, created_at, updated_at"
 );
@@ -615,18 +619,18 @@ define_columns!(
 define_columns!(
     THREAD_OBSERVATION_COLUMNS,
     "id, subject_source, subject_identity_scope_known, subject_identity_scope_value, \
-     subject_owner_scope, subject_native_id, \
+     subject_user_id, subject_native_id, \
      candidate_parent_present, candidate_parent_source, \
      candidate_parent_identity_scope_known, candidate_parent_identity_scope_value, \
-     candidate_parent_owner_scope, candidate_parent_native_id, \
+     candidate_parent_user_id, candidate_parent_native_id, \
      relation_kind, origin, evidence_kind, polarity, source_confidence, \
      evidence_fingerprint, source_record_ref, state, import_run_id, \
      observed_at, created_at, updated_at",
     "id, subject_source, subject_identity_scope_known, subject_identity_scope_value, \
-     subject_owner_scope, subject_native_id, \
+     subject_user_id, subject_native_id, \
      candidate_parent_present, candidate_parent_source, \
      candidate_parent_identity_scope_known, candidate_parent_identity_scope_value, \
-     candidate_parent_owner_scope, candidate_parent_native_id, \
+     candidate_parent_user_id, candidate_parent_native_id, \
      relation_kind, origin, evidence_kind, polarity, source_confidence, \
      evidence_fingerprint, source_record_ref, state, import_run_id, \
      observed_at, created_at, updated_at"
@@ -635,55 +639,55 @@ define_columns!(
 define_columns!(
     CANDIDATE_ASSOCIATION_COLUMNS,
     "id, subject_thread_id, subject_source, subject_identity_scope_known, subject_identity_scope_value, \
-     subject_owner_scope, subject_native_id, candidate_group_id, candidate_parent_thread_id, \
+     subject_user_id, subject_native_id, candidate_group_id, candidate_parent_thread_id, \
      state, selected_observation_id, created_at, updated_at",
     "id, subject_thread_id, subject_source, subject_identity_scope_known, subject_identity_scope_value, \
-     subject_owner_scope, subject_native_id, candidate_group_id, candidate_parent_thread_id, \
+     subject_user_id, subject_native_id, candidate_group_id, candidate_parent_thread_id, \
      state, selected_observation_id, created_at, updated_at"
 );
 
 define_columns!(
     SOURCE_THREAD_IDENTITY_COLUMNS,
-    "owner_scope, source, identity_scope, native_id, thread_id, resolution_state, first_seen_at, last_seen_at",
-    "owner_scope, source, identity_scope, native_id, thread_id, resolution_state, first_seen_at, last_seen_at"
+    "user_id, source, identity_scope, native_id, thread_id, resolution_state, first_seen_at, last_seen_at",
+    "user_id, source, identity_scope, native_id, thread_id, resolution_state, first_seen_at, last_seen_at"
 );
 
 define_columns!(
     THREAD_CANONICAL_KEY_COLUMNS,
-    "thread_id, owner_scope, key, origin, assigned_at",
-    "thread_id, owner_scope, key, origin, assigned_at"
+    "thread_id, user_id, key, origin, assigned_at",
+    "thread_id, user_id, key, origin, assigned_at"
 );
 
 define_columns!(
     THREAD_DELETION_MARKER_COLUMNS,
-    "owner_scope, source, identity_scope, native_id, forbid_reimport, recursive, actor_id, reason, deleted_at",
-    "owner_scope, source, identity_scope, native_id, forbid_reimport, recursive, actor_id, reason, deleted_at"
+    "user_id, source, identity_scope, native_id, forbid_reimport, recursive, actor_id, reason, deleted_at, thread_canonical_key",
+    "user_id, source, identity_scope, native_id, forbid_reimport, recursive, actor_id, reason, deleted_at, thread_canonical_key"
 );
 
 define_columns!(
     OPERATOR_DECISION_COLUMNS,
-    "id, owner_scope, candidate_association_id, actor_id, decision, reason, input_evidence_fingerprint, policy_version, created_at",
-    "id, owner_scope, candidate_association_id, actor_id, decision, reason, input_evidence_fingerprint, policy_version, created_at"
+    "id, user_id, candidate_association_id, actor_id, decision, reason, input_evidence_fingerprint, policy_version, created_at",
+    "id, user_id, candidate_association_id, actor_id, decision, reason, input_evidence_fingerprint, policy_version, created_at"
 );
 
 define_columns!(
     MANUAL_COLLECTION_COLUMNS,
-    "id, owner_scope, title, created_at, updated_at",
-    "id, owner_scope, title, created_at, updated_at"
+    "id, user_id, title, created_at, updated_at",
+    "id, user_id, title, created_at, updated_at"
 );
 
 define_columns!(
     MANUAL_COLLECTION_MEMBER_COLUMNS,
-    "collection_id, thread_id, owner_scope",
-    "collection_id, thread_id, owner_scope"
+    "collection_id, thread_id, user_id",
+    "collection_id, thread_id, user_id"
 );
 
 define_columns!(
     EVENT_OUTBOX_COLUMNS,
-    "event_id, event_type, operation_id, policy_version, source, identity_scope, owner_scope, native_id_ref, \
+    "event_id, event_type, operation_id, policy_version, source, identity_scope, user_id, native_id_ref, \
      group_id, thread_id, source_confidence, selection_basis, operator_decision_id, polarity, \
      payload::text AS payload, created_at",
-    "event_id, event_type, operation_id, policy_version, source, identity_scope, owner_scope, native_id_ref, \
+    "event_id, event_type, operation_id, policy_version, source, identity_scope, user_id, native_id_ref, \
      group_id, thread_id, source_confidence, selection_basis, operator_decision_id, polarity, \
      payload, created_at"
 );

@@ -23,7 +23,7 @@ use sqlx::Executor;
 const INSERT_SQL: &str = concat!(
     "INSERT INTO thread_group_candidate_association \
      (id, subject_thread_id, subject_source, subject_identity_scope_known, \
-      subject_identity_scope_value, subject_owner_scope, subject_native_id, \
+      subject_identity_scope_value, subject_user_id, subject_owner_scope, subject_native_id, \
       candidate_group_id, candidate_parent_thread_id, state, selected_observation_id, \
       created_at, updated_at) \
      VALUES (",
@@ -52,6 +52,8 @@ const INSERT_SQL: &str = concat!(
     p!(12),
     ",",
     p!(13),
+    ",",
+    p!(14),
     ")"
 );
 
@@ -74,7 +76,7 @@ const LIST_BY_SUBJECT_SQL: &str = concat!(
     "SELECT ",
     CANDIDATE_ASSOCIATION_COLUMNS!(),
     " FROM thread_group_candidate_association WHERE \
-      subject_owner_scope = ",
+      subject_user_id = ",
     p!(1),
     " AND subject_source = ",
     p!(2),
@@ -128,7 +130,7 @@ const RECONNECT_SUBJECT_THREAD_SQL: &str = concat!(
     p!(1),
     ", updated_at = ",
     p!(2),
-    " WHERE subject_owner_scope = ",
+    " WHERE subject_user_id = ",
     p!(3),
     " AND subject_source = ",
     p!(4),
@@ -140,7 +142,7 @@ const RECONNECT_SUBJECT_THREAD_SQL: &str = concat!(
 );
 
 pub struct CandidateSubjectIdentity<'a> {
-    pub owner_scope: &'a str,
+    pub user_id: i64,
     pub source: &'a str,
     pub identity_scope_value: &'a str,
     pub native_id: &'a str,
@@ -164,7 +166,10 @@ pub trait ThreadGroupCandidateAssociationRepository:
             .bind(&association.subject_source)
             .bind(association.subject_identity_scope_known)
             .bind(&association.subject_identity_scope_value)
-            .bind(&association.subject_owner_scope)
+            .bind(association.subject_user_id)
+            .bind(common::thread_group_key::legacy_owner_scope(
+                association.subject_user_id,
+            ))
             .bind(&association.subject_native_id)
             .bind(association.candidate_group_id)
             .bind(association.candidate_parent_thread_id)
@@ -240,7 +245,7 @@ pub trait ThreadGroupCandidateAssociationRepository:
     async fn list_by_subject_identity_tx<'c, E: Executor<'c, Database = Rdb>>(
         &self,
         tx: E,
-        subject_owner_scope: &str,
+        subject_user_id: i64,
         subject_source: &str,
         subject_identity_scope_known: bool,
         subject_identity_scope_value: &str,
@@ -248,7 +253,7 @@ pub trait ThreadGroupCandidateAssociationRepository:
     ) -> Result<Vec<ThreadGroupCandidateAssociationRow>> {
         Ok(
             sqlx::query_as::<Rdb, ThreadGroupCandidateAssociationRow>(LIST_BY_SUBJECT_SQL)
-                .bind(subject_owner_scope)
+                .bind(subject_user_id)
                 .bind(subject_source)
                 .bind(subject_identity_scope_known)
                 .bind(subject_identity_scope_value)
@@ -261,7 +266,7 @@ pub trait ThreadGroupCandidateAssociationRepository:
 
     async fn list_by_subject_identity(
         &self,
-        subject_owner_scope: &str,
+        subject_user_id: i64,
         subject_source: &str,
         subject_identity_scope_known: bool,
         subject_identity_scope_value: &str,
@@ -269,7 +274,7 @@ pub trait ThreadGroupCandidateAssociationRepository:
     ) -> Result<Vec<ThreadGroupCandidateAssociationRow>> {
         Ok(
             sqlx::query_as::<Rdb, ThreadGroupCandidateAssociationRow>(LIST_BY_SUBJECT_SQL)
-                .bind(subject_owner_scope)
+                .bind(subject_user_id)
                 .bind(subject_source)
                 .bind(subject_identity_scope_known)
                 .bind(subject_identity_scope_value)
@@ -357,7 +362,7 @@ pub trait ThreadGroupCandidateAssociationRepository:
         let res = sqlx::query::<Rdb>(RECONNECT_SUBJECT_THREAD_SQL)
             .bind(thread_id)
             .bind(updated_at)
-            .bind(subject.owner_scope)
+            .bind(subject.user_id)
             .bind(subject.source)
             .bind(subject.identity_scope_value)
             .bind(subject.native_id)
@@ -414,7 +419,7 @@ mod tests {
         // Subject listing is the idempotency inspection point (no
         // storage-level UNIQUE on this table by design).
         let listed = repo
-            .list_by_subject_identity("user:1", "codex", true, "", "subject-1")
+            .list_by_subject_identity(1, "codex", true, "", "subject-1")
             .await?;
         assert_eq!(listed.len(), 1);
 
@@ -449,7 +454,7 @@ mod tests {
             repo.reconnect_subject_thread_tx(
                 &mut *tx,
                 CandidateSubjectIdentity {
-                    owner_scope: "user:1",
+                    user_id: 1,
                     source: "codex",
                     identity_scope_value: "",
                     native_id: "subject-1",
