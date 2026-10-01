@@ -156,6 +156,41 @@
       ],
       "maintenance_window_required": true,
       "implementation": "thread_groups_user_ids_v2::ThreadGroupsUserIdsV2Task",
+      "lifecycle": "retired"
+    },
+    {
+      "id": "thread-groups-user-ids-v1",
+      "generation": 3,
+      "description": "保存済み Thread canonical key と証明可能な active membership / live relation key の不整合を安全判定し、typed user_id と一体で原子的に補修する",
+      "canonical_definition": {
+        "backends": [
+          "postgres",
+          "sqlite"
+        ],
+        "checkpoint_format": "thread-groups-user-ids-v1@3/atomic",
+        "completion_required_by_schema_version": "20260930000001",
+        "dependencies": [
+          "thread-groups-canonical-keys-v1@2"
+        ],
+        "id": "thread-groups-user-ids-v1",
+        "implementation": "thread_groups_user_ids_v3::ThreadGroupsUserIdsV3Task",
+        "introduced_by_schema_version": "20260930000001",
+        "maintenance_window_required": true,
+        "repair_contract": "saved-thread-canonical-key-only-live-reference-repair-v1",
+        "state_contract": "rdb-typed-owner-backfill-and-alias-repair-atomic-v3"
+      },
+      "canonical_definition_digest": "837a23d4ad769d59947eb9362e463e7455bf71bfac9c5c1fd166b6a4c41a2a78",
+      "backends": [
+        "postgres",
+        "sqlite"
+      ],
+      "introduced_by_schema_version": "20260930000001",
+      "completion_required_by_schema_version": "20260930000001",
+      "dependencies": [
+        "thread-groups-canonical-keys-v1@2"
+      ],
+      "maintenance_window_required": true,
+      "implementation": "thread_groups_user_ids_v3::ThreadGroupsUserIdsV3Task",
       "lifecycle": "active"
     }
   ]

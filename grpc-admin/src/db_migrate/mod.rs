@@ -12,6 +12,7 @@ pub mod catalog;
 pub mod state;
 pub mod thread_groups_canonical_keys_v1;
 pub mod thread_groups_user_ids_v1;
+pub mod thread_groups_user_ids_v3;
 pub mod thread_message_times_v1;
 
 /// Fixed-registry contract for a release-bound post-schema migration task.
@@ -39,6 +40,7 @@ pub fn has_registered_implementation(implementation: &str) -> bool {
             | "thread_groups_canonical_keys_v2::ThreadGroupsCanonicalKeysV2Task"
             | "thread_groups_user_ids_v1::ThreadGroupsUserIdsV1Task"
             | "thread_groups_user_ids_v2::ThreadGroupsUserIdsV2Task"
+            | "thread_groups_user_ids_v3::ThreadGroupsUserIdsV3Task"
     )
 }
 
@@ -63,6 +65,9 @@ pub fn task_from_catalog(
         )),
         "thread_groups_user_ids_v2::ThreadGroupsUserIdsV2Task" => Ok(Box::new(
             thread_groups_user_ids_v1::ThreadGroupsUserIdsV2Task::new(pool, entry)?,
+        )),
+        "thread_groups_user_ids_v3::ThreadGroupsUserIdsV3Task" => Ok(Box::new(
+            thread_groups_user_ids_v3::ThreadGroupsUserIdsV3Task::new(pool, entry)?,
         )),
         _ => unreachable!("TaskCatalogEntry::validate rejects unregistered implementations"),
     }

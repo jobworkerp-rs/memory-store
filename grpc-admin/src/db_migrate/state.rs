@@ -156,6 +156,17 @@ pub async fn load(pool: &RdbPool, task_identity: &str) -> Result<Option<TaskStat
         .context("loading data migration task state")
 }
 
+pub async fn load_tx(
+    tx: &mut RdbTransaction<'_>,
+    task_identity: &str,
+) -> Result<Option<TaskStateRow>> {
+    sqlx::query_as(LOAD_SQL)
+        .bind(task_identity)
+        .fetch_optional(&mut **tx)
+        .await
+        .context("loading data migration task state inside transaction")
+}
+
 pub async fn claim(
     pool: &RdbPool,
     task_identity: &str,
@@ -169,16 +180,45 @@ pub async fn claim(
         bail!("task lease duration must be positive");
     }
     let mut tx = pool.begin().await.context("begin task lease transaction")?;
+    let lease = claim_tx(
+        &mut tx,
+        task_identity,
+        digest,
+        execution_id,
+        holder_id,
+        now,
+        lease_duration_ms,
+    )
+    .await?;
+    tx.commit().await.context("commit task lease")?;
+    Ok(lease)
+}
+
+/// Claim a task while keeping its fencing transition in the caller's
+/// transaction. Atomic migration tasks commit this row together with their
+/// data changes, or roll both back on any rejection or error.
+pub async fn claim_tx(
+    tx: &mut RdbTransaction<'_>,
+    task_identity: &str,
+    digest: &str,
+    execution_id: &str,
+    holder_id: &str,
+    now: i64,
+    lease_duration_ms: i64,
+) -> Result<TaskLease> {
+    if lease_duration_ms <= 0 {
+        bail!("task lease duration must be positive");
+    }
     sqlx::query(INSERT_IF_ABSENT_SQL)
         .bind(task_identity)
         .bind(digest)
         .bind(now)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .context("creating data migration task state")?;
     let current: TaskStateRow = sqlx::query_as(LOAD_FOR_UPDATE_SQL)
         .bind(task_identity)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await
         .context("locking data migration task state")?;
     if current.canonical_definition_digest != digest {
@@ -220,12 +260,11 @@ pub async fn claim(
             .bind(task_identity)
             .bind(digest)
             .bind(current.fencing_token);
-        query.execute(&mut *tx).await?.rows_affected()
+        query.execute(&mut **tx).await?.rows_affected()
     };
     if changed != 1 {
         bail!("task lease was lost before it could be claimed");
     }
-    tx.commit().await.context("commit task lease")?;
     Ok(TaskLease {
         task_identity: task_identity.to_owned(),
         canonical_definition_digest: digest.to_owned(),
@@ -360,6 +399,27 @@ pub async fn complete(pool: &RdbPool, lease: &TaskLease, now: i64) -> Result<()>
     Ok(())
 }
 
+/// Complete a claimed task in the same transaction as its data changes.
+pub async fn complete_tx(tx: &mut RdbTransaction<'_>, lease: &TaskLease, now: i64) -> Result<()> {
+    #[cfg(feature = "postgres")]
+    let query = sqlx::query(COMPLETE_SQL)
+        .bind(now)
+        .bind(&lease.task_identity)
+        .bind(&lease.canonical_definition_digest)
+        .bind(lease.fencing_token);
+    #[cfg(not(feature = "postgres"))]
+    let query = sqlx::query(COMPLETE_SQL)
+        .bind(now)
+        .bind(now)
+        .bind(&lease.task_identity)
+        .bind(&lease.canonical_definition_digest)
+        .bind(lease.fencing_token);
+    if query.execute(&mut **tx).await?.rows_affected() != 1 {
+        bail!("task completion lost its lease");
+    }
+    Ok(())
+}
+
 pub async fn fail(pool: &RdbPool, lease: &TaskLease, classification: &str, now: i64) -> Result<()> {
     #[cfg(feature = "postgres")]
     let query = sqlx::query(FAIL_SQL)
@@ -381,11 +441,42 @@ pub async fn fail(pool: &RdbPool, lease: &TaskLease, classification: &str, now: 
     Ok(())
 }
 
+/// Persist a failure classification under the caller's transaction and
+/// fencing token. Atomic task implementations can roll it back with their
+/// attempted migration writes.
+pub async fn fail_tx(
+    tx: &mut RdbTransaction<'_>,
+    lease: &TaskLease,
+    classification: &str,
+    now: i64,
+) -> Result<()> {
+    #[cfg(feature = "postgres")]
+    let query = sqlx::query(FAIL_SQL)
+        .bind(classification)
+        .bind(now)
+        .bind(&lease.task_identity)
+        .bind(&lease.canonical_definition_digest)
+        .bind(lease.fencing_token);
+    #[cfg(not(feature = "postgres"))]
+    let query = sqlx::query(FAIL_SQL)
+        .bind(classification)
+        .bind(now)
+        .bind(&lease.task_identity)
+        .bind(&lease.canonical_definition_digest)
+        .bind(lease.fencing_token);
+    if query.execute(&mut **tx).await?.rows_affected() != 1 {
+        bail!("task failure write lost its lease");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{TaskCheckpointEnvelope, TaskStateKind, TaskStateRow};
     #[cfg(not(feature = "postgres"))]
-    use super::{claim, complete, load, renew_lease, renew_lease_tx};
+    use super::{
+        claim, claim_tx, complete, complete_tx, fail_tx, load, renew_lease, renew_lease_tx,
+    };
 
     #[cfg(not(feature = "postgres"))]
     async fn test_pool() -> infra_utils::infra::rdb::RdbPool {
@@ -566,6 +657,155 @@ mod tests {
             assert!(renew_lease_tx(&mut tx, &first, 21, 10).await.is_err());
             renew_lease_tx(&mut tx, &second, 21, 10).await.unwrap();
             tx.commit().await.unwrap();
+        });
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn transactional_claim_and_completion_roll_back_as_one_unit() {
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let pool = test_pool().await;
+            let mut tx = pool.begin().await.unwrap();
+            let lease = claim_tx(
+                &mut tx,
+                "atomic-task@1",
+                "digest",
+                "execution",
+                "holder",
+                10,
+                20,
+            )
+            .await
+            .unwrap();
+            assert_eq!(lease.fencing_token, 1);
+            complete_tx(&mut tx, &lease, 11).await.unwrap();
+            tx.rollback().await.unwrap();
+            assert!(load(&pool, "atomic-task@1").await.unwrap().is_none());
+        });
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn transactional_failure_classification_rolls_back_with_the_claim() {
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let pool = test_pool().await;
+            let mut tx = pool.begin().await.unwrap();
+            let lease = claim_tx(
+                &mut tx,
+                "atomic-task@failure",
+                "digest",
+                "execution",
+                "holder",
+                10,
+                20,
+            )
+            .await
+            .unwrap();
+            fail_tx(&mut tx, &lease, "injected_failure", 11)
+                .await
+                .unwrap();
+            tx.rollback().await.unwrap();
+            assert!(load(&pool, "atomic-task@failure").await.unwrap().is_none());
+        });
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn transactional_claim_respects_active_and_expired_fencing_leases() {
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let pool = test_pool().await;
+            let first = claim(&pool, "atomic-task@2", "digest", "one", "holder", 10, 10)
+                .await
+                .unwrap();
+
+            let mut conflict_tx = pool.begin().await.unwrap();
+            assert!(
+                claim_tx(
+                    &mut conflict_tx,
+                    "atomic-task@2",
+                    "digest",
+                    "two",
+                    "holder",
+                    15,
+                    10,
+                )
+                .await
+                .is_err()
+            );
+            conflict_tx.rollback().await.unwrap();
+
+            let mut expired_tx = pool.begin().await.unwrap();
+            let second = claim_tx(
+                &mut expired_tx,
+                "atomic-task@2",
+                "digest",
+                "two",
+                "holder",
+                20,
+                10,
+            )
+            .await
+            .unwrap();
+            assert_eq!(second.fencing_token, first.fencing_token + 1);
+            complete_tx(&mut expired_tx, &second, 21).await.unwrap();
+            expired_tx.commit().await.unwrap();
+            assert_eq!(
+                load(&pool, "atomic-task@2")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .kind()
+                    .unwrap(),
+                TaskStateKind::Completed
+            );
+        });
+    }
+
+    // A transaction-local claim retains its state-row lock through completion.
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn transaction_held_claim_can_complete_after_expiry_without_renewal() {
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let pool = test_pool().await;
+            let mut tx = pool.begin().await.unwrap();
+            let lease = claim_tx(
+                &mut tx,
+                "atomic-task@long-transaction",
+                "digest",
+                "execution",
+                "holder",
+                10,
+                10,
+            )
+            .await
+            .unwrap();
+            assert_eq!(lease.fencing_token, 1);
+
+            complete_tx(&mut tx, &lease, 21).await.unwrap();
+            tx.commit().await.unwrap();
+
+            let completed = load(&pool, "atomic-task@long-transaction")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(completed.kind().unwrap(), TaskStateKind::Completed);
+            assert_eq!(completed.fencing_token, lease.fencing_token);
+            assert_eq!(completed.heartbeat_at, None);
+            assert_eq!(completed.lease_expires_at, None);
+            assert_eq!(completed.completed_at, Some(21));
+            assert!(
+                claim(
+                    &pool,
+                    "atomic-task@long-transaction",
+                    "digest",
+                    "replacement",
+                    "other-holder",
+                    22,
+                    10,
+                )
+                .await
+                .is_err()
+            );
         });
     }
 }

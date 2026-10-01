@@ -65,6 +65,7 @@ const BACKFILL_SQL: &[&str] = &[
     "UPDATE thread_deletion_marker SET thread_canonical_key = (SELECT MIN(k.key) FROM source_thread_identity s JOIN thread_canonical_key k ON k.thread_id = s.thread_id WHERE s.user_id = thread_deletion_marker.user_id AND s.source = thread_deletion_marker.source AND s.identity_scope = thread_deletion_marker.identity_scope AND s.native_id = thread_deletion_marker.native_id) WHERE thread_canonical_key IS NULL AND (SELECT COUNT(DISTINCT k.key) FROM source_thread_identity s JOIN thread_canonical_key k ON k.thread_id = s.thread_id WHERE s.user_id = thread_deletion_marker.user_id AND s.source = thread_deletion_marker.source AND s.identity_scope = thread_deletion_marker.identity_scope AND s.native_id = thread_deletion_marker.native_id) = 1",
     "UPDATE thread_deletion_marker SET thread_canonical_key = (SELECT MIN(m.thread_canonical_key) FROM thread_group_member m WHERE m.user_id = thread_deletion_marker.user_id AND m.source = thread_deletion_marker.source AND m.identity_scope = thread_deletion_marker.identity_scope AND m.native_id = thread_deletion_marker.native_id) WHERE thread_canonical_key IS NULL AND (SELECT COUNT(DISTINCT m.thread_canonical_key) FROM thread_group_member m WHERE m.user_id = thread_deletion_marker.user_id AND m.source = thread_deletion_marker.source AND m.identity_scope = thread_deletion_marker.identity_scope AND m.native_id = thread_deletion_marker.native_id) = 1",
 ];
+const TYPED_ID_BACKFILL_COUNT: usize = 13;
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct InspectResult {
@@ -104,7 +105,7 @@ impl ThreadGroupsUserIdsV1Task {
             .begin()
             .await
             .context("beginning owner ID inspection")?;
-        let mut result = inspect_tx(&mut tx, self.uses_thread_owner_preflight()).await?;
+        let mut result = inspect_tx(&mut tx, self.uses_thread_owner_preflight(), true).await?;
         tx.rollback().await.context("ending owner ID inspection")?;
         result.task_state = state::load(&self.pool, &self.catalog.identity())
             .await?
@@ -177,14 +178,14 @@ impl ThreadGroupsUserIdsV1Task {
         .await?;
 
         // Validate the complete legacy ledger before issuing any update.
-        inspect_tx(&mut tx, self.uses_thread_owner_preflight()).await?;
+        inspect_tx(&mut tx, self.uses_thread_owner_preflight(), true).await?;
         for statement in BACKFILL_SQL {
             sqlx::query(sqlx::AssertSqlSafe(*statement))
                 .execute(&mut *tx)
                 .await
                 .with_context(|| format!("backfilling typed IDs with {statement}"))?;
         }
-        let result = inspect_tx(&mut tx, self.uses_thread_owner_preflight()).await?;
+        let result = inspect_tx(&mut tx, self.uses_thread_owner_preflight(), true).await?;
         if result.pending_count() != 0 {
             bail!(
                 "typed owner ID backfill left pending fields: {:?}",
@@ -216,6 +217,7 @@ impl ThreadGroupsUserIdsV1Task {
 async fn inspect_tx(
     tx: &mut RdbTransaction<'_>,
     validate_thread_owners: bool,
+    validate_canonical_membership_keys: bool,
 ) -> Result<InspectResult> {
     let mut result = InspectResult::default();
     validate_owner_pairs(
@@ -287,8 +289,33 @@ async fn inspect_tx(
         validate_referenced_thread_owners(tx, &mut result).await?;
     }
     validate_group_owners(tx).await?;
-    validate_existing_canonical_keys(tx).await?;
+    if validate_canonical_membership_keys {
+        validate_existing_canonical_keys(tx).await?;
+    }
     validate_marker_key_assignments(tx).await?;
+    Ok(result)
+}
+
+pub(super) async fn inspect_for_v3_tx(
+    tx: &mut RdbTransaction<'_>,
+) -> Result<BTreeMap<String, u64>> {
+    Ok(inspect_tx(tx, true, false).await?.pending_fields)
+}
+
+pub(super) async fn backfill_typed_ids_v3_tx(
+    tx: &mut RdbTransaction<'_>,
+) -> Result<BTreeMap<String, u64>> {
+    // @3 may fill owner IDs, but must not infer or rewrite a deletion marker's canonical key.
+    for statement in BACKFILL_SQL.iter().take(TYPED_ID_BACKFILL_COUNT) {
+        sqlx::query(sqlx::AssertSqlSafe(*statement))
+            .execute(&mut **tx)
+            .await
+            .with_context(|| format!("backfilling typed IDs with {statement}"))?;
+    }
+    let result = inspect_for_v3_tx(tx).await?;
+    if result.values().sum::<u64>() != 0 {
+        bail!("typed owner ID backfill left pending fields: {:?}", result);
+    }
     Ok(result)
 }
 

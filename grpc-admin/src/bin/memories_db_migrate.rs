@@ -1867,12 +1867,12 @@ mod tests {
                 "--id",
                 "thread-groups-user-ids-v1",
                 "--generation",
-                "2",
+                "3",
                 "--maintenance-window-ack",
             ])
             .await?;
         assert!(output.contains(
-            "post_migrate_run task_identity=thread-groups-user-ids-v1@2 status=completed"
+            "post_migrate_run task_identity=thread-groups-user-ids-v1@3 status=completed"
         ));
 
         let migrated =
@@ -1896,7 +1896,7 @@ mod tests {
             "post_migrate_verify task_identity=thread-groups-canonical-keys-v1@2 status=verified"
         ));
         assert!(output.contains(
-            "post_migrate_verify task_identity=thread-groups-user-ids-v1@2 status=verified"
+            "post_migrate_verify task_identity=thread-groups-user-ids-v1@3 status=verified"
         ));
         assert!(output.contains(
             "post_migrate_verify task_identity=thread-message-times-v1@1 status=verified"
@@ -2115,9 +2115,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "thread-groups-canonical-keys-v1@2",
-                "thread-groups-user-ids-v1@2",
+                "thread-groups-user-ids-v1@3",
                 "thread-message-times-v1@1"
             ]
+        );
+        assert!(
+            typed_owner_tasks
+                .iter()
+                .all(|task| task.identity() != "thread-groups-user-ids-v1@2")
         );
         assert!(
             selected_tasks_for_schema_version("20260803000003", "unsupported")

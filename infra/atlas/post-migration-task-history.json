@@ -19,6 +19,10 @@
     {
       "identity": "thread-groups-user-ids-v1@2",
       "canonical_definition_digest": "10e7708f257570259affdae26080118164c9cb6980c2ba0f0c3f6bd119df353b"
+    },
+    {
+      "identity": "thread-groups-user-ids-v1@3",
+      "canonical_definition_digest": "837a23d4ad769d59947eb9362e463e7455bf71bfac9c5c1fd166b6a4c41a2a78"
     }
   ],
   "lifecycle_transitions": [
@@ -57,8 +61,20 @@
       "canonical_definition_digest": "10e7708f257570259affdae26080118164c9cb6980c2ba0f0c3f6bd119df353b",
       "kind": "registered",
       "previous_history_digest": "1fa2e4f240f526fb45e13c4f84d2bcba6e6adb28cf0a6e35bf8f72d78aeff77e"
+    },
+    {
+      "identity": "thread-groups-user-ids-v1@2",
+      "canonical_definition_digest": "10e7708f257570259affdae26080118164c9cb6980c2ba0f0c3f6bd119df353b",
+      "kind": "retired",
+      "previous_history_digest": "b09c000d4461d4692f5656035c8357d34fac92dcda756d7228f916c59645e0c0"
+    },
+    {
+      "identity": "thread-groups-user-ids-v1@3",
+      "canonical_definition_digest": "837a23d4ad769d59947eb9362e463e7455bf71bfac9c5c1fd166b6a4c41a2a78",
+      "kind": "registered",
+      "previous_history_digest": "d6fb4794f0c55aea502c12c7b8cffc61ab38177b1ddc0775b751bf2752492bdc"
     }
   ],
-  "previous_history_digest": "1fa2e4f240f526fb45e13c4f84d2bcba6e6adb28cf0a6e35bf8f72d78aeff77e",
-  "history_digest": "b09c000d4461d4692f5656035c8357d34fac92dcda756d7228f916c59645e0c0"
+  "previous_history_digest": "d6fb4794f0c55aea502c12c7b8cffc61ab38177b1ddc0775b751bf2752492bdc",
+  "history_digest": "023803437e1ea55f7aa891f5e7d86747a2fba7f8c2f272c978981450b5b8529e"
 }
