@@ -191,6 +191,42 @@
       ],
       "maintenance_window_required": true,
       "implementation": "thread_groups_user_ids_v3::ThreadGroupsUserIdsV3Task",
+      "lifecycle": "retired"
+    },
+    {
+      "id": "thread-groups-user-ids-v1",
+      "generation": 4,
+      "description": "typed user_id を所有者の正として、欠落した typed owner だけを正規形の旧 owner_scope、次に参照先 Thread から補完し、保存済み Thread canonical key と証明可能な active membership / live relation key の不整合を一体で原子的に補修する",
+      "canonical_definition": {
+        "backends": [
+          "postgres",
+          "sqlite"
+        ],
+        "checkpoint_format": "thread-groups-user-ids-v1@4/atomic",
+        "completion_required_by_schema_version": "20260930000001",
+        "dependencies": [
+          "thread-groups-canonical-keys-v1@2"
+        ],
+        "id": "thread-groups-user-ids-v1",
+        "implementation": "thread_groups_user_ids_v4::ThreadGroupsUserIdsV4Task",
+        "introduced_by_schema_version": "20260930000001",
+        "maintenance_window_required": true,
+        "owner_contract": "typed-user-id-authoritative-legacy-scope-then-thread-backfill-v1",
+        "repair_contract": "saved-thread-canonical-key-only-live-reference-repair-v1",
+        "state_contract": "rdb-typed-owner-authoritative-backfill-and-alias-repair-atomic-v4"
+      },
+      "canonical_definition_digest": "744a996decd4a48522168a89aae2c460d2ec522ce9f84ea25abc0951001a3501",
+      "backends": [
+        "postgres",
+        "sqlite"
+      ],
+      "introduced_by_schema_version": "20260930000001",
+      "completion_required_by_schema_version": "20260930000001",
+      "dependencies": [
+        "thread-groups-canonical-keys-v1@2"
+      ],
+      "maintenance_window_required": true,
+      "implementation": "thread_groups_user_ids_v4::ThreadGroupsUserIdsV4Task",
       "lifecycle": "active"
     }
   ]

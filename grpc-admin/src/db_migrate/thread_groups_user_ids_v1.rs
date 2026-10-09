@@ -48,7 +48,7 @@ const CANONICAL_MEMBER_KEY_MISMATCH_SQL: &str = "SELECT COUNT(*) FROM thread_can
         AND member.state = 'active' \
     WHERE member.thread_canonical_key <> canonical.key";
 
-const BACKFILL_SQL: &[&str] = &[
+pub(super) const BACKFILL_SQL: &[&str] = &[
     "UPDATE thread_group_member SET user_id = CAST(SUBSTR(owner_scope, 6) AS BIGINT) WHERE user_id IS NULL",
     "UPDATE thread_relation SET parent_user_id = CAST(SUBSTR(parent_owner_scope, 6) AS BIGINT) WHERE parent_user_id IS NULL",
     "UPDATE thread_relation SET child_user_id = CAST(SUBSTR(child_owner_scope, 6) AS BIGINT) WHERE child_user_id IS NULL",
@@ -65,7 +65,7 @@ const BACKFILL_SQL: &[&str] = &[
     "UPDATE thread_deletion_marker SET thread_canonical_key = (SELECT MIN(k.key) FROM source_thread_identity s JOIN thread_canonical_key k ON k.thread_id = s.thread_id WHERE s.user_id = thread_deletion_marker.user_id AND s.source = thread_deletion_marker.source AND s.identity_scope = thread_deletion_marker.identity_scope AND s.native_id = thread_deletion_marker.native_id) WHERE thread_canonical_key IS NULL AND (SELECT COUNT(DISTINCT k.key) FROM source_thread_identity s JOIN thread_canonical_key k ON k.thread_id = s.thread_id WHERE s.user_id = thread_deletion_marker.user_id AND s.source = thread_deletion_marker.source AND s.identity_scope = thread_deletion_marker.identity_scope AND s.native_id = thread_deletion_marker.native_id) = 1",
     "UPDATE thread_deletion_marker SET thread_canonical_key = (SELECT MIN(m.thread_canonical_key) FROM thread_group_member m WHERE m.user_id = thread_deletion_marker.user_id AND m.source = thread_deletion_marker.source AND m.identity_scope = thread_deletion_marker.identity_scope AND m.native_id = thread_deletion_marker.native_id) WHERE thread_canonical_key IS NULL AND (SELECT COUNT(DISTINCT m.thread_canonical_key) FROM thread_group_member m WHERE m.user_id = thread_deletion_marker.user_id AND m.source = thread_deletion_marker.source AND m.identity_scope = thread_deletion_marker.identity_scope AND m.native_id = thread_deletion_marker.native_id) = 1",
 ];
-const TYPED_ID_BACKFILL_COUNT: usize = 13;
+pub(super) const TYPED_ID_BACKFILL_COUNT: usize = 13;
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct InspectResult {
@@ -410,7 +410,7 @@ async fn validate_existing_canonical_keys(tx: &mut RdbTransaction<'_>) -> Result
     Ok(())
 }
 
-async fn validate_marker_key_assignments(tx: &mut RdbTransaction<'_>) -> Result<()> {
+pub(super) async fn validate_marker_key_assignments(tx: &mut RdbTransaction<'_>) -> Result<()> {
     let ambiguous: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(AMBIGUOUS_MARKER_KEY_SQL))
         .fetch_one(&mut **tx)
         .await
@@ -519,7 +519,7 @@ async fn validate_observation_owners(
     Ok(())
 }
 
-async fn validate_group_owners(tx: &mut RdbTransaction<'_>) -> Result<()> {
+pub(super) async fn validate_group_owners(tx: &mut RdbTransaction<'_>) -> Result<()> {
     let invalid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thread_group WHERE user_id <= 0")
         .fetch_one(&mut **tx)
         .await

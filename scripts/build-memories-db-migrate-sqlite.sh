@@ -40,6 +40,16 @@ cargo build --release -p grpc-admin --bin memories-db-migrate --features lindera
 install -m 0755 target/release/memories-db-migrate "$staging_directory/memories-db-migrate"
 cp -R infra/atlas "$staging_directory/atlas"
 "$repo_root/scripts/fetch-atlas.sh" "$native_atlas_platform" "$staging_directory/atlas/bin/atlas"
+
+# Applications detect a stale bundle by its content digest; the revision and
+# dirty flag only help diagnose where a bundle came from.
+source_revision=$(git -C "$repo_root" rev-parse HEAD)
+manifest_args=(--source-revision "$source_revision")
+if [[ -n "$(git -C "$repo_root" status --porcelain)" ]]; then
+  manifest_args+=(--source-dirty)
+fi
+"$staging_directory/memories-db-migrate" bundle manifest "${manifest_args[@]}"
+"$staging_directory/memories-db-migrate" bundle verify
 mv "$staging_directory" "$output_directory"
 trap - EXIT
 

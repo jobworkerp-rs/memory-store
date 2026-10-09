@@ -19,6 +19,7 @@
 use super::{
     DataMigrationTask,
     catalog::TaskCatalogEntry,
+    placeholder,
     state::{self, TaskCheckpointEnvelope, TaskLease, TaskStateKind},
 };
 use anyhow::{Context, Result, bail};
@@ -83,18 +84,6 @@ const SOURCE_BACKED_IDS_BASE_SQL: &str = "SELECT t.id FROM thread t WHERE NOT EX
 const MANUAL_IDS_BASE_SQL: &str = "SELECT t.id FROM thread t WHERE NOT EXISTS \
     (SELECT 1 FROM thread_canonical_key k WHERE k.thread_id = t.id) \
     AND NOT EXISTS (SELECT 1 FROM source_thread_identity s WHERE s.thread_id = t.id)";
-
-fn placeholder(index: usize) -> String {
-    #[cfg(feature = "postgres")]
-    {
-        format!("${index}")
-    }
-    #[cfg(not(feature = "postgres"))]
-    {
-        let _ = index;
-        "?".to_string()
-    }
-}
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

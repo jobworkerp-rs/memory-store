@@ -3,6 +3,7 @@
 use super::{
     DataMigrationTask,
     catalog::TaskCatalogEntry,
+    placeholder,
     state::{self, TaskCheckpointEnvelope, TaskLease, TaskStateKind},
 };
 use anyhow::{Context, Result, bail};
@@ -20,18 +21,6 @@ const CHECKPOINT_FORMAT: &str = "thread-message-times-v1@1/checkpoint-v1";
 const DEFAULT_BATCH_SIZE: i64 = 500;
 const DEFAULT_LEASE_MS: i64 = 120_000;
 const LEGACY_MIGRATION_KEY: &str = "thread-time-fields-v1";
-
-fn placeholder(index: usize) -> String {
-    #[cfg(feature = "postgres")]
-    {
-        format!("${index}")
-    }
-    #[cfg(not(feature = "postgres"))]
-    {
-        let _ = index;
-        "?".to_string()
-    }
-}
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1151,11 +1140,13 @@ impl DataMigrationTask for ThreadMessageTimesV1Task {
     }
 }
 
+/// Whether this task touches LanceDB; a local backup must agree with it.
+pub(crate) fn thread_vectors_enabled(env: impl Fn(&str) -> Option<String>) -> bool {
+    env("THREAD_VECTOR_ENABLED").is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
 fn explicit_thread_vector_config() -> Result<Option<ThreadVectorDBConfig>> {
-    if !std::env::var("THREAD_VECTOR_ENABLED")
-        .unwrap_or_default()
-        .eq_ignore_ascii_case("true")
-    {
+    if !thread_vectors_enabled(|key| std::env::var(key).ok()) {
         return Ok(None);
     }
     ThreadVectorDBConfig::from_env().map(Some)

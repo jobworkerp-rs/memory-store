@@ -96,11 +96,20 @@ CARGO_BUILD_JOBS=1 scripts/build-memories-db-migrate-sqlite.sh /path/to/memories
 ```
 
 The build supports Linux/x86_64 and macOS/Apple Silicon. It packages the native
-`memories-db-migrate` binary and the matching, SHA-256-pinned Atlas binary. Run
-the bundle before opening the database, with all database writers stopped and a
-joint SQLite/LanceDB backup available. The application must invoke the bundle's
-`memories-db-migrate` commands rather than applying SQL or running Atlas
-directly.
+`memories-db-migrate` binary and the matching, SHA-256-pinned Atlas binary, plus
+a `bundle-manifest.json` recording the content digest (checked by
+`memories-db-migrate bundle verify`).
+
+Before opening the database, stop all database writers and run the bundle's
+`memories-db-migrate local apply --maintenance-window-ack` with either
+`--backup-dir <dir> [--backup-keep <n>]` or `--no-backup-unsafe`. The command
+decides whether migration is needed, takes the backup, verifies the result, and
+decides whether a failed run may be retried; `local restore
+--maintenance-window-ack --backup <backup>` restores a backup. Applications
+judge the result only by the exit code and the final structured stdout line
+(including `error_code`) and must not apply SQL or run Atlas directly. See
+[docs/database-migration-tool-spec_ja.md](docs/database-migration-tool-spec_ja.md)
+for the contract.
 
 ## Setup and Run
 

@@ -1,6 +1,11 @@
 //! `thread-groups-user-ids-v1@3`: conservative canonical membership repair.
 
-use super::{DataMigrationTask, catalog::TaskCatalogEntry, state};
+use super::{
+    DataMigrationTask,
+    catalog::TaskCatalogEntry,
+    state,
+    typed_owner_backfill::{TypedOwnerPreparation, prepare_typed_owners_tx},
+};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use common::thread_group_key::{
@@ -47,6 +52,25 @@ const EVENT_REFS_SQL: &str = "SELECT event_type, source, identity_scope, owner_s
 #[cfg(feature = "postgres")]
 const MUTATION_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
 
+/// Owner representation used to prove that a membership row and the rows it
+/// is compared with belong to the same live Thread owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OwnerBasis {
+    /// `@3`: the legacy `owner_scope` strings.
+    LegacyScope,
+    /// `@4`: the typed `user_id` columns, filled before the proof runs.
+    TypedUserId,
+}
+
+impl OwnerBasis {
+    fn owner_key(self, owner_scope: &str, user_id: Option<i64>) -> Option<String> {
+        match self {
+            Self::LegacyScope => Some(owner_scope.to_string()),
+            Self::TypedUserId => user_id.map(|id| id.to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct RepairReport {
     pub status: String,
@@ -74,6 +98,7 @@ pub struct RepairReport {
 pub struct ThreadGroupsUserIdsV3Task {
     pool: RdbPool,
     catalog: TaskCatalogEntry,
+    owner_basis: OwnerBasis,
     lease_duration_ms: i64,
     #[cfg(test)]
     fail_after_repair: bool,
@@ -81,16 +106,26 @@ pub struct ThreadGroupsUserIdsV3Task {
 
 impl ThreadGroupsUserIdsV3Task {
     pub fn new(pool: RdbPool, catalog: TaskCatalogEntry) -> Result<Self> {
-        catalog.validate()?;
         if catalog.identity() != TASK_IDENTITY {
             bail!(
                 "unexpected replacement task catalog identity: {}",
                 catalog.identity()
             );
         }
+        Self::with_owner_basis(pool, catalog, OwnerBasis::LegacyScope)
+    }
+
+    /// The caller selects the generation; it must check the catalog identity.
+    pub(super) fn with_owner_basis(
+        pool: RdbPool,
+        catalog: TaskCatalogEntry,
+        owner_basis: OwnerBasis,
+    ) -> Result<Self> {
+        catalog.validate()?;
         Ok(Self {
             pool,
             catalog,
+            owner_basis,
             lease_duration_ms: DEFAULT_LEASE_MS,
             #[cfg(test)]
             fail_after_repair: false,
@@ -109,7 +144,8 @@ impl ThreadGroupsUserIdsV3Task {
             .begin()
             .await
             .context("beginning canonical mismatch inspection")?;
-        let mut analysis = analyze_tx(&mut tx).await?;
+        let preflight = owner_preflight_tx(&mut tx, self.owner_basis).await?;
+        let mut analysis = analyze_tx(&mut tx, self.owner_basis, preflight).await?;
         tx.rollback()
             .await
             .context("ending canonical mismatch inspection")?;
@@ -151,10 +187,12 @@ impl ThreadGroupsUserIdsV3Task {
         let run = async {
             acquire_group_membership_mutation_lock_tx(&mut tx).await?;
             let prerequisite = canonical_prerequisite_tx(&mut tx).await?;
-            let analysis = analyze_tx(&mut tx).await?;
+            let preflight = owner_preflight_tx(&mut tx, self.owner_basis).await?;
+            let analysis = analyze_tx(&mut tx, self.owner_basis, preflight).await?;
             if prerequisite != "completed" {
                 bail!(
-                    "thread-groups-user-ids-v1@3 requires completed thread-groups-canonical-keys-v1@2; run `memories-db-migrate post-migrate run --id thread-groups-canonical-keys-v1 --generation 2 --maintenance-window-ack` first"
+                    "{} requires completed thread-groups-canonical-keys-v1@2; run `memories-db-migrate post-migrate run --id thread-groups-canonical-keys-v1 --generation 2 --maintenance-window-ack` first",
+                    self.catalog.identity()
                 );
             }
             if analysis.report.canonical_keys_pending_threads != 0 {
@@ -190,13 +228,19 @@ impl ThreadGroupsUserIdsV3Task {
                     update_relation_key_tx(&mut tx, repair, relation).await?;
                 }
             }
-            let pending_typed_fields =
-                super::thread_groups_user_ids_v1::backfill_typed_ids_v3_tx(&mut tx).await?;
+            let pending_typed_fields = match self.owner_basis {
+                OwnerBasis::LegacyScope => {
+                    super::thread_groups_user_ids_v1::backfill_typed_ids_v3_tx(&mut tx).await?
+                }
+                // Owners were filled by the preflight before the proof.
+                OwnerBasis::TypedUserId => analysis.report.pending_typed_fields.clone(),
+            };
             #[cfg(test)]
             if self.fail_after_repair {
                 bail!("injected failure after repair and typed-ID backfill");
             }
-            let after = analyze_tx(&mut tx).await?;
+            let preflight = owner_preflight_tx(&mut tx, self.owner_basis).await?;
+            let after = analyze_tx(&mut tx, self.owner_basis, preflight).await?;
             if after.report.mismatch_rows != 0 {
                 bail!(
                     "canonical membership verification found {} remaining mismatch row(s)",
@@ -210,7 +254,11 @@ impl ThreadGroupsUserIdsV3Task {
                 bail!("typed owner ID verification found pending fields");
             }
             let mut report = analysis.report;
-            report.typed_id_fields_backfilled = report.pending_typed_fields.clone();
+            // @3 fills owners only after the proof, so the pre-backfill pending
+            // set is what it backfilled.
+            if self.owner_basis == OwnerBasis::LegacyScope {
+                report.typed_id_fields_backfilled = report.pending_typed_fields.clone();
+            }
             report.pending_typed_fields = pending_typed_fields;
             report.repaired_memberships = report.mismatch_rows;
             report.status = if report.repaired_memberships == 0 {
@@ -394,6 +442,7 @@ struct EventPayloadFacts {
 #[derive(Debug, Clone, FromRow)]
 struct MarkerRow {
     owner_scope: String,
+    user_id: Option<i64>,
     source: String,
     identity_scope: String,
     native_id: String,
@@ -427,18 +476,183 @@ struct CandidateReasons {
     relation_repairs: Vec<RelationRepair>,
 }
 
+/// Owner key (per [`OwnerBasis`]), source, identity scope, native ID.
+type IdentityKey = (Option<String>, String, String, String);
+
+/// Resolved source identities keyed by the owner representation in use.
+struct IdentityIndex<'a> {
+    owner_basis: OwnerBasis,
+    rows: HashMap<IdentityKey, Vec<&'a IdentityRow>>,
+}
+
+impl<'a> IdentityIndex<'a> {
+    fn new(owner_basis: OwnerBasis, identities: &'a [IdentityRow]) -> Self {
+        let rows = identities.iter().fold(
+            HashMap::<IdentityKey, Vec<&IdentityRow>>::new(),
+            |mut map, row| {
+                map.entry((
+                    owner_basis.owner_key(&row.owner_scope, row.user_id),
+                    row.source.clone(),
+                    row.identity_scope.clone(),
+                    row.native_id.clone(),
+                ))
+                .or_default()
+                .push(row);
+                map
+            },
+        );
+        Self { owner_basis, rows }
+    }
+
+    fn get(
+        &self,
+        owner_scope: &str,
+        user_id: Option<i64>,
+        source: &str,
+        identity_scope: &str,
+        native_id: &str,
+    ) -> Option<&[&'a IdentityRow]> {
+        self.rows
+            .get(&(
+                self.owner_basis.owner_key(owner_scope, user_id),
+                source.to_string(),
+                identity_scope.to_string(),
+                native_id.to_string(),
+            ))
+            .map(Vec::as_slice)
+    }
+}
+
 struct Analysis {
     report: RepairReport,
     repairs: Vec<Repair>,
 }
 
-async fn analyze_tx(tx: &mut RdbTransaction<'_>) -> Result<Analysis> {
-    let typed_inspection = super::thread_groups_user_ids_v1::inspect_for_v3_tx(tx).await;
-    let (pending_typed_fields, global_preflight_failure) = match typed_inspection {
-        Ok(pending_fields) => (pending_fields, false),
-        Err(error) if error.chain().any(|cause| cause.is::<sqlx::Error>()) => return Err(error),
-        Err(_) => (BTreeMap::new(), true),
+/// Rows that can only matter as evidence about a canonical-key mismatch.
+#[derive(Default)]
+struct ReferenceRows {
+    members: Vec<MemberRow>,
+    identities: Vec<IdentityRow>,
+    canonical_rows: Vec<CanonicalRow>,
+    threads: Vec<ThreadRow>,
+    groups: Vec<GroupRow>,
+    relations: Vec<RelationRow>,
+    audits: Vec<AuditRow>,
+    events: Vec<EventRefRow>,
+    markers: Vec<MarkerRow>,
+}
+
+impl ReferenceRows {
+    async fn load(tx: &mut RdbTransaction<'_>) -> Result<Self> {
+        let members: Vec<MemberRow> = sqlx::query_as(
+            "SELECT group_id, thread_id, thread_canonical_key AS key, role, state \
+             FROM thread_group_member",
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .context("reading ThreadGroup membership references")?;
+        let identities: Vec<IdentityRow> = sqlx::query_as(
+            "SELECT owner_scope, source, identity_scope, native_id, thread_id, user_id \
+             FROM source_thread_identity",
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .context("reading resolved source identity ownership")?;
+        let canonical_rows: Vec<CanonicalRow> =
+            sqlx::query_as("SELECT thread_id, key FROM thread_canonical_key")
+                .fetch_all(&mut **tx)
+                .await
+                .context("reading persisted Thread canonical keys")?;
+        let threads: Vec<ThreadRow> = sqlx::query_as("SELECT id, user_id FROM thread")
+            .fetch_all(&mut **tx)
+            .await
+            .context("reading live Thread owners")?;
+        let groups: Vec<GroupRow> = sqlx::query_as(
+            "SELECT id, user_id, status, grouping_authority, group_canonical_key FROM thread_group",
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .context("reading ThreadGroup identity rows")?;
+        let relations: Vec<RelationRow> = sqlx::query_as(
+            "SELECT id, parent_thread_id, child_thread_id, \
+                    parent_thread_canonical_key AS parent_key, child_thread_canonical_key AS child_key, \
+                    parent_owner_scope, parent_user_id, parent_source, parent_identity_scope, parent_native_id, \
+                    child_owner_scope, child_user_id, child_source, child_identity_scope, child_native_id, state \
+             FROM thread_relation",
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .context("reading Thread relation key references")?;
+        let audits: Vec<AuditRow> =
+            sqlx::query_as("SELECT source_group_id, target_group_id FROM thread_group_audit")
+                .fetch_all(&mut **tx)
+                .await
+                .context("reading immutable ThreadGroup audit references")?;
+        let events: Vec<EventRefRow> = sqlx::query_as(EVENT_REFS_SQL)
+            .fetch_all(&mut **tx)
+            .await
+            .context("reading immutable ThreadGroup event references")?;
+        let markers: Vec<MarkerRow> = sqlx::query_as(
+            "SELECT owner_scope, user_id, source, identity_scope, native_id, thread_canonical_key \
+             FROM thread_deletion_marker",
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .context("reading immutable deletion marker references")?;
+        Ok(Self {
+            members,
+            identities,
+            canonical_rows,
+            threads,
+            groups,
+            relations,
+            audits,
+            events,
+            markers,
+        })
+    }
+}
+
+/// Typed-owner preflight the repair proof depends on. A contradiction found by
+/// the preflight blocks the repair instead of aborting the inspection.
+struct OwnerPreflight {
+    preparation: TypedOwnerPreparation,
+    failed: bool,
+}
+
+/// Under the typed basis this also fills missing owners in the caller's
+/// transaction, so the proof compares complete typed owners.
+async fn owner_preflight_tx(
+    tx: &mut RdbTransaction<'_>,
+    owner_basis: OwnerBasis,
+) -> Result<OwnerPreflight> {
+    let outcome = match owner_basis {
+        OwnerBasis::LegacyScope => super::thread_groups_user_ids_v1::inspect_for_v3_tx(tx)
+            .await
+            .map(|unresolved| TypedOwnerPreparation {
+                unresolved,
+                ..TypedOwnerPreparation::default()
+            }),
+        OwnerBasis::TypedUserId => prepare_typed_owners_tx(tx).await,
     };
+    match outcome {
+        Ok(preparation) => Ok(OwnerPreflight {
+            preparation,
+            failed: false,
+        }),
+        Err(error) if error.chain().any(|cause| cause.is::<sqlx::Error>()) => Err(error),
+        Err(_) => Ok(OwnerPreflight {
+            preparation: TypedOwnerPreparation::default(),
+            failed: true,
+        }),
+    }
+}
+
+async fn analyze_tx(
+    tx: &mut RdbTransaction<'_>,
+    owner_basis: OwnerBasis,
+    preflight: OwnerPreflight,
+) -> Result<Analysis> {
     let mismatches: Vec<MismatchRow> = sqlx::query_as(
         "SELECT member.group_id, member.thread_id AS member_thread_id, thread.id AS thread_id, \
                 member.thread_canonical_key AS old_key, canonical.key AS saved_key, \
@@ -459,65 +673,28 @@ async fn analyze_tx(tx: &mut RdbTransaction<'_>) -> Result<Analysis> {
     .await
     .context("reading active ThreadGroup canonical-key mismatches")?;
 
-    let members: Vec<MemberRow> = sqlx::query_as(
-        "SELECT group_id, thread_id, thread_canonical_key AS key, role, state \
-         FROM thread_group_member",
-    )
-    .fetch_all(&mut **tx)
-    .await
-    .context("reading ThreadGroup membership references")?;
-    let identities: Vec<IdentityRow> = sqlx::query_as(
-        "SELECT owner_scope, source, identity_scope, native_id, thread_id, user_id \
-         FROM source_thread_identity",
-    )
-    .fetch_all(&mut **tx)
-    .await
-    .context("reading resolved source identity ownership")?;
-    let canonical_rows: Vec<CanonicalRow> =
-        sqlx::query_as("SELECT thread_id, key FROM thread_canonical_key")
-            .fetch_all(&mut **tx)
-            .await
-            .context("reading persisted Thread canonical keys")?;
-    let threads: Vec<ThreadRow> = sqlx::query_as("SELECT id, user_id FROM thread")
-        .fetch_all(&mut **tx)
-        .await
-        .context("reading live Thread owners")?;
-    let groups: Vec<GroupRow> = sqlx::query_as(
-        "SELECT id, user_id, status, grouping_authority, group_canonical_key FROM thread_group",
-    )
-    .fetch_all(&mut **tx)
-    .await
-    .context("reading ThreadGroup identity rows")?;
-    let relations: Vec<RelationRow> = sqlx::query_as(
-        "SELECT id, parent_thread_id, child_thread_id, \
-                parent_thread_canonical_key AS parent_key, child_thread_canonical_key AS child_key, \
-                parent_owner_scope, parent_user_id, parent_source, parent_identity_scope, parent_native_id, \
-                child_owner_scope, child_user_id, child_source, child_identity_scope, child_native_id, state \
-         FROM thread_relation",
-    )
-    .fetch_all(&mut **tx)
-    .await
-    .context("reading Thread relation key references")?;
-    let audits: Vec<AuditRow> =
-        sqlx::query_as("SELECT source_group_id, target_group_id FROM thread_group_audit")
-            .fetch_all(&mut **tx)
-            .await
-            .context("reading immutable ThreadGroup audit references")?;
-    let events: Vec<EventRefRow> = sqlx::query_as(EVENT_REFS_SQL)
-        .fetch_all(&mut **tx)
-        .await
-        .context("reading immutable ThreadGroup event references")?;
+    // Every reference table (including the full event outbox) is evidence only
+    // for a mismatch row; skipping them keeps no-op runs and verification cheap
+    // on large databases without changing the report.
+    let ReferenceRows {
+        members,
+        identities,
+        canonical_rows,
+        threads,
+        groups,
+        relations,
+        audits,
+        events,
+        markers,
+    } = if mismatches.is_empty() {
+        ReferenceRows::default()
+    } else {
+        ReferenceRows::load(tx).await?
+    };
     let event_payload_facts = events
         .iter()
         .map(|event| inspect_outbox_payload(&event.event_type, &event.payload))
         .collect::<Vec<_>>();
-    let markers: Vec<MarkerRow> = sqlx::query_as(
-        "SELECT owner_scope, source, identity_scope, native_id, thread_canonical_key \
-         FROM thread_deletion_marker",
-    )
-    .fetch_all(&mut **tx)
-    .await
-    .context("reading immutable deletion marker references")?;
     let canonical_keys_pending_threads: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM thread t LEFT JOIN thread_canonical_key k ON k.thread_id = t.id \
          WHERE k.thread_id IS NULL",
@@ -526,20 +703,7 @@ async fn analyze_tx(tx: &mut RdbTransaction<'_>) -> Result<Analysis> {
     .await
     .context("counting Threads without a persisted canonical key")?;
 
-    let identity_index = identities.iter().fold(
-        HashMap::<(String, String, String, String), Vec<&IdentityRow>>::new(),
-        |mut map, row| {
-            map.entry((
-                row.owner_scope.clone(),
-                row.source.clone(),
-                row.identity_scope.clone(),
-                row.native_id.clone(),
-            ))
-            .or_default()
-            .push(row);
-            map
-        },
-    );
+    let identity_index = IdentityIndex::new(owner_basis, &identities);
     let canonical_by_thread = canonical_rows
         .iter()
         .map(|row| (row.thread_id, row))
@@ -562,7 +726,8 @@ async fn analyze_tx(tx: &mut RdbTransaction<'_>) -> Result<Analysis> {
     let mut report = RepairReport {
         status: String::new(),
         mismatch_rows: mismatches.len() as u64,
-        pending_typed_fields,
+        pending_typed_fields: preflight.preparation.unresolved,
+        typed_id_fields_backfilled: preflight.preparation.backfilled,
         canonical_keys_pending_threads: canonical_keys_pending_threads.max(0) as u64,
         summary_policy: "membership_snapshot_changed_regeneration_required_no_summary_rewrite"
             .to_string(),
@@ -590,15 +755,24 @@ async fn analyze_tx(tx: &mut RdbTransaction<'_>) -> Result<Analysis> {
                 .reasons
                 .insert("non_current_membership".to_string());
         }
-        if parse_legacy_owner_scope(&mismatch.owner_scope) != Some(mismatch.thread_user_id)
-            || parse_legacy_owner_scope(&mismatch.canonical_owner_scope)
-                != Some(mismatch.thread_user_id)
-            || mismatch
-                .member_user_id
-                .is_some_and(|id| id != mismatch.thread_user_id)
-            || mismatch
-                .canonical_user_id
-                .is_some_and(|id| id != mismatch.thread_user_id)
+        let owners_disagree = match owner_basis {
+            OwnerBasis::LegacyScope => {
+                parse_legacy_owner_scope(&mismatch.owner_scope) != Some(mismatch.thread_user_id)
+                    || parse_legacy_owner_scope(&mismatch.canonical_owner_scope)
+                        != Some(mismatch.thread_user_id)
+                    || mismatch
+                        .member_user_id
+                        .is_some_and(|id| id != mismatch.thread_user_id)
+                    || mismatch
+                        .canonical_user_id
+                        .is_some_and(|id| id != mismatch.thread_user_id)
+            }
+            OwnerBasis::TypedUserId => {
+                mismatch.member_user_id != Some(mismatch.thread_user_id)
+                    || mismatch.canonical_user_id != Some(mismatch.thread_user_id)
+            }
+        };
+        if owners_disagree
             || mismatch
                 .group_user_id
                 .is_some_and(|id| id != mismatch.thread_user_id)
@@ -617,13 +791,13 @@ async fn analyze_tx(tx: &mut RdbTransaction<'_>) -> Result<Analysis> {
             mismatch.native_id.as_deref(),
         ) {
             (Some(source), Some(scope), Some(native_id)) => {
-                let identity_key = (
-                    mismatch.owner_scope.clone(),
-                    source.to_string(),
-                    scope.to_string(),
-                    native_id.to_string(),
-                );
-                match identity_index.get(&identity_key).map(Vec::as_slice) {
+                match identity_index.get(
+                    &mismatch.owner_scope,
+                    mismatch.member_user_id,
+                    source,
+                    scope,
+                    native_id,
+                ) {
                     Some([identity]) if identity.thread_id == mismatch.thread_id => {
                         if identity
                             .user_id
@@ -733,7 +907,7 @@ async fn analyze_tx(tx: &mut RdbTransaction<'_>) -> Result<Analysis> {
         for (event, payload_facts) in events.iter().zip(&event_payload_facts) {
             if event.group_id == Some(group.id)
                 || event.thread_id == Some(mismatch.thread_id)
-                || event_identity_refers_to_candidate(event, mismatch)
+                || event_identity_refers_to_candidate(event, mismatch, owner_basis)
             {
                 reasons[index]
                     .reasons
@@ -768,7 +942,8 @@ async fn analyze_tx(tx: &mut RdbTransaction<'_>) -> Result<Analysis> {
                 == Some(marker.source.as_str())
                 && mismatch.identity_scope.as_deref() == Some(marker.identity_scope.as_str())
                 && mismatch.native_id.as_deref() == Some(marker.native_id.as_str())
-                && mismatch.owner_scope == marker.owner_scope;
+                && owner_basis.owner_key(&mismatch.owner_scope, mismatch.member_user_id)
+                    == owner_basis.owner_key(&marker.owner_scope, marker.user_id);
             if identity_refers_to_candidate
                 || marker.thread_canonical_key.as_deref() == Some(mismatch.old_key.as_str())
             {
@@ -917,8 +1092,12 @@ async fn analyze_tx(tx: &mut RdbTransaction<'_>) -> Result<Analysis> {
             }
         }
     }
-    if global_preflight_failure {
+    if preflight.failed {
         increment(&mut report.stop_reasons, "typed_owner_or_marker_preflight");
+    }
+    // Under the typed basis, a pending field is a row whose owner no source can supply.
+    if owner_basis == OwnerBasis::TypedUserId && !report.pending_typed_fields.is_empty() {
+        increment(&mut report.stop_reasons, "typed_owner_unresolvable");
     }
     report.distinct_threads = distinct_threads.len() as u64;
     report.affected_group_count = affected_groups.len() as u64;
@@ -1023,7 +1202,7 @@ fn inspect_relation_side(
     side: RelationSide,
     mismatches: &[MismatchRow],
     old_key_candidates: &HashMap<&str, Vec<usize>>,
-    identity_index: &HashMap<(String, String, String, String), Vec<&IdentityRow>>,
+    identity_index: &IdentityIndex<'_>,
     threads_by_id: &HashMap<i64, &ThreadRow>,
     reasons: &mut [CandidateReasons],
 ) {
@@ -1064,10 +1243,14 @@ fn inspect_relation_side(
                 .insert("historical_relation_reference".to_string());
             continue;
         }
-        if thread_id != Some(mismatch.thread_id)
-            || parse_legacy_owner_scope(owner_scope) != Some(thread.user_id)
-            || user_id.is_some_and(|id| id != thread.user_id)
-        {
+        let endpoint_owner_disagrees = match identity_index.owner_basis {
+            OwnerBasis::LegacyScope => {
+                parse_legacy_owner_scope(owner_scope) != Some(thread.user_id)
+                    || user_id.is_some_and(|id| id != thread.user_id)
+            }
+            OwnerBasis::TypedUserId => user_id != Some(thread.user_id),
+        };
+        if thread_id != Some(mismatch.thread_id) || endpoint_owner_disagrees {
             reasons[*index]
                 .reasons
                 .insert("relation_endpoint_mismatch".to_string());
@@ -1076,13 +1259,7 @@ fn inspect_relation_side(
         match (source, scope, native_id) {
             (None, None, None) => {}
             (Some(source), Some(scope), Some(native_id)) => {
-                let identity_key = (
-                    owner_scope.to_string(),
-                    source.to_string(),
-                    scope.to_string(),
-                    native_id.to_string(),
-                );
-                match identity_index.get(&identity_key).map(Vec::as_slice) {
+                match identity_index.get(owner_scope, user_id, source, scope, native_id) {
                     Some([identity]) if identity.thread_id == mismatch.thread_id => {}
                     Some([_]) => {
                         reasons[*index]
@@ -1557,7 +1734,11 @@ fn is_canonical_key(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn event_identity_refers_to_candidate(event: &EventRefRow, mismatch: &MismatchRow) -> bool {
+fn event_identity_refers_to_candidate(
+    event: &EventRefRow,
+    mismatch: &MismatchRow,
+    owner_basis: OwnerBasis,
+) -> bool {
     let has_identity_reference = event.source.is_some()
         || event.identity_scope.is_some()
         || event.owner_scope.is_some()
@@ -1574,10 +1755,11 @@ fn event_identity_refers_to_candidate(event: &EventRefRow, mismatch: &MismatchRo
             .identity_scope
             .as_deref()
             .is_some_and(|value| mismatch.identity_scope.as_deref() != Some(value))
-        || event
-            .owner_scope
-            .as_deref()
-            .is_some_and(|value| value != mismatch.owner_scope)
+        || (owner_basis == OwnerBasis::LegacyScope
+            && event
+                .owner_scope
+                .as_deref()
+                .is_some_and(|value| value != mismatch.owner_scope))
         || event
             .user_id
             .is_some_and(|value| value != mismatch.thread_user_id)
@@ -1672,7 +1854,7 @@ fn collect_canonical_key_values(value: &serde_json::Value, values: &mut Vec<Stri
 }
 
 #[cfg(all(test, not(feature = "postgres")))]
-mod tests {
+pub(in crate::db_migrate) mod tests {
     use super::{ThreadGroupsUserIdsV3Task, find_cycle_nodes_from_edges};
     use crate::db_migrate::{
         catalog,
@@ -1689,7 +1871,7 @@ mod tests {
 
     static FIXTURE_ID: AtomicI64 = AtomicI64::new(50_000_000);
 
-    async fn test_pool() -> &'static RdbPool {
+    pub(in crate::db_migrate) async fn test_pool() -> &'static RdbPool {
         use sqlx::sqlite::SqlitePoolOptions;
 
         let pool = SqlitePoolOptions::new()
@@ -1721,16 +1903,16 @@ mod tests {
         Box::leak(Box::new(pool))
     }
 
-    struct Seed {
-        group_id: i64,
-        thread_id: i64,
-        root_thread_id: i64,
-        old_key: String,
-        saved_key: String,
-        root_key: String,
+    pub(in crate::db_migrate) struct Seed {
+        pub(in crate::db_migrate) group_id: i64,
+        pub(in crate::db_migrate) thread_id: i64,
+        pub(in crate::db_migrate) root_thread_id: i64,
+        pub(in crate::db_migrate) old_key: String,
+        pub(in crate::db_migrate) saved_key: String,
+        pub(in crate::db_migrate) root_key: String,
     }
 
-    async fn prepare_task_rows(pool: &RdbPool) {
+    pub(in crate::db_migrate) async fn prepare_task_rows(pool: &RdbPool) {
         sqlx::raw_sql(
             "CREATE TABLE IF NOT EXISTS memories_data_migration_task_state (\
                task_identity TEXT PRIMARY KEY, canonical_definition_digest TEXT NOT NULL, state TEXT NOT NULL,\
@@ -1776,7 +1958,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn seed_membership(pool: &RdbPool, mismatch: bool) -> Seed {
+    pub(in crate::db_migrate) async fn seed_membership(pool: &RdbPool, mismatch: bool) -> Seed {
         let n = FIXTURE_ID.fetch_add(10, Ordering::Relaxed);
         let group_id = n;
         let thread_id = n + 1;
@@ -1866,7 +2048,10 @@ mod tests {
         }
     }
 
-    async fn insert_live_child_relation(pool: &RdbPool, seed: &Seed) -> (i64, i64) {
+    pub(in crate::db_migrate) async fn insert_live_child_relation(
+        pool: &RdbPool,
+        seed: &Seed,
+    ) -> (i64, i64) {
         let relation_id = seed.group_id + 5_000_000;
         sqlx::query(
             "INSERT INTO thread_relation \
@@ -2060,7 +2245,9 @@ mod tests {
             .unwrap()
     }
 
-    async fn business_table_snapshot(pool: &RdbPool) -> Vec<(String, String)> {
+    pub(in crate::db_migrate) async fn business_table_snapshot(
+        pool: &RdbPool,
+    ) -> Vec<(String, String)> {
         const TABLES: &[&str] = &[
             "thread",
             "thread_group",
@@ -3904,6 +4091,9 @@ mod tests {
 mod postgres_tests {
     use super::ThreadGroupsUserIdsV3Task;
     use crate::db_migrate::{
+        DataMigrationTask, thread_groups_user_ids_v4::ThreadGroupsUserIdsV4Task,
+    };
+    use crate::db_migrate::{
         catalog,
         state::{self, TaskStateKind},
     };
@@ -4147,6 +4337,106 @@ mod postgres_tests {
             catalog::thread_groups_user_ids_v3().expect("fixed @3 catalog entry"),
         )
         .expect("construct fixed @3 task")
+    }
+
+    fn typed_owner_task(pool: &sqlx::PgPool) -> ThreadGroupsUserIdsV4Task {
+        ThreadGroupsUserIdsV4Task::new(
+            pool.clone(),
+            catalog::thread_groups_user_ids_v4().expect("fixed @4 catalog entry"),
+        )
+        .expect("construct fixed @4 task")
+    }
+
+    #[test]
+    #[ignore = "requires TEST_POSTGRES_URL for disposable PostgreSQL; creates an isolated schema"]
+    fn pg_v4_fills_typed_owners_and_repairs_aliases_by_typed_owner() {
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let db = PgTestDatabase::new().await;
+            prepare_canonical_key_prerequisite(&db.pool).await;
+            let seed = seed_membership(&db.pool, true).await;
+            for statement in [
+                "UPDATE thread_group_member SET owner_scope = 'broken'",
+                "UPDATE source_thread_identity SET owner_scope = 'broken'",
+                "UPDATE thread_canonical_key SET owner_scope = 'broken', user_id = NULL",
+                "INSERT INTO manual_collection (id, user_id, owner_scope, title, created_at, updated_at) \
+                 VALUES (91, NULL, 'user:7', 'fixture', 1, 1)",
+            ] {
+                sqlx::query(statement)
+                    .execute(&db.pool)
+                    .await
+                    .expect("prepare legacy owner fixture");
+            }
+            for (event_id, thread_id) in [("pg-thread-owned", Some(seed.thread_id)), ("pg-ownerless", None)] {
+                sqlx::query(
+                    "INSERT INTO thread_group_event_outbox \
+                     (event_id, event_type, operation_id, policy_version, owner_scope, user_id, thread_id, payload, created_at) \
+                     VALUES ($1, 'thread_group_observation_recorded', 'fixture-operation', 'fixture-policy', \
+                             NULL, NULL, $2, $3::jsonb, 60)",
+                )
+                .bind(event_id)
+                .bind(thread_id)
+                .bind(
+                    serde_json::json!({
+                        "state": "recorded",
+                        "adapter_version": "fixture",
+                        "evidence_kind": "fixture",
+                    })
+                    .to_string(),
+                )
+                .execute(&db.pool)
+                .await
+                .expect("insert outbox fixture");
+            }
+
+            let report = typed_owner_task(&db.pool)
+                .inspect()
+                .await
+                .expect("inspect typed owners");
+            assert_eq!(
+                report["typed_id_fields_backfilled"]["thread_canonical_key.user_id"],
+                2
+            );
+            // A thread-owned outbox event is history that references the candidate.
+            assert_eq!(
+                report["stop_reasons"]["event_history_reference"],
+                1,
+                "{report}"
+            );
+            sqlx::query("DELETE FROM thread_group_event_outbox WHERE event_id = 'pg-thread-owned'")
+                .execute(&db.pool)
+                .await
+                .expect("remove referencing event");
+
+            let repaired = typed_owner_task(&db.pool)
+                .apply("pg-v4", "pg-test")
+                .await
+                .expect("apply typed-owner repair");
+            assert_eq!(repaired["repaired_memberships"], 1, "{repaired}");
+            let owners: Vec<Option<i64>> =
+                sqlx::query_scalar("SELECT user_id FROM thread_canonical_key ORDER BY thread_id")
+                    .fetch_all(&db.pool)
+                    .await
+                    .expect("read filled owners");
+            assert_eq!(owners, vec![Some(1), Some(1)]);
+            let collection_owner: Option<i64> =
+                sqlx::query_scalar("SELECT user_id FROM manual_collection WHERE id = 91")
+                    .fetch_one(&db.pool)
+                    .await
+                    .expect("read legacy-scope owner");
+            assert_eq!(collection_owner, Some(7));
+            let ownerless: Option<i64> = sqlx::query_scalar(
+                "SELECT user_id FROM thread_group_event_outbox WHERE event_id = 'pg-ownerless'",
+            )
+            .fetch_one(&db.pool)
+            .await
+            .expect("read ownerless event");
+            assert_eq!(ownerless, None);
+            typed_owner_task(&db.pool)
+                .verify()
+                .await
+                .expect("verify typed-owner repair");
+            db.close().await;
+        });
     }
 
     #[test]

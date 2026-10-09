@@ -96,10 +96,17 @@ CARGO_BUILD_JOBS=1 scripts/build-memories-db-migrate-sqlite.sh /path/to/memories
 
 このビルドは Linux/x86_64 および macOS/Apple Silicon をサポートします。ネイティブの
 `memories-db-migrate` バイナリと、対応する SHA-256 固定済み Atlas バイナリを
-パッケージ化します。データベースを開く前に、すべてのデータベース書き込み処理を停止し、
-SQLite/LanceDB の一体化したバックアップを利用可能な状態にしてからバンドルを実行してください。
-アプリケーションは SQL を適用したり Atlas を直接実行したりせず、バンドル内の
-`memories-db-migrate` コマンドを呼び出す必要があります。
+パッケージ化し、内容 digest を記録した `bundle-manifest.json` を含めます
+（`memories-db-migrate bundle verify` で検証できます）。
+
+データベースを開く前に、すべてのデータベース書き込み処理を停止し、バンドル内の
+`memories-db-migrate local apply --maintenance-window-ack` を実行してください。
+`--backup-dir <ディレクトリ> [--backup-keep <世代数>]` か `--no-backup-unsafe` のどちらかの指定が必須です。
+移行要否の判断、バックアップ、検証、失敗時の再実行可否の判断はこのコマンドが行い、
+復元は `local restore --maintenance-window-ack --backup <バックアップ>` で行います。
+アプリケーションは終了コードと stdout 最終行の構造化行（`error_code` など）だけで判定し、
+SQL を適用したり Atlas を直接実行したりしてはいけません。
+契約の詳細は [docs/database-migration-tool-spec_ja.md](docs/database-migration-tool-spec_ja.md) を参照してください。
 
 ## セットアップと実行
 

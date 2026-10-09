@@ -9,11 +9,42 @@ use async_trait::async_trait;
 use infra_utils::infra::rdb::RdbPool;
 
 pub mod catalog;
+pub mod local;
 pub mod state;
 pub mod thread_groups_canonical_keys_v1;
 pub mod thread_groups_user_ids_v1;
 pub mod thread_groups_user_ids_v3;
+pub mod thread_groups_user_ids_v4;
 pub mod thread_message_times_v1;
+mod typed_owner_backfill;
+
+/// Bind placeholder for the compiled RDB backend.
+fn placeholder(index: usize) -> String {
+    #[cfg(feature = "postgres")]
+    {
+        format!("${index}")
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let _ = index;
+        "?".to_string()
+    }
+}
+
+/// Storage outside the RDB that a task may change. Local backups copy it
+/// together with the database so that both can be restored as one unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TaskResource {
+    ThreadLanceDb,
+}
+
+/// Resources changed by a registered task implementation.
+pub fn task_resources(implementation: &str) -> &'static [TaskResource] {
+    match implementation {
+        "thread_message_times_v1::ThreadMessageTimesV1Task" => &[TaskResource::ThreadLanceDb],
+        _ => &[],
+    }
+}
 
 /// Fixed-registry contract for a release-bound post-schema migration task.
 ///
@@ -41,6 +72,7 @@ pub fn has_registered_implementation(implementation: &str) -> bool {
             | "thread_groups_user_ids_v1::ThreadGroupsUserIdsV1Task"
             | "thread_groups_user_ids_v2::ThreadGroupsUserIdsV2Task"
             | "thread_groups_user_ids_v3::ThreadGroupsUserIdsV3Task"
+            | "thread_groups_user_ids_v4::ThreadGroupsUserIdsV4Task"
     )
 }
 
@@ -68,6 +100,9 @@ pub fn task_from_catalog(
         )),
         "thread_groups_user_ids_v3::ThreadGroupsUserIdsV3Task" => Ok(Box::new(
             thread_groups_user_ids_v3::ThreadGroupsUserIdsV3Task::new(pool, entry)?,
+        )),
+        "thread_groups_user_ids_v4::ThreadGroupsUserIdsV4Task" => Ok(Box::new(
+            thread_groups_user_ids_v4::ThreadGroupsUserIdsV4Task::new(pool, entry)?,
         )),
         _ => unreachable!("TaskCatalogEntry::validate rejects unregistered implementations"),
     }

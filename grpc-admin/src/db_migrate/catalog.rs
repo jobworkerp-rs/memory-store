@@ -20,9 +20,19 @@ pub const THREAD_GROUPS_USER_IDS_V2_GENERATION: u32 = 2;
 pub const THREAD_GROUPS_USER_IDS_V2_IDENTITY: &str = "thread-groups-user-ids-v1@2";
 pub const THREAD_GROUPS_USER_IDS_V3_GENERATION: u32 = 3;
 pub const THREAD_GROUPS_USER_IDS_V3_IDENTITY: &str = "thread-groups-user-ids-v1@3";
+pub const THREAD_GROUPS_USER_IDS_V4_IDENTITY: &str = "thread-groups-user-ids-v1@4";
 
 const CATALOG_JSON: &str = include_str!("../../../infra/atlas/post-migration-tasks.json");
 const HISTORY_JSON: &str = include_str!("../../../infra/atlas/post-migration-task-history.json");
+
+/// File names and contents of the catalog compiled into this binary, so that a
+/// release bundle can prove that it ships the same catalog.
+pub fn compiled_catalog_files() -> [(&'static str, &'static str); 2] {
+    [
+        ("post-migration-tasks.json", CATALOG_JSON),
+        ("post-migration-task-history.json", HISTORY_JSON),
+    ]
+}
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct TaskCatalog {
@@ -502,6 +512,15 @@ pub fn thread_groups_user_ids_v3() -> Result<TaskCatalogEntry> {
     Ok(task)
 }
 
+pub fn thread_groups_user_ids_v4() -> Result<TaskCatalogEntry> {
+    let task = load_catalog()?
+        .tasks
+        .into_iter()
+        .find(|task| task.identity() == THREAD_GROUPS_USER_IDS_V4_IDENTITY)
+        .context("thread-groups-user-ids-v1@4 is missing from task catalog")?;
+    Ok(task)
+}
+
 pub fn thread_message_times_v1() -> Result<TaskCatalogEntry> {
     let task = load_catalog()?
         .tasks
@@ -566,11 +585,12 @@ fn validate_schema_version(version: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HISTORY_JSON, THREAD_GROUPS_USER_IDS_V2_IDENTITY, TaskCatalog, TaskCatalogEntry,
-        TaskHistory, canonical_definition_digest, load_catalog, select_tasks_for_schema_version,
-        thread_groups_canonical_keys_v1, thread_groups_canonical_keys_v2,
-        thread_groups_user_ids_v1, thread_groups_user_ids_v2, thread_groups_user_ids_v3,
-        thread_message_times_v1, validate_fixed_catalog_entry, validate_history_chain,
+        HISTORY_JSON, THREAD_GROUPS_USER_IDS_V2_IDENTITY, THREAD_GROUPS_USER_IDS_V3_IDENTITY,
+        TaskCatalog, TaskCatalogEntry, TaskHistory, canonical_definition_digest, load_catalog,
+        select_tasks_for_schema_version, thread_groups_canonical_keys_v1,
+        thread_groups_canonical_keys_v2, thread_groups_user_ids_v1, thread_groups_user_ids_v2,
+        thread_groups_user_ids_v3, thread_groups_user_ids_v4, thread_message_times_v1,
+        validate_fixed_catalog_entry, validate_history_chain,
     };
     use crate::db_migrate::has_registered_implementation;
     use serde_json::json;
@@ -578,7 +598,7 @@ mod tests {
     #[test]
     fn catalog_is_valid_and_contains_the_required_tasks() {
         let catalog = load_catalog().expect("catalog must be valid");
-        assert_eq!(catalog.tasks.len(), 6);
+        assert_eq!(catalog.tasks.len(), 7);
         assert_eq!(
             thread_message_times_v1().unwrap().identity(),
             "thread-message-times-v1@1"
@@ -604,11 +624,42 @@ mod tests {
             "thread-groups-user-ids-v1@3"
         );
         assert_eq!(
+            thread_groups_user_ids_v4().unwrap().identity(),
+            "thread-groups-user-ids-v1@4"
+        );
+        // Released generations keep their digests when a replacement is added.
+        assert_eq!(
+            thread_groups_user_ids_v3()
+                .unwrap()
+                .canonical_definition_digest,
+            "837a23d4ad769d59947eb9362e463e7455bf71bfac9c5c1fd166b6a4c41a2a78"
+        );
+        assert_eq!(thread_groups_user_ids_v3().unwrap().lifecycle, "retired");
+        assert_eq!(
             thread_groups_user_ids_v2()
                 .unwrap()
                 .canonical_definition_digest,
             "10e7708f257570259affdae26080118164c9cb6980c2ba0f0c3f6bd119df353b"
         );
+    }
+
+    #[test]
+    fn every_task_declares_the_storage_it_changes_outside_the_rdb() {
+        use crate::db_migrate::{TaskResource, task_resources};
+
+        for task in load_catalog().unwrap().tasks {
+            let expected: &[TaskResource] = match task.id.as_str() {
+                "thread-message-times-v1" => &[TaskResource::ThreadLanceDb],
+                "thread-groups-canonical-keys-v1" | "thread-groups-user-ids-v1" => &[],
+                other => panic!("declare the resources changed by {other}"),
+            };
+            assert_eq!(
+                task_resources(&task.implementation),
+                expected,
+                "{}",
+                task.identity()
+            );
+        }
     }
 
     #[test]
@@ -635,15 +686,14 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![
                     "thread-groups-canonical-keys-v1@2",
-                    "thread-groups-user-ids-v1@3",
+                    "thread-groups-user-ids-v1@4",
                     "thread-message-times-v1@1"
                 ]
             );
-            assert!(
-                selected
-                    .iter()
-                    .all(|task| { task.identity() != THREAD_GROUPS_USER_IDS_V2_IDENTITY })
-            );
+            assert!(selected.iter().all(|task| {
+                task.identity() != THREAD_GROUPS_USER_IDS_V2_IDENTITY
+                    && task.identity() != THREAD_GROUPS_USER_IDS_V3_IDENTITY
+            }));
         }
         // The task is introduced by the ThreadGroup schema version, so
         // earlier schema versions must not select it.

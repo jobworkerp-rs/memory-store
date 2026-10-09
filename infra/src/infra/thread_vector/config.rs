@@ -14,6 +14,14 @@ pub struct ThreadVectorDBConfig {
 }
 
 impl ThreadVectorDBConfig {
+    /// LanceDB location of thread vectors. Exposed separately because a
+    /// pre-migration backup must copy exactly the directory the server uses.
+    pub fn lancedb_uri_from(env: impl Fn(&str) -> Option<String>) -> String {
+        env("THREAD_LANCEDB_URI")
+            .or_else(|| env("MEMORY_LANCEDB_URI"))
+            .unwrap_or_else(|| "data/lancedb/memories.lancedb".to_string())
+    }
+
     /// Build from environment variables. THREAD_VECTOR_SIZE is required.
     pub fn from_env() -> anyhow::Result<Self> {
         let vector_size: usize = std::env::var("THREAD_VECTOR_SIZE")
@@ -27,9 +35,7 @@ impl ThreadVectorDBConfig {
             .parse()?;
 
         let cfg = Self {
-            uri: std::env::var("THREAD_LANCEDB_URI")
-                .or_else(|_| std::env::var("MEMORY_LANCEDB_URI"))
-                .unwrap_or_else(|_| "data/lancedb/memories.lancedb".to_string()),
+            uri: Self::lancedb_uri_from(|key| std::env::var(key).ok()),
             table_name: std::env::var("THREAD_LANCEDB_TABLE")
                 .unwrap_or_else(|_| "threads".to_string()),
             vector_size,

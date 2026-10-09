@@ -116,6 +116,9 @@ tracing-subscriber = { workspace = true, features = [
     "env-filter",
 ] }
 tokio-stream = { workspace = true, features = ["net"] }
+# local migration: free-space checks (statvfs) and detecting other SQLite
+# connections through their advisory locks (fcntl).
+libc = "0.2"
 
 
 [features]
