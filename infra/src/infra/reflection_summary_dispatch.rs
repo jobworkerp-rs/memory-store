@@ -12,9 +12,11 @@
 //! to prevent double dispatch.
 
 use crate::infra::embedding_dispatch::{DispatchSpec, EmbeddingConfig, EmbeddingDispatcherCore};
+use crate::infra::embedding_space::registration::WorkerRegistry;
 use anyhow::Result;
 use async_trait::async_trait;
 use jobworkerp_client::jobworkerp::data::JobId;
+use std::sync::Arc;
 
 pub use crate::infra::embedding_dispatch::{
     DispatchError, EmbeddingDispatch, EmbeddingDispatchStatus, EmbeddingJobId,
@@ -25,6 +27,7 @@ const SPEC: DispatchSpec = DispatchSpec {
     // memory_id matches the existing UpsertEmbedding RPC parameter so
     // the workflow can pass it through transparently to MemoryVectorService.
     id_field_name: "memory_id",
+    text_source: crate::infra::embedding_index::source_version::TextSource::MemoryText,
 };
 
 const WORKERS_YAML_ENV: &str = "REFLECTION_WORKERS_YAML";
@@ -33,40 +36,35 @@ const DEFAULT_WORKERS_YAML_PATH: &str = concat!(
     "/../workflows/thread-reflection/auto-reflection-summary-embedding-workers.yaml"
 );
 
-pub fn summary_dispatch_config_from_env() -> Result<EmbeddingConfig> {
-    let cfg = EmbeddingConfig::from_env(WORKERS_YAML_ENV, DEFAULT_WORKERS_YAML_PATH)?;
-    // The matching workflow YAML lands in Phase F; until then the
-    // dispatcher cannot register its worker. Fail loudly here
-    // instead of letting `ensure_initialized` blow up inside
-    // `register_workers_from_yaml`.
-    if !cfg.workers_yaml_path.exists() {
-        anyhow::bail!(
-            "reflection summary embedding workers YAML not found at {} \
-             (set {WORKERS_YAML_ENV} to override). The workflow ships in \
-             a follow-up PR; until then the reflection summary dispatcher \
-             cannot be initialised.",
-            cfg.workers_yaml_path.display()
-        );
-    }
-    Ok(cfg)
+/// Workers YAML this dispatcher needs registered.
+pub fn workers_yaml_path() -> std::path::PathBuf {
+    std::env::var(WORKERS_YAML_ENV)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_WORKERS_YAML_PATH))
 }
 
-/// Public dispatcher type. Single-method surface: app-layer
-/// `ReflectionApp::finalize_generated_reflection` calls
-/// `dispatch(memory_id, summary)` after Phase 3 commits.
+pub fn summary_dispatch_config_from_env() -> Result<EmbeddingConfig> {
+    let path = workers_yaml_path();
+    // Fail at construction with the env var to fix, instead of a generic
+    // "no such file" from the background registration.
+    if !path.exists() {
+        anyhow::bail!(
+            "reflection summary embedding workers YAML not found at {} (set {WORKERS_YAML_ENV} to override)",
+            path.display()
+        );
+    }
+    EmbeddingConfig::from_env()
+}
+
 pub struct ReflectionSummaryDispatcher {
     core: EmbeddingDispatcherCore,
 }
 
 impl ReflectionSummaryDispatcher {
-    pub fn from_env() -> Result<Self> {
+    pub fn from_env(registry: Arc<WorkerRegistry>) -> Result<Self> {
         Ok(Self {
-            core: EmbeddingDispatcherCore::new(summary_dispatch_config_from_env()?, SPEC),
+            core: EmbeddingDispatcherCore::new(summary_dispatch_config_from_env()?, SPEC, registry),
         })
-    }
-
-    pub async fn ensure_initialized(&self) -> Result<()> {
-        self.core.ensure_initialized().await
     }
 
     pub async fn dispatch(

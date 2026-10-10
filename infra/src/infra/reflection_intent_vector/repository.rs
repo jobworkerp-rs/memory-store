@@ -18,7 +18,7 @@ use super::safe_filter::IntentSafeFilter;
 use super::schema::intent_arrow_schema;
 use crate::infra::memory_vector::config::DistanceType;
 use crate::infra::memory_vector::repository::{
-    InFlightGuard, compact_with, prune_with, schema_fingerprint, try_claim_gate,
+    InFlightGuard, compact_with, prune_with, try_claim_gate,
 };
 use arc_swap::ArcSwap;
 use arrow_array::{
@@ -29,7 +29,6 @@ use arrow_schema::Schema;
 use futures::StreamExt;
 use lancedb::Table;
 use lancedb::connection::Connection;
-use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
@@ -47,7 +46,10 @@ pub struct IntentSearchHit {
     pub matched_content: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct ReflectionIntentVectorRepository {
+    /// Embedding index of this table's LanceDB directory.
+    embedding_index: Option<crate::infra::embedding_index::EmbeddingIndex>,
     /// Held so we can reopen the table after writes; the LanceDB
     /// `Table` handle is bound to the snapshot at open time, so a
     /// write+read pair against the same handle would otherwise miss
@@ -81,32 +83,25 @@ impl ReflectionIntentVectorRepository {
     /// (on first creation) installs scalar BTree indexes used by the
     /// 2-stage filter path.
     pub async fn open(config: ReflectionIntentVectorConfig) -> anyhow::Result<Self> {
-        let database = lancedb::connect(&config.uri)
-            .execute()
-            .await
-            .map_err(|e| anyhow::anyhow!("LanceDB connect failed: {e}"))?;
-
         let schema = intent_arrow_schema(config.vector_size);
-        let (table, is_new) = match database.open_table(&config.table_name).execute().await {
-            Ok(t) => (t, false),
-            Err(_) => {
-                let empty = RecordBatch::new_empty(schema.clone());
-                let reader: Box<dyn arrow_array::RecordBatchReader + Send> =
-                    Box::new(RecordBatchIterator::new(vec![Ok(empty)], schema.clone()));
-                let t = database
-                    .create_table(&config.table_name, reader)
-                    .execute()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("LanceDB create_table failed: {e}"))?;
-                (t, true)
-            }
-        };
+        let crate::infra::vector_table::OpenedTable {
+            connection: database,
+            table,
+            is_new,
+        } = crate::infra::vector_table::open_or_create(&config.uri, &config.table_name, &schema)
+            .await?;
 
         // Reject incompatible on-disk tables up front. Otherwise an
         // older schema (e.g. before a column was added or after
         // vector_size changed) would silently let upsert / search
         // fail much later, possibly after returning bad results.
-        verify_intent_table_schema(&table, &schema, &config).await?;
+        crate::infra::vector_table::verify_schema_fingerprint(
+            &table,
+            &config.table_name,
+            &config.uri,
+            &schema,
+        )
+        .await?;
 
         if is_new {
             create_scalar_indexes(&table).await?;
@@ -121,6 +116,7 @@ impl ReflectionIntentVectorRepository {
         );
 
         let repo = Self {
+            embedding_index: None,
             database,
             table: Arc::new(ArcSwap::from_pointee(table)),
             config,
@@ -153,7 +149,11 @@ impl ReflectionIntentVectorRepository {
     pub async fn compact_and_optimize_index(&self) -> anyhow::Result<()> {
         // Shared with the spawned auto-compaction in `track_operation`. This
         // store has no `create_index` DDL, so no ddl_lock is needed.
-        compact_with(&self.table, &self.last_optimized_at, None).await
+        compact_with(&self.table, &self.last_optimized_at, None).await?;
+        if let Some(index) = &self.embedding_index {
+            index.compact().await?;
+        }
+        Ok(())
     }
 
     /// Prune old manifests. Cheap; honors the configured retention (which
@@ -161,7 +161,13 @@ impl ReflectionIntentVectorRepository {
     /// so LanceDB's 7-day floor always protects live data. Does NOT update
     /// `last_optimized_at`. Mirrors `MemoryVectorRepositoryImpl::prune`.
     pub async fn prune(&self) -> anyhow::Result<()> {
-        prune_with(&self.table, &self.config.optimize).await
+        prune_with(&self.table, &self.config.optimize).await?;
+        if let Some(index) = &self.embedding_index {
+            index
+                .prune(self.config.optimize.prune_older_than_secs)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Backward-compatible "do everything" entry point: heavy path + prune.
@@ -193,10 +199,16 @@ impl ReflectionIntentVectorRepository {
             let table = Arc::clone(&self.table);
             let last_optimized_at = Arc::clone(&self.last_optimized_at);
             let optimize = self.config.optimize; // Copy
+            let index = self.embedding_index.clone();
             tokio::spawn(async move {
                 let _guard = guard;
                 if let Err(e) = compact_with(&table, &last_optimized_at, None).await {
                     tracing::warn!("Auto-compact failed: {e}");
+                }
+                if let Some(index) = &index
+                    && let Err(e) = index.compact().await
+                {
+                    tracing::warn!("Auto-compact of the embedding index failed: {e}");
                 }
                 if prune_due && let Err(e) = prune_with(&table, &optimize).await {
                     tracing::warn!("Auto-prune failed: {e}");
@@ -226,6 +238,30 @@ impl ReflectionIntentVectorRepository {
             .map_err(|e| anyhow::anyhow!("intent vector reload_table failed: {e}"))?;
         self.table.store(Arc::new(new_table));
         Ok(())
+    }
+
+    /// Attach the embedding index of this table's directory.
+    pub fn with_embedding_index(
+        mut self,
+        index: crate::infra::embedding_index::EmbeddingIndex,
+    ) -> Self {
+        self.embedding_index = Some(index);
+        self
+    }
+
+    pub fn embedding_index(&self) -> Option<&crate::infra::embedding_index::EmbeddingIndex> {
+        self.embedding_index.as_ref()
+    }
+
+    /// LanceDB URI the table lives in.
+    pub fn uri(&self) -> &str {
+        &self.config.uri
+    }
+
+    /// The current table handle, for table-level metadata (embedding
+    /// space records) outside the repository's own operations.
+    pub fn table_handle(&self) -> lancedb::Table {
+        (*self.table.load_full()).clone()
     }
 
     pub fn vector_size(&self) -> usize {
@@ -326,6 +362,15 @@ impl ReflectionIntentVectorRepository {
 
         if records.is_empty() {
             self.reload_table().await?;
+            if let Some(index) = &self.embedding_index {
+                index
+                    .delete(
+                        crate::infra::embedding_index::TableLabel::ReflectionIntent,
+                        memory_id,
+                        replace_kinds,
+                    )
+                    .await?;
+            }
             // The delete above created a new version; count it so the stale-
             // delete path still drives maintenance. The non-empty path is
             // tracked by the batch_upsert call below.
@@ -345,6 +390,14 @@ impl ReflectionIntentVectorRepository {
                 .map_err(|e| anyhow::anyhow!("intent vector delete failed: {e}"))?;
         }
         self.reload_table().await?;
+        if let Some(index) = &self.embedding_index {
+            index
+                .delete_entities(
+                    crate::infra::embedding_index::TableLabel::ReflectionIntent,
+                    &[memory_id],
+                )
+                .await?;
+        }
         self.track_operation(1).await;
         Ok(())
     }
@@ -634,49 +687,12 @@ fn dedup_intent_hits(hits: Vec<IntentSearchHit>) -> Vec<IntentSearchHit> {
         .collect()
 }
 
-async fn verify_intent_table_schema(
-    table: &Table,
-    expected: &Arc<Schema>,
-    config: &ReflectionIntentVectorConfig,
-) -> anyhow::Result<()> {
-    let actual = table
-        .schema()
-        .await
-        .map_err(|e| anyhow::anyhow!("intent vector schema read failed: {e}"))?;
-    let actual_arrow = actual.as_ref().clone();
-    let expected_fp = schema_fingerprint(expected.as_ref());
-    let actual_fp = schema_fingerprint(&actual_arrow);
-    if actual_fp == expected_fp {
-        return Ok(());
-    }
-    // Surface as structured StartupError so the parent (agent-app) can
-    // route into the LanceDB-dim recovery flow without parsing the
-    // message text. The `embedding` field shape mirrors memory_vector,
-    // so the same dim extractor works here.
-    let expected_dim =
-        crate::infra::memory_vector::schema::extract_embedding_dim_from_schema(expected.as_ref())
-            .unwrap_or(0);
-    let actual_dim =
-        crate::infra::memory_vector::schema::extract_embedding_dim_from_schema(&actual_arrow)
-            .unwrap_or(0);
-    Err(anyhow::Error::new(
-        crate::infra::startup_error::StartupError::LancedbSchemaMismatch {
-            table: config.table_name.clone(),
-            uri: config.uri.clone(),
-            expected_dim,
-            actual_dim,
-            expected_fingerprint: expected_fp,
-            actual_fingerprint: actual_fp,
-        },
-    ))
-}
-
 /// Install BTree indexes on the scalar columns the 2-stage filter
 /// path uses (`only_if` predicates and direct `delete` filters).
 /// Without these, queries against a non-trivial corpus fall back to
 /// a full scan. Pre-existing indexes (when this is called against a
 /// previously-created table) are tolerated as no-ops.
-async fn create_scalar_indexes(table: &Table) -> anyhow::Result<()> {
+pub async fn create_scalar_indexes(table: &Table) -> anyhow::Result<()> {
     // memory_id is part of the merge key for upsert / delete and feeds
     // the RDB→IN list 2-stage filter. vector_kind backs the N-row
     // replace_kinds delete. The remaining columns mirror the RDB sidecar
@@ -690,23 +706,7 @@ async fn create_scalar_indexes(table: &Table) -> anyhow::Result<()> {
         "outcome",
         "created_at",
     ];
-    for col_name in columns {
-        if let Err(e) = table
-            .create_index(&[col_name], Index::BTree(Default::default()))
-            .execute()
-            .await
-        {
-            let msg = e.to_string();
-            if msg.contains("already exists") || msg.contains("duplicate") {
-                continue;
-            }
-            tracing::warn!(
-                "reflection_intent_vector: failed to create BTree index on {}: {}",
-                col_name,
-                e
-            );
-        }
-    }
+    crate::infra::vector_table::ensure_btree_indexes(table, &columns).await;
     Ok(())
 }
 

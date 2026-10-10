@@ -12,6 +12,14 @@ input:
           type: string
         content:
           type: string
+        # Vector kind the rows are written as: "text" (default) or
+        # "caption" (an image memory's body embedded as its caption).
+        vector_kind:
+          type: string
+        # Dispatch token issued by memories; forwarded unchanged to the
+        # write RPC so stale results are rejected there.
+        token:
+          type: object
       required: [memory_id, content]
 do:
   # Step 1: Generate text embeddings via the MultimodalEmbeddingRunner.
@@ -29,51 +37,73 @@ do:
   #  - text_rows: one VectorRow per chunk. `to_entries[]` gives the
   #    0-based array index as `.key`, which is the contiguous
   #    chunk_index within (memory_id, vector_kind="text").
-  - generateEmbedding:
-      run:
-        worker:
-          name: "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}"
-          using: embed_text
-          arguments:
-            # No document prefix here: the Rust-side `validate_document_prefix_configuration`
-            # (infra/src/infra/embedding_dispatch.rs) rejects MEMORY_EMBEDDING_DOCUMENT_PREFIX
-            # at startup, since this runner chunks `text` internally and a prepended prefix
-            # would corrupt persisted chunk offsets.
-            text: "${ .content }"
-      output:
-        as:
-          model_name: "${ .model_info.model_name? // \"unknown\" }"
-          text_rows: >-
-            ${ [ .embeddings | to_entries[] | {
-                  vector_kind: "text",
-                  chunk_index: .key,
-                  begin_position: .value.begin_position,
-                  end_position: .value.end_position,
-                  content: .value.content,
-                  embedding: { values: .value.values }
-                } ] }
+  - generateAndStore:
+      try:
+        - generateEmbedding:
+            run:
+              worker:
+                name: "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}%{MEMORY_EMBEDDING_SPACE_SUFFIX}"
+                using: embed_text
+                arguments:
+                  # No document prefix here: the Rust-side `validate_document_prefix_configuration`
+                  # (infra/src/infra/embedding_dispatch.rs) rejects MEMORY_EMBEDDING_DOCUMENT_PREFIX
+                  # at startup, since this runner chunks `text` internally and a prepended prefix
+                  # would corrupt persisted chunk offsets.
+                  text: "${ .content }"
+            output:
+              as:
+                model_name: "${ .model_info.model_name? // \"unknown\" }"
+                text_rows: >-
+                  ${ [ .embeddings | to_entries[] | {
+                        vector_kind: "text",
+                        chunk_index: .key,
+                        begin_position: .value.begin_position,
+                        end_position: .value.end_position,
+                        content: .value.content,
+                        embedding: { values: .value.values }
+                      } ] }
 
-  # Step 2: Upsert every chunk row via the BatchUpsertEmbeddings N-row
-  # path. `replace_kinds: ["text"]` deletes only this memory's existing
-  # `text` rows before inserting the new chunk set, so a shorter rebuild
-  # leaves no stale rows and the image pipeline's image/caption rows
-  # (managed by a different dispatch) are never touched (design 1/3
-  # §3.3.1 kind isolation).
-  #
-  # The whole JSON body is built in one jq expression: object-literal
-  # syntax composes values with correct typing and `tojson` serialises
-  # in one pass (DSL §Runtime Expressions forbids mixing literal text
-  # with ${...}; the Liquid json_encode filter is scalar-only).
-  - upsertEmbedding:
-      run:
-        worker:
-          name: memories-upsert-embedding
-          using: unary
-          arguments:
-            json_body: >-
-              ${ {
-                memory_id: $workflow.input.memory_id,
-                embedding_model: (.model_name // "unknown"),
-                replace_kinds: ["text"],
-                rows: .text_rows
-              } | tojson }
+        # Step 2: Upsert every chunk row via the BatchUpsertEmbeddings N-row
+        # path. `replace_kinds: ["text"]` deletes only this memory's existing
+        # `text` rows before inserting the new chunk set, so a shorter rebuild
+        # leaves no stale rows and the image pipeline's image/caption rows
+        # (managed by a different dispatch) are never touched (design 1/3
+        # §3.3.1 kind isolation).
+        #
+        # The whole JSON body is built in one jq expression: object-literal
+        # syntax composes values with correct typing and `tojson` serialises
+        # in one pass (DSL §Runtime Expressions forbids mixing literal text
+        # with ${...}; the Liquid json_encode filter is scalar-only).
+        - upsertEmbedding:
+            run:
+              worker:
+                name: memories-upsert-embedding
+                using: unary
+                arguments:
+                  json_body: >-
+                    ${ ($workflow.input.vector_kind // "text") as $kind | {
+                      memory_id: $workflow.input.memory_id,
+                      embedding_model: (.model_name // "unknown"),
+                      replace_kinds: [$kind],
+                      rows: [.text_rows[] | .vector_kind = $kind]
+                    } + (if $workflow.input.token then {token: $workflow.input.token} else {} end)
+                    | tojson }
+      catch:
+        as: err
+        do:
+          - reportFailure:
+              if: "${ $workflow.input.token != null }"
+              run:
+                worker:
+                  name: memories-report-embedding-failure
+                  using: unary
+                  arguments:
+                    json_body: >-
+                      ${ {
+                        token: $workflow.input.token,
+                        table: "memory",
+                        entity_id: ($workflow.input.memory_id | tonumber),
+                        vector_kind: ($workflow.input.vector_kind // "text"),
+                        reason: "workflow_error",
+                        message: ($err | tostring)
+                      } | tojson }

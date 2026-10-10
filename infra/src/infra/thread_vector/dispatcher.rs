@@ -1,6 +1,5 @@
-use crate::infra::embedding_dispatch::{
-    DispatchError, DispatchSpec, EmbeddingConfig, EmbeddingDispatcherCore,
-};
+use crate::infra::embedding_dispatch::{DispatchError, DispatchSpec, EmbeddingDispatcherCore};
+use crate::infra::embedding_space::registration::WorkerRegistry;
 use crate::infra::memory_vector::dispatcher::AutoEmbeddingConfig;
 use anyhow::Result;
 use jobworkerp_client::jobworkerp::data::JobId;
@@ -10,6 +9,7 @@ use std::sync::Arc;
 const SPEC: DispatchSpec = DispatchSpec {
     target_worker_name: "memories-auto-thread-embedding",
     id_field_name: "thread_id",
+    text_source: crate::infra::embedding_index::source_version::TextSource::ThreadDescription,
 };
 
 const WORKERS_YAML_ENV: &str = "MEMORY_THREAD_WORKERS_YAML";
@@ -19,7 +19,9 @@ const DEFAULT_WORKERS_YAML_PATH: &str = concat!(
 );
 
 /// Resolve the thread-side workers YAML path from env (or compile-time default).
-fn workers_yaml_path() -> PathBuf {
+/// Workers YAML this dispatcher needs registered. Its workflow uses the
+/// mm-embedding worker defined by the memory workers YAML.
+pub fn workers_yaml_path() -> PathBuf {
     std::env::var(WORKERS_YAML_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_WORKERS_YAML_PATH))
@@ -40,28 +42,15 @@ impl ThreadEmbeddingJobDispatcher {
     /// YAML is recorded as a prerequisite so the shared
     /// `memories-mm-embedding` worker is registered from its single
     /// source of truth before the thread YAML's workflow references it.
-    pub fn from_config(config: AutoEmbeddingConfig) -> Self {
-        let memory_yaml = config.workers_yaml_path.clone();
-        let thread_config = EmbeddingConfig {
-            workers_yaml_path: workers_yaml_path(),
-            prerequisite_yaml_paths: vec![memory_yaml],
-            ..config
-        };
+    pub fn from_config(config: AutoEmbeddingConfig, registry: Arc<WorkerRegistry>) -> Self {
         Self {
-            core: EmbeddingDispatcherCore::new(thread_config, SPEC),
+            core: EmbeddingDispatcherCore::new(config, SPEC, registry),
         }
     }
 
-    pub fn from_env() -> Result<Self> {
-        let memory_config =
-            crate::infra::memory_vector::dispatcher::auto_embedding_config_from_env()?;
-        Ok(Self::from_config(memory_config))
-    }
-
-    /// Eagerly run the lazy init so configuration errors surface at
-    /// startup. See `EmbeddingDispatcherCore::ensure_initialized`.
-    pub async fn ensure_initialized(&self) -> Result<()> {
-        self.core.ensure_initialized().await
+    pub fn from_env(registry: Arc<WorkerRegistry>) -> Result<Self> {
+        let config = crate::infra::memory_vector::dispatcher::auto_embedding_config_from_env()?;
+        Ok(Self::from_config(config, registry))
     }
 
     pub async fn dispatch(
@@ -74,7 +63,7 @@ impl ThreadEmbeddingJobDispatcher {
 
     /// Spawn thread embedding dispatch (fire-and-forget).
     pub fn spawn_dispatch(dispatcher: &Arc<Self>, thread_id: i64, content: &str) {
-        if content.is_empty() {
+        if !crate::infra::embedding_target::thread_description_is_target(content) {
             return;
         }
         let d = dispatcher.clone();
@@ -102,49 +91,14 @@ impl ThreadEmbeddingJobDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infra::embedding_dispatch::EmbeddingConfig;
     use serial_test::serial;
 
-    fn memory_config() -> EmbeddingConfig {
-        EmbeddingConfig {
-            timeout_sec: 90,
-            max_content_len: 4096,
-            workers_yaml_path: PathBuf::from("/tmp/memory-workers.yaml"),
-            prerequisite_yaml_paths: Vec::new(),
-            extra_worker_names: Vec::new(),
-        }
-    }
-
-    /// `from_config` must promote the memory YAML to a prerequisite so the
-    /// shared `memories-mm-embedding` worker is registered from its
-    /// single source of truth before the thread YAML's workflow runs.
     #[test]
     #[serial]
-    fn from_config_records_memory_yaml_as_prerequisite() {
+    fn default_workers_yaml_is_the_thread_pipeline() {
         // SAFETY: serialized via `#[serial]`.
         unsafe { std::env::remove_var(WORKERS_YAML_ENV) };
-        let memory = memory_config();
-        let memory_yaml = memory.workers_yaml_path.clone();
-        let dispatcher = ThreadEmbeddingJobDispatcher::from_config(memory);
-        let cfg = &dispatcher.core.config_for_test();
-        assert_eq!(cfg.prerequisite_yaml_paths, vec![memory_yaml]);
-        assert!(
-            cfg.workers_yaml_path
-                .ends_with("auto-thread-embedding-workers.yaml"),
-            "expected default thread YAML, got {:?}",
-            cfg.workers_yaml_path
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn from_config_inherits_shared_knobs() {
-        // SAFETY: serialized via `#[serial]`.
-        unsafe { std::env::remove_var(WORKERS_YAML_ENV) };
-        let dispatcher = ThreadEmbeddingJobDispatcher::from_config(memory_config());
-        let cfg = &dispatcher.core.config_for_test();
-        assert_eq!(cfg.timeout_sec, 90);
-        assert_eq!(cfg.max_content_len, 4096);
+        assert!(workers_yaml_path().ends_with("auto-thread-embedding-workers.yaml"));
     }
 
     /// Mirror of the memory-side guard in `memory_vector::dispatcher`. The
@@ -162,7 +116,9 @@ mod tests {
             std::fs::read_to_string(&path).expect("auto-thread-embedding-workers.yaml must exist");
 
         let block = yaml
-            .split_once("- name: memories-auto-thread-embedding")
+            .split_once(
+                "- name: \"memories-auto-thread-embedding%{MEMORY_EMBEDDING_SPACE_SUFFIX}\"",
+            )
             .map(|(_, rest)| rest)
             .expect("memories-auto-thread-embedding worker must be defined");
         let block = block.split("\n  - ").next().unwrap_or(block);

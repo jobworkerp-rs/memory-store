@@ -5,20 +5,15 @@
 //! the same enqueue / cache-args-descriptor flow against jobworkerp. This
 //! module factors that logic so the per-dispatcher modules can stay thin.
 
+use crate::infra::embedding_space::registration::{Registered, WorkerRegistry};
+use crate::infra::embedding_space::workers::current_space_worker_name;
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
-use jobworkerp_client::client::UseJobworkerpClient;
-use jobworkerp_client::client::helper::UseJobworkerpClientHelper;
-use jobworkerp_client::client::worker_yaml;
-use jobworkerp_client::client::wrapper::JobworkerpClientWrapper;
 use jobworkerp_client::jobworkerp::data::{JobId, WorkerId};
 use jobworkerp_client::jobworkerp::service::{JobRequest, job_request};
 use jobworkerp_client::proto::JobworkerpProto;
-use prost_reflect::MessageDescriptor;
 use serde_json::json;
-use smallvec::{SmallVec, smallvec};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use smallvec::SmallVec;
 use std::sync::Arc;
 
 /// Re-exports so downstream crates (notably `app`) that hold an
@@ -61,16 +56,21 @@ pub const EMBEDDING_QUERY_PREFIX_JAQ_ENV: &str = "MEMORY_EMBEDDING_QUERY_PREFIX_
 /// asserts it stays in sync with [`MM_EMBEDDING_WORKER_ENV`] /
 /// [`MM_EMBEDDING_WORKER_DEFAULT`].
 pub const MM_EMBEDDING_WORKER_PLACEHOLDER: &str =
-    "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}";
+    "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}%{MEMORY_EMBEDDING_SPACE_SUFFIX}";
 
-/// Resolve the mm-embedding worker name from [`MM_EMBEDDING_WORKER_ENV`],
-/// falling back to [`MM_EMBEDDING_WORKER_DEFAULT`]. Used by every Rust
-/// query-embed path (memory_vector SearchSemantic / SearchByMedia, the
-/// startup dimension probe, and reflection F-S8) so they all hit the same
-/// worker the storage YAMLs registered.
-pub fn mm_embedding_worker_name() -> String {
+/// Base name of the MultimodalEmbeddingRunner worker, from
+/// [`MM_EMBEDDING_WORKER_ENV`] or [`MM_EMBEDDING_WORKER_DEFAULT`].
+pub fn mm_embedding_worker_base() -> String {
     std::env::var(MM_EMBEDDING_WORKER_ENV)
         .unwrap_or_else(|_| MM_EMBEDDING_WORKER_DEFAULT.to_string())
+}
+
+/// The mm-embedding worker name in the current embedding space. Used by
+/// every Rust query-embed path (memory_vector SearchSemantic /
+/// SearchByMedia and reflection F-S8) so they all hit the worker the
+/// storage YAMLs registered for the same space.
+pub fn mm_embedding_worker_name() -> String {
+    crate::infra::embedding_space::workers::current_space_worker_name(&mm_embedding_worker_base())
 }
 
 fn nonempty_env(name: &str) -> Option<String> {
@@ -184,6 +184,9 @@ impl ImageSearchMode {
 pub const TEXT_WORKFLOW_WORKER: &str = "memories-auto-embedding";
 /// The workflow worker that handles `DispatchKind::Media` jobs.
 pub const IMAGE_WORKFLOW_WORKER: &str = "memories-auto-image-embedding";
+/// Caption generation workflow worker (VLM, not tied to the embedding
+/// model, so its name has no space suffix).
+pub const CAPTION_WORKFLOW_WORKER: &str = "memories-auto-image-caption";
 
 /// Which embedding pipeline a memory row should be (re)dispatched for.
 /// Independent axes — a memory with both text and an image attachment
@@ -232,78 +235,7 @@ impl TryFrom<i32> for DispatchKind {
     }
 }
 
-/// Decide which embedding pipelines a memory row should be dispatched to.
-///
-/// Two independent axes:
-/// - **Text**: `role ∈ {USER,ASSISTANT,SYSTEM} ∧ content_type ≠ TOOL ∧
-///   non-empty content`. TOOL content is excluded to keep tool-call /
-///   tool-output previews out of the text vector space (the historical
-///   `content_type=TEXT` narrowing carried this intent; role alone would
-///   let ASSISTANT-role tool_use rows pollute the index).
-/// - **Media**: the linked `media_object.kind == IMAGE` ∧ its
-///   `storage_backend ∉ {unresolvable, inline}` ∧ `mode != none`.
-///   Independent of `content_type` (any content_type may carry media —
-///   a TOOL memory's screenshot is still embeddable). AUDIO/VIDEO are
-///   out of scope. `unresolvable` has no bytes to embed (promoted later);
-///   `inline` is a test-only backend the embedding workflow cannot read.
-///
-/// `ROLE_REFLECTION` is excluded via the role allow-list: reflection
-/// memories travel through their own dispatchers, and dispatching them
-/// here too would double-dispatch with status-update gaps.
-/// Whether a memory's linked media would be dispatched to the image
-/// (Media) pipeline. The three conjuncts are exactly the Media axis of
-/// [`dispatch_kinds`]: `kind == IMAGE` ∧ `storage_backend ∉
-/// {unresolvable, inline}` ∧ image mode enabled. `unresolvable` has no
-/// bytes to embed; `inline` is a test-only backend the embedding
-/// workflow cannot read; `mode=none` disables the image pipeline
-/// entirely. Exposed as a standalone predicate so callers that must
-/// reason about "will this media produce image/caption vectors?" (e.g.
-/// the Update path deciding whether old image rows are now orphaned)
-/// share one definition with `dispatch_kinds` instead of re-deriving a
-/// subset of the conditions.
-pub fn media_axis_dispatchable(
-    media_kind: Option<i32>,
-    media_storage_backend: Option<&str>,
-    mode: ImageSearchMode,
-) -> bool {
-    use protobuf::llm_memory::data::ContentType;
-    let is_image = matches!(
-        media_kind.and_then(|k| ContentType::try_from(k).ok()),
-        Some(ContentType::Image)
-    );
-    let media_embeddable = !matches!(media_storage_backend, Some("unresolvable") | Some("inline"));
-    is_image && media_embeddable && mode.is_image_enabled()
-}
-
-pub fn dispatch_kinds(
-    content: &str,
-    role: i32,
-    content_type: i32,
-    media_kind: Option<i32>,
-    media_storage_backend: Option<&str>,
-    mode: ImageSearchMode,
-) -> SmallVec<[DispatchKind; 2]> {
-    use protobuf::llm_memory::data::{ContentType, MessageRole};
-    let role_ok = matches!(
-        MessageRole::try_from(role),
-        Ok(MessageRole::RoleUser
-            | MessageRole::RoleAssistant
-            | MessageRole::RoleSystem
-            | MessageRole::RoleReflection)
-    );
-    if !role_ok {
-        return SmallVec::new();
-    }
-    let mut kinds: SmallVec<[DispatchKind; 2]> = smallvec![];
-    let is_tool = matches!(ContentType::try_from(content_type), Ok(ContentType::Tool));
-    if !is_tool && !content.trim().is_empty() {
-        kinds.push(DispatchKind::Text);
-    }
-    if media_axis_dispatchable(media_kind, media_storage_backend, mode) {
-        kinds.push(DispatchKind::Media);
-    }
-    kinds
-}
+pub use crate::infra::embedding_target::{dispatch_kinds, media_axis_dispatchable};
 
 /// A memory row resolved for dispatch: which pipelines to run, the
 /// content for the text pipeline, and the linked media for the image
@@ -421,10 +353,9 @@ pub trait EmbeddingDispatch: Send + Sync {
     }
 }
 
-/// Configuration for an embedding dispatcher. Worker-specific settings
-/// (runner_settings, response_type, retry policy, ...) live in the YAML
-/// referenced by `workers_yaml_path`; this struct only carries values
-/// needed at job-args construction and dispatch time.
+/// Configuration for an embedding dispatcher. Worker definitions live in
+/// the workers YAML registered by the [`WorkerRegistry`]; this struct only
+/// carries values needed at job-args construction and dispatch time.
 ///
 /// Note: the `embedding_model` label persisted alongside each vector
 /// record is sourced from the runner's `model_info.model_name` inside
@@ -433,85 +364,43 @@ pub trait EmbeddingDispatch: Send + Sync {
 pub struct EmbeddingConfig {
     pub timeout_sec: u32,
     pub max_content_len: usize,
-    /// Primary YAML defining the dispatcher's workflow worker plus any
-    /// workers it owns exclusively.
-    pub workers_yaml_path: PathBuf,
-    /// YAMLs to register *before* `workers_yaml_path`. Used by the thread
-    /// dispatcher to pull in the shared `memories-mm-embedding` worker
-    /// from the memory YAML rather than redefining it (which would race
-    /// against the memory dispatcher under last-write-wins).
-    pub prerequisite_yaml_paths: Vec<PathBuf>,
-    /// Extra workflow worker names to resolve to `WorkerId` during lazy
-    /// init, on top of `DispatchSpec.target_worker_name`. The memory
-    /// dispatcher uses this to also resolve the image workflow worker so
-    /// it can route `DispatchKind::Media` to a second worker. Resolution
-    /// is best-effort: a name absent from the registered set is skipped
-    /// (it may be a mode-gated worker that this deployment did not
-    /// register), so the text path is never blocked by an image worker
-    /// that is intentionally not present.
-    pub extra_worker_names: Vec<&'static str>,
 }
 
 impl EmbeddingConfig {
-    /// Read the shared `MEMORY_EMBEDDING_*` knobs plus a caller-supplied
-    /// env var for the workers YAML path.
-    pub fn from_env(workers_yaml_env: &str, workers_yaml_default: &str) -> Result<Self> {
+    /// Read the shared `MEMORY_EMBEDDING_*` knobs.
+    pub fn from_env() -> Result<Self> {
         validate_document_prefix_configuration()?;
         Ok(Self {
             timeout_sec: std::env::var("MEMORY_EMBEDDING_TIMEOUT_SEC")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(120),
-            max_content_len: std::env::var("MEMORY_EMBEDDING_MAX_CONTENT_LEN")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8192),
-            workers_yaml_path: std::env::var(workers_yaml_env)
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from(workers_yaml_default)),
-            prerequisite_yaml_paths: Vec::new(),
-            extra_worker_names: Vec::new(),
+            max_content_len: max_content_len_from_env(),
         })
     }
 }
 
+/// Characters of text sent to the embedding worker
+/// (`MEMORY_EMBEDDING_MAX_CONTENT_LEN`). Source versions cover exactly the
+/// truncated text, so dispatch and verification must agree on it.
+pub fn max_content_len_from_env() -> usize {
+    std::env::var("MEMORY_EMBEDDING_MAX_CONTENT_LEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8192)
+}
+
 /// Constants distinguishing a memory dispatcher from a thread dispatcher.
-/// `id_field_name` is the JSON key under which the target id is sent to
-/// the workflow runner (the workflow YAML reads it back out).
+/// `target_worker_name` is the base name of the dispatcher's workflow
+/// worker (registered with the current space's suffix); `id_field_name`
+/// is the JSON key under which the target id is sent to the workflow
+/// runner (the workflow YAML reads it back out).
 pub struct DispatchSpec {
     pub target_worker_name: &'static str,
     pub id_field_name: &'static str,
-}
-
-/// Lazy-initialized state shared by both dispatcher kinds.
-struct DispatcherInner {
-    client: JobworkerpClientWrapper,
-    /// WorkerId of the primary workflow worker (`spec.target_worker_name`)
-    /// — avoids find_by_name on every enqueue.
-    worker_id: WorkerId,
-    /// WorkerIds of `config.extra_worker_names` resolved at init.
-    /// Best-effort: a name not present in the registered set is absent
-    /// here (a mode-gated worker this deployment did not register), so
-    /// routing to it later fails loudly rather than blocking init.
-    extra_worker_ids: HashMap<&'static str, WorkerId>,
-    /// WorkflowRunArgs schema descriptor, cached for repeat encoding.
-    args_descriptor: Option<MessageDescriptor>,
-    /// Lazy per-(worker, using) cache for `query_embed`: the WorkerData
-    /// and the method's args descriptor. SearchSemantic / SearchByMedia
-    /// are a per-request hot path, so resolving the worker + descriptor
-    /// (two gRPC round-trips) only once per (worker, using) — instead of
-    /// every query — matters as search QPS grows. Mutex (not OnceCell)
-    /// because the key set is small but not known until first use.
-    #[allow(clippy::type_complexity)]
-    query_resolve_cache: tokio::sync::Mutex<
-        HashMap<
-            (String, String),
-            (
-                jobworkerp_client::jobworkerp::data::WorkerData,
-                Option<MessageDescriptor>,
-            ),
-        >,
-    >,
+    /// What the text sent by this dispatcher is embedded as (part of its
+    /// source version).
+    pub text_source: crate::infra::embedding_index::source_version::TextSource,
 }
 
 /// Core dispatcher logic shared by memory and thread dispatchers. Public
@@ -519,150 +408,62 @@ struct DispatcherInner {
 pub struct EmbeddingDispatcherCore {
     config: EmbeddingConfig,
     spec: DispatchSpec,
-    inner: tokio::sync::OnceCell<DispatcherInner>,
+    registry: Arc<WorkerRegistry>,
 }
 
 impl EmbeddingDispatcherCore {
-    pub fn new(config: EmbeddingConfig, spec: DispatchSpec) -> Self {
+    pub fn new(config: EmbeddingConfig, spec: DispatchSpec, registry: Arc<WorkerRegistry>) -> Self {
         Self {
             config,
             spec,
-            inner: tokio::sync::OnceCell::new(),
+            registry,
         }
     }
 
-    /// Read-only accessor for tests in sibling modules that need to verify
-    /// how a dispatcher composed its config (e.g. that the thread
-    /// dispatcher promoted the memory YAML to a prerequisite).
-    #[cfg(test)]
-    pub(crate) fn config_for_test(&self) -> &EmbeddingConfig {
-        &self.config
+    pub fn registry(&self) -> &Arc<WorkerRegistry> {
+        &self.registry
     }
 
-    /// Force the lazy init path now so YAML parse / schema validation /
-    /// jobworkerp connectivity errors surface at app startup instead of
-    /// being deferred to the first fire-and-forget `dispatch()` call,
-    /// where they would only show up as a `tracing::error!` log buried
-    /// in a `tokio::spawn` task. Callers that handle the `Err` may then
-    /// disable auto-embedding for the rest of the process lifetime.
-    pub async fn ensure_initialized(&self) -> Result<()> {
-        self.get_or_init().await.map(|_| ())
-    }
-
-    /// Lazy initialization: connect to jobworkerp, register all workers
-    /// from the YAML, and cache the WorkerId of the workflow entry point.
-    /// On Err, the OnceCell remains uninitialized and retries on next
-    /// call (tokio 1.22+).
-    async fn get_or_init(&self) -> Result<&DispatcherInner> {
-        self.inner
-            .get_or_try_init(|| async {
-                let client = JobworkerpClientWrapper::new_by_env(Some(30)).await?;
-                let metadata = Arc::new(HashMap::new());
-
-                // Register prerequisite YAMLs first so workers shared
-                // with another dispatcher (e.g. `memories-mm-embedding`
-                // owned by the memory YAML) are present before the
-                // primary YAML's workflow references them. Their
-                // registered WorkerIds are kept too: the image workflow
-                // worker (`memories-auto-image-embedding`) lives in a
-                // prerequisite YAML, and `extra_worker_ids` must resolve
-                // it from there — not only from the primary YAML.
-                let mut all_registered: HashMap<String, WorkerId> = HashMap::new();
-                for prereq_path in &self.config.prerequisite_yaml_paths {
-                    let reg = worker_yaml::register_workers_from_yaml(
-                        &client,
-                        None,
-                        metadata.clone(),
-                        prereq_path,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to register prerequisite workers from {}",
-                            prereq_path.display()
-                        )
-                    })?;
-                    all_registered.extend(reg);
-                }
-
-                let registered = worker_yaml::register_workers_from_yaml(
-                    &client,
-                    None,
-                    metadata.clone(),
-                    &self.config.workers_yaml_path,
-                )
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to register {} workers from {}",
-                        self.spec.target_worker_name,
-                        self.config.workers_yaml_path.display()
-                    )
-                })?;
-                all_registered.extend(registered);
-                let worker_id = *all_registered
-                    .get(self.spec.target_worker_name)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "{} missing from {}",
-                            self.spec.target_worker_name,
-                            self.config.workers_yaml_path.display()
-                        )
-                    })?;
-
-                // Best-effort resolve of the extra workflow workers (e.g.
-                // the image workflow, which lives in a prerequisite YAML).
-                // Absence is not an init error: an image-mode worker is
-                // intentionally not registered in a text-only deployment,
-                // and the text path must still come up. Routing to a
-                // missing name fails loudly at enqueue time.
-                let mut extra_worker_ids = HashMap::new();
-                for name in &self.config.extra_worker_names {
-                    if let Some(id) = all_registered.get(*name) {
-                        extra_worker_ids.insert(*name, *id);
-                    }
-                }
-
-                let (_, wf_rdata) = client
-                    .find_runner_or_error(None, metadata, "WORKFLOW")
-                    .await?;
-                let args_descriptor =
-                    JobworkerpProto::parse_job_args_schema_descriptor(&wf_rdata, Some("run"))?;
-
-                Ok(DispatcherInner {
-                    client,
-                    worker_id,
-                    extra_worker_ids,
-                    args_descriptor,
-                    query_resolve_cache: tokio::sync::Mutex::new(HashMap::new()),
-                })
-            })
-            .await
+    /// Nothing is dispatched until every planned worker is registered.
+    fn registered(&self) -> std::result::Result<Arc<Registered>, DispatchError> {
+        self.registry.registered().ok_or_else(|| {
+            DispatchError::Init(anyhow::anyhow!(
+                "embedding workers are not registered in jobworkerp yet"
+            ))
+        })
     }
 
     /// Truncate content to max_content_len Unicode characters.
     fn truncate_content<'a>(&self, content: &'a str) -> std::borrow::Cow<'a, str> {
-        if content.chars().count() > self.config.max_content_len {
-            std::borrow::Cow::Owned(
-                content
-                    .chars()
-                    .take(self.config.max_content_len)
-                    .collect::<String>(),
-            )
-        } else {
-            std::borrow::Cow::Borrowed(content)
-        }
+        crate::infra::embedding_target::truncate_chars(content, self.config.max_content_len)
     }
 
+    /// `content` must already be truncated: the dispatch token's source
+    /// version covers exactly the text sent.
     fn build_job_args_json(&self, target_id: i64, content: &str) -> serde_json::Value {
+        self.build_text_args(target_id, content, self.spec.text_source, None)
+    }
+
+    fn build_text_args(
+        &self,
+        target_id: i64,
+        content: &str,
+        source: crate::infra::embedding_index::source_version::TextSource,
+        vector_kind: Option<&str>,
+    ) -> serde_json::Value {
         // The `input` field is itself a JSON-encoded string because the
         // WORKFLOW runner accepts a single string-typed parameter. The
         // workflow itself reads `embedding_model` from the runner output
         // (`model_info.model_name`), so it does not appear here.
-        let inner = serde_json::json!({
+        let mut inner = serde_json::json!({
             self.spec.id_field_name: target_id.to_string(),
             "content": content,
         });
+        if let Some(kind) = vector_kind {
+            inner["vector_kind"] = serde_json::json!(kind);
+        }
+        let version = crate::infra::embedding_index::source_version::text(source, content);
+        with_token(&mut inner, &version);
         serde_json::json!({ "input": inner.to_string() })
     }
 
@@ -672,12 +473,12 @@ impl EmbeddingDispatcherCore {
     /// `worker_label` is only for logs.
     async fn enqueue_workflow_job(
         &self,
-        inner: &DispatcherInner,
+        registered: &Registered,
         worker_id: WorkerId,
         worker_label: &str,
         job_args_json: &serde_json::Value,
     ) -> std::result::Result<Option<JobId>, DispatchError> {
-        let args_bytes = match &inner.args_descriptor {
+        let args_bytes = match &registered.workflow_args_descriptor {
             Some(desc) => match JobworkerpProto::json_value_to_message(
                 desc.clone(),
                 job_args_json,
@@ -705,16 +506,8 @@ impl EmbeddingDispatcherCore {
             ..Default::default()
         };
 
-        match inner
-            .client
-            .jobworkerp_client()
-            .job_client()
-            .await
-            .enqueue(tonic::Request::new(job_request))
-            .await
-        {
-            Ok(resp) => {
-                let job_id = resp.into_inner().id;
+        match registered.ops.enqueue(job_request).await {
+            Ok(job_id) => {
                 tracing::debug!(
                     target_worker = worker_label,
                     "Embedding job enqueued: job_id={:?}",
@@ -746,64 +539,58 @@ impl EmbeddingDispatcherCore {
         if content.is_empty() {
             return Ok(None);
         }
-        let inner = match self.get_or_init().await {
-            Ok(inner) => inner,
-            Err(e) => {
-                tracing::error!(
-                    target_worker = self.spec.target_worker_name,
-                    "embedding dispatcher init failed: {e}"
-                );
-                return Err(DispatchError::Init(e));
-            }
-        };
-
         let content = self.truncate_content(content);
         let job_args_json = self.build_job_args_json(target_id, &content);
-        self.enqueue_workflow_job(
-            inner,
-            inner.worker_id,
-            self.spec.target_worker_name,
-            &job_args_json,
-        )
-        .await
+        self.dispatch_to_worker(self.spec.target_worker_name, &job_args_json)
+            .await
     }
 
-    /// Enqueue a pre-built workflow `input` JSON to a named workflow
-    /// worker. The name must be one of `config.extra_worker_names` (or
-    /// `spec.target_worker_name`); a name not resolved at init (e.g. an
-    /// image worker absent in a text-only deployment) returns an
-    /// `Enqueue` error rather than silently dropping the job. Used by the
-    /// memory dispatcher to route `DispatchKind::{Text,Media}` to two
-    /// different workflow workers.
+    /// Enqueue a pre-built workflow `input` JSON to the workflow worker
+    /// with base name `worker_base` in the current space. A worker that
+    /// was not registered (e.g. an image worker absent in a text-only
+    /// deployment) returns an `Enqueue` error rather than silently
+    /// dropping the job. Used by the memory dispatcher to route
+    /// `DispatchKind::{Text,Media}` to two different workflow workers.
     pub async fn dispatch_to_worker(
+        &self,
+        worker_base: &str,
+        job_args_json: &serde_json::Value,
+    ) -> std::result::Result<Option<JobId>, DispatchError> {
+        self.dispatch_to_named(&current_space_worker_name(worker_base), job_args_json)
+            .await
+    }
+
+    /// Enqueue to a worker whose name does not depend on the embedding
+    /// space (e.g. caption generation).
+    pub async fn dispatch_to_fixed_worker(
         &self,
         worker_name: &str,
         job_args_json: &serde_json::Value,
     ) -> std::result::Result<Option<JobId>, DispatchError> {
-        let inner = match self.get_or_init().await {
-            Ok(inner) => inner,
+        self.dispatch_to_named(worker_name, job_args_json).await
+    }
+
+    async fn dispatch_to_named(
+        &self,
+        worker_name: &str,
+        job_args_json: &serde_json::Value,
+    ) -> std::result::Result<Option<JobId>, DispatchError> {
+        let registered = match self.registered() {
+            Ok(r) => r,
             Err(e) => {
-                tracing::error!(
+                tracing::warn!(
                     target_worker = worker_name,
-                    "embedding dispatcher init failed: {e}"
+                    "embedding dispatch skipped: {e}"
                 );
-                return Err(DispatchError::Init(e));
+                return Err(e);
             }
         };
-        let worker_id = if worker_name == self.spec.target_worker_name {
-            inner.worker_id
-        } else if let Some(id) = inner.extra_worker_ids.get(worker_name) {
-            *id
-        } else {
-            // The worker was not registered (mode-gated worker missing in
-            // this deployment, or a name typo). Surface it as an enqueue
-            // failure so the fire-and-forget caller logs it, instead of a
-            // silent no-op that loses the embedding.
+        let Some(worker_id) = registered.worker_ids.get(worker_name).copied() else {
             return Err(DispatchError::Enqueue(tonic::Status::not_found(format!(
                 "workflow worker not registered: {worker_name}"
             ))));
         };
-        self.enqueue_workflow_job(inner, worker_id, worker_name, job_args_json)
+        self.enqueue_workflow_job(&registered, worker_id, worker_name, job_args_json)
             .await
     }
 
@@ -815,10 +602,23 @@ impl EmbeddingDispatcherCore {
         self.build_job_args_json(target_id, &content)
     }
 
+    /// Text workflow args writing rows of `vector_kind` (e.g. a caption
+    /// embedded through the text pipeline).
+    pub fn build_kind_job_args(
+        &self,
+        target_id: i64,
+        content: &str,
+        vector_kind: &str,
+        source: crate::infra::embedding_index::source_version::TextSource,
+    ) -> serde_json::Value {
+        let content = self.truncate_content(content);
+        self.build_text_args(target_id, &content, source, Some(vector_kind))
+    }
+
     /// Synchronously embed a query in the SAME model space as the stored
     /// vectors, by submitting the embedding worker (`memories-mm-embedding`)
     /// as a job and waiting for the result. Used by
-    /// SearchSemantic / SearchByMedia and the startup dimension probe.
+    /// SearchSemantic / SearchByMedia.
     ///
     /// `using` is `"embed_text"` or `"embed_image"`; `args_json` is the
     /// method's args message as JSON (e.g. `{"text": "..."}` or
@@ -831,146 +631,17 @@ impl EmbeddingDispatcherCore {
         using: &str,
         args_json: &serde_json::Value,
     ) -> Result<QueryEmbedding> {
-        let inner = self
-            .get_or_init()
-            .await
-            .context("embedding dispatcher init failed (query_embed)")?;
-        let client = inner.client.jobworkerp_client();
-        let metadata = Arc::new(HashMap::new());
-
-        // Resolve (worker, args-descriptor) once per (worker, using) and
-        // cache: this is a per-request search path, so the two gRPC
-        // round-trips below should not run on every query. The args
-        // descriptor is needed because job args MUST be protobuf-encoded
-        // (raw JSON bytes make the runner fail with "buffer underflow").
-        let cache_key = (embed_worker_name.to_string(), using.to_string());
-        let (worker_data, args_desc) = {
-            let mut cache = inner.query_resolve_cache.lock().await;
-            if let Some(hit) = cache.get(&cache_key) {
-                hit.clone()
-            } else {
-                let (_, worker_data) = inner
-                    .client
-                    .find_worker_by_name(None, metadata.clone(), embed_worker_name)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("embedding worker not registered: {embed_worker_name}")
-                    })?;
-                let (_, args_desc, _) = JobworkerpProto::find_runner_descriptors_by_worker(
-                    client,
-                    job_request::Worker::WorkerName(embed_worker_name.to_string()),
-                    Some(using),
-                )
-                .await
-                .with_context(|| format!("resolving {using} args descriptor failed"))?;
-                let entry = (worker_data, args_desc);
-                cache.insert(cache_key, entry.clone());
-                entry
-            }
-        };
-
-        let args_bytes = match args_desc {
-            Some(desc) => JobworkerpProto::json_value_to_message(desc, args_json, true, true)
-                .with_context(|| format!("encoding {using} args failed"))?,
-            // No proto schema (raw-bytes runner) — fall back to JSON.
-            None => serde_json::to_vec(args_json)?,
-        };
-
-        let result = inner
-            .client
-            .enqueue_and_get_result_worker_job(
-                None,
-                metadata,
-                &worker_data,
-                args_bytes,
-                u64::from(self.config.timeout_sec),
-                None,
-                Some(jobworkerp_client::jobworkerp::data::Priority::High),
-                Some(using),
-            )
+        let registered = self
+            .registry
+            .registered()
+            .context("embedding workers are not registered in jobworkerp yet (query_embed)")?;
+        let out = registered
+            .ops
+            .run_worker_job(embed_worker_name, using, args_json, self.config.timeout_sec)
             .await
             .with_context(|| format!("query embed job failed ({using})"))?;
-
-        // A non-Success job (bad settings / runner error / timeout)
-        // yields an empty output, which would otherwise decode to "" and
-        // surface as a confusing "no embeddings array". Fail loudly with
-        // the runner's error text instead.
-        use jobworkerp_client::jobworkerp::data::ResultStatus;
-        if result.status() != ResultStatus::Success {
-            let err_body = result
-                .output
-                .as_ref()
-                .map(|o| String::from_utf8_lossy(&o.items).into_owned())
-                .unwrap_or_default();
-            anyhow::bail!(
-                "{using} job did not succeed (status={:?}): {err_body}",
-                result.status()
-            );
-        }
-
-        let out = JobworkerpProto::resolve_result_output_to_json(
-            client,
-            embed_worker_name,
-            &result,
-            Some(using),
-        )
-        .await
-        .with_context(|| format!("decoding {using} result failed"))?;
-
-        // MmEmbeddingResult: { embeddings: [{ values: [f32], ... }],
-        // model_info: { embedding_dimension: u32, model_name } }.
-        // `resolve_result_output_to_json` may return the message either
-        // bare or wrapped in a single-element array (it builds an array
-        // and unwraps len==1) — accept both shapes.
-        let body = match out.as_array() {
-            Some(arr) if arr.len() == 1 => &arr[0],
-            _ => &out,
-        };
-        let embeddings = body
-            .get("embeddings")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{using} result has no `embeddings` array; raw decoded \
-                     output = {out}"
-                )
-            })?;
-        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embeddings.len());
-        for e in embeddings {
-            let values = e
-                .get("values")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| anyhow::anyhow!("{using} embedding row has no `values`"))?;
-            let v: Vec<f32> = values
-                .iter()
-                .map(|n| n.as_f64().map(|f| f as f32))
-                .collect::<Option<_>>()
-                .ok_or_else(|| anyhow::anyhow!("{using} `values` is not all numeric"))?;
-            vectors.push(v);
-        }
-        if vectors.is_empty() {
-            anyhow::bail!("{using} returned no embedding rows");
-        }
-        let dimension = body
-            .get("model_info")
-            .and_then(|m| m.get("embedding_dimension"))
-            .and_then(|d| d.as_u64())
-            .map(|d| d as usize)
-            // model_info is optional in the result; fall back to the
-            // length of the first vector so the probe still has a value.
-            .unwrap_or_else(|| vectors[0].len());
-        let model_name = body
-            .get("model_info")
-            .and_then(|m| m.get("model_name"))
-            .and_then(|n| n.as_str())
-            .map(str::to_owned);
-        Ok(QueryEmbedding {
-            vectors,
-            dimension,
-            model_name,
-        })
+        parse_query_embedding(using, &out)
     }
-
     /// Convenience: embed a single short text query (one row expected).
     pub async fn query_embed_text(
         &self,
@@ -1000,6 +671,75 @@ impl EmbeddingDispatcherCore {
     }
 }
 
+/// Attach a dispatch token for `version` to a workflow input object, when
+/// this process serves an embedding space.
+pub fn with_token(
+    input: &mut serde_json::Value,
+    version: &crate::infra::embedding_index::SourceVersion,
+) {
+    if let Some(token) = crate::infra::embedding_space::token::DispatchToken::issue(version) {
+        input["token"] = token.to_json();
+    }
+}
+
+/// Decode a MultimodalEmbeddingRunner result
+/// (`{ embeddings: [{ values }], model_info: { embedding_dimension, model_name } }`)
+/// into a [`QueryEmbedding`].
+fn parse_query_embedding(using: &str, out: &serde_json::Value) -> Result<QueryEmbedding> {
+    // MmEmbeddingResult: { embeddings: [{ values: [f32], ... }],
+    // model_info: { embedding_dimension: u32, model_name } }.
+    // `resolve_result_output_to_json` may return the message either
+    // bare or wrapped in a single-element array (it builds an array
+    // and unwraps len==1) — accept both shapes.
+    let body = match out.as_array() {
+        Some(arr) if arr.len() == 1 => &arr[0],
+        _ => out,
+    };
+    let embeddings = body
+        .get("embeddings")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{using} result has no `embeddings` array; raw decoded \
+                 output = {out}"
+            )
+        })?;
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embeddings.len());
+    for e in embeddings {
+        let values = e
+            .get("values")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("{using} embedding row has no `values`"))?;
+        let v: Vec<f32> = values
+            .iter()
+            .map(|n| n.as_f64().map(|f| f as f32))
+            .collect::<Option<_>>()
+            .ok_or_else(|| anyhow::anyhow!("{using} `values` is not all numeric"))?;
+        vectors.push(v);
+    }
+    if vectors.is_empty() {
+        anyhow::bail!("{using} returned no embedding rows");
+    }
+    let dimension = body
+        .get("model_info")
+        .and_then(|m| m.get("embedding_dimension"))
+        .and_then(|d| d.as_u64())
+        .map(|d| d as usize)
+        // model_info is optional in the result; fall back to the
+        // length of the first vector so the probe still has a value.
+        .unwrap_or_else(|| vectors[0].len());
+    let model_name = body
+        .get("model_info")
+        .and_then(|m| m.get("model_name"))
+        .and_then(|n| n.as_str())
+        .map(str::to_owned);
+    Ok(QueryEmbedding {
+        vectors,
+        dimension,
+        model_name,
+    })
+}
+
 /// Result of a synchronous query embedding.
 #[derive(Debug, Clone)]
 pub struct QueryEmbedding {
@@ -1017,6 +757,7 @@ pub struct QueryEmbedding {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     /// `MM_EMBEDDING_WORKER_PLACEHOLDER` re-states the env name and default
     /// as a literal (jobworkerp's `%{...}` syntax can't be built from
@@ -1029,20 +770,28 @@ mod tests {
     fn placeholder_matches_env_and_default() {
         assert_eq!(
             MM_EMBEDDING_WORKER_PLACEHOLDER,
-            format!("%{{{MM_EMBEDDING_WORKER_ENV}:-{MM_EMBEDDING_WORKER_DEFAULT}}}")
+            format!(
+                "%{{{MM_EMBEDDING_WORKER_ENV}:-{MM_EMBEDDING_WORKER_DEFAULT}}}%{{{}}}",
+                crate::infra::embedding_space::workers::SPACE_SUFFIX_PLACEHOLDER
+            )
         );
     }
 
     fn test_core(spec: DispatchSpec, max_content_len: usize) -> EmbeddingDispatcherCore {
+        let fake = crate::infra::jobworkerp_ops::fake::FakeJobworkerp::new();
         EmbeddingDispatcherCore::new(
             EmbeddingConfig {
                 timeout_sec: 60,
                 max_content_len,
-                workers_yaml_path: PathBuf::from("nonexistent.yaml"),
-                prerequisite_yaml_paths: Vec::new(),
-                extra_worker_names: Vec::new(),
             },
             spec,
+            WorkerRegistry::new(
+                Arc::new(fake),
+                Default::default(),
+                None,
+                HashMap::new(),
+                std::time::Duration::from_millis(10),
+            ),
         )
     }
 
@@ -1050,6 +799,7 @@ mod tests {
         DispatchSpec {
             target_worker_name: "memories-auto-embedding",
             id_field_name: "memory_id",
+            text_source: crate::infra::embedding_index::source_version::TextSource::MemoryText,
         }
     }
 
@@ -1057,7 +807,143 @@ mod tests {
         DispatchSpec {
             target_worker_name: "memories-auto-thread-embedding",
             id_field_name: "thread_id",
+            text_source:
+                crate::infra::embedding_index::source_version::TextSource::ThreadDescription,
         }
+    }
+
+    mod with_fake_jobworkerp {
+        use super::*;
+        use crate::infra::embedding_space::registration::RegistrationPlan;
+        use crate::infra::jobworkerp_ops::fake::FakeJobworkerp;
+
+        struct Fixture {
+            _dir: tempfile::TempDir,
+            fake: Arc<FakeJobworkerp>,
+            core: EmbeddingDispatcherCore,
+        }
+
+        /// Space-less registration: names stay at their bases.
+        fn fixture() -> Fixture {
+            let dir = tempfile::tempdir().unwrap();
+            let yaml = dir.path().join("workers.yaml");
+            std::fs::write(
+                &yaml,
+                "workers:\n  - name: memories-mm-embedding\n  - name: memories-auto-embedding\n  - name: image-wf\n",
+            )
+            .unwrap();
+            let fake = FakeJobworkerp::new();
+            let registry = WorkerRegistry::new(
+                Arc::new(fake.clone()),
+                RegistrationPlan {
+                    worker_yamls: vec![yaml],
+                    ..Default::default()
+                },
+                None,
+                HashMap::new(),
+                std::time::Duration::from_millis(10),
+            );
+            let core = EmbeddingDispatcherCore::new(
+                EmbeddingConfig {
+                    timeout_sec: 60,
+                    max_content_len: 100,
+                },
+                memory_spec(),
+                registry,
+            );
+            Fixture {
+                _dir: dir,
+                fake,
+                core,
+            }
+        }
+
+        #[tokio::test]
+        async fn nothing_is_dispatched_before_registration_completes() {
+            let fx = fixture();
+            assert!(matches!(
+                fx.core.dispatch(1, "x").await,
+                Err(DispatchError::Init(_))
+            ));
+            assert!(
+                fx.core
+                    .query_embed_text("memories-mm-embedding", "q")
+                    .await
+                    .is_err()
+            );
+            assert!(fx.fake.enqueued.lock().unwrap().is_empty());
+            assert!(fx.fake.job_calls.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn dispatch_enqueues_to_primary_worker_with_job_args() {
+            let fx = fixture();
+            fx.core.registry().register_once().await.unwrap();
+            let job = fx.core.dispatch(7, "hello").await.unwrap();
+            assert!(job.is_some());
+            let enqueued = fx.fake.enqueued.lock().unwrap();
+            assert_eq!(enqueued.len(), 1);
+            assert_eq!(
+                enqueued[0].worker,
+                Some(job_request::Worker::WorkerId(
+                    fx.fake.worker_id("memories-auto-embedding").unwrap()
+                ))
+            );
+            let args: serde_json::Value = serde_json::from_slice(&enqueued[0].args).unwrap();
+            let input: serde_json::Value =
+                serde_json::from_str(args["input"].as_str().unwrap()).unwrap();
+            assert_eq!(input["memory_id"], "7");
+            assert_eq!(input["content"], "hello");
+        }
+
+        #[tokio::test]
+        async fn unregistered_worker_fails_loudly() {
+            let fx = fixture();
+            fx.core.registry().register_once().await.unwrap();
+            let args = serde_json::json!({"input": "{}"});
+            fx.core.dispatch_to_worker("image-wf", &args).await.unwrap();
+            let err = fx
+                .core
+                .dispatch_to_worker("absent-wf", &args)
+                .await
+                .expect_err("unregistered worker must fail loudly");
+            assert!(matches!(err, DispatchError::Enqueue(s) if s.code() == tonic::Code::NotFound));
+        }
+
+        #[tokio::test]
+        async fn query_embed_parses_runner_output() {
+            let fx = fixture();
+            fx.core.registry().register_once().await.unwrap();
+            *fx.fake.job_output.lock().unwrap() = serde_json::json!([{
+                "embeddings": [{"values": [0.5, 1.0, 2.0]}],
+                "model_info": {"embedding_dimension": 3, "model_name": "m"}
+            }]);
+            let emb = fx
+                .core
+                .query_embed_text("memories-mm-embedding", "q")
+                .await
+                .unwrap();
+            assert_eq!(emb.vectors, vec![vec![0.5, 1.0, 2.0]]);
+            assert_eq!(emb.dimension, 3);
+            assert_eq!(emb.model_name.as_deref(), Some("m"));
+            let calls = fx.fake.job_calls.lock().unwrap();
+            assert_eq!(calls[0].0, "memories-mm-embedding");
+            assert_eq!(calls[0].1, "embed_text");
+        }
+    }
+
+    #[test]
+    fn parse_query_embedding_rejects_malformed_output() {
+        assert!(parse_query_embedding("embed_text", &serde_json::json!({})).is_err());
+        assert!(
+            parse_query_embedding("embed_text", &serde_json::json!({"embeddings": []})).is_err()
+        );
+        let emb = parse_query_embedding(
+            "embed_text",
+            &serde_json::json!({"embeddings": [{"values": [1.0, 2.0]}]}),
+        )
+        .unwrap();
+        assert_eq!(emb.dimension, 2, "falls back to the vector length");
     }
 
     #[test]
@@ -1161,6 +1047,28 @@ mod tests {
         assert_eq!(input["thread_id"], "7465246090942480532");
         assert!(input.get("memory_id").is_none());
         assert!(input.get("embedding_model").is_none());
+    }
+
+    /// Every embedding workflow forwards its dispatch token to the write
+    /// RPC and, when generation fails, reports the failure with it.
+    #[test]
+    fn embedding_workflows_forward_tokens_and_report_failures() {
+        for yaml in [
+            include_str!("../../../workflows/auto-embedding.yaml"),
+            include_str!("../../../workflows/auto-thread-embedding.yaml"),
+            include_str!("../../../workflows/auto-image-embedding.yaml"),
+            include_str!(
+                "../../../workflows/thread-reflection/auto-reflection-summary-embedding.yaml"
+            ),
+            include_str!(
+                "../../../workflows/thread-reflection/auto-reflection-intent-embedding.yaml"
+            ),
+        ] {
+            assert!(yaml.contains("{token: $workflow.input.token}"));
+            assert!(yaml.contains("catch:"));
+            assert!(yaml.contains("name: memories-report-embedding-failure"));
+            assert!(yaml.contains("token: $workflow.input.token,"));
+        }
     }
 
     #[test]
@@ -1283,7 +1191,7 @@ mod tests {
         // A document prefix would be prepended before the runner splits the
         // input, corrupting stored offsets and leaving later chunks unprefixed.
         unsafe { std::env::set_var(EMBEDDING_DOCUMENT_PREFIX_ENV, "passage: ") };
-        let error = EmbeddingConfig::from_env("TEST_WORKERS_YAML", "workers.yaml")
+        let error = EmbeddingConfig::from_env()
             .err()
             .expect("document prefix must be rejected");
         unsafe { std::env::remove_var(EMBEDDING_DOCUMENT_PREFIX_ENV) };
@@ -1356,7 +1264,20 @@ mod tests {
         // test follows a MEMORY_MM_EMBEDDING_WORKER override too.
         let config = crate::infra::memory_vector::dispatcher::auto_embedding_config_from_env()
             .expect("auto_embedding_config_from_env");
-        let core = EmbeddingDispatcherCore::new(config, memory_spec());
+        let registry = WorkerRegistry::new(
+            Arc::new(crate::infra::jobworkerp_ops::EnvJobworkerpConnector::default()),
+            crate::infra::embedding_space::registration::RegistrationPlan {
+                worker_yamls: vec![
+                    crate::infra::memory_vector::dispatcher::workers_yaml_path_from_env(),
+                ],
+                ..Default::default()
+            },
+            None,
+            HashMap::new(),
+            std::time::Duration::from_secs(1),
+        );
+        registry.register_once().await.expect("registering workers");
+        let core = EmbeddingDispatcherCore::new(config, memory_spec(), registry);
         let worker = mm_embedding_worker_name();
 
         let emb = core

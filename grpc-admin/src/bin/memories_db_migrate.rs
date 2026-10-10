@@ -24,6 +24,15 @@ mod bundle_command;
 #[path = "memories_db_migrate/local_command.rs"]
 mod local_command;
 
+#[path = "memories_db_migrate/embedding_command.rs"]
+mod embedding_command;
+
+#[path = "memories_db_migrate/embedding_migrate.rs"]
+mod embedding_migrate;
+
+#[path = "memories_db_migrate/embedding_finish.rs"]
+mod embedding_finish;
+
 const ATLAS_TOOL_LOCK_FILE: &str = "atlas-tool.lock.json";
 #[cfg(feature = "postgres")]
 const ATLAS_SUM: &str = include_str!("../../../infra/atlas/postgres/migrations/atlas.sum");
@@ -90,6 +99,12 @@ enum Command {
     Local {
         #[command(subcommand)]
         command: local_command::LocalCommand,
+    },
+    /// Status, planning, and migration of the embedding space (both RDB
+    /// backends).
+    Embedding {
+        #[command(subcommand)]
+        command: embedding_command::EmbeddingCommand,
     },
     /// Identity and integrity of the release bundle this binary belongs to.
     Bundle {
@@ -191,14 +206,35 @@ async fn main() -> Result<()> {
         Command::Schema { command } => match command {
             SchemaCommand::Validate => run_schema_validate().await,
             SchemaCommand::Status => run_status().await,
-            SchemaCommand::Apply(args) => run_apply(args.dry_run).await,
+            SchemaCommand::Apply(args) => {
+                let _embedding_guard = if args.dry_run {
+                    None
+                } else {
+                    embedding_guard_for_rdb_work(RdbWork::Schema).await?
+                };
+                run_apply(args.dry_run).await
+            }
             SchemaCommand::Verify(verify_args) => run_verify(verify_args.to_version).await,
-            SchemaCommand::Baseline => run_baseline().await,
+            SchemaCommand::Baseline => {
+                let _embedding_guard = embedding_guard_for_rdb_work(RdbWork::Schema).await?;
+                run_baseline().await
+            }
         },
-        Command::PostMigrate { command } => run_post_migrate(command).await,
+        Command::PostMigrate { command } => {
+            let _embedding_guard = match &command {
+                PostMigrateCommand::Run(args) if !args.dry_run => {
+                    embedding_guard_for_rdb_work(RdbWork::Tasks).await?
+                }
+                _ => None,
+            };
+            run_post_migrate(command).await
+        }
         Command::Release { command } => run_release(command).await,
         #[cfg(not(feature = "postgres"))]
         Command::Local { command } => std::process::exit(local_command::run_local(command).await),
+        Command::Embedding { command } => {
+            std::process::exit(embedding_command::run_embedding(command).await)
+        }
         Command::Bundle { command } => {
             std::process::exit(bundle_command::run_bundle(command).await)
         }
@@ -223,6 +259,7 @@ async fn run_release(command: ReleaseCommand) -> Result<()> {
         ReleaseCommand::Baseline => {
             run_schema_validate().await?;
             run_status().await?;
+            let _embedding_guard = embedding_guard_for_rdb_work(RdbWork::Both).await?;
             run_baseline().await?;
             run_status().await?;
             run_verify(None).await?;
@@ -234,6 +271,7 @@ async fn run_release(command: ReleaseCommand) -> Result<()> {
             }
             run_schema_validate().await?;
             run_status().await?;
+            let _embedding_guard = embedding_guard_for_rdb_work(RdbWork::Both).await?;
             run_apply(true).await?;
             run_apply(false).await?;
             run_post_migrate(PostMigrateCommand::Status).await?;
@@ -353,6 +391,159 @@ fn selected_tasks_for_schema_version(
     backend: &str,
 ) -> Result<Vec<catalog::TaskCatalogEntry>> {
     catalog::select_tasks_for_schema_version(&catalog::load_catalog()?, schema_version, backend)
+}
+
+/// Required tasks of `latest_version` that are not completed with their
+/// current definition. Task state is trusted only once the schema is fully
+/// managed; before that every required task is pending.
+async fn pending_required_tasks(
+    pool: &RdbPool,
+    state: SchemaState,
+    latest_version: &str,
+    backend: &str,
+) -> Result<Vec<catalog::TaskCatalogEntry>> {
+    required_tasks_not_completed(pool, state == SchemaState::Managed, latest_version, backend).await
+}
+
+/// Required tasks that will actually run: a task already completed with
+/// its current definition is skipped by `post-migrate run` even while
+/// schema migrations are pending, so the embedding neutrality of the work
+/// is judged without it.
+async fn required_tasks_left_to_run(
+    pool: &RdbPool,
+    state: SchemaState,
+    latest_version: &str,
+    backend: &str,
+) -> Result<Vec<catalog::TaskCatalogEntry>> {
+    let has_task_state = matches!(state, SchemaState::Managed | SchemaState::Pending { .. })
+        && table_exists(pool, "memories_data_migration_task_state").await?;
+    required_tasks_not_completed(pool, has_task_state, latest_version, backend).await
+}
+
+async fn required_tasks_not_completed(
+    pool: &RdbPool,
+    trust_task_state: bool,
+    latest_version: &str,
+    backend: &str,
+) -> Result<Vec<catalog::TaskCatalogEntry>> {
+    let mut pending = Vec::new();
+    for task in selected_tasks_for_schema_version(latest_version, backend)?
+        .into_iter()
+        .filter(|task| task.completion_required_by_schema_version.is_some())
+    {
+        let completed = trust_task_state
+            && state::load(pool, &task.identity())
+                .await?
+                .map(|row| -> Result<bool> {
+                    Ok(row.kind()? == TaskStateKind::Completed
+                        && row.canonical_definition_digest == task.canonical_definition_digest)
+                })
+                .transpose()?
+                .unwrap_or(false);
+        if !completed {
+            pending.push(task);
+        }
+    }
+    Ok(pending)
+}
+
+/// Schema migrations a database in `state` has yet to apply (all of them
+/// when the state does not tell).
+fn pending_schema_versions(state: SchemaState) -> Vec<String> {
+    let versions = atlas_migration_versions();
+    match state {
+        SchemaState::Managed => Vec::new(),
+        SchemaState::Pending { applied_count } => {
+            versions.into_iter().skip(applied_count).collect()
+        }
+        _ => versions,
+    }
+}
+
+/// Whether pending schema migrations and tasks are all embedding neutral.
+fn pending_work_is_embedding_neutral(
+    state: SchemaState,
+    tasks: &[catalog::TaskCatalogEntry],
+) -> bool {
+    let versions = pending_schema_versions(state);
+    grpc_admin::db_migrate::work_is_embedding_neutral(
+        versions.iter().map(String::as_str),
+        tasks.iter().map(|t| t.implementation.as_str()),
+    )
+}
+
+/// Commands that change the RDB outside `local` (`release`, `schema`,
+/// `post-migrate`) take the embedding exclusion and are refused by an
+/// unfinished embedding migration like `local apply` (embedding space
+/// management spec §3.8). Taken once per command, at its entry. `None`
+/// when there is no work.
+/// Which pending work a guarded command performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RdbWork {
+    /// `schema apply` / `schema baseline`.
+    Schema,
+    /// `post-migrate run`.
+    Tasks,
+    /// `release apply` / `release baseline`.
+    Both,
+}
+
+async fn embedding_guard_for_rdb_work(
+    kind: RdbWork,
+) -> Result<Option<grpc_admin::db_migrate::embedding::guard::Guard>> {
+    use grpc_admin::db_migrate::embedding::guard::{self, Work};
+    let pool = open_target_pool().await?;
+    let state = schema_state(&pool).await?;
+    let latest = atlas_migration_versions()
+        .last()
+        .cloned()
+        .context("the migration catalog is empty")?;
+    let schema_work = kind != RdbWork::Tasks && !pending_schema_versions(state).is_empty();
+    let task_work = kind != RdbWork::Schema
+        && !pending_required_tasks(&pool, state, &latest, target_backend()?)
+            .await?
+            .is_empty();
+    if !schema_work && !task_work {
+        return Ok(None);
+    }
+    let to_run = if kind == RdbWork::Schema {
+        Vec::new()
+    } else {
+        required_tasks_left_to_run(&pool, state, &latest, target_backend()?).await?
+    };
+    let neutral = if kind == RdbWork::Tasks {
+        grpc_admin::db_migrate::work_is_embedding_neutral(
+            [],
+            to_run.iter().map(|t| t.implementation.as_str()),
+        )
+    } else {
+        pending_work_is_embedding_neutral(state, &to_run)
+    };
+    let state_dir = infra::infra::embedding_space::storage::state_dir_from_env();
+    match guard::acquire(Some(&pool), &state_dir, Work::Apply { neutral }, None).await {
+        Ok(g) => Ok(Some(g)),
+        Err(e) => {
+            let encode = grpc_admin::db_migrate::vocabulary::encode_value;
+            let refused = e.refused();
+            let mut extra = String::new();
+            if let Some(a) = &refused.attempt {
+                extra.push_str(&format!(
+                    " attempt={} attempt_stage={} backup_mode={}",
+                    encode(&a.attempt),
+                    a.stage,
+                    a.backup_mode
+                ));
+            }
+            if let Some(b) = &refused.backup {
+                extra.push_str(&format!(" backup={}", encode(b)));
+            }
+            if let Some(op) = refused.cancel_operation {
+                extra.push_str(&format!(" cancel_operation={op}"));
+            }
+            let (code, resolution) = (refused.error_code, refused.resolution);
+            bail!("refused error_code={code} resolution={resolution}{extra}: {e}")
+        }
+    }
 }
 
 async fn run_uninitialized_dry_run() -> Result<()> {
@@ -1569,6 +1760,33 @@ mod tests {
     ];
 
     #[test]
+    fn pending_work_neutrality_follows_the_declarations() {
+        use super::{atlas_migration_versions, catalog, pending_work_is_embedding_neutral};
+        let versions = atlas_migration_versions();
+        let latest_only = SchemaState::Pending {
+            applied_count: versions.len() - 1,
+        };
+        assert!(pending_work_is_embedding_neutral(latest_only, &[]));
+        assert!(pending_work_is_embedding_neutral(SchemaState::Managed, &[]));
+        let thread_message_times = catalog::thread_message_times_v1().unwrap();
+        assert!(!pending_work_is_embedding_neutral(
+            SchemaState::Managed,
+            std::slice::from_ref(&thread_message_times)
+        ));
+        let thread_groups = catalog::thread_groups_user_ids_v4().unwrap();
+        assert!(pending_work_is_embedding_neutral(
+            latest_only,
+            std::slice::from_ref(&thread_groups)
+        ));
+        // A database that has applied nothing runs every migration,
+        // including undeclared ones.
+        assert!(!pending_work_is_embedding_neutral(
+            SchemaState::Uninitialized,
+            &[]
+        ));
+    }
+
+    #[test]
     fn release_apply_command_accepts_maintenance_acknowledgement() {
         Cli::try_parse_from([
             "memories-db-migrate",
@@ -1772,6 +1990,13 @@ mod tests {
                 .env("THREAD_LANCEDB_URI", self.vector_uri)
                 .env("THREAD_LANCEDB_TABLE", "threads")
                 .env("THREAD_VECTOR_SIZE", "4")
+                .env(
+                    "MEMORY_EMBEDDING_STATE_DIR",
+                    self.vector_uri
+                        .parent()
+                        .context("E2E LanceDB fixture must have a parent directory")?
+                        .join("embedding-state"),
+                )
                 .envs(E2E_FIXED_SEARCH_ENVIRONMENT)
                 .stdin(Stdio::null())
                 .kill_on_drop(true);
@@ -1973,7 +2198,7 @@ mod tests {
         assert_eq!(row.content, "fixture");
         assert_eq!(row.embedding, vec![0.1, 0.2, 0.3, 0.4]);
         let output = command.run(&["schema", "verify"]).await?;
-        assert!(output.contains("verify status=verified version=20260930000001"));
+        assert!(output.contains("verify status=verified version=20261009000001"));
         let output = command.run(&["post-migrate", "verify"]).await?;
         assert!(output.contains(
             "post_migrate_verify task_identity=thread-groups-canonical-keys-v1@2 status=verified"
@@ -2031,7 +2256,7 @@ mod tests {
             "baseline status=completed baseline_version={candidate_version}"
         )));
         let output = command.run(&["schema", "verify"]).await?;
-        assert!(output.contains("verify status=verified version=20260930000001"));
+        assert!(output.contains("verify status=verified version=20261009000001"));
 
         let pool = sqlx::Pool::<Rdb>::connect(database_url).await?;
         assert_eq!(schema_state(&pool).await?, SchemaState::Managed);
@@ -2040,7 +2265,7 @@ mod tests {
         )
         .fetch_one(&pool)
         .await?;
-        assert_eq!(contract, "20260930000001");
+        assert_eq!(contract, "20261009000001");
         Ok(())
     }
 
@@ -2082,15 +2307,15 @@ mod tests {
     fn baseline_applies_every_migration_after_the_selected_candidate() {
         assert_eq!(
             remaining_migration_count_after_baseline("20260803000001").unwrap(),
-            5
+            6
         );
         assert_eq!(
             remaining_migration_count_after_baseline("20260803000002").unwrap(),
-            4
+            5
         );
         assert_eq!(
             remaining_migration_count_after_baseline("20260803000003").unwrap(),
-            3
+            4
         );
     }
 
@@ -2671,6 +2896,42 @@ mod tests {
             grpc_admin::db_migrate::local::attempt::AttemptRecord::path(&self.target())
         }
 
+        fn embedding_state_dir(&self) -> std::path::PathBuf {
+            self.vector_uri.parent().unwrap().join("embedding-state")
+        }
+
+        /// Migrate to the previous release only, with Atlas alone (no
+        /// task runs), as a database the previous release left behind.
+        fn apply_previous_release(&self) {
+            let previous = atlas_migration_versions().len() - 1;
+            let applied = std::process::Command::new(
+                std::path::Path::new(&self.artifact_root).join("bin/atlas"),
+            )
+            .current_dir(&self.artifact_root)
+            .args(["migrate", "apply", &previous.to_string()])
+            .args(["--config", "file://migrate.hcl", "--env", "sqlite"])
+            .env(
+                "MEMORIES_ATLAS_DATABASE_URL",
+                atlas_database_url(&self.database_url).unwrap(),
+            )
+            .output()
+            .unwrap();
+            assert!(
+                applied.status.success(),
+                "{}",
+                String::from_utf8_lossy(&applied.stderr)
+            );
+        }
+
+        async fn embedding_attempt(
+            &self,
+            marker: Option<infra::infra::embedding_space::MarkerState>,
+            stage: grpc_admin::db_migrate::embedding::attempt::Stage,
+        ) {
+            write_embedding_attempt(&self.vector_uri, &self.embedding_state_dir(), marker, stage)
+                .await;
+        }
+
         /// Record a previous attempt that left the database needing a restore.
         fn record_restore_required(&self, backup: Option<std::path::PathBuf>) {
             use grpc_admin::db_migrate::local::{
@@ -2688,6 +2949,195 @@ mod tests {
             .store(&self.target())
             .unwrap();
         }
+    }
+
+    /// `local apply` and the release commands during an unfinished
+    /// embedding migration: work that is not embedding neutral is refused
+    /// with the migration's next step, neutral work is applied before the
+    /// commit, and nothing is refused when there is no work.
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
+    fn local_apply_e2e_respects_an_unfinished_embedding_migration() {
+        use grpc_admin::db_migrate::embedding::attempt::Stage;
+        use infra::infra::embedding_space::MarkerState;
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let local = LocalE2e::new();
+            local.apply_previous_release();
+            local
+                .embedding_attempt(Some(MarkerState::Pending), Stage::RebuildPending)
+                .await;
+            // The previous release's tasks never ran; one of them touches
+            // thread vectors.
+            let (code, line) = local.apply().await;
+            assert_eq!(code, Some(1));
+            assert_eq!(
+                line,
+                "local_apply status=failed stage=preflight error_code=embedding_migration_in_progress \
+                 resolution=continue_or_restore attempt=a1 attempt_stage=rebuild_pending \
+                 backup_mode=backup backup=/embedding-backup"
+            );
+            let pool = local.pool().await;
+            assert!(
+                !super::table_exists(&pool, "memories_storage_identity")
+                    .await
+                    .unwrap(),
+                "nothing was applied"
+            );
+            pool.close().await;
+            let (code, _, stderr) = local
+                .command()
+                .run_with_status(&[
+                    "post-migrate",
+                    "run",
+                    "--all-required",
+                    "--maintenance-window-ack",
+                ])
+                .await
+                .unwrap();
+            assert_ne!(code, Some(0));
+            assert!(
+                stderr.contains("error_code=embedding_migration_in_progress resolution=continue_or_restore"),
+                "{stderr}"
+            );
+
+            local
+                .embedding_attempt(Some(MarkerState::Committing), Stage::Commit)
+                .await;
+            let (code, line) = local.apply().await;
+            assert_eq!(code, Some(1));
+            assert!(
+                line.ends_with(
+                    "error_code=embedding_migration_in_progress resolution=finalize_required \
+                     attempt=a1 attempt_stage=commit backup_mode=backup"
+                ),
+                "{line}"
+            );
+
+            // Once the migration has ended the work applies; with no work
+            // left, nothing is refused even in the middle of a commit.
+            local.embedding_attempt(None, Stage::Backup).await;
+            let (code, line) = local.apply().await;
+            assert_eq!(code, Some(0), "{line}");
+            assert!(
+                line.starts_with("local_apply status=completed outcome=migrated"),
+                "{line}"
+            );
+            local
+                .embedding_attempt(Some(MarkerState::Committing), Stage::Commit)
+                .await;
+            assert_eq!(
+                local.apply().await,
+                (
+                    Some(0),
+                    "local_apply status=completed outcome=no_op".to_string()
+                )
+            );
+        });
+    }
+
+    /// `local restore` during an unfinished embedding migration, and of a
+    /// backup whose vector tables belong to another embedding space.
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
+    fn local_restore_e2e_respects_the_embedding_space() {
+        use grpc_admin::db_migrate::embedding::attempt::Stage;
+        use infra::infra::embedding_space::MarkerState;
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let local = LocalE2e::new();
+            local.apply_previous_release();
+            // The thread table exists, so the backup holds it.
+            local.embedding_attempt(None, Stage::Backup).await;
+            let (code, line) = local.apply().await;
+            assert_eq!(code, Some(0), "{line}");
+            let backup = LocalE2e::backup_from(&line);
+            let manifest_path = backup.join("manifest.json");
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+            assert!(
+                manifest["resources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["present"] == true),
+                "the backup holds the thread vectors: {manifest}"
+            );
+            let backup_arg = backup.to_string_lossy().into_owned();
+            let restore = [
+                "local",
+                "restore",
+                "--maintenance-window-ack",
+                "--backup",
+                backup_arg.as_str(),
+            ];
+
+            local
+                .embedding_attempt(Some(MarkerState::Pending), Stage::RebuildPending)
+                .await;
+            let (code, line) = local.local(&restore).await;
+            assert_eq!(code, Some(1));
+            assert_eq!(
+                line,
+                "local_restore status=failed stage=restore_preflight \
+                 error_code=embedding_migration_in_progress resolution=continue_or_restore \
+                 attempt=a1 attempt_stage=rebuild_pending backup_mode=backup backup=/embedding-backup"
+            );
+
+            // A vector store recorded as absent is restored by removing
+            // the current one, so it counts as vector tables.
+            let mut absent = manifest.clone();
+            for r in absent["resources"].as_array_mut().unwrap() {
+                r["present"] = serde_json::json!(false);
+                r["files"] = serde_json::json!([]);
+            }
+            std::fs::write(&manifest_path, serde_json::to_vec(&absent).unwrap()).unwrap();
+            let (code, line) = local.local(&restore).await;
+            assert_eq!(code, Some(1));
+            assert!(
+                line.contains("error_code=embedding_migration_in_progress"),
+                "{line}"
+            );
+
+            // A backup of the database alone may be restored meanwhile.
+            let mut sqlite_only = manifest.clone();
+            sqlite_only["resources"] = serde_json::json!([]);
+            std::fs::write(&manifest_path, serde_json::to_vec(&sqlite_only).unwrap()).unwrap();
+            let (code, line) = local.local(&restore).await;
+            assert_eq!(code, Some(0), "{line}");
+            assert_eq!(line, "local_restore status=completed next_action=apply");
+
+            // Vector tables of another space are never restored.
+            local.embedding_attempt(None, Stage::Backup).await;
+            let mut other_space = manifest.clone();
+            other_space["embedding_space_id"] = serde_json::json!("other-space");
+            std::fs::write(&manifest_path, serde_json::to_vec(&other_space).unwrap()).unwrap();
+            let table = infra::infra::vector_table::open_existing(
+                &local.vector_uri.to_string_lossy(),
+                "threads",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            infra::infra::embedding_space::record::write_space_record(
+                &table,
+                &infra::infra::embedding_space::SpaceRecord {
+                    space_id: infra::infra::embedding_space::SpaceId("current-space".into()),
+                    components: None,
+                    legacy_accept: false,
+                },
+            )
+            .await
+            .unwrap();
+            let (code, line) = local.local(&restore).await;
+            assert_eq!(code, Some(1));
+            assert!(
+                line.contains(
+                    "stage=restore_preflight error_code=backup_space_mismatch resolution=manual_recovery"
+                ),
+                "{line}"
+            );
+        });
     }
 
     #[cfg(not(feature = "postgres"))]
@@ -2811,6 +3261,1318 @@ mod tests {
             );
             assert_eq!(
                 tasks_pending.apply().await.1,
+                "local_apply status=completed outcome=no_op"
+            );
+        });
+    }
+
+    /// Runs `embedding` commands of the release binary against a migrated
+    /// database (a local SQLite file, or a fresh schema in
+    /// `TEST_POSTGRES_URL`) whose thread store is the only vector store.
+    /// Everything lives in a temporary fixture.
+    struct EmbeddingE2e {
+        binary: std::path::PathBuf,
+        artifact_root: String,
+        /// The URL handed to the binary.
+        database_url: String,
+        vector_uri: std::path::PathBuf,
+        workers_yaml: std::path::PathBuf,
+        state_dir: std::path::PathBuf,
+        backups: std::path::PathBuf,
+        _fixture: tempfile::TempDir,
+        /// `(service URL, schema)` dropped with the fixture.
+        #[cfg(feature = "postgres")]
+        schema: (String, String),
+    }
+
+    /// An unfinished embedding migration (white-box): the attempt record
+    /// in `state_dir` and the marker of the thread table at `vector_uri`
+    /// (`None` ends it).
+    async fn write_embedding_attempt(
+        vector_uri: &std::path::Path,
+        state_dir: &std::path::Path,
+        marker: Option<infra::infra::embedding_space::MarkerState>,
+        stage: grpc_admin::db_migrate::embedding::attempt::Stage,
+    ) {
+        use grpc_admin::db_migrate::embedding::attempt::{self, AttemptRecord, Method, Status};
+        use infra::infra::embedding_space::{MigrationMarker, SpaceComponents, replace};
+        let spec = replace::StoreSpec {
+            label: infra::infra::embedding_index::TableLabel::Thread,
+            uri: vector_uri.to_string_lossy().into_owned(),
+            table_name: "threads".into(),
+        };
+        let table = replace::open_or_create(&spec, 4).await.unwrap();
+        infra::infra::embedding_space::record::write_marker(
+            &table,
+            marker
+                .map(|state| MigrationMarker {
+                    state,
+                    attempt_id: "a1".into(),
+                })
+                .as_ref(),
+        )
+        .await
+        .unwrap();
+        std::fs::create_dir_all(state_dir).unwrap();
+        if marker.is_none() {
+            let _ = std::fs::remove_file(state_dir.join("attempt.json"));
+            return;
+        }
+        attempt::save(
+            state_dir,
+            &AttemptRecord {
+                format_version: attempt::FORMAT_VERSION,
+                attempt_id: "a1".into(),
+                method: Method::Backup,
+                source_space_id: None,
+                target_space_id: "t".into(),
+                target_space: SpaceComponents {
+                    model_id: "m".into(),
+                    tokenizer_model_id: String::new(),
+                    revision: "r".into(),
+                    dimension: 4,
+                    distance: "cosine".into(),
+                },
+                backup_path: Some("/embedding-backup".into()),
+                backup_complete: true,
+                stage,
+                status: Status::Running,
+                cancel_operation: None,
+                discarded: false,
+                accepted_failed: None,
+                backup_keep: None,
+                started_at: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    /// Bind placeholder of the compiled backend.
+    fn e2e_placeholder(index: usize) -> String {
+        if cfg!(feature = "postgres") {
+            format!("${index}")
+        } else {
+            "?".to_string()
+        }
+    }
+
+    impl EmbeddingE2e {
+        #[cfg(not(feature = "postgres"))]
+        async fn new() -> Self {
+            let local = LocalE2e::new();
+            assert_eq!(local.apply().await.0, Some(0));
+            let LocalE2e {
+                _temporary,
+                artifact_root,
+                binary,
+                database_url,
+                vector_uri,
+                ..
+            } = local;
+            Self::with_database(binary, artifact_root, database_url, vector_uri, _temporary)
+        }
+
+        #[cfg(feature = "postgres")]
+        async fn new() -> Self {
+            let e = Self::new_postgres().await;
+            let (code, line) = e
+                .run(&["release", "apply", "--maintenance-window-ack"])
+                .await;
+            assert_eq!(code, Some(0), "{line}");
+            e
+        }
+
+        /// A schema the previous release left behind: Atlas alone up to the
+        /// previous version, so the latest migration and the tasks are
+        /// still pending.
+        #[cfg(feature = "postgres")]
+        async fn new_previous_release() -> Self {
+            let e = Self::new_postgres().await;
+            let previous = atlas_migration_versions().len() - 1;
+            let applied = std::process::Command::new(
+                std::path::Path::new(&e.artifact_root).join("bin/atlas"),
+            )
+            .current_dir(&e.artifact_root)
+            .args(["migrate", "apply", &previous.to_string()])
+            .args(["--config", "file://migrate.hcl", "--env", "postgres"])
+            .env(
+                "MEMORIES_ATLAS_DATABASE_URL",
+                atlas_database_url(&e.database_url).unwrap(),
+            )
+            .output()
+            .unwrap();
+            assert!(
+                applied.status.success(),
+                "{}",
+                String::from_utf8_lossy(&applied.stderr)
+            );
+            e
+        }
+
+        #[cfg(feature = "postgres")]
+        async fn new_postgres() -> Self {
+            use sqlx::postgres::PgPoolOptions;
+            let service_url = std::env::var("TEST_POSTGRES_URL")
+                .expect("TEST_POSTGRES_URL must be set for the PostgreSQL E2E test");
+            let schema = format!(
+                "memories_embedding_e2e_{}_{}",
+                std::process::id(),
+                command_utils::util::datetime::now_millis()
+            );
+            let admin = PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&service_url)
+                .await
+                .unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE SCHEMA {}",
+                quote_postgres_identifier(&schema)
+            )))
+            .execute(&admin)
+            .await
+            .unwrap();
+            admin.close().await;
+            let fixture = tempfile::tempdir().unwrap();
+            let vector_uri = fixture.path().join("threads.lancedb");
+            let mut e = Self::with_database(
+                fixed_e2e_release_binary().unwrap(),
+                fixed_e2e_atlas_artifact_root().unwrap(),
+                postgres_schema_url(&service_url, &schema).unwrap(),
+                vector_uri,
+                fixture,
+            );
+            e.schema = (service_url, schema);
+            e
+        }
+
+        #[cfg(feature = "postgres")]
+        async fn embedding_attempt(
+            &self,
+            marker: Option<infra::infra::embedding_space::MarkerState>,
+            stage: grpc_admin::db_migrate::embedding::attempt::Stage,
+        ) {
+            write_embedding_attempt(&self.vector_uri, &self.state_dir, marker, stage).await;
+        }
+
+        fn with_database(
+            binary: std::path::PathBuf,
+            artifact_root: String,
+            database_url: String,
+            vector_uri: std::path::PathBuf,
+            fixture: tempfile::TempDir,
+        ) -> Self {
+            let root = vector_uri.parent().unwrap().to_path_buf();
+            let workers_yaml = root.join("workers.yaml");
+            std::fs::write(
+                &workers_yaml,
+                "workers:\n  - name: mm\n    runner: MultimodalEmbeddingRunner\n    settings:\n      model_id: source-model\n",
+            )
+            .unwrap();
+            Self {
+                binary,
+                artifact_root,
+                database_url,
+                state_dir: root.join("embedding-state"),
+                backups: root.join("embedding backups"),
+                workers_yaml,
+                vector_uri,
+                _fixture: fixture,
+                #[cfg(feature = "postgres")]
+                schema: (String::new(), String::new()),
+            }
+        }
+
+        /// What a running memories server looks like to the changing
+        /// commands, until the returned value is dropped.
+        async fn hold_writer(&self) -> Box<dyn std::any::Any + Send> {
+            let pool = self.pool().await;
+            #[cfg(feature = "postgres")]
+            {
+                use infra::infra::embedding_space::writer_lock::WRITER_KEY;
+                let mut conn = pool.acquire().await.unwrap().detach();
+                let held: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock_shared($1)")
+                    .bind(WRITER_KEY)
+                    .fetch_one(&mut conn)
+                    .await
+                    .unwrap();
+                assert!(held);
+                Box::new(conn)
+            }
+            #[cfg(not(feature = "postgres"))]
+            {
+                // The fixture database is not in WAL mode, where only a
+                // connection inside a transaction is detectable.
+                let mut tx = pool.begin().await.unwrap();
+                sqlx::query("SELECT COUNT(*) FROM thread")
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                Box::new((tx, pool))
+            }
+        }
+
+        fn root(&self) -> &std::path::Path {
+            self.vector_uri.parent().unwrap()
+        }
+
+        async fn pool(&self) -> RdbPool {
+            #[cfg(feature = "postgres")]
+            let url = super::postgres_sqlx_database_url(&self.database_url).unwrap();
+            #[cfg(not(feature = "postgres"))]
+            let url = self.database_url.clone();
+            sqlx::Pool::<Rdb>::connect(&url).await.unwrap()
+        }
+
+        /// The binary in the fixture, with only the given environment (it
+        /// loads `.env` from its working directory upwards, so it never
+        /// runs where a developer's `.env` with real stores is found).
+        fn command(&self) -> tokio::process::Command {
+            let mut command = tokio::process::Command::new(&self.binary);
+            command
+                .current_dir(self.root())
+                .env_clear()
+                .env("MEMORIES_ATLAS_DIR", &self.artifact_root)
+                .env("MEMORIES_ATLAS_DATABASE_URL", &self.database_url)
+                .env("MEMORY_WORKERS_YAML", &self.workers_yaml)
+                .env("MEMORY_EMBEDDING_STATE_DIR", &self.state_dir)
+                .stdin(Stdio::null());
+            command
+        }
+
+        async fn run(&self, arguments: &[&str]) -> (Option<i32>, String) {
+            let (code, stdout, _) = self.run_full(arguments).await;
+            (code, stdout.lines().last().unwrap_or_default().to_string())
+        }
+
+        /// Exit code, stdout, and stderr.
+        async fn run_full(&self, arguments: &[&str]) -> (Option<i32>, String, String) {
+            let output = self
+                .command()
+                .args(arguments)
+                .env("THREAD_VECTOR_ENABLED", "true")
+                .env("THREAD_LANCEDB_URI", &self.vector_uri)
+                .env("THREAD_LANCEDB_TABLE", "threads")
+                .env("THREAD_VECTOR_SIZE", "4")
+                .envs(E2E_FIXED_SEARCH_ENVIRONMENT)
+                .output()
+                .await
+                .unwrap();
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout).to_string(),
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            )
+        }
+
+        fn field<'a>(line: &'a str, key: &str) -> &'a str {
+            line.split(' ')
+                .find_map(|kv| kv.strip_prefix(&format!("{key}=")))
+                .unwrap_or_else(|| panic!("{key} missing in {line}"))
+        }
+
+        async fn add_thread(&self, description: &str) -> i64 {
+            let pool = self.pool().await;
+            let id = rand::random::<u32>() as i64 + 1;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO thread (id, user_id, channel, description, created_at, updated_at, memory_kind) VALUES ({}, 1, 'c', {}, 1, 1, 1)",
+                e2e_placeholder(1),
+                e2e_placeholder(2)
+            )))
+            .bind(id)
+            .bind(description)
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+            id
+        }
+
+        async fn delete_thread(&self, id: i64) {
+            let pool = self.pool().await;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM thread WHERE id = {}",
+                e2e_placeholder(1)
+            )))
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+
+        fn uri(&self) -> String {
+            self.vector_uri.to_string_lossy().into_owned()
+        }
+
+        /// The user data embedding commands must never change.
+        async fn user_data(&self) -> Vec<String> {
+            let pool = self.pool().await;
+            let mut rows: Vec<String> = sqlx::query_as::<_, (i64, String, i64)>(
+                "SELECT id, COALESCE(description, ''), updated_at FROM thread ORDER BY id",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| format!("thread {r:?}"))
+            .collect();
+            rows.extend(
+                sqlx::query_as::<_, (i64, String, i64)>(
+                    "SELECT id, content, updated_at FROM memory ORDER BY id",
+                )
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| format!("memory {r:?}")),
+            );
+            pool.close().await;
+            rows
+        }
+
+        /// Record a failed generation of a thread in `space`, as the
+        /// failure report of an embedding workflow would.
+        async fn fail_thread(&self, id: i64, description: &str, space: &str) {
+            use infra::infra::embedding_index::source_version::{self, TextSource};
+            use infra::infra::embedding_index::{EmbeddingIndex, EntryOutcome, IndexEntry};
+            EmbeddingIndex::open(&self.uri())
+                .await
+                .unwrap()
+                .put(&[IndexEntry {
+                    table: infra::infra::embedding_index::TableLabel::Thread,
+                    entity_id: id,
+                    vector_kind: "text".into(),
+                    space_id: infra::infra::embedding_space::SpaceId(space.into()),
+                    source_version: source_version::text(
+                        TextSource::ThreadDescription,
+                        description,
+                    ),
+                    generation_id: "g".into(),
+                    outcome: EntryOutcome::Failure {
+                        reason: "fetch_failed".into(),
+                        class: "permanent".into(),
+                    },
+                    media_digest: None,
+                    recorded_at: 0,
+                }])
+                .await
+                .unwrap();
+        }
+
+        /// Record the fixture's configured space on the thread table, as
+        /// a server start would; returns its ID.
+        async fn record_source_space(&self) -> String {
+            use infra::infra::embedding_space::{SpaceComponents, SpaceRecord, replace};
+            let spec = replace::StoreSpec {
+                label: infra::infra::embedding_index::TableLabel::Thread,
+                uri: self.uri(),
+                table_name: "threads".into(),
+            };
+            let table = replace::open_or_create(&spec, 4).await.unwrap();
+            let source = SpaceComponents {
+                model_id: "source-model".into(),
+                tokenizer_model_id: String::new(),
+                revision: "unversioned".into(),
+                dimension: 4,
+                distance: "cosine".into(),
+            };
+            infra::infra::embedding_space::record::write_space_record(
+                &table,
+                &SpaceRecord::new(&source, false),
+            )
+            .await
+            .unwrap();
+            source.space_id().to_string()
+        }
+
+        async fn index_entries(&self) -> usize {
+            infra::infra::embedding_index::EmbeddingIndex::open(&self.uri())
+                .await
+                .unwrap()
+                .count()
+                .await
+                .unwrap()
+        }
+
+        async fn table(&self) -> infra::infra::vector_table::Table {
+            infra::infra::vector_table::open_existing(&self.uri(), "threads")
+                .await
+                .unwrap()
+                .expect("thread table")
+        }
+
+        async fn marker(&self) -> Option<infra::infra::embedding_space::MigrationMarker> {
+            infra::infra::embedding_space::record::read_table_record(&self.table().await)
+                .await
+                .unwrap()
+                .marker
+        }
+
+        async fn set_marker(
+            &self,
+            state: infra::infra::embedding_space::MarkerState,
+            attempt: &str,
+        ) {
+            infra::infra::embedding_space::record::write_marker(
+                &self.table().await,
+                Some(&infra::infra::embedding_space::MigrationMarker {
+                    state,
+                    attempt_id: attempt.into(),
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        /// `switch` to the 8-dimensional target model, with a backup in
+        /// `self.backups` or none.
+        async fn switch(&self, expected: &str, backup: bool) -> (Option<i32>, String) {
+            let backups = self.backups.to_string_lossy().into_owned();
+            let mut args = vec![
+                "embedding",
+                "switch",
+                "--expected-space",
+                expected,
+                "--maintenance-window-ack",
+                "--model-id",
+                "target-model",
+                "--dimension",
+                "8",
+            ];
+            if backup {
+                args.extend(["--backup-dir", backups.as_str()]);
+            } else {
+                args.push("--no-backup-unsafe");
+            }
+            self.run(&args).await
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    impl Drop for EmbeddingE2e {
+        fn drop(&mut self) {
+            let (url, schema) = self.schema.clone();
+            if schema.is_empty() {
+                return;
+            }
+            // The test runtime is busy in `block_on`; drop on a fresh one.
+            let dropped = std::thread::spawn(move || {
+                tokio::runtime::Runtime::new().unwrap().block_on(async {
+                    let admin = sqlx::postgres::PgPoolOptions::new()
+                        .max_connections(1)
+                        .connect(&url)
+                        .await?;
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
+                        "DROP SCHEMA {} CASCADE",
+                        quote_postgres_identifier(&schema)
+                    )))
+                    .execute(&admin)
+                    .await?;
+                    admin.close().await;
+                    Ok::<_, sqlx::Error>(())
+                })
+            })
+            .join();
+            if !matches!(dropped, Ok(Ok(()))) {
+                eprintln!("warning: could not drop the E2E schema");
+            }
+        }
+    }
+
+    /// A running writer and another changing command are both refused
+    /// before anything changes; `inspect` and `plan` still answer and
+    /// change nothing.
+    #[test]
+    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
+    fn embedding_e2e_writers_and_concurrent_commands_are_refused() {
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let e = EmbeddingE2e::new().await;
+            e.add_thread("topic").await;
+            let before = e.user_data().await;
+            let (_, line) = e.run(&["embedding", "inspect"]).await;
+            let space = EmbeddingE2e::field(&line, "space").to_string();
+
+            let writer = e.hold_writer().await;
+            let (code, line) = e.switch(&space, false).await;
+            assert_eq!(code, Some(1));
+            assert!(
+                line.contains("stage=preflight error_code=writer_active resolution=retry"),
+                "{line}"
+            );
+            let (code, line) = e.run(&["embedding", "inspect"]).await;
+            assert_eq!(code, Some(0), "{line}");
+            assert_eq!(EmbeddingE2e::field(&line, "state"), "incomplete");
+            let (code, line) = e
+                .run(&[
+                    "embedding",
+                    "plan",
+                    "--model-id",
+                    "target-model",
+                    "--dimension",
+                    "8",
+                ])
+                .await;
+            assert_eq!(code, Some(0), "{line}");
+            drop(writer);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+            // Another command holding the operation lock (another Job).
+            let pool = e.pool().await;
+            let held = grpc_admin::db_migrate::embedding::lock::acquire(&pool, &e.state_dir)
+                .await
+                .ok()
+                .unwrap();
+            let (code, line) = e.switch(&space, false).await;
+            assert_eq!(code, Some(1));
+            assert!(
+                line.contains("error_code=operation_in_progress resolution=retry"),
+                "{line}"
+            );
+            let (_, line) = e.run(&["embedding", "inspect"]).await;
+            assert_eq!(EmbeddingE2e::field(&line, "next_action"), "wait", "{line}");
+            drop(held);
+            pool.close().await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+            assert_eq!(e.user_data().await, before);
+            let (code, line) = e.switch(&space, false).await;
+            assert_eq!(code, Some(0), "nothing was left behind: {line}");
+        });
+    }
+
+    /// `release apply` on PostgreSQL: refused while a memories instance
+    /// holds the writer key and while an unfinished embedding migration
+    /// cannot take the work; applied once the migration has ended.
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "requires TEST_POSTGRES_URL, fixed Atlas artifact, and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
+    fn release_e2e_respects_writers_and_an_unfinished_embedding_migration() {
+        use grpc_admin::db_migrate::embedding::attempt::Stage;
+        use infra::infra::embedding_space::MarkerState;
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let e = EmbeddingE2e::new_previous_release().await;
+            let release = ["release", "apply", "--maintenance-window-ack"];
+            e.embedding_attempt(Some(MarkerState::Pending), Stage::RebuildPending)
+                .await;
+            let (code, _, line) = e.run_full(&release).await;
+            assert_ne!(code, Some(0));
+            assert!(
+                line.contains(
+                    "refused error_code=embedding_migration_in_progress resolution=continue_or_restore \
+                     attempt=a1 attempt_stage=rebuild_pending backup_mode=backup backup=/embedding-backup"
+                ),
+                "{line}"
+            );
+            let pool = e.pool().await;
+            assert!(
+                !super::table_exists(&pool, "memories_storage_identity")
+                    .await
+                    .unwrap(),
+                "nothing was applied"
+            );
+            pool.close().await;
+
+            e.embedding_attempt(None, Stage::Backup).await;
+            let writer = e.hold_writer().await;
+            let (code, _, line) = e.run_full(&release).await;
+            assert_ne!(code, Some(0));
+            assert!(line.contains("refused error_code=writer_active"), "{line}");
+            drop(writer);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+            let (code, _, line) = e.run_full(&release).await;
+            assert_eq!(code, Some(0), "{line}");
+            let pool = e.pool().await;
+            assert!(
+                super::table_exists(&pool, "memories_storage_identity")
+                    .await
+                    .unwrap()
+            );
+            pool.close().await;
+        });
+    }
+
+    /// Verification refuses incomplete rebuilds and unaccepted failures,
+    /// then the commit ends the attempt in the target space.
+    #[test]
+    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
+    fn embedding_e2e_finalize_verifies_and_accepts_failures() {
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let e = EmbeddingE2e::new().await;
+            let thread = e.add_thread("topic").await;
+            let before = e.user_data().await;
+            let (_, line) = e.run(&["embedding", "inspect"]).await;
+            let space = EmbeddingE2e::field(&line, "space").to_string();
+            let (code, line) = e.switch(&space, false).await;
+            assert_eq!(code, Some(0), "{line}");
+            let attempt = EmbeddingE2e::field(&line, "attempt").to_string();
+            let target = EmbeddingE2e::field(&line, "target_space").to_string();
+
+            let finalize = async |accept: Option<&str>| {
+                let mut args = vec!["embedding", "finalize", "--attempt", attempt.as_str()];
+                if let Some(n) = accept {
+                    args.extend(["--accept-failed", n]);
+                }
+                e.run(&args).await
+            };
+            let (code, line) = finalize(None).await;
+            assert_eq!(code, Some(1));
+            assert!(
+                line.contains("stage=verify error_code=rebuild_incomplete resolution=resume_rebuild"),
+                "{line}"
+            );
+            assert_eq!(EmbeddingE2e::field(&line, "attempt"), attempt);
+            assert_eq!(EmbeddingE2e::field(&line, "missing_thread"), "1");
+            assert_eq!(EmbeddingE2e::field(&line, "orphan"), "0");
+            assert_eq!(
+                e.marker().await.map(|m| m.state),
+                Some(infra::infra::embedding_space::MarkerState::Pending),
+                "a failed verification changes nothing"
+            );
+
+            e.fail_thread(thread, "topic", &target).await;
+            let (code, line) = finalize(None).await;
+            assert_eq!(code, Some(1));
+            assert!(
+                line.contains("error_code=rebuild_has_failures resolution=resolve_failures"),
+                "{line}"
+            );
+            assert_eq!(EmbeddingE2e::field(&line, "failed_thread"), "1");
+            let (code, line) = finalize(Some("2")).await;
+            assert_eq!(code, Some(1), "a different count is not accepted: {line}");
+
+            let (code, line) = finalize(Some("1")).await;
+            assert_eq!(code, Some(0), "{line}");
+            assert_eq!(
+                line,
+                format!(
+                    "embedding_finalize status=completed outcome=finalized attempt={attempt} space={target} accepted_failed=1 next_action=apply"
+                )
+            );
+            assert_eq!(e.marker().await, None);
+            assert_eq!(e.user_data().await, before, "switch and finalize keep user data");
+            let (code, line) = finalize(None).await;
+            assert_eq!(code, Some(0), "{line}");
+            assert_eq!(EmbeddingE2e::field(&line, "outcome"), "already_completed");
+            assert_eq!(EmbeddingE2e::field(&line, "accepted_failed"), "1");
+
+            let (_, line) = e.run(&["embedding", "inspect"]).await;
+            assert_eq!(EmbeddingE2e::field(&line, "state"), "failed", "{line}");
+            assert_eq!(EmbeddingE2e::field(&line, "space"), target);
+            assert_eq!(EmbeddingE2e::field(&line, "next_action"), "resolve_failed");
+            for cmd in [
+                vec!["embedding", "abandon", "--attempt", attempt.as_str()],
+                vec!["embedding", "restore", "--attempt", attempt.as_str()],
+                vec!["embedding", "switch", "--resume", attempt.as_str()],
+            ] {
+                let (code, line) = e.run(&cmd).await;
+                assert_eq!(code, Some(1));
+                assert!(
+                    line.contains("error_code=attempt_finished resolution=plan_required"),
+                    "{line}"
+                );
+            }
+        });
+    }
+
+    /// A commit interrupted after `committing` is completed without
+    /// verifying again; one interrupted after `completed` only clears
+    /// the markers.
+    #[test]
+    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
+    fn embedding_e2e_interrupted_finalize_completes_on_rerun() {
+        use grpc_admin::db_migrate::embedding::attempt::{self, Stage, Status};
+        use infra::infra::embedding_space::MarkerState;
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let e = EmbeddingE2e::new().await;
+            e.add_thread("never embedded").await;
+            let (_, line) = e.run(&["embedding", "inspect"]).await;
+            let space = EmbeddingE2e::field(&line, "space").to_string();
+            let (_, line) = e.switch(&space, false).await;
+            let attempt = EmbeddingE2e::field(&line, "attempt").to_string();
+            let finalize = ["embedding", "finalize", "--attempt", attempt.as_str()];
+
+            // After the last `committing` marker, before `completed`; the
+            // server had pinned the chunking settings meanwhile.
+            infra::infra::embedding_space::record::write_rebuild_chunking(
+                &e.table().await,
+                Some("{}"),
+            )
+            .await
+            .unwrap();
+            e.set_marker(MarkerState::Committing, &attempt).await;
+            let mut record = attempt::load(&e.state_dir).unwrap().unwrap();
+            record.stage = Stage::Commit;
+            attempt::save(&e.state_dir, &record).unwrap();
+            let (code, line) = e.run(&["embedding", "inspect"]).await;
+            assert_eq!(code, Some(0));
+            assert_eq!(
+                EmbeddingE2e::field(&line, "attempt_stage"),
+                "commit",
+                "{line}"
+            );
+            assert_eq!(EmbeddingE2e::field(&line, "next_action"), "finalize");
+            // The stage table answers before the ordinary checks: a running
+            // writer does not change it.
+            let writer = e.hold_writer().await;
+            let (code, line) = e.run(&["embedding", "switch", "--resume", &attempt]).await;
+            assert_eq!(code, Some(1));
+            assert!(
+                line.contains("error_code=finalize_in_progress resolution=finalize_required"),
+                "{line}"
+            );
+            let (code, line) = e.run(&finalize).await;
+            assert_eq!(code, Some(1));
+            assert!(line.contains("error_code=writer_active"), "{line}");
+            drop(writer);
+            // Released asynchronously (connection close / rollback).
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let (code, line) = e.run(&finalize).await;
+            assert_eq!(
+                code,
+                Some(0),
+                "the missing thread is not verified again: {line}"
+            );
+            assert_eq!(EmbeddingE2e::field(&line, "outcome"), "finalized");
+            assert_eq!(e.marker().await, None);
+            let record = infra::infra::embedding_space::record::read_table_record(&e.table().await)
+                .await
+                .unwrap();
+            assert_eq!(
+                record.rebuild_chunking, None,
+                "the pin ends with the rebuild"
+            );
+
+            // After `completed`, before the markers were cleared.
+            e.set_marker(MarkerState::Committing, &attempt).await;
+            assert_eq!(
+                attempt::load(&e.state_dir).unwrap().unwrap().status,
+                Status::Completed
+            );
+            let (code, line) = e.run(&finalize).await;
+            assert_eq!(code, Some(0), "{line}");
+            assert_eq!(EmbeddingE2e::field(&line, "outcome"), "already_completed");
+            assert_eq!(e.marker().await, None);
+        });
+    }
+
+    /// `restore` puts the backed-up tables and index back, removes what
+    /// the RDB no longer has, and ends the attempt; reruns and
+    /// interrupted runs complete idempotently.
+    #[test]
+    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
+    fn embedding_e2e_restore_puts_the_backup_back() {
+        use grpc_admin::db_migrate::embedding::attempt::{self, CancelOperation, Status};
+        use infra::infra::embedding_space::MarkerState;
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let e = EmbeddingE2e::new().await;
+            let kept = e.add_thread("kept").await;
+            let gone = e.add_thread("gone").await;
+            let space = e.record_source_space().await;
+            let (_, line) = e.run(&["embedding", "inspect"]).await;
+            assert_eq!(EmbeddingE2e::field(&line, "space"), space, "{line}");
+            // Source-space index entries end up in the backup.
+            e.fail_thread(kept, "kept", &space).await;
+            e.fail_thread(gone, "gone", &space).await;
+            let (code, line) = e.switch(&space, true).await;
+            assert_eq!(code, Some(0), "{line}");
+            let attempt = EmbeddingE2e::field(&line, "attempt").to_string();
+            let backup = attempt::load(&e.state_dir)
+                .unwrap()
+                .unwrap()
+                .backup_path
+                .unwrap();
+            assert_eq!(e.index_entries().await, 0, "switch emptied the index");
+            e.delete_thread(gone).await;
+            let before = e.user_data().await;
+
+            let restore = ["embedding", "restore", "--attempt", attempt.as_str()];
+            let (code, line) = e.run(&restore).await;
+            assert_eq!(code, Some(0), "{line}");
+            assert_eq!(
+                line,
+                format!(
+                    "embedding_restore status=completed outcome=restored attempt={attempt} space={space} next_action=reconcile"
+                )
+            );
+            assert_eq!(e.marker().await, None);
+            assert_eq!(e.user_data().await, before, "restore keeps user data");
+            assert_eq!(e.index_entries().await, 1, "the deleted thread's entry is gone");
+            let (_, line) = e.run(&["embedding", "inspect"]).await;
+            assert_eq!(EmbeddingE2e::field(&line, "space"), space, "{line}");
+            assert_eq!(EmbeddingE2e::field(&line, "orphan"), "0");
+            assert_eq!(EmbeddingE2e::field(&line, "failed_permanent"), "1");
+            assert!(std::path::Path::new(&backup).exists());
+
+            let (code, line) = e.run(&restore).await;
+            assert_eq!(code, Some(0), "{line}");
+            assert_eq!(EmbeddingE2e::field(&line, "outcome"), "already_restored");
+            let (code, line) = e
+                .run(&["embedding", "finalize", "--attempt", &attempt])
+                .await;
+            assert_eq!(code, Some(1));
+            assert!(
+                line.contains("error_code=rebuild_not_pending resolution=plan_required"),
+                "{line}"
+            );
+
+            // Interrupted after `restored` was recorded, markers left.
+            e.set_marker(MarkerState::Restoring, &attempt).await;
+            let (code, line) = e
+                .run(&["embedding", "finalize", "--attempt", &attempt])
+                .await;
+            assert_eq!(code, Some(1));
+            assert!(line.contains("error_code=cancel_in_progress"), "{line}");
+            assert_eq!(EmbeddingE2e::field(&line, "cancel_operation"), "restore");
+            let (code, line) = e.run(&restore).await;
+            assert_eq!(code, Some(0), "{line}");
+            assert_eq!(EmbeddingE2e::field(&line, "outcome"), "already_restored");
+            assert_eq!(e.marker().await, None);
+
+            // Interrupted in the middle: the restore runs again in full.
+            let mut record = attempt::load(&e.state_dir).unwrap().unwrap();
+            record.status = Status::Running;
+            record.cancel_operation = Some(CancelOperation::Restore);
+            attempt::save(&e.state_dir, &record).unwrap();
+            e.set_marker(MarkerState::Restoring, &attempt).await;
+            let (code, line) = e.run(&restore).await;
+            assert_eq!(code, Some(0), "{line}");
+            assert_eq!(EmbeddingE2e::field(&line, "outcome"), "restored");
+            assert_eq!(e.marker().await, None);
+        });
+    }
+
+    /// A broken backup manifest is reported before anything changes.
+    #[test]
+    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
+    fn embedding_e2e_restore_refuses_a_corrupt_backup() {
+        use infra::infra::embedding_space::MarkerState;
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let e = EmbeddingE2e::new().await;
+            e.add_thread("topic").await;
+            let (_, line) = e.run(&["embedding", "inspect"]).await;
+            let space = EmbeddingE2e::field(&line, "space").to_string();
+            let (_, line) = e.switch(&space, true).await;
+            let attempt = EmbeddingE2e::field(&line, "attempt").to_string();
+            let backup = grpc_admin::db_migrate::embedding::attempt::load(&e.state_dir)
+                .unwrap()
+                .unwrap()
+                .backup_path
+                .unwrap();
+            std::fs::write(std::path::Path::new(&backup).join("manifest.json"), b"{").unwrap();
+            let (code, line) = e
+                .run(&["embedding", "restore", "--attempt", &attempt])
+                .await;
+            assert_eq!(code, Some(1));
+            assert!(
+                line.contains(
+                    "stage=validate error_code=resource_corrupt resolution=manual_recovery"
+                ),
+                "{line}"
+            );
+            assert_eq!(
+                e.marker().await.map(|m| m.state),
+                Some(MarkerState::Pending),
+                "nothing changed"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
+    fn embedding_e2e_switch_resume_and_discard_without_backup() {
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let e = EmbeddingE2e::new().await;
+            e.add_thread("topic").await;
+            let (code, line) = e.run(&["embedding", "inspect"]).await;
+            assert_eq!(code, Some(0), "{line}");
+            assert_eq!(EmbeddingE2e::field(&line, "state"), "incomplete");
+            let space = EmbeddingE2e::field(&line, "space").to_string();
+
+            let target = ["--model-id", "target-model", "--dimension", "8"];
+            let (code, line) = e
+                .run(&[&["embedding", "plan"][..], &target[..]].concat())
+                .await;
+            assert_eq!(code, Some(0), "{line}");
+            assert_eq!(EmbeddingE2e::field(&line, "decision"), "reembed_required");
+            assert_eq!(EmbeddingE2e::field(&line, "thread"), "1");
+
+            // Neither or both backup options: nothing changes.
+            let (code, line) = e
+                .run(
+                    &[
+                        &[
+                            "embedding",
+                            "switch",
+                            "--expected-space",
+                            &space,
+                            "--maintenance-window-ack",
+                        ][..],
+                        &target[..],
+                    ]
+                    .concat(),
+                )
+                .await;
+            assert_eq!(code, Some(1));
+            assert!(line.contains("error_code=backup_option_required"), "{line}");
+            // A stale expectation of the current space.
+            let (code, line) = e
+                .run(
+                    &[
+                        &[
+                            "embedding",
+                            "switch",
+                            "--expected-space",
+                            "unknown",
+                            "--maintenance-window-ack",
+                            "--no-backup-unsafe",
+                        ][..],
+                        &target[..],
+                    ]
+                    .concat(),
+                )
+                .await;
+            assert_eq!(code, Some(1));
+            assert!(
+                line.contains("error_code=space_changed resolution=plan_required"),
+                "{line}"
+            );
+
+            let (code, line) = e
+                .run(
+                    &[
+                        &[
+                            "embedding",
+                            "switch",
+                            "--expected-space",
+                            &space,
+                            "--maintenance-window-ack",
+                            "--no-backup-unsafe",
+                        ][..],
+                        &target[..],
+                    ]
+                    .concat(),
+                )
+                .await;
+            assert_eq!(code, Some(0), "{line}");
+            assert_eq!(EmbeddingE2e::field(&line, "outcome"), "switched");
+            assert_eq!(EmbeddingE2e::field(&line, "backup"), "none");
+            let attempt = EmbeddingE2e::field(&line, "attempt").to_string();
+
+            let (_, line) = e.run(&["embedding", "inspect"]).await;
+            assert_eq!(EmbeddingE2e::field(&line, "state"), "migrating");
+            assert_eq!(
+                EmbeddingE2e::field(&line, "attempt_stage"),
+                "rebuild_pending"
+            );
+            assert_eq!(EmbeddingE2e::field(&line, "next_action"), "start_rebuild");
+
+            let (code, line) = e.run(&["embedding", "switch", "--resume", &attempt]).await;
+            assert_eq!(code, Some(0), "{line}");
+            assert_eq!(EmbeddingE2e::field(&line, "outcome"), "already_switched");
+
+            // A new switch while this one is unfinished is refused with
+            // the stage-specific resolution and the attempt.
+            let (code, line) = e
+                .run(
+                    &[
+                        &[
+                            "embedding",
+                            "switch",
+                            "--expected-space",
+                            &space,
+                            "--maintenance-window-ack",
+                            "--no-backup-unsafe",
+                        ][..],
+                        &target[..],
+                    ]
+                    .concat(),
+                )
+                .await;
+            assert_eq!(code, Some(1));
+            assert!(
+                line.contains(
+                    "error_code=embedding_switch_in_progress resolution=continue_or_abandon"
+                ),
+                "{line}"
+            );
+            assert_eq!(EmbeddingE2e::field(&line, "attempt"), attempt);
+
+            let (code, line) = e
+                .run(&["embedding", "abandon", "--attempt", &attempt])
+                .await;
+            assert_eq!(code, Some(0), "{line}");
+            assert_eq!(EmbeddingE2e::field(&line, "outcome"), "discarded");
+            assert_eq!(EmbeddingE2e::field(&line, "next_action"), "reconcile");
+            let (_, line) = e
+                .run(&["embedding", "abandon", "--attempt", &attempt])
+                .await;
+            assert_eq!(EmbeddingE2e::field(&line, "outcome"), "already_abandoned");
+            let (_, line) = e.run(&["embedding", "inspect"]).await;
+            assert_eq!(EmbeddingE2e::field(&line, "state"), "incomplete", "{line}");
+            assert_eq!(EmbeddingE2e::field(&line, "space"), "none");
+
+            let (code, line) = e.run(&["embedding", "switch", "--resume", &attempt]).await;
+            assert_eq!(code, Some(1));
+            assert!(
+                line.contains("error_code=attempt_finished resolution=plan_required"),
+                "{line}"
+            );
+        });
+    }
+
+    /// Regression: a configured store that holds rows but no storage
+    /// identifier (for example another environment's store picked up from
+    /// configuration) is refused by changing commands and left untouched.
+    #[test]
+    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
+    fn embedding_e2e_changes_never_touch_an_unidentified_store() {
+        use infra::infra::memory_vector::config::{
+            DistanceType, FtsConfig, VectorDBConfig, VectorIndexConfig,
+        };
+        use infra::infra::memory_vector::record::MemoryVectorRecord;
+        use infra::infra::memory_vector::repository::MemoryVectorRepositoryImpl;
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let e = EmbeddingE2e::new().await;
+            e.add_thread("topic").await;
+            let foreign = e.root().join("foreign.lancedb");
+            let repo = MemoryVectorRepositoryImpl::new(VectorDBConfig {
+                uri: foreign.to_string_lossy().into_owned(),
+                table_name: "memories".into(),
+                vector_size: 4,
+                distance_type: DistanceType::Cosine,
+                fts: FtsConfig::default(),
+                vector_index: VectorIndexConfig::default(),
+            })
+            .await
+            .unwrap();
+            let data = protobuf::llm_memory::data::MemoryData {
+                content: "x".into(),
+                ..Default::default()
+            };
+            let row = MemoryVectorRecord::from_chunk_with_content(
+                1,
+                &data,
+                &[0.5; 4],
+                Some("m"),
+                "text",
+                0,
+                0,
+                1,
+                "x".into(),
+            );
+            repo.replace_kinds_upsert(1, &["text"], vec![row])
+                .await
+                .unwrap();
+            let version = repo.table_handle().version().await.unwrap();
+
+            let output = e
+                .command()
+                .args([
+                    "embedding",
+                    "switch",
+                    "--expected-space",
+                    "unknown",
+                    "--maintenance-window-ack",
+                    "--no-backup-unsafe",
+                    "--model-id",
+                    "target-model",
+                    "--dimension",
+                    "8",
+                ])
+                .env("MEMORY_VECTOR_ENABLED", "true")
+                .env("MEMORY_LANCEDB_URI", &foreign)
+                .env("MEMORY_VECTOR_SIZE", "4")
+                .env("MEMORY_WORKERS_YAML", &e.workers_yaml)
+                .env("MEMORY_EMBEDDING_STATE_DIR", &e.state_dir)
+                .output()
+                .await
+                .unwrap();
+            let line = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .to_string();
+            assert_eq!(output.status.code(), Some(1), "{line}");
+            assert!(
+                line.contains("error_code=storage_mismatch resolution=check_environment"),
+                "{line}"
+            );
+            let latest = repo.table_handle();
+            latest.checkout_latest().await.unwrap();
+            assert_eq!(
+                latest.version().await.unwrap(),
+                version,
+                "the store is untouched"
+            );
+            assert!(!e.state_dir.join("attempt.json").exists());
+        });
+    }
+
+    /// An attempt interrupted right after its record was written (stage
+    /// `backup`, no marker yet) is resumed to completion, and one stopped
+    /// there can instead be abandoned without changing anything.
+    #[test]
+    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
+    fn embedding_e2e_interrupted_switch_resumes_or_abandons() {
+        use grpc_admin::db_migrate::embedding::attempt::{
+            self, AttemptRecord, FORMAT_VERSION, Method, Stage, Status,
+        };
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let e = EmbeddingE2e::new().await;
+            e.add_thread("topic").await;
+            let target = infra::infra::embedding_space::SpaceComponents {
+                model_id: "target-model".into(),
+                tokenizer_model_id: String::new(),
+                revision: "unversioned".into(),
+                dimension: 8,
+                distance: "cosine".into(),
+            };
+            let interrupted = |id: &str| AttemptRecord {
+                format_version: FORMAT_VERSION,
+                attempt_id: id.into(),
+                method: Method::NoBackup,
+                source_space_id: None,
+                target_space_id: target.space_id().to_string(),
+                target_space: target.clone(),
+                backup_path: None,
+                backup_complete: false,
+                stage: Stage::Backup,
+                status: Status::Running,
+                cancel_operation: None,
+                discarded: false,
+                accepted_failed: None,
+                backup_keep: None,
+                started_at: 0,
+            };
+            attempt::save(&e.state_dir, &interrupted("a1")).unwrap();
+            let (_, line) = e.run(&["embedding", "inspect"]).await;
+            assert_eq!(EmbeddingE2e::field(&line, "attempt_stage"), "backup");
+            assert_eq!(
+                EmbeddingE2e::field(&line, "next_action"),
+                "resume_or_abandon"
+            );
+            let (code, line) = e.run(&["embedding", "abandon", "--attempt", "a1"]).await;
+            assert_eq!(code, Some(0), "{line}");
+            assert_eq!(EmbeddingE2e::field(&line, "outcome"), "abandoned");
+            assert_eq!(EmbeddingE2e::field(&line, "next_action"), "none");
+
+            attempt::save(&e.state_dir, &interrupted("a2")).unwrap();
+            let (code, line) = e.run(&["embedding", "switch", "--resume", "a2"]).await;
+            assert_eq!(code, Some(0), "{line}");
+            assert_eq!(EmbeddingE2e::field(&line, "outcome"), "switched");
+            let (_, line) = e.run(&["embedding", "inspect"]).await;
+            assert_eq!(
+                EmbeddingE2e::field(&line, "attempt_stage"),
+                "rebuild_pending"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
+    fn embedding_e2e_switch_with_backup_and_abandon_before_changes() {
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let e = EmbeddingE2e::new().await;
+            e.add_thread("topic").await;
+            let backups = e.backups.to_string_lossy().to_string();
+            let (_, line) = e.run(&["embedding", "inspect"]).await;
+            let space = EmbeddingE2e::field(&line, "space").to_string();
+            let target = ["--model-id", "target-model", "--dimension", "8"];
+            let (code, line) = e
+                .run(
+                    &[
+                        &[
+                            "embedding",
+                            "switch",
+                            "--expected-space",
+                            &space,
+                            "--maintenance-window-ack",
+                            "--backup-dir",
+                            &backups,
+                        ][..],
+                        &target[..],
+                    ]
+                    .concat(),
+                )
+                .await;
+            assert_eq!(code, Some(0), "{line}");
+            let attempt = EmbeddingE2e::field(&line, "attempt").to_string();
+            let backup = EmbeddingE2e::field(&line, "backup").to_string();
+            assert_ne!(backup, "none");
+            assert!(
+                e.backups
+                    .join(format!("embedding-{attempt}/manifest.json"))
+                    .is_file()
+            );
+
+            // A backup attempt that replaced the tables cannot be abandoned.
+            let (code, line) = e
+                .run(&["embedding", "abandon", "--attempt", &attempt])
+                .await;
+            assert_eq!(code, Some(1));
+            assert!(
+                line.contains("error_code=abandon_not_allowed resolution=continue_or_restore"),
+                "{line}"
+            );
+            assert!(line.contains("backup="), "{line}");
+            let (code, line) = e.run(&["embedding", "abandon", "--attempt", "other"]).await;
+            assert_eq!(code, Some(1));
+            assert!(line.contains("error_code=attempt_not_found"), "{line}");
+        });
+    }
+
+    /// A database of the release before embedding storage identifiers
+    /// gains its RDB identifier through the ordinary `local apply`.
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
+    fn local_apply_e2e_adds_the_storage_identifier_to_a_previous_release_database() {
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let local = LocalE2e::new();
+            let previous = atlas_migration_versions().len() - 1;
+            let applied = std::process::Command::new(
+                std::path::Path::new(&local.artifact_root).join("bin/atlas"),
+            )
+            .current_dir(&local.artifact_root)
+            .args(["migrate", "apply", &previous.to_string()])
+            .args(["--config", "file://migrate.hcl", "--env", "sqlite"])
+            .env(
+                "MEMORIES_ATLAS_DATABASE_URL",
+                atlas_database_url(&local.database_url).unwrap(),
+            )
+            .output()
+            .unwrap();
+            assert!(
+                applied.status.success(),
+                "{}",
+                String::from_utf8_lossy(&applied.stderr)
+            );
+            let pool = local.pool().await;
+            assert!(
+                !super::table_exists(&pool, "memories_storage_identity")
+                    .await
+                    .unwrap()
+            );
+            pool.close().await;
+
+            let (code, line) = local.apply().await;
+            assert_eq!(code, Some(0), "{line}");
+            assert!(
+                line.starts_with("local_apply status=completed outcome=migrated"),
+                "{line}"
+            );
+            let pool = local.pool().await;
+            let id: String = sqlx::query_scalar(
+                "SELECT storage_id FROM memories_storage_identity WHERE identity_key = 'rdb'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(id.len(), 32);
+            pool.close().await;
+            assert_eq!(
+                local.apply().await.1,
                 "local_apply status=completed outcome=no_op"
             );
         });
@@ -3497,7 +5259,7 @@ mod tests {
                     SchemaState::Pending { applied_count: 1 },
                     atlas_migration_versions().len()
                 ),
-                Some(5)
+                Some(6)
             );
 
             sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
@@ -3572,6 +5334,21 @@ mod tests {
                 .unwrap();
             sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
                 .bind("20260930000001")
+                .bind(ATLAS_APPLIED_REVISION_TYPE)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                schema_state(&pool).await.unwrap(),
+                SchemaState::Pending { applied_count: 6 }
+            );
+            sqlx::query("UPDATE memories_schema_contract SET version = ? WHERE contract_key = 'rdb_schema'")
+                .bind("20261009000001")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
+                .bind("20261009000001")
                 .bind(ATLAS_APPLIED_REVISION_TYPE)
                 .execute(&pool)
                 .await
@@ -3690,6 +5467,21 @@ mod tests {
                 .execute(&pool)
                 .await
                 .unwrap();
+            assert_eq!(
+                schema_state(&pool).await.unwrap(),
+                SchemaState::Pending { applied_count: 6 }
+            );
+            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
+                .bind("20261009000001")
+                .bind(ATLAS_APPLIED_REVISION_TYPE)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE memories_schema_contract SET version = ?")
+                .bind("20261009000001")
+                .execute(&pool)
+                .await
+                .unwrap();
             assert_eq!(schema_state(&pool).await.unwrap(), SchemaState::Managed);
         });
     }
@@ -3800,6 +5592,21 @@ mod tests {
                 .unwrap();
             sqlx::query("UPDATE memories_schema_contract SET version = ?")
                 .bind("20260930000001")
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                schema_state(&pool).await.unwrap(),
+                SchemaState::Pending { applied_count: 6 }
+            );
+            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
+                .bind("20261009000001")
+                .bind(ATLAS_APPLIED_REVISION_TYPE)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE memories_schema_contract SET version = ?")
+                .bind("20261009000001")
                 .execute(&pool)
                 .await
                 .unwrap();

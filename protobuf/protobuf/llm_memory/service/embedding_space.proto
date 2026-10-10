@@ -1,0 +1,197 @@
+syntax = "proto3";
+
+package llm_memory.service;
+
+import "llm_memory/data/embedding_space.proto";
+
+message GetEmbeddingSpaceRequest {}
+
+enum WorkerRegistrationState {
+  WORKER_REGISTRATION_STATE_UNSPECIFIED = 0;
+  // Every worker memories needs is registered in jobworkerp.
+  WORKER_REGISTRATION_STATE_REGISTERED = 1;
+  // Registration has not completed; the returned worker names may not
+  // exist in jobworkerp or may be incompletely defined.
+  WORKER_REGISTRATION_STATE_PENDING = 2;
+}
+
+message EmbeddingTableRecord {
+  // `memory`, `thread`, or `reflection_intent`.
+  string table = 1;
+  llm_memory.data.EmbeddingSpaceRecord record = 2;
+}
+
+message GetEmbeddingSpaceResponse {
+  // Space derived from the current configuration. Unset when no vector
+  // store is enabled.
+  optional llm_memory.data.EmbeddingSpace current_space = 1;
+  // Name of the mm-embedding worker of the current space. Derived from
+  // configuration, so it is returned even while registration is pending.
+  string mm_embedding_worker_name = 2;
+  WorkerRegistrationState registration_state = 3;
+  // Records of each enabled vector table as verified at startup.
+  repeated EmbeddingTableRecord tables = 4;
+  // Always false: the embedding space changes only through
+  // `memories-db-migrate embedding`, never through an RPC.
+  bool rpc_migration_supported = 5;
+  // Embedding writes rejected since startup, per reason
+  // (`space_mismatch`, `attempt_mismatch`, `source_version_mismatch`,
+  // `dimension_mismatch`, `missing_token`).
+  map<string, uint64> write_rejections = 6;
+}
+
+// Sent by an embedding workflow once a generation failed for good.
+message ReportEmbeddingFailureRequest {
+  // Token of the failed request, unchanged.
+  llm_memory.data.DispatchToken token = 1;
+  // `memory`, `thread`, or `reflection_intent`.
+  string table = 2;
+  int64 entity_id = 3;
+  string vector_kind = 4;
+  // Short machine-readable reason, e.g. `fetch_failed`, `workflow_error`.
+  string reason = 5;
+  // Error text, used to tell transient from permanent failures.
+  string message = 6;
+}
+
+enum FailureReportOutcome {
+  FAILURE_REPORT_OUTCOME_UNSPECIFIED = 0;
+  // A failure entry describes the target now (also for a resend).
+  FAILURE_REPORT_OUTCOME_RECORDED = 1;
+  // The target already completed for this version; nothing recorded.
+  FAILURE_REPORT_OUTCOME_ALREADY_COMPLETE = 2;
+  // The token is stale (other space, attempt, or source version) or the
+  // target no longer exists; nothing recorded.
+  FAILURE_REPORT_OUTCOME_REJECTED = 3;
+}
+
+message ReportEmbeddingFailureResponse {
+  FailureReportOutcome outcome = 1;
+}
+
+// Read-only view of the embedding space this server serves, and the
+// failure report of embedding workflows.
+service EmbeddingSpaceService {
+  rpc GetEmbeddingSpace(GetEmbeddingSpaceRequest) returns (GetEmbeddingSpaceResponse);
+  rpc ReportEmbeddingFailure(ReportEmbeddingFailureRequest)
+      returns (ReportEmbeddingFailureResponse);
+}
+
+// ===== Reconciliation (management listener) =====
+
+message StartEmbeddingReconcileRequest {
+  // Also dispatch targets whose generation failed.
+  bool retry_failed = 1;
+  // Also dispatch complete targets, to repair results that are
+  // classified complete but are not. With no `force_entity_ids`, every
+  // target; otherwise only those entities of `force_table`.
+  bool force = 2;
+  // `memory`, `thread`, or `reflection_intent`.
+  string force_table = 3;
+  repeated int64 force_entity_ids = 4;
+}
+
+message StartEmbeddingReconcileResponse {
+  // A resent start with the same options returns the running task.
+  string task_id = 1;
+}
+
+message GetEmbeddingReconcileProgressRequest {
+  string task_id = 1;
+}
+
+message EmbeddingReconcileKindProgress {
+  // `memory_text`, `memory_media`, `thread`, or `reflection_intent`.
+  string kind = 1;
+  uint64 missing = 2;
+  uint64 stale = 3;
+  uint64 unverified = 4;
+  uint64 failed = 5;
+  uint64 orphan = 6;
+  uint64 dispatched = 7;
+  uint64 complete = 8;
+  // Items whose dispatch or orphan deletion failed (skipped, not retried
+  // until the next reconciliation).
+  uint64 failed_to_dispatch = 9;
+}
+
+message GetEmbeddingReconcileProgressResponse {
+  string task_id = 1;
+  // `running`, `completed`, or `failed`.
+  string status = 2;
+  repeated EmbeddingReconcileKindProgress kinds = 3;
+  // Image memories without a body whose caption was requested.
+  uint64 captions_requested = 4;
+  optional string error = 5;
+}
+
+// ===== Rebuild task of a pending embedding migration (management listener) =====
+
+message StartEmbeddingRebuildRequest {
+  // Attempt ID printed by `memories-db-migrate embedding switch`.
+  string attempt_id = 1;
+  // Also dispatch targets whose generation failed.
+  bool retry_failed = 2;
+}
+
+message StartEmbeddingRebuildResponse {
+  string attempt_id = 1;
+  // A resent start returns the running task of this instance.
+  string task_id = 2;
+}
+
+message GetEmbeddingRebuildProgressRequest {
+  string attempt_id = 1;
+}
+
+message EmbeddingRebuildKindProgress {
+  // `memory_text`, `memory_media`, `thread`, or `reflection_intent`.
+  string kind = 1;
+  // Counted from the vector tables when the progress is requested.
+  uint64 targets = 2;
+  uint64 complete = 3;
+  uint64 missing = 4;
+  uint64 stale = 5;
+  uint64 unverified = 6;
+  uint64 failed_transient = 7;
+  uint64 failed_permanent = 8;
+  // Dispatch counters of the latest task of this instance.
+  uint64 dispatched = 9;
+  uint64 failed_to_dispatch = 10;
+}
+
+message GetEmbeddingRebuildProgressResponse {
+  string attempt_id = 1;
+  // `not_started` (no task in this instance since it started), `running`
+  // (dispatching), `dispatched` (results arriving), `stalled` (dispatched,
+  // but no target completed or failed for the stall threshold), or
+  // `failed` (the task stopped; start it again).
+  string status = 2;
+  repeated EmbeddingRebuildKindProgress kinds = 3;
+  // Vector rows or index entries without a target; the task deletes them.
+  uint64 orphan = 4;
+  // Image memories without a body whose caption is still to be generated.
+  uint64 caption_missing = 5;
+  uint64 captions_requested = 6;
+  // Every target is complete or failed and nothing is orphaned: run
+  // `finalize`, which makes the final decision.
+  bool completion_expected = 7;
+  // Failed targets (transient and permanent), for `--accept-failed`.
+  uint64 failed = 8;
+  // Embedding writes this instance rejected since startup, per reason.
+  map<string, uint64> write_rejections = 9;
+  optional string error = 10;
+}
+
+// Served on the management listener only.
+service EmbeddingMaintenanceService {
+  // Rejected with FAILED_PRECONDITION while a rebuild is pending.
+  rpc StartReconcile(StartEmbeddingReconcileRequest) returns (StartEmbeddingReconcileResponse);
+  rpc GetReconcileProgress(GetEmbeddingReconcileProgressRequest)
+      returns (GetEmbeddingReconcileProgressResponse);
+  // Rejected with FAILED_PRECONDITION unless the vector tables are
+  // pending for this attempt.
+  rpc StartRebuild(StartEmbeddingRebuildRequest) returns (StartEmbeddingRebuildResponse);
+  rpc GetRebuildProgress(GetEmbeddingRebuildProgressRequest)
+      returns (GetEmbeddingRebuildProgressResponse);
+}

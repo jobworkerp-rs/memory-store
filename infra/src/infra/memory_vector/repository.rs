@@ -150,9 +150,20 @@ pub(crate) async fn prune_with(
 pub(crate) async fn maintenance_optimize_action(
     table: &ArcSwap<Table>,
     ddl_lock: &Mutex<()>,
+    embedding_index: Option<&crate::infra::embedding_index::EmbeddingIndex>,
     action: crate::infra::search_index_maintenance::OptimizeAction,
     prune_older_than_secs: u64,
 ) -> anyhow::Result<()> {
+    // The embedding index of the same directory is rewritten on every
+    // embedding write, so it is compacted and pruned with the table.
+    if let Some(index) = embedding_index {
+        use crate::infra::search_index_maintenance::OptimizeAction;
+        match action {
+            OptimizeAction::Compact => index.compact().await?,
+            OptimizeAction::Prune => index.prune(prune_older_than_secs).await?,
+            OptimizeAction::Index => {}
+        }
+    }
     let _ddl = ddl_lock.lock().await;
     let table = table.load_full();
     let action = match action {
@@ -690,6 +701,8 @@ pub struct IndexStats {
     pub fts_tokenizer: super::config::FtsTokenizerKind,
     pub fts_ngram_min: Option<u32>,
     pub fts_ngram_max: Option<u32>,
+    /// Embedding space and migration marker recorded on the table.
+    pub embedding_space: crate::infra::embedding_space::record::TableRecord,
 }
 
 /// Wire-shaped projection of `IndexStats` used by both
@@ -775,6 +788,8 @@ pub enum AggregationStrategy {
 #[derive(Clone)]
 #[allow(dead_code)] // Removed runtime gates remain temporarily referenced by focused legacy migration tests.
 pub struct MemoryVectorRepositoryImpl {
+    /// Embedding index of this table's LanceDB directory.
+    embedding_index: Option<crate::infra::embedding_index::EmbeddingIndex>,
     /// The single shared LanceDB table handle, published via `ArcSwap`.
     ///
     /// One `Arc<Table>` is stored at construction and kept for the table's
@@ -965,6 +980,7 @@ impl MemoryVectorRepositoryImpl {
         maintenance_optimize_action(
             &self.table,
             &self.index_ddl_lock,
+            self.embedding_index.as_ref(),
             action,
             prune_older_than_secs,
         )
@@ -998,6 +1014,30 @@ impl MemoryVectorRepositoryImpl {
     /// cross-checks it against the embedding runner's reported
     /// `embedding_dimension` so a model/config drift fails fast instead
     /// of every INSERT erroring later (design 3/3 §14.3 (b)).
+    /// Attach the embedding index of this table's directory.
+    pub fn with_embedding_index(
+        mut self,
+        index: crate::infra::embedding_index::EmbeddingIndex,
+    ) -> Self {
+        self.embedding_index = Some(index);
+        self
+    }
+
+    pub fn embedding_index(&self) -> Option<&crate::infra::embedding_index::EmbeddingIndex> {
+        self.embedding_index.as_ref()
+    }
+
+    /// LanceDB URI the table lives in.
+    pub fn uri(&self) -> &str {
+        &self.config.uri
+    }
+
+    /// The current table handle, for table-level metadata (embedding
+    /// space records) outside the repository's own operations.
+    pub fn table_handle(&self) -> lancedb::Table {
+        (*self.table.load_full()).clone()
+    }
+
     pub fn vector_size(&self) -> usize {
         self.config.vector_size
     }
@@ -1008,37 +1048,27 @@ impl MemoryVectorRepositoryImpl {
         // repository keeps the resulting `Table` handle (in `ArcSwap`) and
         // refreshes it via `checkout_latest`, so it does not retain the
         // `Connection`.
-        let database = lancedb::connect(&config.uri)
-            .execute()
-            .await
-            .map_err(|e| anyhow::anyhow!("LanceDB connect failed: {e}"))?;
-
         let schema = memory_arrow_schema(config.vector_size);
-        let (table, is_new) = match database.open_table(&config.table_name).execute().await {
-            Ok(t) => (t, false),
-            Err(_) => {
-                let empty_batch = RecordBatch::new_empty(schema.clone());
-                let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
-                    RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone()),
-                );
-                let t = database
-                    .create_table(&config.table_name, reader)
-                    .execute()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("LanceDB create_table failed: {e}"))?;
-                (t, true)
-            }
-        };
+        let crate::infra::vector_table::OpenedTable { table, is_new, .. } =
+            crate::infra::vector_table::open_or_create(&config.uri, &config.table_name, &schema)
+                .await?;
         if !is_new {
             add_legacy_memory_kind_column_if_missing(&table).await?;
         }
-        verify_table_schema_or_fail(&table, &schema, &config).await?;
+        crate::infra::vector_table::verify_schema_fingerprint(
+            &table,
+            &config.table_name,
+            &config.uri,
+            &schema,
+        )
+        .await?;
 
         if is_new {
             Self::create_btree_indexes(&table).await?;
         }
 
         let repo = Self {
+            embedding_index: None,
             table: Arc::new(ArcSwap::from_pointee(table)),
             config,
             last_optimized_at: Arc::new(AtomicI64::new(0)),
@@ -1084,7 +1114,7 @@ impl MemoryVectorRepositoryImpl {
     }
 
     /// Create BTree indexes on scalar filter columns
-    async fn create_btree_indexes(table: &Table) -> anyhow::Result<()> {
+    pub async fn create_btree_indexes(table: &Table) -> anyhow::Result<()> {
         // Phase 4: `thread_id` was removed from the LanceDB schema together
         // with its BTree index. Thread-scoped searches walk the `thread_memory`
         // junction on the RDB side and narrow vectors via `memory_id IN (...)`.
@@ -1099,19 +1129,7 @@ impl MemoryVectorRepositoryImpl {
             "memory_kind",
             "created_at",
         ];
-        for col in columns {
-            if let Err(e) = table
-                .create_index(&[col], Index::BTree(Default::default()))
-                .execute()
-                .await
-            {
-                let msg = e.to_string();
-                if msg.contains("already exists") || msg.contains("duplicate") {
-                    continue;
-                }
-                tracing::warn!("Failed to create BTree index on {}: {}", col, e);
-            }
-        }
+        crate::infra::vector_table::ensure_btree_indexes(table, &columns).await;
         tracing::info!("Created BTree indexes on {} columns", columns.len());
         Ok(())
     }
@@ -1236,6 +1254,16 @@ impl MemoryVectorRepositoryImpl {
         //    so a single (memory, kinds) replace does ONE reload, not two.
         if records.is_empty() {
             self.reload_table().await?;
+            // The kinds are gone, so their index entries must go too.
+            if let Some(index) = &self.embedding_index {
+                index
+                    .delete(
+                        crate::infra::embedding_index::TableLabel::Memory,
+                        memory_id,
+                        replace_kinds,
+                    )
+                    .await?;
+            }
             // Stale-delete path: the delete above created a new version but
             // no batch_upsert follows to count it, so track it here. The
             // non-empty path is covered by batch_upsert's own tracking.
@@ -1255,6 +1283,14 @@ impl MemoryVectorRepositoryImpl {
             .map_err(|e| anyhow::anyhow!("LanceDB delete failed: {e}"))?;
         drop(table);
         self.reload_table().await?;
+        if let Some(index) = &self.embedding_index {
+            index
+                .delete_entities(
+                    crate::infra::embedding_index::TableLabel::Memory,
+                    &[memory_id],
+                )
+                .await?;
+        }
         // A delete creates a new version too, so it must drive maintenance —
         // otherwise a delete-heavy workload grows `_versions/` without ever
         // tripping the prune gate.
@@ -1275,6 +1311,14 @@ impl MemoryVectorRepositoryImpl {
             .map_err(|e| anyhow::anyhow!("LanceDB delete_by_memory_ids failed: {e}"))?;
         drop(table);
         self.reload_table().await?;
+        if let Some(index) = &self.embedding_index {
+            index
+                .delete_entities(
+                    crate::infra::embedding_index::TableLabel::Memory,
+                    memory_ids,
+                )
+                .await?;
+        }
         // One bulk delete = one new version, regardless of how many ids it
         // matched; count it once so cascade deletes drive prune/compact.
         Ok(())
@@ -1586,6 +1630,8 @@ impl MemoryVectorRepositoryImpl {
             fts_tokenizer,
             fts_ngram_min,
             fts_ngram_max,
+            embedding_space: crate::infra::embedding_space::record::read_table_record(&table)
+                .await?,
         })
     }
 
@@ -2536,58 +2582,7 @@ pub(crate) async fn add_legacy_memory_kind_column_if_missing(
         .map_err(|e| anyhow::anyhow!("LanceDB schema read after migration failed: {e}"))
 }
 
-async fn verify_table_schema_or_fail(
-    table: &Table,
-    expected: &Arc<Schema>,
-    config: &VectorDBConfig,
-) -> anyhow::Result<()> {
-    let actual = table
-        .schema()
-        .await
-        .map_err(|e| anyhow::anyhow!("LanceDB schema read failed: {e}"))?;
-    let actual_arrow = actual.as_ref().clone();
-    let expected_fp = schema_fingerprint(expected.as_ref());
-    let actual_fp = schema_fingerprint(&actual_arrow);
-    if actual_fp == expected_fp {
-        return Ok(());
-    }
-
-    // Surface as `StartupError::LancedbSchemaMismatch` (wrapped in
-    // `anyhow::Error`) so `module.rs` can downcast and route into the
-    // structured `fatal()` path — agent-app's stdout JSON scanner
-    // matches on the `code` field, not the message text.
-    let expected_dim =
-        super::schema::extract_embedding_dim_from_schema(expected.as_ref()).unwrap_or(0);
-    let actual_dim = super::schema::extract_embedding_dim_from_schema(&actual_arrow).unwrap_or(0);
-    Err(anyhow::Error::new(
-        crate::infra::startup_error::StartupError::LancedbSchemaMismatch {
-            table: config.table_name.clone(),
-            uri: config.uri.clone(),
-            expected_dim,
-            actual_dim,
-            expected_fingerprint: expected_fp,
-            actual_fingerprint: actual_fp,
-        },
-    ))
-}
-
-pub fn schema_fingerprint(schema: &Schema) -> String {
-    schema
-        .fields()
-        .iter()
-        .map(|field| field_fingerprint(field.as_ref()))
-        .collect::<Vec<_>>()
-        .join("|")
-}
-
-pub fn field_fingerprint(field: &Field) -> String {
-    format!(
-        "{}:{:?}:nullable={}",
-        field.name(),
-        field.data_type(),
-        field.is_nullable()
-    )
-}
+pub use crate::infra::vector_table::{field_fingerprint, schema_fingerprint};
 
 /// Result of reading the FTS manifest fingerprint pair.
 ///
@@ -2617,25 +2612,18 @@ pub(crate) enum ManifestFingerprint {
 /// does not expose a native manifest (future-proofing against
 /// non-NativeTable backends) or the manifest fetch itself errors.
 pub(crate) async fn read_fts_manifest_fingerprint(table: &Table) -> ManifestFingerprint {
-    let Some(native) = table.as_native() else {
+    let Some(config) = crate::infra::vector_table::read_manifest_config(table).await else {
         return ManifestFingerprint::ManifestUnavailable;
-    };
-    let manifest = match native.manifest().await {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!("failed to read lancedb manifest for FTS fingerprint check: {e}");
-            return ManifestFingerprint::ManifestUnavailable;
-        }
     };
 
     let expected_schema = FTS_FINGERPRINT_SCHEMA_VERSION.to_string();
-    match manifest.config.get(FTS_MANIFEST_KEY_SCHEMA_VERSION) {
+    match config.get(FTS_MANIFEST_KEY_SCHEMA_VERSION) {
         Some(v) if *v == expected_schema => {}
         Some(v) => return ManifestFingerprint::SchemaVersionMismatch(v.clone()),
         None => return ManifestFingerprint::MissingFingerprint,
     }
 
-    match manifest.config.get(FTS_MANIFEST_KEY_FINGERPRINT) {
+    match config.get(FTS_MANIFEST_KEY_FINGERPRINT) {
         Some(fp) => ManifestFingerprint::Match(fp.clone()),
         None => ManifestFingerprint::MissingFingerprint,
     }
@@ -2653,24 +2641,26 @@ pub(crate) async fn write_fts_manifest_fingerprint(
     table: &Table,
     fingerprint: &str,
 ) -> anyhow::Result<()> {
-    let Some(native) = table.as_native() else {
-        tracing::warn!(
-            "FTS manifest fingerprint write skipped: current table backend does not \
-             expose NativeTable::update_config. Config drift detection will be best-effort."
-        );
-        return Ok(());
-    };
-    let schema_version = FTS_FINGERPRINT_SCHEMA_VERSION.to_string();
-    native
-        .update_config(vec![
-            (FTS_MANIFEST_KEY_SCHEMA_VERSION.to_string(), schema_version),
+    let written = crate::infra::vector_table::write_manifest_config(
+        table,
+        vec![
+            (
+                FTS_MANIFEST_KEY_SCHEMA_VERSION.to_string(),
+                FTS_FINGERPRINT_SCHEMA_VERSION.to_string(),
+            ),
             (
                 FTS_MANIFEST_KEY_FINGERPRINT.to_string(),
                 fingerprint.to_string(),
             ),
-        ])
-        .await
-        .map_err(|e| anyhow::anyhow!("FTS manifest fingerprint update_config failed: {e}"))?;
+        ],
+    )
+    .await?;
+    if !written {
+        tracing::warn!(
+            "FTS manifest fingerprint write skipped: current table backend does not \
+             expose NativeTable::update_config. Config drift detection will be best-effort."
+        );
+    }
     Ok(())
 }
 
@@ -3241,6 +3231,44 @@ mod test {
             repo.get_stats().await?.last_optimized_at > 0,
             "compact+index must stamp last_optimized_at for the GetIndexStats RPC"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn maintenance_compacts_and_prunes_the_embedding_index_of_the_directory()
+    -> anyhow::Result<()> {
+        use crate::infra::embedding_index::{EmbeddingIndex, EntryOutcome, IndexEntry, TableLabel};
+        use crate::infra::search_index_maintenance::OptimizeAction;
+        let (config, _db) = TestDb::config(16);
+        let index = EmbeddingIndex::open(&config.uri).await?;
+        let repo = MemoryVectorRepositoryImpl::new(config)
+            .await?
+            .with_embedding_index(index.clone());
+        repo.upsert(&test_record(1, 1, 16)).await?;
+        // Separate writes leave separate fragments for compaction to merge.
+        for entity_id in 1..=3 {
+            index
+                .put(&[IndexEntry {
+                    table: TableLabel::Memory,
+                    entity_id,
+                    vector_kind: "text".into(),
+                    space_id: crate::infra::embedding_space::SpaceId("s".into()),
+                    source_version: crate::infra::embedding_index::SourceVersion("v".into()),
+                    generation_id: "g".into(),
+                    outcome: EntryOutcome::Success { chunk_count: 1 },
+                    media_digest: None,
+                    recorded_at: 0,
+                }])
+                .await?;
+        }
+        let before = index.version().await?;
+        repo.maintenance_optimize_action(OptimizeAction::Compact, 300)
+            .await?;
+        let compacted = index.version().await?;
+        assert!(compacted > before, "compaction must also rewrite the index");
+        repo.maintenance_optimize_action(OptimizeAction::Prune, 0)
+            .await?;
+        assert_eq!(index.count().await?, 3);
         Ok(())
     }
 

@@ -1,3 +1,4 @@
+pub mod embedding_reconcile;
 pub mod media;
 pub mod memory;
 pub mod memory_kind;

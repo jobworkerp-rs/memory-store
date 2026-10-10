@@ -7,46 +7,6 @@ use infra::infra::module::RepositoryModule;
 use protobuf::llm_memory::data::{Memory, MemoryRating, Thread};
 use std::sync::Arc;
 
-/// Outcome of pre-init for an embedding dispatcher. Encodes the rule
-/// "transient init failure must not silently disable the dispatcher"
-/// in a value the caller can inspect rather than as a control-flow
-/// branch buried in `new_by_env`. Tests can assert directly on this
-/// outcome to pin down the regression that motivated this PR.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum DispatcherInitOutcome {
-    /// `ensure_initialized` succeeded; dispatcher is ready and `Some`.
-    Ready,
-    /// `ensure_initialized` returned `Err`. The dispatcher MUST still
-    /// be retained as `Some` so the lazy `OnceCell` retry path inside
-    /// the dispatcher core can recover on the next `dispatch()` call.
-    /// This is the regression class — previous code dropped to `None`,
-    /// permanently disabling auto-embedding after a flaky jobworkerp
-    /// startup.
-    InitDeferred,
-}
-
-/// Decide what to do with a freshly constructed dispatcher: log
-/// outcome, then declare it Ready or InitDeferred. The function never
-/// drops the dispatcher; the caller wraps `Some(dispatcher)` regardless
-/// of outcome. Extracted from `AppModule::new_by_env` so the
-/// "init-error keeps Some" invariant is checkable in isolation without
-/// standing up a real jobworkerp / OnceCell.
-pub(crate) async fn classify_dispatcher_init<F>(label: &str, init: F) -> DispatcherInitOutcome
-where
-    F: std::future::Future<Output = anyhow::Result<()>>,
-{
-    match init.await {
-        Ok(()) => {
-            tracing::info!("{label} initialized");
-            DispatcherInitOutcome::Ready
-        }
-        Err(e) => {
-            tracing::warn!("{label} init deferred (will retry on first dispatch): {e:#}");
-            DispatcherInitOutcome::InitDeferred
-        }
-    }
-}
-
 fn auto_embedding_config_startup_error(
     error: anyhow::Error,
 ) -> infra::infra::startup_error::StartupError {
@@ -67,6 +27,12 @@ pub struct AppModule {
     pub thread_group_read_app: crate::app::thread_group::ThreadGroupReadService,
     pub thread_group_reconcile_app: crate::app::thread_group::ThreadGroupReconciliationService,
     pub thread_group_event_app: crate::app::thread_group::ThreadGroupObservationService,
+    /// Registration of this process's jobworkerp workers.
+    pub worker_registry: Arc<infra::infra::embedding_space::registration::WorkerRegistry>,
+    /// Reconciliation of the vector tables; `None` without vector stores.
+    pub embedding_reconciler: Option<Arc<crate::app::embedding_reconcile::EmbeddingReconciler>>,
+    /// Embedding space verified at startup; `None` without vector stores.
+    pub embedding_space: Option<infra::infra::embedding_space::bootstrap::SpaceState>,
 }
 
 impl AppModule {
@@ -75,6 +41,7 @@ impl AppModule {
         // moved out. ThreadGroup services are pool-only and hold no
         // LanceDB state.
         let thread_group_pool = repositories.pool();
+        let embedding_space = repositories.embedding_space.clone();
         let mc_config = envy::prefixed("MEMORY_CACHE_")
             .from_env::<memory_utils::cache::stretto::MemoryCacheConfig>()
             .unwrap_or_else(|e| {
@@ -127,26 +94,34 @@ impl AppModule {
         let auto_embedding_enabled = std::env::var("MEMORY_AUTO_EMBEDDING_ENABLED")
             .unwrap_or_default()
             .eq_ignore_ascii_case("true");
+        // One registry registers every enabled worker (embedding
+        // pipelines, callbacks, RAG tools) in the background; dispatchers
+        // and query embedding stay inactive until it completes.
+        let enabled_workers = infra::infra::embedding_space::plan::EnabledWorkers::from_env();
+        let worker_registry = {
+            use infra::infra::embedding_space::{plan, registration, workers};
+            let space = workers::current_space();
+            let registry = registration::WorkerRegistry::new(
+                Arc::new(infra::infra::jobworkerp_ops::EnvJobworkerpConnector::default()),
+                enabled_workers.plan(),
+                space.clone(),
+                plan::registration_overrides(space.as_ref()),
+                registration::DEFAULT_RETRY_INTERVAL,
+            );
+            if enabled_workers.any() {
+                registry.spawn_until_registered();
+            }
+            registry
+        };
         let embedding_dispatcher: Option<
             Arc<infra::infra::memory_vector::dispatcher::EmbeddingJobDispatcher>,
         > = if auto_embedding_enabled {
-            match infra::infra::memory_vector::dispatcher::EmbeddingJobDispatcher::from_env() {
-                Ok(d) => {
-                    // Eager init surfaces YAML / jobworkerp / schema errors
-                    // at startup as a warning. The dispatcher is retained
-                    // as `Some` regardless of outcome — `classify_dispatcher_init`
-                    // never drops the dispatcher — so the lazy `OnceCell`
-                    // retry path can recover on the next `dispatch()` call.
-                    // Dropping to `None` here would permanently disable
-                    // auto-embedding after a transient jobworkerp startup
-                    // delay (regression fix).
-                    let _ = classify_dispatcher_init(
-                        "Auto-embedding dispatcher",
-                        d.ensure_initialized(),
-                    )
-                    .await;
-                    Some(Arc::new(d))
-                }
+            match infra::infra::memory_vector::dispatcher::EmbeddingJobDispatcher::from_env(
+                worker_registry.clone(),
+            ) {
+                Ok(d) => Some(Arc::new(
+                    d.with_media_repository(repositories.create_media_object_repository()),
+                )),
                 Err(e) => {
                     // Config error (env / YAML path) is not transient —
                     // the dispatcher cannot even be constructed, so
@@ -163,17 +138,10 @@ impl AppModule {
         let thread_embedding_dispatcher: Option<
             Arc<infra::infra::thread_vector::dispatcher::ThreadEmbeddingJobDispatcher>,
         > = if auto_embedding_enabled {
-            match infra::infra::thread_vector::dispatcher::ThreadEmbeddingJobDispatcher::from_env()
-            {
-                Ok(d) => {
-                    // Same retry rationale as `embedding_dispatcher` above.
-                    let _ = classify_dispatcher_init(
-                        "Thread auto-embedding dispatcher",
-                        d.ensure_initialized(),
-                    )
-                    .await;
-                    Some(Arc::new(d))
-                }
+            match infra::infra::thread_vector::dispatcher::ThreadEmbeddingJobDispatcher::from_env(
+                worker_registry.clone(),
+            ) {
+                Ok(d) => Some(Arc::new(d)),
                 Err(e) => auto_embedding_config_startup_error(e).fatal(),
             }
         } else {
@@ -206,6 +174,13 @@ impl AppModule {
         // carried in an Option so the take()/map happens before the move.
         let memory_vector_enrich_media_repo = repositories.create_media_object_repository();
         let memory_vector_repo_opt = repositories.memory_vector_repository.take();
+        // The reconciler reads the same stores and dispatches through the
+        // same dispatchers as the apps below.
+        let reconcile_memory_vector = memory_vector_repo_opt.clone();
+        let reconcile_thread_vector = repositories.thread_vector_repository.clone();
+        let reconcile_media_repo = repositories.create_media_object_repository();
+        let reconcile_memory_repo = repositories.create_memory_repository();
+        let reconcile_thread_repo = repositories.create_thread_repository();
 
         // Create thread_vector_app before fields are moved
         let thread_vector_app = repositories
@@ -235,16 +210,10 @@ impl AppModule {
         let reflection_summary_dispatcher: Option<
             Arc<infra::infra::reflection_summary_dispatch::ReflectionSummaryDispatcher>,
         > = if reflection_dispatch_enabled {
-            match infra::infra::reflection_summary_dispatch::ReflectionSummaryDispatcher::from_env()
-            {
-                Ok(d) => {
-                    let _ = classify_dispatcher_init(
-                        "Reflection summary dispatcher",
-                        d.ensure_initialized(),
-                    )
-                    .await;
-                    Some(Arc::new(d))
-                }
+            match infra::infra::reflection_summary_dispatch::ReflectionSummaryDispatcher::from_env(
+                worker_registry.clone(),
+            ) {
+                Ok(d) => Some(Arc::new(d)),
                 Err(e) => {
                     tracing::warn!("Reflection summary dispatcher disabled: config error: {e}");
                     None
@@ -256,15 +225,10 @@ impl AppModule {
         let reflection_intent_dispatcher: Option<
             Arc<infra::infra::reflection_intent_dispatch::ReflectionIntentDispatcher>,
         > = if reflection_dispatch_enabled {
-            match infra::infra::reflection_intent_dispatch::ReflectionIntentDispatcher::from_env() {
-                Ok(d) => {
-                    let _ = classify_dispatcher_init(
-                        "Reflection intent dispatcher",
-                        d.ensure_initialized(),
-                    )
-                    .await;
-                    Some(Arc::new(d))
-                }
+            match infra::infra::reflection_intent_dispatch::ReflectionIntentDispatcher::from_env(
+                worker_registry.clone(),
+            ) {
+                Ok(d) => Some(Arc::new(d)),
                 Err(e) => {
                     tracing::warn!("Reflection intent dispatcher disabled: config error: {e}");
                     None
@@ -314,6 +278,26 @@ impl AppModule {
 
         let reflection_pool = repositories.pool();
         let reflection_intent_vector_repo = repositories.reflection_intent_vector_repository.take();
+        let embedding_reconciler = repositories.embedding_space.as_ref().map(|_| {
+            crate::app::embedding_reconcile::EmbeddingReconciler::new(
+                crate::app::embedding_reconcile::ReconcileDeps {
+                    pool: repositories.pool(),
+                    memory_repo: reconcile_memory_repo,
+                    media_repo: reconcile_media_repo,
+                    thread_repo: reconcile_thread_repo,
+                    memory_vector: reconcile_memory_vector,
+                    thread_vector: reconcile_thread_vector,
+                    intent_vector: reflection_intent_vector_repo.clone(),
+                    memory_dispatcher: embedding_dispatcher.clone(),
+                    thread_dispatcher: thread_embedding_dispatcher.clone(),
+                    intent_dispatcher: reflection_intent_dispatcher.clone(),
+                    image_search_mode: infra::infra::embedding_dispatch::ImageSearchMode::from_env(
+                    ),
+                    max_content_len: infra::infra::embedding_dispatch::max_content_len_from_env(),
+                    page_size: 500,
+                },
+            )
+        });
         let reflection_app = ReflectionAppImpl::new(
             reflection_pool,
             repositories.create_memory_repository(),
@@ -464,45 +448,16 @@ impl AppModule {
             thread_group_event_app: crate::app::thread_group::ThreadGroupObservationService::new(
                 thread_group_pool,
             ),
+            embedding_reconciler,
+            worker_registry,
+            embedding_space,
         }
     }
 }
 
 #[cfg(test)]
-mod dispatcher_init_outcome_tests {
-    //! Pin the regression fix: `AppModule::new_by_env` must NOT drop a
-    //! dispatcher to `None` when its eager init returns `Err`. The check
-    //! lives on `classify_dispatcher_init` because the helper carries
-    //! the only branch that distinguishes Ready vs InitDeferred — every
-    //! caller in `new_by_env` wraps `Some(Arc::new(d))` directly after,
-    //! so as long as the helper never says "drop me", the invariant
-    //! holds. Refactoring `new_by_env` to once again drop the dispatcher
-    //! on init error would force this test (and the `InitDeferred`
-    //! variant) to be deleted — making the regression visible at code
-    //! review time, not at runtime.
-
+mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn ok_init_classifies_as_ready() {
-        let outcome =
-            classify_dispatcher_init("test-dispatcher", async { Ok::<(), anyhow::Error>(()) })
-                .await;
-        assert_eq!(outcome, DispatcherInitOutcome::Ready);
-    }
-
-    #[tokio::test]
-    async fn err_init_classifies_as_init_deferred_not_drop() {
-        let outcome = classify_dispatcher_init("test-dispatcher", async {
-            Err::<(), anyhow::Error>(anyhow::anyhow!("simulated transient init failure"))
-        })
-        .await;
-        // The outcome enum has no "Drop" variant by construction. If a
-        // future refactor added one and routed Err there, this assertion
-        // would force a conscious decision rather than silently changing
-        // the on-Err behaviour.
-        assert_eq!(outcome, DispatcherInitOutcome::InitDeferred);
-    }
 
     #[test]
     fn configuration_errors_are_promoted_to_fatal_startup_errors() {

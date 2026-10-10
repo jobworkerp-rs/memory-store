@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package llm_memory.data;
+
+// Components that identify an embedding space. Vectors are comparable
+// only within one space. All values come from configuration.
+message EmbeddingSpace {
+  // Deterministic ID derived from the components (64 lowercase hex).
+  string space_id = 1;
+  string model_id = 2;
+  // Empty when the model's own tokenizer is used.
+  string tokenizer_model_id = 3;
+  // `MEMORY_EMBEDDING_MODEL_REVISION`, `unversioned` when unset.
+  string revision = 4;
+  uint32 dimension = 5;
+  // `cosine`, `l2`, or `dot`.
+  string distance = 6;
+}
+
+// Embedding migration state recorded on a vector table.
+message EmbeddingMigrationMarker {
+  // `switching`, `pending`, `committing`, `restoring`, or `discarding`.
+  string state = 1;
+  string attempt_id = 2;
+}
+
+// What a vector table records about its embedding space.
+message EmbeddingSpaceRecord {
+  // Unset when the table has no recorded space.
+  optional EmbeddingSpace space = 1;
+  // Whether writes without a dispatch token are accepted.
+  bool legacy_accept = 2;
+  // Unset outside an embedding migration.
+  optional EmbeddingMigrationMarker migration_marker = 3;
+}
+
+// Attached to every embedding generation request and carried unchanged
+// to the write (or failure report) RPC, so memories can tell which space,
+// attempt, and source version a result was generated for.
+message DispatchToken {
+  string space_id = 1;
+  // Rebuild attempt the request belongs to; empty outside a rebuild.
+  string attempt_id = 2;
+  // Source version of the input at request time.
+  string source_version = 3;
+  // Unique per generation request.
+  string generation_id = 4;
+}

@@ -8,9 +8,9 @@
 # auto-embedding-workers.yaml (always registered, the text path needs
 # them too) — this file only adds the image-pipeline-specific workers.
 #
-# The VLM caption / update-content workers are defined unconditionally
-# here; in `multimodal` mode the workflow's per-step `if` simply skips
-# them, so registering an unused worker is harmless (it never runs).
+# The VLM caption and caption write-back workers are defined
+# unconditionally; in `multimodal` mode memories never dispatches the
+# caption workflow, so registering them is harmless.
 
 defaults:
   response_type: DIRECT
@@ -37,18 +37,19 @@ workers:
       method: llm_memory.service.MediaService/Resolve
       as_json: true
 
-  # 2. GRPC worker that calls MemoryService/UpdateContentNoDispatch back
-  #    on this server to write the VLM caption into memory.content. This
-  #    RPC deliberately does NOT spawn the embedding dispatcher, which is
-  #    what breaks the caption→Update→re-dispatch loop (design 3/3
-  #    §11.3). Only used in vlm_caption / both modes.
-  - name: memories-update-content-no-dispatch
+  # 2. GRPC worker that calls MemoryService/WriteBackCaption back on
+  #    this server. memories stores the caption only while the memory
+  #    still exists, links the same media object, and has an empty body
+  #    (one conditional update), then dispatches the caption embedding
+  #    itself. A late or duplicate caption therefore never overwrites a
+  #    user's text or resurrects a deleted memory.
+  - name: memories-write-back-caption
     runner: GRPC
     settings:
       host: %{MEMORY_GRPC_HOST}
       port: %{MEMORY_GRPC_PORT}
       use_reflection: true
-      method: llm_memory.service.MemoryService/UpdateContentNoDispatch
+      method: llm_memory.service.MemoryService/WriteBackCaption
       as_json: true
 
   # 3. VLM caption worker (LLM runner, ollama backend). Describes the
@@ -83,17 +84,30 @@ workers:
         model: qwen3.6:27b
         pull_model: false
 
-  # 4. WORKFLOW worker that orchestrates resolve → (image embed) →
-  #    (caption → update → caption embed) → upsert. Pinned to the same
-  #    single-slot `embedding_workflow` channel as memories-auto-embedding
-  #    (shares the GPU-bound embedding bottleneck; concurrency=1 prevents
-  #    the wall-clock inflation / deadlock described in
-  #    auto-embedding-workers.yaml). The $file directive inlines
-  #    auto-image-embedding.yaml at registration time.
-  - name: memories-auto-image-embedding
+  # 4. WORKFLOW worker that embeds the image: resolve → embed_image →
+  #    upsert. Pinned to the same single-slot `embedding_workflow` channel
+  #    as memories-auto-embedding (shares the GPU-bound embedding
+  #    bottleneck; concurrency=1 prevents the wall-clock inflation /
+  #    deadlock described in auto-embedding-workers.yaml). The $file
+  #    directive inlines auto-image-embedding.yaml at registration time.
+  - name: "memories-auto-image-embedding%{MEMORY_EMBEDDING_SPACE_SUFFIX}"
     runner: WORKFLOW
     response_type: NO_RESULT
     channel: embedding_workflow
     settings:
       workflow_data:
         $file: auto-image-embedding.yaml
+
+  # 5. WORKFLOW worker that generates a caption for an image memory with
+  #    an empty body: resolve → VLM caption → write back. It does not use
+  #    the embedding model, so its name carries no space suffix; the
+  #    caption embedding is dispatched by memories after the write-back.
+  #    Runs on the default channel: on `llm` it would hold the slot the
+  #    VLM step it waits for needs, and on `embedding_workflow` it would
+  #    stall embeddings behind slow captioning.
+  - name: memories-auto-image-caption
+    runner: WORKFLOW
+    response_type: NO_RESULT
+    settings:
+      workflow_data:
+        $file: auto-image-caption.yaml

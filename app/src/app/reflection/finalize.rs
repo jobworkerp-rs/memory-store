@@ -635,7 +635,7 @@ async fn dispatch_embeddings(
     task_intent: &str,
 ) {
     if let Some(d) = &app.memory_embedding_dispatcher
-        && !search_document.is_empty()
+        && infra::infra::embedding_target::reflection_text_is_target(search_document)
     {
         match d.dispatch(memory_id, search_document).await {
             Ok(_) => {}
@@ -645,7 +645,7 @@ async fn dispatch_embeddings(
         }
     }
     if let Some(d) = &app.intent_dispatcher
-        && !task_intent.is_empty()
+        && infra::infra::embedding_target::reflection_text_is_target(task_intent)
     {
         match d.dispatch(memory_id, task_intent).await {
             Ok(_) => {}

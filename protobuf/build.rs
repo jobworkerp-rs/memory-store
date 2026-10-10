@@ -25,6 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "protobuf/llm_memory/service/memory_rating.proto",
                 "protobuf/llm_memory/data/highlight.proto",
                 "protobuf/llm_memory/data/search_filter.proto",
+                "protobuf/llm_memory/data/embedding_space.proto",
                 "protobuf/llm_memory/data/memory_vector.proto",
                 "protobuf/llm_memory/data/thread_vector.proto",
                 "protobuf/llm_memory/service/memory_vector.proto",
@@ -35,6 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "protobuf/llm_memory/service/reflection.proto",
                 "protobuf/llm_memory/service/reflection_vector.proto",
                 "protobuf/llm_memory/service/search_index_maintenance.proto",
+                "protobuf/llm_memory/service/embedding_space.proto",
             ],
             &["protobuf"],
         )

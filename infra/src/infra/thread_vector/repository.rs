@@ -87,6 +87,8 @@ pub struct ThreadVectorSearchHit {
 
 #[derive(Clone)]
 pub struct ThreadVectorRepositoryImpl {
+    /// Embedding index of this table's LanceDB directory.
+    embedding_index: Option<crate::infra::embedding_index::EmbeddingIndex>,
     /// Lock-free table handle (see `MemoryVectorRepositoryImpl::table` for
     /// the `ArcSwap` rationale — readers never block on a `reload_table`).
     table: Arc<ArcSwap<Table>>,
@@ -372,6 +374,7 @@ impl ThreadVectorRepositoryImpl {
         crate::infra::memory_vector::repository::maintenance_optimize_action(
             &self.table,
             &self.index_ddl_lock,
+            self.embedding_index.as_ref(),
             action,
             prune_older_than_secs,
         )
@@ -384,31 +387,43 @@ impl ThreadVectorRepositoryImpl {
         &self.config.fts
     }
 
+    /// The configured embedding dimension of this table.
+    pub fn vector_size(&self) -> usize {
+        self.config.vector_size
+    }
+
+    /// Attach the embedding index of this table's directory.
+    pub fn with_embedding_index(
+        mut self,
+        index: crate::infra::embedding_index::EmbeddingIndex,
+    ) -> Self {
+        self.embedding_index = Some(index);
+        self
+    }
+
+    pub fn embedding_index(&self) -> Option<&crate::infra::embedding_index::EmbeddingIndex> {
+        self.embedding_index.as_ref()
+    }
+
+    /// LanceDB URI the table lives in.
+    pub fn uri(&self) -> &str {
+        &self.config.uri
+    }
+
+    /// The current table handle, for table-level metadata (embedding
+    /// space records) outside the repository's own operations.
+    pub fn table_handle(&self) -> lancedb::Table {
+        (*self.table.load_full()).clone()
+    }
+
     pub async fn new(config: ThreadVectorDBConfig) -> anyhow::Result<Self> {
         // Connection is only needed to open/create the table; the repo keeps
         // the `Table` handle and refreshes it via `checkout_latest`, so the
         // `Connection` is not retained (see memory repo for the rationale).
-        let database = lancedb::connect(&config.uri)
-            .execute()
-            .await
-            .map_err(|e| anyhow::anyhow!("LanceDB connect failed: {e}"))?;
-
         let schema = thread_arrow_schema(config.vector_size);
-        let (table, is_new) = match database.open_table(&config.table_name).execute().await {
-            Ok(t) => (t, false),
-            Err(_) => {
-                let empty_batch = RecordBatch::new_empty(schema.clone());
-                let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
-                    RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone()),
-                );
-                let t = database
-                    .create_table(&config.table_name, reader)
-                    .execute()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("LanceDB create_table failed: {e}"))?;
-                (t, true)
-            }
-        };
+        let crate::infra::vector_table::OpenedTable { table, is_new, .. } =
+            crate::infra::vector_table::open_or_create(&config.uri, &config.table_name, &schema)
+                .await?;
 
         if !is_new {
             // Validate existing table schema matches expected schema.
@@ -421,36 +436,12 @@ impl ThreadVectorRepositoryImpl {
                 )
                 .await?;
             let actual = add_legacy_message_time_columns_if_missing(&table, actual).await?;
-            let actual_arrow = actual.as_ref().clone();
-            let expected_fp =
-                crate::infra::memory_vector::repository::schema_fingerprint(schema.as_ref());
-            let actual_fp =
-                crate::infra::memory_vector::repository::schema_fingerprint(&actual_arrow);
-            if actual_fp != expected_fp {
-                // Surface as structured StartupError so the parent
-                // process (agent-app) can route into the LanceDB-dim
-                // recovery flow without parsing the message text.
-                let expected_dim =
-                    crate::infra::memory_vector::schema::extract_embedding_dim_from_schema(
-                        schema.as_ref(),
-                    )
-                    .unwrap_or(0);
-                let actual_dim =
-                    crate::infra::memory_vector::schema::extract_embedding_dim_from_schema(
-                        &actual_arrow,
-                    )
-                    .unwrap_or(0);
-                return Err(anyhow::Error::new(
-                    crate::infra::startup_error::StartupError::LancedbSchemaMismatch {
-                        table: config.table_name.clone(),
-                        uri: config.uri.clone(),
-                        expected_dim,
-                        actual_dim,
-                        expected_fingerprint: expected_fp,
-                        actual_fingerprint: actual_fp,
-                    },
-                ));
-            }
+            crate::infra::vector_table::check_schema_fingerprint(
+                &config.table_name,
+                &config.uri,
+                schema.as_ref(),
+                actual.as_ref(),
+            )?;
         }
 
         // Ensure indexes exist for both new and existing tables.
@@ -458,6 +449,7 @@ impl ThreadVectorRepositoryImpl {
         Self::create_indexes(&table).await?;
 
         let repo = Self {
+            embedding_index: None,
             table: Arc::new(ArcSwap::from_pointee(table)),
             config,
             last_optimized_at: Arc::new(AtomicI64::new(0)),
@@ -498,7 +490,7 @@ impl ThreadVectorRepositoryImpl {
         }
     }
 
-    async fn create_indexes(table: &Table) -> anyhow::Result<()> {
+    pub async fn create_indexes(table: &Table) -> anyhow::Result<()> {
         // BTree indexes on scalar filter columns. `vector_kind` /
         // `chunk_index` back the N-row replace_kinds delete and chunk-0
         // narrowing (count / scalar sync).
@@ -512,19 +504,7 @@ impl ThreadVectorRepositoryImpl {
             "first_message_at",
             "last_message_at",
         ];
-        for col_name in btree_columns {
-            if let Err(e) = table
-                .create_index(&[col_name], Index::BTree(Default::default()))
-                .execute()
-                .await
-            {
-                let msg = e.to_string();
-                if msg.contains("already exists") || msg.contains("duplicate") {
-                    continue;
-                }
-                tracing::warn!("Failed to create BTree index on {}: {}", col_name, e);
-            }
-        }
+        crate::infra::vector_table::ensure_btree_indexes(table, &btree_columns).await;
 
         // LABEL_LIST index on labels column for array_contains filtering
         if let Err(e) = table
@@ -624,6 +604,14 @@ impl ThreadVectorRepositoryImpl {
             .map_err(|e| anyhow::anyhow!("LanceDB delete failed: {e}"))?;
         drop(table);
         self.reload_table().await?;
+        if let Some(index) = &self.embedding_index {
+            index
+                .delete_entities(
+                    crate::infra::embedding_index::TableLabel::Thread,
+                    &[thread_id],
+                )
+                .await?;
+        }
         // A delete creates a new version too, so it must drive maintenance —
         // otherwise a delete-heavy workload grows `_versions/` without ever
         // tripping the prune gate.
@@ -668,6 +656,15 @@ impl ThreadVectorRepositoryImpl {
 
         if records.is_empty() {
             self.reload_table().await?;
+            if let Some(index) = &self.embedding_index {
+                index
+                    .delete(
+                        crate::infra::embedding_index::TableLabel::Thread,
+                        thread_id,
+                        replace_kinds,
+                    )
+                    .await?;
+            }
             // Stale-delete path: the delete above created a new version but
             // no batch_upsert follows to count it, so track it here. The
             // non-empty path is covered by batch_upsert's own tracking.
@@ -1251,6 +1248,8 @@ impl ThreadVectorRepositoryImpl {
             fts_tokenizer,
             fts_ngram_min,
             fts_ngram_max,
+            embedding_space: crate::infra::embedding_space::record::read_table_record(&table)
+                .await?,
         })
     }
 

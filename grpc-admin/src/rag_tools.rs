@@ -1,120 +1,25 @@
-//! Startup-time registration of memories RAG tools into jobworkerp.
+//! Rendering checks for the bundled RAG tools manifest.
 //!
-//! When `MEMORY_RAG_TOOLS_ENABLED=true`, the manifest at
-//! `MEMORY_RAG_MANIFEST_YAML` (default: `workflows/rag-tools-manifest.yaml`)
-//! is upserted to the jobworkerp server pointed to by `JOBWORKERP_ADDR`.
-//! The manifest defines three workers (`recall_memories`,
-//! `find_conversations`, `expand_memory_context`) and the `memory-recall`
-//! function set that bundles them.
-//!
-//! Failure policy: log a warning and continue. RAG tool exposure is an
-//! adjunct feature; the memories gRPC server should still start so that
-//! user-facing reads/writes work even if jobworkerp is unreachable.
+//! The manifest is registered by the worker registry
+//! (`infra::infra::embedding_space::registration`) together with the
+//! embedding workers; these tests pin what the rendered manifest exposes
+//! to the LLM.
 
-use jobworkerp_client::client::manifest_yaml;
-use jobworkerp_client::client::wrapper::JobworkerpClientWrapper;
+use infra::infra::embedding_space::plan::{
+    DEFAULT_RAG_MANIFEST_PATH as DEFAULT_MANIFEST_PATH, RAG_MANIFEST_ENV as MANIFEST_ENV,
+    rag_manifest_path_from_env as manifest_path_from_env, registration_overrides,
+};
 use jobworkerp_client::client::yaml_common;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-const MANIFEST_ENV: &str = "MEMORY_RAG_MANIFEST_YAML";
-const DEFAULT_MANIFEST_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../workflows/rag-tools-manifest.yaml"
-);
-
-fn manifest_path_from_env() -> PathBuf {
-    std::env::var(MANIFEST_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_MANIFEST_PATH))
-}
-
-fn workflow_env_overrides() -> HashMap<String, String> {
-    let prefix = infra::infra::embedding_dispatch::embedding_query_prefix();
-    HashMap::from([(
-        infra::infra::embedding_dispatch::EMBEDDING_QUERY_PREFIX_JAQ_ENV.to_string(),
-        infra::infra::embedding_dispatch::query_prefix_jaq_literal(prefix.as_deref()),
-    )])
-}
-
-/// jobworkerp-client expands `%{VAR}` only on the manifest YAML itself,
-/// not on the bodies pulled in via `$file:` (documented as "No nested
-/// expansion" in worker-yaml.md). Our workflow YAMLs reference
-/// `%{MEMORY_GRPC_HOST}` / `%{MEMORY_GRPC_PORT}` because the workflows
-/// run on the jobworkerp host and need to call back into the memories
-/// gRPC endpoint by routable address — those values must resolve at
-/// manifest-registration time so they end up baked into the
-/// `runner_settings.workflow_data` payload that jobworkerp persists.
-///
-/// To bridge the gap, we resolve `$file:` includes ourselves and run
-/// `expand_env` over the included content before handing the resulting
-/// raw YAML to `register_manifest_from_yaml_str` (which still does its
-/// own outer expansion at the manifest level — idempotent, since the
-/// manifest body no longer contains unresolved placeholders).
 async fn read_manifest_with_inlined_includes(
     yaml_path: &Path,
 ) -> anyhow::Result<(String, PathBuf)> {
-    let raw = tokio::fs::read_to_string(yaml_path).await.map_err(|e| {
-        anyhow::anyhow!(
-            "failed to read manifest YAML at {}: {e}",
-            yaml_path.display()
-        )
-    })?;
-    let base_dir = yaml_path
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-
-    // Outer expansion must run *before* parse: `%{VAR:-default}` placeholders
-    // sit at YAML positions where the raw `%` would otherwise be rejected by
-    // the YAML scanner (it reserves `%` for directives at the start of a
-    // line / scalar).
-    let overrides = workflow_env_overrides();
-    let expanded_outer = yaml_common::expand_env_with_overrides(&raw, &overrides)
-        .map_err(|e| anyhow::anyhow!("env expansion failed on manifest YAML: {e}"))?;
-
-    let mut doc: serde_yaml::Value = serde_yaml::from_str(&expanded_outer)
-        .map_err(|e| anyhow::anyhow!("manifest YAML parse error: {e}"))?;
-
-    yaml_common::resolve_includes_with_overrides(&mut doc, &base_dir, &overrides)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to resolve $file: includes: {e}"))?;
-
-    let serialized = serde_yaml::to_string(&doc)
-        .map_err(|e| anyhow::anyhow!("failed to re-serialize manifest YAML: {e}"))?;
-    Ok((serialized, base_dir))
-}
-
-async fn register(yaml_path: &Path) -> anyhow::Result<manifest_yaml::ManifestResult> {
-    let (raw_yaml, base_dir) = read_manifest_with_inlined_includes(yaml_path).await?;
-    // 10s: this is a fire-and-forget background task; stalling longer
-    // just delays surfacing a jobworkerp connectivity issue in the log.
-    let client = JobworkerpClientWrapper::new_by_env(Some(10)).await?;
-    let metadata: Arc<HashMap<String, String>> = Arc::new(HashMap::new());
-    manifest_yaml::register_manifest_from_yaml_str(&client, None, metadata, &raw_yaml, &base_dir)
-        .await
-}
-
-/// Never returns an error: the front server must stay up even when
-/// jobworkerp is unreachable, so failures are downgraded to WARN logs.
-pub(crate) async fn register_on_startup() {
-    let path = manifest_path_from_env();
-    match register(&path).await {
-        Ok(result) => {
-            let workers: Vec<&String> = result.workers.keys().collect();
-            let function_sets: Vec<&String> = result.function_sets.keys().collect();
-            tracing::info!(
-                manifest = %path.display(),
-                "RAG tools registered: workers={workers:?}, function_sets={function_sets:?}"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                manifest = %path.display(),
-                "RAG tools registration failed (server will start without them): {e:?}"
-            );
-        }
-    }
+    infra::infra::embedding_space::registration::render_yaml(
+        yaml_path,
+        &registration_overrides(None),
+    )
+    .await
 }
 
 #[cfg(test)]

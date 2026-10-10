@@ -635,7 +635,7 @@ pub trait ThreadApp:
                 let desc_changed = w.description != existing.description;
                 if desc_changed {
                     let new_desc = w.description.as_deref().unwrap_or("");
-                    if new_desc.is_empty() {
+                    if !infra::infra::embedding_target::thread_description_is_target(new_desc) {
                         // Description cleared — remove stale LanceDB record
                         if let Some(tva) = self.thread_vector_app()
                             && let Err(e) = tva.delete_thread_vector(id.value).await
@@ -655,8 +655,10 @@ pub trait ThreadApp:
                 }
                 // Sync scalar columns (labels, channel, etc.) unless the
                 // vector record was just deleted (empty description).
-                let vector_deleted =
-                    desc_changed && w.description.as_deref().unwrap_or("").is_empty();
+                let vector_deleted = desc_changed
+                    && !infra::infra::embedding_target::thread_description_is_target(
+                        w.description.as_deref().unwrap_or(""),
+                    );
                 if !vector_deleted
                     && let Some(tva) = self.thread_vector_app()
                     && let Err(e) = tva.sync_thread_scalars(id.value).await

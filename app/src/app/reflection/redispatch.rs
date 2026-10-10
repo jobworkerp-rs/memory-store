@@ -74,8 +74,10 @@ pub async fn redispatch(
         let search_document = memory_data.content.as_str();
         let task_intent = extract_task_intent(memory_data.metadata.as_deref());
 
-        let want_summary = item.want_summary && !search_document.is_empty();
-        let want_intent = item.want_intent && !task_intent.is_empty();
+        let want_summary = item.want_summary
+            && infra::infra::embedding_target::reflection_text_is_target(search_document);
+        let want_intent = item.want_intent
+            && infra::infra::embedding_target::reflection_text_is_target(&task_intent);
 
         match dispatch_one(
             app,
@@ -386,14 +388,5 @@ fn has_non_empty_string(values: &[String]) -> bool {
 }
 
 fn extract_task_intent(metadata: Option<&str>) -> String {
-    let Some(s) = metadata else {
-        return String::new();
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
-        return String::new();
-    };
-    v.pointer("/eval/task_intent")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string()
+    infra::infra::embedding_target::reflection_task_intent(metadata)
 }

@@ -6,6 +6,7 @@ pub mod front;
 pub mod protobuf;
 pub mod service;
 
+#[cfg(test)]
 mod rag_tools;
 
 use anyhow::Result;
@@ -115,9 +116,8 @@ pub async fn setup_and_start_front_server() -> Result<()> {
             }
             .fatal();
         }
-        // Spawned so a slow / unreachable jobworkerp doesn't stall the
-        // memories gRPC server. Failure is logged at WARN, never returned.
-        tokio::spawn(rag_tools::register_on_startup());
+        // The manifest itself is registered by the worker registry
+        // (`AppModule`), together with the embedding workers.
     }
 
     let use_web: bool = env::var("USE_GRPC_WEB")

@@ -63,7 +63,7 @@ workers:
   # reasons as `memories-auto-embedding`: GPU-bound embedding step
   # must be single-slot, and sharing the GPU channel would deadlock the
   # workflow on its own child.
-  - name: memories-auto-reflection-summary-embedding
+  - name: "memories-auto-reflection-summary-embedding%{MEMORY_EMBEDDING_SPACE_SUFFIX}"
     runner: WORKFLOW
     response_type: NO_RESULT
     channel: embedding_workflow

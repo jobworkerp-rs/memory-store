@@ -85,6 +85,10 @@ impl ReflectionVectorService for ReflectionVectorGrpcImpl {
                 req.embedding_model.as_deref(),
                 &req.replace_kinds,
                 rows,
+                req.token
+                    .as_ref()
+                    .map(infra::infra::embedding_space::token::DispatchToken::from)
+                    .as_ref(),
             )
             .await
         {

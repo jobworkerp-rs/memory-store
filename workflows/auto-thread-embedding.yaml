@@ -12,6 +12,10 @@ input:
           type: string
         content:
           type: string
+        # Dispatch token issued by memories; forwarded unchanged to the
+        # write RPC so stale results are rejected there.
+        token:
+          type: object
       required: [thread_id, content]
 do:
   # Step 1: Generate embeddings via the shared `memories-mm-embedding`
@@ -23,44 +27,66 @@ do:
   # (thread_id, vector_kind, chunk_index)). `text_rows` builds one
   # VectorRow per chunk; `to_entries[]` yields the 0-based array index as
   # `.key` (the contiguous chunk_index within vector_kind="text").
-  - generateEmbedding:
-      run:
-        worker:
-          name: "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}"
-          using: embed_text
-          arguments:
-            text: "${.content}"
-      output:
-        as:
-          # `?` suppresses jaq's "cannot use null as iterable" error for
-          # `null | .field`. See auto-embedding.yaml for the full rationale.
-          model_name: "${ .model_info.model_name? // \"unknown\" }"
-          text_rows: >-
-            ${ [ .embeddings | to_entries[] | {
-                  vector_kind: "text",
-                  chunk_index: .key,
-                  begin_position: .value.begin_position,
-                  end_position: .value.end_position,
-                  content: .value.content,
-                  embedding: { values: .value.values }
-                } ] }
+  - generateAndStore:
+      try:
+        - generateEmbedding:
+            run:
+              worker:
+                name: "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}%{MEMORY_EMBEDDING_SPACE_SUFFIX}"
+                using: embed_text
+                arguments:
+                  text: "${.content}"
+            output:
+              as:
+                # `?` suppresses jaq's "cannot use null as iterable" error for
+                # `null | .field`. See auto-embedding.yaml for the full rationale.
+                model_name: "${ .model_info.model_name? // \"unknown\" }"
+                text_rows: >-
+                  ${ [ .embeddings | to_entries[] | {
+                        vector_kind: "text",
+                        chunk_index: .key,
+                        begin_position: .value.begin_position,
+                        end_position: .value.end_position,
+                        content: .value.content,
+                        embedding: { values: .value.values }
+                      } ] }
 
-  # Step 2: Upsert every chunk row via the N-row
-  # ThreadVectorService/BatchUpsertEmbeddingsRows path.
-  # `replace_kinds: ["text"]` deletes only this thread's existing `text`
-  # rows before inserting the new chunk set, so a shorter rebuild leaves
-  # no stale rows. See auto-embedding.yaml for the rationale on building
-  # the body via a single jq expression.
-  - upsertThreadEmbedding:
-      run:
-        worker:
-          name: memories-upsert-thread-embedding
-          using: unary
-          arguments:
-            json_body: >-
-              ${ {
-                thread_id: $workflow.input.thread_id,
-                embedding_model: (.model_name // "unknown"),
-                replace_kinds: ["text"],
-                rows: .text_rows
-              } | tojson }
+        # Step 2: Upsert every chunk row via the N-row
+        # ThreadVectorService/BatchUpsertEmbeddingsRows path.
+        # `replace_kinds: ["text"]` deletes only this thread's existing `text`
+        # rows before inserting the new chunk set, so a shorter rebuild leaves
+        # no stale rows. See auto-embedding.yaml for the rationale on building
+        # the body via a single jq expression.
+        - upsertThreadEmbedding:
+            run:
+              worker:
+                name: memories-upsert-thread-embedding
+                using: unary
+                arguments:
+                  json_body: >-
+                    ${ {
+                      thread_id: $workflow.input.thread_id,
+                      embedding_model: (.model_name // "unknown"),
+                      replace_kinds: ["text"],
+                      rows: .text_rows
+                    } + (if $workflow.input.token then {token: $workflow.input.token} else {} end)
+                    | tojson }
+      catch:
+        as: err
+        do:
+          - reportFailure:
+              if: "${ $workflow.input.token != null }"
+              run:
+                worker:
+                  name: memories-report-embedding-failure
+                  using: unary
+                  arguments:
+                    json_body: >-
+                      ${ {
+                        token: $workflow.input.token,
+                        table: "thread",
+                        entity_id: ($workflow.input.thread_id | tonumber),
+                        vector_kind: "text",
+                        reason: "workflow_error",
+                        message: ($err | tostring)
+                      } | tojson }

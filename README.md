@@ -111,6 +111,34 @@ judge the result only by the exit code and the final structured stdout line
 [docs/database-migration-tool-spec_ja.md](docs/database-migration-tool-spec_ja.md)
 for the contract.
 
+### Migration tool E2E tests
+
+The end-to-end tests of `memories-db-migrate` (`local`, `release`, and
+`embedding` commands) are `#[ignore]`d and run the release binary as a child
+process inside temporary fixtures. Build the binary of the backend under test
+and point the tests at it and at the Atlas artifact of the bundle:
+
+```bash
+# SQLite
+scripts/build-memories-db-migrate-sqlite.sh /tmp/mdm-bundle
+MEMORIES_DB_MIGRATE_E2E_ATLAS_DIR=/tmp/mdm-bundle/atlas \
+MEMORIES_DB_MIGRATE_E2E_BINARY=/tmp/mdm-bundle/memories-db-migrate \
+  cargo test -p grpc-admin --bin memories-db-migrate -- --ignored --test-threads=1
+
+# PostgreSQL: each test creates and drops its own schema in this database
+cargo build --release -p grpc-admin --bin memories-db-migrate --no-default-features --features postgres
+cp target/release/memories-db-migrate /tmp/mdm-pg/
+TEST_POSTGRES_URL='postgres://postgres:postgres@127.0.0.1:5432/memories_e2e?sslmode=disable' \
+MEMORIES_DB_MIGRATE_E2E_ATLAS_DIR=/tmp/mdm-bundle/atlas \
+MEMORIES_DB_MIGRATE_E2E_BINARY=/tmp/mdm-pg/memories-db-migrate \
+  cargo test -p grpc-admin --bin memories-db-migrate --no-default-features --features postgres \
+  -- --ignored --test-threads=1
+```
+
+Use `sslmode=disable` only for a local server without TLS. The tests run the
+binary with a cleared environment inside the fixture, so a developer's `.env`
+(which may point at real stores) is never read.
+
 ## Setup and Run
 
 ```bash
@@ -193,9 +221,18 @@ set value stops startup with a configuration error.
 Worker definitions are managed in YAML. Memories-specific workers are described
 in [yaml-workers.md](yaml-workers.md), and the general YAML format is described
 in [modules/jobworkerp-client/docs/worker-yaml.md](modules/jobworkerp-client/docs/worker-yaml.md).
-To change embedding models, edit `workflows/auto-embedding-workers.yaml`
-directly. The actual model name used to generate vectors is read from the
-runner's `model_info.model_name` and recorded in vector metadata.
+The embedding model is defined by the single `MultimodalEmbeddingRunner`
+worker in `workflows/auto-embedding-workers.yaml`. Its `model_id` /
+`tokenizer_model_id`, `MEMORY_EMBEDDING_MODEL_REVISION`, the vector size, and
+the distance identify the *embedding space*, which every vector table records.
+The server refuses to start when the configured space differs from the
+recorded one; moving to another model goes through
+`memories-db-migrate embedding` (`plan` → `switch` → rebuild → `finalize`). See
+[docs/embedding-space-management-spec_ja.md](docs/embedding-space-management-spec_ja.md)
+and, for servers, [docs/vectordb-rebuild-runbook_ja.md](docs/vectordb-rebuild-runbook_ja.md).
+Workers whose behaviour depends on the model are registered under per-space
+names (`<base>-<first 16 hex digits of the space ID>`), so two spaces never
+share a worker definition in jobworkerp.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -207,7 +244,10 @@ runner's `model_info.model_name` and recorded in vector metadata.
 | `MEMORY_THREAD_WORKERS_YAML` | `<infra crate>/../workflows/auto-thread-embedding-workers.yaml` | Thread worker YAML |
 | `MEMORY_GRPC_HOST` | required | Host that embedding workflows use to call back into this server |
 | `MEMORY_GRPC_PORT` | required | Callback port |
-| `MEMORY_MM_EMBEDDING_WORKER` | `memories-mm-embedding` | Shared jobworkerp worker for text, image, and query embeddings |
+| `MEMORY_MM_EMBEDDING_WORKER` | `memories-mm-embedding` | Base name of the shared jobworkerp worker for text, image, and query embeddings; the registered name carries the space suffix (`GetEmbeddingSpace` returns it) |
+| `MEMORY_EMBEDDING_MODEL_REVISION` | `unversioned` | Declared revision of the model distribution (weights and tokenizer); part of the embedding space |
+| `MEMORY_EMBEDDING_STATE_DIR` | `<MEMORY_LANCEDB_URI>.embedding-state` | Embedding migration state (attempt record, storage identifiers); mount it together with the LanceDB directories |
+| `MEMORY_EMBEDDING_REBUILD_STALL_SECS` | `900` | Seconds without progress after dispatch before the rebuild progress RPC reports `stalled` |
 | `MEMORY_EMBEDDING_DOCUMENT_PREFIX` | unset | Unsupported: startup rejects a non-empty value because the current runner cannot apply it to each chunk while preserving source offsets |
 | `MEMORY_EMBEDDING_QUERY_PREFIX` | unset | Prefix prepended to semantic, hybrid, RAG, and intent query text before embedding; RAG embeds it at registration so jobworkerp need not define it |
 | `MEMORY_IMAGE_WORKERS_YAML` | `workflows/auto-image-embedding-workers.yaml` | Image embedding worker YAML |

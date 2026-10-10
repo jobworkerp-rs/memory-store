@@ -1,6 +1,7 @@
 use crate::infra::embedding_dispatch::{
     DispatchSpec, EmbeddingConfig, EmbeddingDispatcherCore, ImageSearchMode,
 };
+use crate::infra::embedding_space::registration::WorkerRegistry;
 use anyhow::Result;
 use async_trait::async_trait;
 use jobworkerp_client::jobworkerp::data::JobId;
@@ -14,6 +15,7 @@ pub use crate::infra::embedding_dispatch::{
 const SPEC: DispatchSpec = DispatchSpec {
     target_worker_name: "memories-auto-embedding",
     id_field_name: "memory_id",
+    text_source: crate::infra::embedding_index::source_version::TextSource::MemoryText,
 };
 
 const WORKERS_YAML_ENV: &str = "MEMORY_WORKERS_YAML";
@@ -36,15 +38,40 @@ pub type AutoEmbeddingConfig = EmbeddingConfig;
 /// Read configuration from `MEMORY_EMBEDDING_*` env vars and the
 /// `MEMORY_WORKERS_YAML` path. Same shape as [`EmbeddingConfig::from_env`]
 /// with the memory-side defaults baked in.
-pub fn auto_embedding_config_from_env() -> Result<AutoEmbeddingConfig> {
-    EmbeddingConfig::from_env(WORKERS_YAML_ENV, DEFAULT_WORKERS_YAML_PATH)
+/// The workers YAML whose mm-embedding worker defines the embedding model.
+pub fn workers_yaml_path_from_env() -> std::path::PathBuf {
+    std::env::var(WORKERS_YAML_ENV)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_WORKERS_YAML_PATH))
 }
 
-pub use crate::infra::embedding_dispatch::{IMAGE_WORKFLOW_WORKER, TEXT_WORKFLOW_WORKER};
+pub fn auto_embedding_config_from_env() -> Result<AutoEmbeddingConfig> {
+    EmbeddingConfig::from_env()
+}
+
+/// Workers YAML files the memory dispatcher needs registered: the text
+/// pipeline (which also defines the mm-embedding worker) and, in any
+/// image mode, the image pipeline.
+pub fn workers_yaml_paths(mode: ImageSearchMode) -> Vec<std::path::PathBuf> {
+    let mut paths = vec![workers_yaml_path_from_env()];
+    if mode.is_image_enabled() {
+        paths.push(
+            std::env::var(IMAGE_WORKERS_YAML_ENV)
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_IMAGE_WORKERS_YAML_PATH)),
+        );
+    }
+    paths
+}
+
+pub use crate::infra::embedding_dispatch::{
+    CAPTION_WORKFLOW_WORKER, IMAGE_WORKFLOW_WORKER, TEXT_WORKFLOW_WORKER,
+};
 
 /// Dispatches embedding generation jobs to jobworkerp (fire-and-forget).
 pub struct EmbeddingJobDispatcher {
     core: EmbeddingDispatcherCore,
+    media: Option<crate::infra::media_object::rdb::MediaObjectRepositoryImpl>,
 }
 
 impl EmbeddingJobDispatcher {
@@ -86,33 +113,90 @@ impl EmbeddingJobDispatcher {
         });
     }
 
-    pub fn from_env() -> Result<Self> {
-        let mut config = auto_embedding_config_from_env()?;
-        // Resolve the image workflow worker too so `Media` jobs can be
-        // routed to it. Best-effort at init: absent in text-only
-        // deployments (see EmbeddingConfig.extra_worker_names).
-        config.extra_worker_names = vec![IMAGE_WORKFLOW_WORKER];
-        // In any image mode, register the image-pipeline workers
-        // (resolve / image+caption workflow / VLM / update-content) as a
-        // prerequisite YAML so the image workflow worker exists before
-        // the text YAML's dispatcher references it. text-only (`none`)
-        // skips this so a deployment with no image workers still starts.
-        if ImageSearchMode::from_env().is_image_enabled() {
-            let image_yaml = std::env::var(IMAGE_WORKERS_YAML_ENV)
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_IMAGE_WORKERS_YAML_PATH));
-            config.prerequisite_yaml_paths.push(image_yaml);
-        }
+    pub fn from_env(registry: Arc<WorkerRegistry>) -> Result<Self> {
         Ok(Self {
-            core: EmbeddingDispatcherCore::new(config, SPEC),
+            core: EmbeddingDispatcherCore::new(auto_embedding_config_from_env()?, SPEC, registry),
+            media: None,
         })
     }
 
-    /// Eagerly run the lazy init so configuration errors (missing YAML,
-    /// unparseable settings, jobworkerp unreachable, ...) surface here
-    /// instead of inside the first fire-and-forget dispatch call.
-    pub async fn ensure_initialized(&self) -> Result<()> {
-        self.core.ensure_initialized().await
+    /// Media rows are read at dispatch time to version image requests
+    /// (content digest or URL). Without it, image requests carry no token.
+    pub fn with_media_repository(
+        mut self,
+        media: crate::infra::media_object::rdb::MediaObjectRepositoryImpl,
+    ) -> Self {
+        self.media = Some(media);
+        self
+    }
+
+    /// Dispatch the caption embedding of an image memory whose body is
+    /// `caption` (the caption kind is the body embedded as a caption).
+    pub async fn dispatch_caption(
+        &self,
+        memory_id: i64,
+        caption: &str,
+    ) -> std::result::Result<Option<JobId>, DispatchError> {
+        let args = self.core.build_kind_job_args(
+            memory_id,
+            caption,
+            crate::infra::memory_vector::record::vector_kind::CAPTION,
+            crate::infra::embedding_index::source_version::TextSource::Caption,
+        );
+        self.core
+            .dispatch_to_worker(TEXT_WORKFLOW_WORKER, &args)
+            .await
+    }
+
+    /// Dispatch the image embedding of a memory's media.
+    pub async fn dispatch_image(
+        &self,
+        memory_id: i64,
+        media_object_id: i64,
+    ) -> std::result::Result<Option<JobId>, DispatchError> {
+        let version = self.media_version(media_object_id).await;
+        let args = build_image_job_args(memory_id, media_object_id, version.as_ref());
+        self.core
+            .dispatch_to_worker(IMAGE_WORKFLOW_WORKER, &args)
+            .await
+    }
+
+    /// Request a caption for an image memory whose body is empty.
+    pub async fn dispatch_caption_generation(
+        &self,
+        memory_id: i64,
+        media_object_id: i64,
+    ) -> std::result::Result<Option<JobId>, DispatchError> {
+        self.core
+            .dispatch_to_fixed_worker(
+                CAPTION_WORKFLOW_WORKER,
+                &build_caption_job_args(memory_id, media_object_id),
+            )
+            .await
+    }
+
+    async fn media_version(
+        &self,
+        media_object_id: i64,
+    ) -> Option<crate::infra::embedding_index::SourceVersion> {
+        use crate::infra::media_object::rdb::MediaObjectRepository as _;
+        let repo = self.media.as_ref()?;
+        match repo.find_by_ids(&[media_object_id]).await {
+            Ok(rows) => rows.into_iter().find(|r| r.id == media_object_id).map(|r| {
+                crate::infra::embedding_index::source_version::media(
+                    r.id,
+                    r.sha256.as_deref(),
+                    r.storage_uri.as_deref(),
+                )
+            }),
+            Err(e) => {
+                tracing::warn!(
+                    media_object_id,
+                    "media lookup for the dispatch token failed: {e:#}"
+                );
+                None
+            }
+        }
     }
 
     /// Synchronously embed a short text query in the stored-vector model
@@ -163,28 +247,71 @@ impl EmbeddingJobDispatcher {
                         "Media dispatch requested without media_object_id",
                     )));
                 };
-                let args = build_image_job_args(target.memory_id, mid, target.image_search_mode);
-                self.core
-                    .dispatch_to_worker(IMAGE_WORKFLOW_WORKER, &args)
-                    .await
+                let mode = target.image_search_mode;
+                let mut first = None;
+                if matches!(mode, ImageSearchMode::Multimodal | ImageSearchMode::Both) {
+                    let version = self.media_version(mid).await;
+                    let args = build_image_job_args(target.memory_id, mid, version.as_ref());
+                    first = self
+                        .core
+                        .dispatch_to_worker(IMAGE_WORKFLOW_WORKER, &args)
+                        .await?;
+                }
+                if matches!(mode, ImageSearchMode::VlmCaption | ImageSearchMode::Both) {
+                    // The caption is the memory body: embed it when there
+                    // is one, otherwise have one generated (its write-back
+                    // dispatches the embedding).
+                    let job = if target.content.trim().is_empty() {
+                        self.core
+                            .dispatch_to_fixed_worker(
+                                CAPTION_WORKFLOW_WORKER,
+                                &build_caption_job_args(target.memory_id, mid),
+                            )
+                            .await?
+                    } else {
+                        let args = self.core.build_kind_job_args(
+                            target.memory_id,
+                            &target.content,
+                            crate::infra::memory_vector::record::vector_kind::CAPTION,
+                            crate::infra::embedding_index::source_version::TextSource::Caption,
+                        );
+                        self.core
+                            .dispatch_to_worker(TEXT_WORKFLOW_WORKER, &args)
+                            .await?
+                    };
+                    first = first.or(job);
+                }
+                Ok(first)
             }
         }
     }
 }
 
 /// Build the image workflow `input` JSON. The WORKFLOW runner takes a
-/// single string-typed parameter, so `input` is itself a JSON string.
-/// `image_search_mode` lets the workflow branch image vs caption; the
+/// single string-typed parameter, so `input` is itself a JSON string. The
 /// `embedding_model` is read from the runner output inside the workflow.
 fn build_image_job_args(
     memory_id: i64,
     media_object_id: i64,
-    mode: ImageSearchMode,
+    version: Option<&crate::infra::embedding_index::SourceVersion>,
 ) -> serde_json::Value {
+    let mut inner = serde_json::json!({
+        "memory_id": memory_id.to_string(),
+        "media_object_id": media_object_id.to_string(),
+    });
+    if let Some(v) = version {
+        crate::infra::embedding_dispatch::with_token(&mut inner, v);
+    }
+    serde_json::json!({ "input": inner.to_string() })
+}
+
+/// Build the caption generation workflow `input` JSON. The media object
+/// ID is carried so the write-back only lands while the memory still
+/// links the same media.
+fn build_caption_job_args(memory_id: i64, media_object_id: i64) -> serde_json::Value {
     let inner = serde_json::json!({
         "memory_id": memory_id.to_string(),
         "media_object_id": media_object_id.to_string(),
-        "image_search_mode": mode.as_str(),
     });
     serde_json::json!({ "input": inner.to_string() })
 }
@@ -428,18 +555,44 @@ mod tests {
     }
 
     #[test]
-    fn build_image_job_args_shape() {
+    #[serial]
+    fn image_job_args_carry_a_token_for_the_media_version() {
+        use crate::infra::embedding_space::{SpaceId, workers};
+        let version = crate::infra::embedding_index::source_version::media(9, Some("d"), None);
+        workers::set_current_space(Some(SpaceId("ab".repeat(32))));
         let v = build_image_job_args(
             7_465_246_090_942_480_532,
             7_465_246_090_942_480_757,
-            ImageSearchMode::VlmCaption,
+            Some(&version),
         );
+        workers::set_current_space(None);
         let inner: serde_json::Value = serde_json::from_str(v["input"].as_str().unwrap()).unwrap();
         assert_eq!(inner["memory_id"], "7465246090942480532");
         assert_eq!(inner["media_object_id"], "7465246090942480757");
-        assert_eq!(inner["image_search_mode"], "vlm_caption");
+        assert_eq!(inner["token"]["source_version"], version.as_str());
+        assert_eq!(inner["token"]["space_id"], "ab".repeat(32));
+        assert_eq!(inner["token"]["attempt_id"], "");
+        assert!(!inner["token"]["generation_id"].as_str().unwrap().is_empty());
         // embedding_model is read from runner output in the workflow.
         assert!(inner.get("embedding_model").is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn requests_carry_no_token_without_a_space() {
+        crate::infra::embedding_space::workers::set_current_space(None);
+        let version = crate::infra::embedding_index::source_version::media(9, Some("d"), None);
+        let v = build_image_job_args(1, 2, Some(&version));
+        let inner: serde_json::Value = serde_json::from_str(v["input"].as_str().unwrap()).unwrap();
+        assert!(inner.get("token").is_none());
+    }
+
+    #[test]
+    fn caption_job_args_carry_the_media_object() {
+        let v = build_caption_job_args(1, 2);
+        let inner: serde_json::Value = serde_json::from_str(v["input"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["memory_id"], "1");
+        assert_eq!(inner["media_object_id"], "2");
     }
 
     #[test]
@@ -455,11 +608,8 @@ mod tests {
         assert_eq!(config.timeout_sec, 120);
         assert_eq!(config.max_content_len, 8192);
         assert!(
-            config
-                .workers_yaml_path
-                .ends_with("auto-embedding-workers.yaml"),
-            "expected default workers YAML path, got {:?}",
-            config.workers_yaml_path
+            workers_yaml_path_from_env().ends_with("auto-embedding-workers.yaml"),
+            "expected default workers YAML path"
         );
     }
 
@@ -502,7 +652,7 @@ mod tests {
         let yaml = std::fs::read_to_string(&path).expect("auto-embedding-workers.yaml must exist");
 
         let block = yaml
-            .split_once("- name: memories-auto-embedding")
+            .split_once("- name: \"memories-auto-embedding%{MEMORY_EMBEDDING_SPACE_SUFFIX}\"")
             .map(|(_, rest)| rest)
             .expect("memories-auto-embedding worker must be defined");
         // Stop at the next top-level worker entry (or end of file).
@@ -545,33 +695,28 @@ mod tests {
         );
     }
 
-    /// The image workflow MUST resolve a URL, embed the image, and route
-    /// the caption write-back through UpdateContentNoDispatch — using the
-    /// public Update RPC there would re-trigger dispatch_kinds and loop
-    /// the caption workflow forever. It must also keep image/caption rows
-    /// isolated from the text dispatch's rows.
+    /// The image workflow embeds only the image and replaces only image
+    /// rows; captions are generated by a separate workflow that writes
+    /// back through the conditional WriteBackCaption RPC (never an
+    /// unconditional content update).
     #[test]
-    fn auto_image_embedding_yaml_shape_and_loop_break() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../workflows/auto-image-embedding.yaml");
-        let yaml = std::fs::read_to_string(&path).expect("auto-image-embedding.yaml must exist");
+    fn image_and_caption_workflows_are_separate() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../workflows");
+        let image = std::fs::read_to_string(root.join("auto-image-embedding.yaml")).unwrap();
+        assert!(image.contains("name: memories-media-resolve"));
+        assert!(image.contains("using: embed_image"));
+        assert!(image.contains("replace_kinds: [\"image\"]"));
+        assert!(!image.contains("memories-vlm-caption"));
+        assert!(!image.contains("UpdateContentNoDispatch") && !image.contains("update-content"));
+        assert!(image.contains("$workflow.input.token"));
+
+        let caption = std::fs::read_to_string(root.join("auto-image-caption.yaml")).unwrap();
+        assert!(caption.contains("name: memories-vlm-caption"));
+        assert!(caption.contains("name: memories-write-back-caption"));
+        assert!(caption.contains("media_object_id: { value: $workflow.input.media_object_id }"));
         assert!(
-            yaml.contains("name: memories-media-resolve"),
-            "must resolve a media URL first"
-        );
-        assert!(
-            yaml.contains("using: embed_image"),
-            "must call embed_image for the image vector"
-        );
-        assert!(
-            yaml.contains("name: memories-update-content-no-dispatch"),
-            "caption write-back MUST go through UpdateContentNoDispatch \
-             (loop break); the public Update RPC would re-dispatch"
-        );
-        assert!(
-            yaml.contains("replace_kinds: [\"image\", \"caption\"]"),
-            "image workflow must replace only image/caption rows, never \
-             the text dispatch's text rows (kind isolation)"
+            !caption.contains("embed_text"),
+            "memories dispatches the caption embedding"
         );
     }
 
@@ -586,7 +731,7 @@ mod tests {
         let yaml =
             std::fs::read_to_string(&path).expect("auto-image-embedding-workers.yaml must exist");
         let block = yaml
-            .split_once("- name: memories-auto-image-embedding")
+            .split_once("- name: \"memories-auto-image-embedding%{MEMORY_EMBEDDING_SPACE_SUFFIX}\"")
             .map(|(_, rest)| rest)
             .expect("memories-auto-image-embedding worker must be defined");
         let block = block.split("\n  - ").next().unwrap_or(block);

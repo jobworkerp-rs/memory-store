@@ -8,16 +8,19 @@
 use super::{
     PostMigrateCommand, PostMigrateRunArgs, SchemaState, atlas_artifact_root,
     bundle_command::running_bundle_digest, current_schema_contract_version,
-    latest_migration_version, migration_database_url, run_apply, run_baseline, run_post_migrate,
-    run_verify, schema_state, selected_tasks_for_schema_version, verify_atlas_sum,
+    latest_migration_version, migration_database_url, pending_required_tasks,
+    pending_work_is_embedding_neutral, required_tasks_left_to_run, run_apply, run_baseline,
+    run_post_migrate, run_verify, schema_state, selected_tasks_for_schema_version,
+    verify_atlas_sum,
 };
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use grpc_admin::db_migrate::{
     catalog,
+    embedding::guard::{self as embedding_guard, GuardError, Work},
     local::{
         attempt::{AttemptRecord, AttemptStatus},
-        backup::{BackupInfo, apply_retention, create_backup},
+        backup::{BackupInfo, BackupManifest, apply_retention, create_backup},
         output::{
             Command, ErrorCode, FailureLine, LocalFailure, Outcome, Resolution, Stage, SuccessLine,
             classify, fail, progress_line,
@@ -28,7 +31,6 @@ use grpc_admin::db_migrate::{
         target::{SqliteTarget, TargetFiles},
         writer::ensure_no_other_connection,
     },
-    state::{self, TaskStateKind},
     task_resources,
 };
 use infra_utils::infra::rdb::RdbPool;
@@ -167,7 +169,8 @@ impl Progress {
 
     /// Classify a failure and persist the classification for the next run.
     async fn failure_line(&mut self, error: &anyhow::Error) -> FailureLine {
-        let (error_code, mut resolution) = match error.downcast_ref::<LocalFailure>() {
+        let failure = error.downcast_ref::<LocalFailure>();
+        let (error_code, mut resolution) = match failure {
             Some(failure) => (failure.error_code, failure.resolution),
             None => default_classification(self.stage),
         };
@@ -187,18 +190,72 @@ impl Progress {
                 eprintln!("warning: could not record the failed attempt: {store_error:#}");
             }
         }
-        FailureLine {
-            command: Command::Apply,
-            stage: self.stage,
+        let line = FailureLine::new(
+            Command::Apply,
+            self.stage,
             error_code,
             resolution,
-            backup: self
-                .attempt
-                .as_ref()
-                .and_then(|attempt| attempt.backup.clone())
+            failure
+                .and_then(|f| f.backup.clone())
+                .or_else(|| {
+                    self.attempt
+                        .as_ref()
+                        .and_then(|attempt| attempt.backup.clone())
+                })
                 .or_else(|| self.report_backup.clone()),
-        }
+        );
+        line.with_embedding_fields(failure)
     }
+}
+
+/// A refusal of the embedding guard as a classified local failure.
+fn guard_failure(error: GuardError) -> anyhow::Error {
+    use grpc_admin::db_migrate::local::output::EmbeddingAttempt;
+    let refused = error.refused();
+    // Every word of `refused` is in the local vocabulary.
+    let mut failure = LocalFailure::new(
+        ErrorCode::parse(refused.error_code).unwrap_or(ErrorCode::InvalidTarget),
+        Resolution::parse(refused.resolution).unwrap_or(Resolution::ManualRecovery),
+        error.to_string(),
+    );
+    failure.backup = refused.backup.map(PathBuf::from);
+    failure.embedding_attempt = refused.attempt.map(|a| EmbeddingAttempt {
+        attempt: a.attempt,
+        attempt_stage: a.stage,
+        backup_mode: a.backup_mode,
+    });
+    failure.cancel_operation = refused.cancel_operation;
+    failure.into()
+}
+
+/// Take the embedding guard for `work`; the database is opened only to
+/// read its storage identifier and closed again, since the writer checks
+/// must not see this process's connection.
+async fn guard_embedding(
+    target: &SqliteTarget,
+    work: Work,
+    backup_space: Option<&str>,
+) -> Result<embedding_guard::Guard> {
+    // Without a vector store there is nothing to guard; the database is
+    // then left alone (a damaged one must stay restorable).
+    if grpc_admin::db_migrate::embedding::observe::stores_from_env()
+        .map_err(|e| guard_failure(GuardError::Unavailable(e)))?
+        .is_empty()
+    {
+        return Ok(embedding_guard::Guard::none());
+    }
+    // A database that cannot be opened only skips the identifier check.
+    let pool = if target.database().exists() {
+        open_existing(target).await.ok()
+    } else {
+        None
+    };
+    let state_dir = infra::infra::embedding_space::storage::state_dir_from_env();
+    let guarded = embedding_guard::acquire(pool.as_ref(), &state_dir, work, backup_space).await;
+    if let Some(pool) = pool {
+        pool.close().await;
+    }
+    guarded.map_err(guard_failure)
 }
 
 async fn apply(args: &LocalApplyArgs, progress: &mut Progress) -> Result<SuccessLine> {
@@ -248,6 +305,21 @@ async fn apply(args: &LocalApplyArgs, progress: &mut Progress) -> Result<Success
         });
     }
 
+    if progress.stage != Stage::Preflight {
+        progress.enter(Stage::Preflight)?;
+    }
+    let neutral = match files {
+        TargetFiles::Present => {
+            let pool = open_existing(&target).await?;
+            let to_run =
+                required_tasks_left_to_run(&pool, plan.state, &latest_version, "sqlite").await;
+            pool.close().await;
+            pending_work_is_embedding_neutral(plan.state, &to_run?)
+        }
+        TargetFiles::Missing => false,
+    };
+    let _embedding_guard = guard_embedding(&target, Work::Apply { neutral }, None).await?;
+
     let started_at = command_utils::util::datetime::now_millis();
     let bundle_digest = running_bundle_digest();
     progress.attempt = Some(AttemptRecord {
@@ -269,10 +341,16 @@ async fn apply(args: &LocalApplyArgs, progress: &mut Progress) -> Result<Success
             .flat_map(|task| task_resources(&task.implementation).iter().copied())
             .collect::<Vec<_>>();
         let resources = backup_resources(&resources, |key| std::env::var(key).ok())?;
+        let embedding_space_id = if resources.is_empty() {
+            None
+        } else {
+            embedding_guard::current_space().await.ok().flatten()
+        };
         let info = BackupInfo {
             schema_status: plan.state.as_str().to_string(),
             schema_version: plan.contract_version.clone(),
             bundle_digest,
+            embedding_space_id,
         };
         let backup = create_backup(parent, &target, &resources, &info).await?;
         if let Some(attempt) = &mut progress.attempt {
@@ -366,22 +444,7 @@ async fn plan_existing(pool: &RdbPool, latest_version: &str) -> Result<Plan> {
         }
         _ => None,
     };
-    let mut pending_tasks = Vec::new();
-    for task in selected_required_tasks(latest_version)? {
-        // Task state is trustworthy only once the schema is fully managed.
-        let completed = state == SchemaState::Managed
-            && state::load(pool, &task.identity())
-                .await?
-                .map(|row| -> Result<bool> {
-                    Ok(row.kind()? == TaskStateKind::Completed
-                        && row.canonical_definition_digest == task.canonical_definition_digest)
-                })
-                .transpose()?
-                .unwrap_or(false);
-        if !completed {
-            pending_tasks.push(task);
-        }
-    }
+    let pending_tasks = pending_required_tasks(pool, state, latest_version, "sqlite").await?;
     Ok(Plan {
         schema_up_to_date: state == SchemaState::Managed
             && contract_version.as_deref() == Some(latest_version),
@@ -488,6 +551,17 @@ async fn restore(args: &LocalRestoreArgs) -> Result<()> {
     let artifact_root = atlas_artifact_root().map_err(bundle_invalid)?;
     let latest_version =
         latest_migration_version(&artifact_root, "sqlite").map_err(bundle_invalid)?;
+    let manifest = BackupManifest::load(&args.backup)?;
+    let _embedding_guard = guard_embedding(
+        &target,
+        Work::Restore {
+            // An absent resource is restored as absent, which also removes
+            // the current directory.
+            vector_tables: !manifest.resources.is_empty(),
+        },
+        manifest.embedding_space_id.as_deref(),
+    )
+    .await?;
     restore_backup(&args.backup, &target, &latest_version).await?;
     let record = AttemptRecord::path(&target);
     if record.exists() {
@@ -507,13 +581,19 @@ fn restore_failure_line(args: &LocalRestoreArgs, error: &anyhow::Error) -> Failu
         ErrorCode::RestoreFailed => Stage::RestoreReplace,
         _ => Stage::RestorePreflight,
     };
-    FailureLine {
-        command: Command::Restore,
+    let failure = error.downcast_ref::<LocalFailure>();
+    let line = FailureLine::new(
+        Command::Restore,
         stage,
         error_code,
         resolution,
-        backup: Some(args.backup.clone()),
-    }
+        // An embedding refusal names only the embedding backup (if any).
+        match failure {
+            Some(f) if f.embedding_attempt.is_some() => f.backup.clone(),
+            _ => Some(args.backup.clone()),
+        },
+    );
+    line.with_embedding_fields(failure)
 }
 
 #[cfg(test)]

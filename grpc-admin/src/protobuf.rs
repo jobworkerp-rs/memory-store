@@ -75,6 +75,8 @@ pub mod llm_memory {
         pub type HighlightRange = data::HighlightRange;
         pub type HighlightSource = data::HighlightSource;
         pub type FtsTokenizerKind = data::FtsTokenizerKind;
+        pub type EmbeddingSpaceRecord = data::EmbeddingSpaceRecord;
+        pub type DispatchToken = data::DispatchToken;
         // Reflection request / response types are NOT generated inside
         // this crate (see `grpc-admin/build.rs`) — the
         // `reflection.proto` / `reflection_vector.proto` files are

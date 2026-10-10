@@ -1198,6 +1198,14 @@ mod tests {
         {
             Err(Status::unimplemented("not used by this test"))
         }
+
+        async fn write_back_caption(
+            &self,
+            _request: tonic::Request<protobuf::llm_memory::service::WriteBackCaptionRequest>,
+        ) -> Result<tonic::Response<protobuf::llm_memory::service::WriteBackCaptionResponse>, Status>
+        {
+            Err(Status::unimplemented("not used by this test"))
+        }
     }
 
     #[tokio::test]

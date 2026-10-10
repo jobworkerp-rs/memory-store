@@ -1,3 +1,5 @@
+pub mod embedding_maintenance;
+pub mod embedding_space;
 pub mod error_handle;
 
 pub mod media;

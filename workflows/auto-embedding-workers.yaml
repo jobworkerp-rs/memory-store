@@ -43,7 +43,7 @@ workers:
   #    SearchByMedia and reflection F-S8 via
   #    `mm_embedding_worker_name()`) — resolves the same env var, so a name
   #    override can never split query vectors from stored vectors.
-  - name: "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}"
+  - name: "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}%{MEMORY_EMBEDDING_SPACE_SUFFIX}"
     runner: MultimodalEmbeddingRunner
     use_static: true
     channel: embedding
@@ -74,6 +74,20 @@ workers:
       method: llm_memory.service.MemoryVectorService/BatchUpsertEmbeddings
       as_json: true
 
+  # 2b. GRPC worker that reports a failed generation back to this server
+  #     (EmbeddingSpaceService/ReportEmbeddingFailure) with the request's
+  #     dispatch token, so the target is counted as failed instead of
+  #     staying missing. Used from the catch branch of every embedding
+  #     workflow.
+  - name: memories-report-embedding-failure
+    runner: GRPC
+    settings:
+      host: %{MEMORY_GRPC_HOST}
+      port: %{MEMORY_GRPC_PORT}
+      use_reflection: true
+      method: llm_memory.service.EmbeddingSpaceService/ReportEmbeddingFailure
+      as_json: true
+
   # 3. WORKFLOW worker that orchestrates the embed → upsert pipeline.
   #    The $file directive inlines auto-embedding.yaml at registration time.
   #
@@ -90,7 +104,7 @@ workers:
   #    - A separate single-slot channel serializes the workflow itself,
   #      keeps each run within ~ embedding-time + ~50ms upsert, and lets
   #      backlog pile up in the channel queue without timing out.
-  - name: memories-auto-embedding
+  - name: "memories-auto-embedding%{MEMORY_EMBEDDING_SPACE_SUFFIX}"
     runner: WORKFLOW
     response_type: NO_RESULT
     channel: embedding_workflow

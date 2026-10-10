@@ -43,7 +43,7 @@ workers:
   # into the same GPU-bound `embedding` worker, so allowing them to run
   # in parallel only redistributes the same bottleneck while making
   # individual workflow runs more likely to hit the 600s timeout.
-  - name: memories-auto-thread-embedding
+  - name: "memories-auto-thread-embedding%{MEMORY_EMBEDDING_SPACE_SUFFIX}"
     runner: WORKFLOW
     response_type: NO_RESULT
     channel: embedding_workflow

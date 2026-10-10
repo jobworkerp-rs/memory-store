@@ -80,6 +80,7 @@ impl ThreadVectorAppImpl {
         embedding_model: Option<&str>,
         replace_kinds: &[String],
         rows: Vec<(String, i32, i32, i32, String, Vec<f32>)>,
+        token: Option<&infra::infra::embedding_space::token::DispatchToken>,
     ) -> Result<(u32, u32, Vec<String>)> {
         if replace_kinds.is_empty() {
             return Err(LlmMemoryError::InvalidArgument(
@@ -103,6 +104,36 @@ impl ThreadVectorAppImpl {
                 vec![format!("thread_id={thread_id}: has no data")],
             ));
         };
+        let current_version = infra::infra::embedding_target::thread_target(
+            data.description.as_deref().unwrap_or(""),
+            infra::infra::embedding_dispatch::max_content_len_from_env(),
+        )
+        .filter(|t| replace_kinds.first().map(String::as_str) == Some(t.vector_kind))
+        .map(|t| t.version);
+        let guarded = match infra::infra::embedding_index::write::guard(
+            infra::infra::embedding_index::TableLabel::Thread,
+            thread_id,
+            replace_kinds,
+            token,
+            current_version.as_ref(),
+            self.vector_repo.vector_size(),
+            rows.iter().map(|r| r.5.len()),
+        ) {
+            Ok(g) => g,
+            Err(r) => {
+                return Ok((
+                    0,
+                    rows.len() as u32,
+                    vec![format!(
+                        "thread_id={thread_id}: embedding write rejected ({})",
+                        r.as_str()
+                    )],
+                ));
+            }
+        };
+        let index = self.vector_repo.embedding_index();
+        guarded.before_rows(index).await?;
+        let chunk_count = rows.len();
         let mut labels = self
             .thread_label_repo
             .find_labels_by_thread(thread_id)
@@ -137,7 +168,61 @@ impl ThreadVectorAppImpl {
             .vector_repo
             .replace_kinds_upsert(thread_id, &replace_refs, records)
             .await? as u32;
+        if chunk_count > 0 {
+            guarded.after_rows(index, chunk_count).await?;
+        }
         Ok((success, 0, Vec::new()))
+    }
+
+    /// Record that generating a thread's description embedding failed for
+    /// good.
+    pub async fn report_embedding_failure(
+        &self,
+        thread_id: i64,
+        vector_kind: &str,
+        token: &infra::infra::embedding_space::token::DispatchToken,
+        reason: &str,
+        message: &str,
+    ) -> Result<infra::infra::embedding_index::write::FailureReport> {
+        use infra::infra::embedding_index::TableLabel;
+        let version = self
+            .thread_repo
+            .find(&ThreadId { value: thread_id })
+            .await?
+            .and_then(|t| t.data)
+            .and_then(|d| {
+                infra::infra::embedding_target::thread_target(
+                    d.description.as_deref().unwrap_or(""),
+                    infra::infra::embedding_dispatch::max_content_len_from_env(),
+                )
+            })
+            .filter(|t| t.vector_kind == vector_kind)
+            .map(|t| t.version);
+        let chunks = infra::infra::embedding_index::scan::target_chunk_indexes(
+            &self.vector_repo.table_handle(),
+            TableLabel::Thread,
+            thread_id,
+            vector_kind,
+        )
+        .await?;
+        let repo = &self.vector_repo;
+        infra::infra::embedding_index::write::record_failure(
+            repo.embedding_index(),
+            TableLabel::Thread,
+            thread_id,
+            vector_kind,
+            token,
+            version.as_ref(),
+            &chunks,
+            reason,
+            message,
+            || async move {
+                repo.replace_kinds_upsert(thread_id, &[vector_kind], Vec::new())
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await
     }
 
     /// Re-enqueue thread description embedding jobs from RDB after a

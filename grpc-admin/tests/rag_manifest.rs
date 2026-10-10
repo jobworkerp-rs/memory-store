@@ -138,9 +138,13 @@ fn manifest_workflow_workers_reference_existing_yaml_files() {
 #[test]
 fn find_conversations_uses_explicit_thread_time_filter_names() {
     let _ = manifest();
-    let expanded =
-        jobworkerp_client::client::yaml_common::expand_env(find_conversations_workflow())
-            .expect("find-conversations workflow env expansion must succeed");
+    // memories supplies the space suffix itself when it registers the
+    // manifest; it is never read from the environment.
+    let expanded = jobworkerp_client::client::yaml_common::expand_env_with_overrides(
+        find_conversations_workflow(),
+        &infra::infra::embedding_space::plan::registration_overrides(None),
+    )
+    .expect("find-conversations workflow env expansion must succeed");
     let workflow: serde_yaml::Value =
         serde_yaml::from_str(&expanded).expect("find-conversations workflow YAML must parse");
     let properties = &workflow["input"]["schema"]["document"]["properties"]["filter"]["properties"];

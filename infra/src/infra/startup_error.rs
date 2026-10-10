@@ -36,6 +36,11 @@
 //! | `RdbPoolInitFailed`             | `url_sanitized`                 |
 //! | `EnvVarInvalid`                 | `name`                          |
 //! | `ConfigLoadFailed`              | `component`                     |
+//! | `EmbeddingSpaceMismatch`        | `table`                         |
+//! | `EmbeddingSpaceUnknown`         | `table`                         |
+//! | `Embedding*Incomplete`, `EmbeddingRebuildConfigChanged` | `attempt_id` |
+//! | `EmbeddingRebuildInconsistent`  | `markers`                       |
+//! | `EmbeddingStorageMismatch`      | `mismatches`                    |
 //! | `Other`                         | `component`                     |
 //!
 //! See `agent-app/ai-docs/sidecar-startup-failure-handling.md` for the
@@ -75,7 +80,9 @@ pub enum StartupError {
     /// `MEMORY_VECTOR_SIZE`. Same root cause as `LancedbSchemaMismatch`
     /// (model swap), but caught at the startup dimension probe rather
     /// than the LanceDB open. UI recovery actions are identical
-    /// (evacuate / reset).
+    /// (evacuate / reset). No longer emitted: the startup probe was
+    /// replaced by the configuration-derived embedding space check. The
+    /// code stays reserved because the parent still recognizes it.
     #[error(
         "embedding dimension mismatch (runner={runner_name}): expected={expected_dim}, actual={actual_dim}"
     )]
@@ -113,6 +120,50 @@ pub enum StartupError {
     /// to inspect.
     #[error("config load failed for {component}: {message}")]
     ConfigLoadFailed { component: String, message: String },
+    /// The configured embedding space differs from the space recorded in
+    /// a vector table. Changing the space requires the embedding
+    /// migration (`memories-db-migrate embedding`). `*_space` fields are
+    /// the component JSON (model, tokenizer, revision, dimension,
+    /// distance).
+    #[error(
+        "embedding space mismatch on table='{table}': current={current_space_id}, recorded={recorded_space_id}"
+    )]
+    EmbeddingSpaceMismatch {
+        table: String,
+        current_space_id: String,
+        current_space: String,
+        recorded_space_id: String,
+        recorded_space: String,
+    },
+    /// A table created before space recording mixes embedding models or
+    /// has rows without a model label, so its space cannot be inferred.
+    /// `row_models` is a JSON array of the labels found.
+    #[error("embedding space unknown on table='{table}': row models={row_models}")]
+    EmbeddingSpaceUnknown { table: String, row_models: String },
+    /// Only some tables are in the rebuild-pending state, or their
+    /// attempt IDs differ. `markers` is a JSON object of table → marker.
+    #[error("embedding rebuild state inconsistent across tables: {markers}")]
+    EmbeddingRebuildInconsistent { markers: String },
+    /// The chunking configuration changed while a rebuild is pending.
+    #[error("chunking configuration changed during embedding rebuild attempt {attempt_id}")]
+    EmbeddingRebuildConfigChanged { attempt_id: String },
+    /// An embedding `switch` was interrupted.
+    #[error("embedding switch attempt {attempt_id} is incomplete")]
+    EmbeddingSwitchIncomplete { attempt_id: String },
+    /// An embedding `finalize` was interrupted.
+    #[error("embedding finalize of attempt {attempt_id} is incomplete")]
+    EmbeddingFinalizeIncomplete { attempt_id: String },
+    /// An embedding `restore` / `abandon` (`operation`) was interrupted.
+    #[error("embedding {operation} of attempt {attempt_id} is incomplete")]
+    EmbeddingCancelIncomplete {
+        attempt_id: String,
+        operation: String,
+    },
+    /// The RDB, vector stores, and embedding state directory are not the
+    /// same storage set. `mismatches` is a JSON array describing each
+    /// disagreeing pair.
+    #[error("embedding storage mismatch: {mismatches}")]
+    EmbeddingStorageMismatch { mismatches: String },
     /// Catch-all for non-classified startup failures. Parent shows the
     /// message; recovery is manual.
     #[error("startup failed at {component}: {message}")]
@@ -199,6 +250,69 @@ impl StartupError {
                 code = "config_load_failed",
                 component = %component,
                 message = %message,
+            ),
+            Self::EmbeddingSpaceMismatch {
+                table,
+                current_space_id,
+                current_space,
+                recorded_space_id,
+                recorded_space,
+            } => tracing::error!(
+                target: STARTUP_ERROR_TARGET,
+                code = "embedding_space_mismatch",
+                table = %table,
+                current_space_id = %current_space_id,
+                current_space = %current_space,
+                recorded_space_id = %recorded_space_id,
+                recorded_space = %recorded_space,
+                "embedding space differs from the space recorded in the vector table",
+            ),
+            Self::EmbeddingSpaceUnknown { table, row_models } => tracing::error!(
+                target: STARTUP_ERROR_TARGET,
+                code = "embedding_space_unknown",
+                table = %table,
+                row_models = %row_models,
+                "embedding space of a pre-existing vector table cannot be determined",
+            ),
+            Self::EmbeddingRebuildInconsistent { markers } => tracing::error!(
+                target: STARTUP_ERROR_TARGET,
+                code = "embedding_rebuild_inconsistent",
+                markers = %markers,
+                "embedding rebuild state is inconsistent across vector tables",
+            ),
+            Self::EmbeddingRebuildConfigChanged { attempt_id } => tracing::error!(
+                target: STARTUP_ERROR_TARGET,
+                code = "embedding_rebuild_config_changed",
+                attempt_id = %attempt_id,
+                "chunking configuration changed during an embedding rebuild",
+            ),
+            Self::EmbeddingSwitchIncomplete { attempt_id } => tracing::error!(
+                target: STARTUP_ERROR_TARGET,
+                code = "embedding_switch_incomplete",
+                attempt_id = %attempt_id,
+                "embedding switch is incomplete",
+            ),
+            Self::EmbeddingFinalizeIncomplete { attempt_id } => tracing::error!(
+                target: STARTUP_ERROR_TARGET,
+                code = "embedding_finalize_incomplete",
+                attempt_id = %attempt_id,
+                "embedding finalize is incomplete",
+            ),
+            Self::EmbeddingCancelIncomplete {
+                attempt_id,
+                operation,
+            } => tracing::error!(
+                target: STARTUP_ERROR_TARGET,
+                code = "embedding_cancel_incomplete",
+                attempt_id = %attempt_id,
+                operation = %operation,
+                "embedding migration cancel is incomplete",
+            ),
+            Self::EmbeddingStorageMismatch { mismatches } => tracing::error!(
+                target: STARTUP_ERROR_TARGET,
+                code = "embedding_storage_mismatch",
+                mismatches = %mismatches,
+                "RDB, vector stores, and embedding state directory do not belong together",
             ),
             Self::Other { component, message } => tracing::error!(
                 target: STARTUP_ERROR_TARGET,
@@ -382,6 +496,27 @@ mod tests {
         assert!(logs_contain("front"));
     }
 
+    #[test]
+    #[traced_test]
+    fn emit_embedding_space_errors_pin_code_and_locator() {
+        for err in sample_errors() {
+            let code = serde_json::to_value(&err).unwrap()["code"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            if !code.starts_with("embedding_") || code == "embedding_dimension_mismatch" {
+                continue;
+            }
+            err.emit_via_tracing();
+            assert!(logs_contain(&format!("code=\"{code}\"")) || logs_contain(&code));
+        }
+        assert!(logs_contain("attempt_id"));
+        assert!(logs_contain("current_space_id"));
+        assert!(logs_contain("row_models"));
+        assert!(logs_contain("mismatches"));
+        assert!(logs_contain("operation"));
+    }
+
     // ---- Serde round-trip ----
     //
     // The parent process deserializes the tracing row's `fields` block
@@ -417,6 +552,23 @@ mod tests {
             ("RdbPoolInitFailed", "rdb_pool_init_failed"),
             ("EnvVarInvalid", "env_var_invalid"),
             ("ConfigLoadFailed", "config_load_failed"),
+            ("EmbeddingSpaceMismatch", "embedding_space_mismatch"),
+            ("EmbeddingSpaceUnknown", "embedding_space_unknown"),
+            (
+                "EmbeddingRebuildInconsistent",
+                "embedding_rebuild_inconsistent",
+            ),
+            (
+                "EmbeddingRebuildConfigChanged",
+                "embedding_rebuild_config_changed",
+            ),
+            ("EmbeddingSwitchIncomplete", "embedding_switch_incomplete"),
+            (
+                "EmbeddingFinalizeIncomplete",
+                "embedding_finalize_incomplete",
+            ),
+            ("EmbeddingCancelIncomplete", "embedding_cancel_incomplete"),
+            ("EmbeddingStorageMismatch", "embedding_storage_mismatch"),
             ("Other", "other"),
         ];
         let samples = sample_errors();
@@ -613,6 +765,36 @@ mod tests {
             StartupError::ConfigLoadFailed {
                 component: "MemoryCacheConfig".into(),
                 message: "missing field".into(),
+            },
+            StartupError::EmbeddingSpaceMismatch {
+                table: "memories".into(),
+                current_space_id: "c".into(),
+                current_space: "{}".into(),
+                recorded_space_id: "r".into(),
+                recorded_space: "{}".into(),
+            },
+            StartupError::EmbeddingSpaceUnknown {
+                table: "memories".into(),
+                row_models: "[\"a\",\"b\"]".into(),
+            },
+            StartupError::EmbeddingRebuildInconsistent {
+                markers: "{}".into(),
+            },
+            StartupError::EmbeddingRebuildConfigChanged {
+                attempt_id: "att".into(),
+            },
+            StartupError::EmbeddingSwitchIncomplete {
+                attempt_id: "att".into(),
+            },
+            StartupError::EmbeddingFinalizeIncomplete {
+                attempt_id: "att".into(),
+            },
+            StartupError::EmbeddingCancelIncomplete {
+                attempt_id: "att".into(),
+                operation: "restore".into(),
+            },
+            StartupError::EmbeddingStorageMismatch {
+                mismatches: "[]".into(),
             },
             StartupError::Other {
                 component: "front".into(),

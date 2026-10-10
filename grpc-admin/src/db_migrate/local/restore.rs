@@ -379,6 +379,25 @@ fn sync_parent(path: &Path) -> Result<()> {
     }
 }
 
+/// A local apply attempt waits for `local restore` (interrupted restore,
+/// or a failure that requires one). Embedding commands refuse to run
+/// meanwhile (`apply_restore_required`).
+pub fn restore_pending(database_url: &str) -> bool {
+    let Ok(target) = SqliteTarget::from_url(database_url) else {
+        return false;
+    };
+    interrupted_restore(&target).is_some()
+        || super::attempt::AttemptRecord::load(&target)
+            .ok()
+            .flatten()
+            .is_some_and(|record| {
+                record.status
+                    == super::attempt::AttemptStatus::Failed(
+                        super::output::Resolution::RestoreRequired,
+                    )
+            })
+}
+
 #[cfg(all(test, not(feature = "postgres")))]
 mod tests {
     use super::*;
@@ -446,6 +465,7 @@ mod tests {
                 schema_status: "managed".to_string(),
                 schema_version: Some(schema_version.to_string()),
                 bundle_digest: None,
+                embedding_space_id: None,
             },
         )
         .await
@@ -612,6 +632,7 @@ mod tests {
                     schema_status: "pending".to_string(),
                     schema_version: Some("20260803000003".to_string()),
                     bundle_digest: None,
+                    embedding_space_id: None,
                 },
             )
             .await

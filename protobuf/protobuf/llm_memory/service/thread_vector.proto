@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package llm_memory.service;
 
+import "llm_memory/data/embedding_space.proto";
 import "llm_memory/data/highlight.proto";
 import "llm_memory/data/thread.proto";
 import "llm_memory/data/memory_vector.proto";
@@ -83,6 +84,8 @@ message BatchUpsertThreadEmbeddingsRowsRequest {
   // (thread_id, vector_kind in replace_kinds) is deleted before insert.
   repeated string replace_kinds = 3;
   repeated VectorRow rows = 4;
+  // Token of the generation request; see BatchUpsertEmbeddingsRequest.
+  optional llm_memory.data.DispatchToken token = 5;
 }
 
 message BatchUpsertThreadEmbeddingsResponse {
@@ -144,6 +147,9 @@ message ThreadIndexStatsResponse {
   llm_memory.data.FtsTokenizerKind fts_tokenizer = 7;
   optional uint32 fts_ngram_min = 8;
   optional uint32 fts_ngram_max = 9;
+  // Embedding space recorded on this table and any in-progress
+  // embedding migration marker.
+  llm_memory.data.EmbeddingSpaceRecord embedding_space = 10;
 }
 
 // ===== Thread count requests =====

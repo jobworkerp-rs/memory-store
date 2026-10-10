@@ -1,4 +1,8 @@
 pub mod embedding_dispatch;
+pub mod embedding_index;
+pub mod embedding_space;
+pub mod embedding_target;
+pub mod jobworkerp_ops;
 pub mod media_object;
 pub mod media_storage;
 pub mod memory;
@@ -17,6 +21,7 @@ pub mod thread_group;
 pub mod thread_label;
 pub mod thread_memory;
 pub mod thread_vector;
+pub mod vector_table;
 
 // Pins the post-migration memory_kind contract (NOT NULL, no default,
 // no CHECK) on a fresh schema so a later edit can't silently reintroduce
@@ -28,6 +33,8 @@ mod memory_kind_schema_test;
 // is wired up and the seed data is present.
 #[cfg(test)]
 mod reflection_schema_test;
+#[cfg(test)]
+mod workflow_schema_test;
 
 use crate::error::LlmMemoryError;
 use anyhow::Result;

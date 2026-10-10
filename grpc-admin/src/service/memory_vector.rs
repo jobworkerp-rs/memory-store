@@ -151,6 +151,10 @@ impl<T: MemoryVectorGrpc + Tracing + Send + Debug + Sync + 'static> MemoryVector
         // are mutually exclusive request shapes. Routing the four cases
         // explicitly avoids the silent `success_count=0` data-loss trap a
         // `rows` client would hit if it fell through the items-only loop.
+        let token = req
+            .token
+            .as_ref()
+            .map(infra::infra::embedding_space::token::DispatchToken::from);
         let has_rows = !req.rows.is_empty();
         let has_items = !req.items.is_empty();
         match (has_rows, has_items) {
@@ -206,6 +210,7 @@ impl<T: MemoryVectorGrpc + Tracing + Send + Debug + Sync + 'static> MemoryVector
                         req.embedding_model.as_deref(),
                         &req.replace_kinds,
                         rows,
+                        token.as_ref(),
                     )
                     .await
                 {
@@ -257,6 +262,7 @@ impl<T: MemoryVectorGrpc + Tracing + Send + Debug + Sync + 'static> MemoryVector
                             req.embedding_model.as_deref(),
                             &req.replace_kinds,
                             Vec::new(),
+                            token.as_ref(),
                         )
                         .await
                     {
@@ -285,6 +291,26 @@ impl<T: MemoryVectorGrpc + Tracing + Send + Debug + Sync + 'static> MemoryVector
             .iter()
             .filter_map(
                 |item| match item.embedding.as_ref().filter(|e| !e.values.is_empty()) {
+                    // The legacy shape carries no token: accepted only
+                    // while every vector table accepts token-less writes.
+                    Some(emb)
+                        if infra::infra::embedding_index::write::guard(
+                            infra::infra::embedding_index::TableLabel::Memory,
+                            item.memory_id,
+                            &["text".to_string()],
+                            None,
+                            None,
+                            self.app().vector_repo().vector_size(),
+                            [emb.values.len()],
+                        )
+                        .is_err() =>
+                    {
+                        skipped_errors.push(format!(
+                            "memory {} skipped: embedding write rejected",
+                            item.memory_id
+                        ));
+                        None
+                    }
                     Some(emb) => Some((
                         item.memory_id,
                         emb.values.clone(),
@@ -301,6 +327,22 @@ impl<T: MemoryVectorGrpc + Tracing + Send + Debug + Sync + 'static> MemoryVector
             )
             .collect();
         let skipped_count = total_count - items.len() as u32;
+        // Token-less rows are of unknown version: drop the index entry so
+        // the target counts as unverified rather than complete.
+        if let Some(index) = self.app().vector_repo().embedding_index() {
+            for (memory_id, _, _) in &items {
+                if let Err(e) = index
+                    .delete(
+                        infra::infra::embedding_index::TableLabel::Memory,
+                        *memory_id,
+                        &["text"],
+                    )
+                    .await
+                {
+                    return Err(handle_error(&e));
+                }
+            }
+        }
         match self.app().batch_upsert_embeddings(items).await {
             Ok((s, f, mut errors)) => {
                 errors.extend(skipped_errors);
@@ -783,6 +825,7 @@ impl<T: MemoryVectorGrpc + Tracing + Send + Debug + Sync + 'static> MemoryVector
                     fts_tokenizer: wire.fts_tokenizer,
                     fts_ngram_min: wire.fts_ngram_min,
                     fts_ngram_max: wire.fts_ngram_max,
+                    embedding_space: Some((&stats.embedding_space).into()),
                 }))
             }
             Err(e) => Err(handle_error(&e)),

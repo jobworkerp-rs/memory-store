@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package llm_memory.service;
 
+import "llm_memory/data/embedding_space.proto";
 import "llm_memory/data/memory_vector.proto";
 import "llm_memory/data/reflection.proto";
 import "llm_memory/data/reflection_filter.proto";
@@ -28,6 +29,8 @@ message BatchUpsertIntentEmbeddingsRowsRequest {
   optional string embedding_model = 2;
   repeated string replace_kinds = 3;
   repeated VectorRow rows = 4;
+  // Token of the generation request; see BatchUpsertEmbeddingsRequest.
+  optional llm_memory.data.DispatchToken token = 5;
 }
 
 message RedispatchReflectionEmbeddingsRequest {

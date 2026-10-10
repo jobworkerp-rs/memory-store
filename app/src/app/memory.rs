@@ -593,8 +593,106 @@ impl MediaSubsystem {
     }
 }
 
+/// Outcome of [`MemoryAppImpl::write_back_caption`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptionWriteBack {
+    Applied,
+    MemoryNotFound,
+    MediaChanged,
+    BodyPresent,
+    EmptyCaption,
+}
+
 impl MemoryAppImpl {
     const DEFAULT_TTL_SEC: u64 = 60;
+
+    /// Store a generated caption as the body of an image memory, only
+    /// while it exists, links `media_object_id`, and has an empty body;
+    /// then dispatch the embeddings of the new body (text and caption).
+    /// A late or duplicated caption is refused rather than overwriting.
+    pub async fn write_back_caption(
+        &self,
+        id: &MemoryId,
+        media_object_id: i64,
+        caption: &str,
+    ) -> Result<CaptionWriteBack> {
+        if caption.trim().is_empty() {
+            return Ok(CaptionWriteBack::EmptyCaption);
+        }
+        let pool = self.memory_repository().db_pool();
+        let mut tx = pool.begin().await.map_err(LlmMemoryError::DBError)?;
+        use infra::infra::thread_group::lock::ThreadGroupLockRepository;
+        infra::infra::thread_group::lock::ThreadGroupLockRepositoryImpl::new(
+            self.thread_repository().static_pool(),
+        )
+        .lock_group_membership_tx(&mut *tx)
+        .await?;
+        // The row lock (FOR UPDATE on PostgreSQL, the write lock taken by
+        // the group-membership lock on SQLite) makes check and write one
+        // atomic step. Emptiness uses the same `trim` as dispatch, which
+        // decided that a caption was needed.
+        let locked = self
+            .memory_repository()
+            .find_by_ids_for_update_tx(&mut tx, &[id.value])
+            .await?
+            .into_iter()
+            .next()
+            .and_then(|m| m.data);
+        let outcome = match &locked {
+            None => CaptionWriteBack::MemoryNotFound,
+            Some(d) if d.media_object_id.map(|m| m.value) != Some(media_object_id) => {
+                CaptionWriteBack::MediaChanged
+            }
+            Some(d) if !d.content.trim().is_empty() => CaptionWriteBack::BodyPresent,
+            Some(_) => CaptionWriteBack::Applied,
+        };
+        if outcome != CaptionWriteBack::Applied {
+            return Ok(outcome);
+        }
+        self.memory_repository()
+            .update_content_only(&mut *tx, id, caption)
+            .await?;
+        tx.commit().await.map_err(LlmMemoryError::DBError)?;
+        let current = locked.map(|d| MemoryData {
+            content: caption.to_string(),
+            ..d
+        });
+        let k = Arc::new(Self::find_cache_key(&id.value));
+        let _ = self.delete_cache(&k).await;
+
+        if let (Some(dispatcher), Some(data)) = (&self.embedding_dispatcher, current) {
+            let text = infra::infra::embedding_target::dispatch_kinds(
+                caption,
+                data.role,
+                data.content_type,
+                None,
+                None,
+                self.image_search_mode,
+            )
+            .contains(&infra::infra::embedding_dispatch::DispatchKind::Text);
+            let caption_kind = matches!(
+                self.image_search_mode,
+                infra::infra::embedding_dispatch::ImageSearchMode::VlmCaption
+                    | infra::infra::embedding_dispatch::ImageSearchMode::Both
+            );
+            let d = dispatcher.clone();
+            let memory_id = id.value;
+            let caption = caption.to_string();
+            tokio::spawn(async move {
+                use infra::infra::embedding_dispatch::EmbeddingDispatch as _;
+                if text && let Err(e) = d.dispatch(memory_id, &caption).await {
+                    tracing::warn!(
+                        memory_id,
+                        "text embedding dispatch after caption failed: {e}"
+                    );
+                }
+                if caption_kind && let Err(e) = d.dispatch_caption(memory_id, &caption).await {
+                    tracing::warn!(memory_id, "caption embedding dispatch failed: {e}");
+                }
+            });
+        }
+        Ok(CaptionWriteBack::Applied)
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         memory_repository: MemoryRepositoryImpl,
@@ -1310,6 +1408,7 @@ mod tests {
                     "thread description".to_string(),
                     vec![1.0, 0.0, 0.0, 0.0],
                 )],
+                None,
             )
             .await
             .unwrap();
@@ -1786,6 +1885,74 @@ mod tests {
                 "A.ref_count must be restored when B is rejected (spec §4.2.1.1)"
             );
             a.delete_memory(&id).await?;
+            Ok(())
+        })
+    }
+
+    // ---- write_back_caption ----
+
+    async fn caption_body(a: &MemoryAppImpl, id: MemoryId) -> Option<String> {
+        a.find_memory(&id, None)
+            .await
+            .unwrap()
+            .and_then(|m| m.data)
+            .map(|d| d.content)
+    }
+
+    #[test]
+    fn caption_write_back_fills_only_an_empty_body_of_the_same_media() -> Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let p = pool().await;
+            let (a, _) = app(p);
+            let mid = seed_confirmed_media(p, "sha_wb1").await;
+            let other = seed_confirmed_media(p, "sha_wb2").await;
+
+            let id = a.create_memory(&mem("", Some(mid))).await?;
+            assert_eq!(
+                a.write_back_caption(&id, mid, "").await?,
+                CaptionWriteBack::EmptyCaption
+            );
+            assert_eq!(
+                a.write_back_caption(&id, other, "wrong media").await?,
+                CaptionWriteBack::MediaChanged
+            );
+            assert_eq!(
+                a.write_back_caption(&id, mid, "a cat").await?,
+                CaptionWriteBack::Applied
+            );
+            assert_eq!(caption_body(&a, id).await.as_deref(), Some("a cat"));
+            // A duplicate or late caption never overwrites the body.
+            assert_eq!(
+                a.write_back_caption(&id, mid, "a dog").await?,
+                CaptionWriteBack::BodyPresent
+            );
+            assert_eq!(caption_body(&a, id).await.as_deref(), Some("a cat"));
+
+            // A body the user wrote meanwhile is kept.
+            let user = a.create_memory(&mem("user text", Some(mid))).await?;
+            assert_eq!(
+                a.write_back_caption(&user, mid, "caption").await?,
+                CaptionWriteBack::BodyPresent
+            );
+            assert_eq!(caption_body(&a, user).await.as_deref(), Some("user text"));
+
+            // A whitespace-only body counts as empty, as it does for dispatch.
+            let blank = a.create_memory(&mem("\n\u{3000}\t", Some(mid))).await?;
+            assert_eq!(
+                a.write_back_caption(&blank, mid, "a bird").await?,
+                CaptionWriteBack::Applied
+            );
+            assert_eq!(caption_body(&a, blank).await.as_deref(), Some("a bird"));
+            a.delete_memory(&blank).await?;
+
+            // A deleted memory is not resurrected.
+            a.delete_memory(&id).await?;
+            assert_eq!(
+                a.write_back_caption(&id, mid, "late").await?,
+                CaptionWriteBack::MemoryNotFound
+            );
+            assert!(a.find_memory(&id, None).await?.is_none());
+            a.delete_memory(&user).await?;
             Ok(())
         })
     }

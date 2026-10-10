@@ -48,6 +48,181 @@ fn fatal_lancedb_init_error(uri: &str, e: anyhow::Error) -> ! {
         .fatal()
 }
 
+/// Open one embedding index per LanceDB directory and attach it to the
+/// vector repositories in that directory.
+async fn attach_embedding_indexes(
+    memory: Option<super::memory_vector::repository::MemoryVectorRepositoryImpl>,
+    thread: Option<super::thread_vector::repository::ThreadVectorRepositoryImpl>,
+    intent: Option<super::reflection_intent_vector::repository::ReflectionIntentVectorRepository>,
+) -> (
+    Option<super::memory_vector::repository::MemoryVectorRepositoryImpl>,
+    Option<super::thread_vector::repository::ThreadVectorRepositoryImpl>,
+    Option<super::reflection_intent_vector::repository::ReflectionIntentVectorRepository>,
+) {
+    use super::embedding_index::EmbeddingIndex;
+    let mut opened: std::collections::HashMap<String, EmbeddingIndex> =
+        std::collections::HashMap::new();
+    let mut index_for = async |uri: &str| -> EmbeddingIndex {
+        if let Some(index) = opened.get(uri) {
+            return index.clone();
+        }
+        let index = EmbeddingIndex::open(uri)
+            .await
+            .unwrap_or_else(|e| fatal_lancedb_init_error(uri, e));
+        opened.insert(uri.to_string(), index.clone());
+        index
+    };
+    let memory = match memory {
+        Some(r) => {
+            let index = index_for(r.uri()).await;
+            Some(r.with_embedding_index(index))
+        }
+        None => None,
+    };
+    let thread = match thread {
+        Some(r) => {
+            let index = index_for(r.uri()).await;
+            Some(r.with_embedding_index(index))
+        }
+        None => None,
+    };
+    let intent = match intent {
+        Some(r) => {
+            let index = index_for(r.uri()).await;
+            Some(r.with_embedding_index(index))
+        }
+        None => None,
+    };
+    (memory, thread, intent)
+}
+
+/// Resolve the configured embedding space and run the startup decision
+/// over the enabled vector tables. Any failure stops startup.
+#[allow(clippy::too_many_arguments)]
+async fn bootstrap_embedding_space(
+    pool: &'static RdbPool,
+    id_generator: &IdGeneratorWrapper,
+    memory: Option<&super::memory_vector::repository::MemoryVectorRepositoryImpl>,
+    thread: Option<&super::thread_vector::repository::ThreadVectorRepositoryImpl>,
+    intent: Option<&super::reflection_intent_vector::repository::ReflectionIntentVectorRepository>,
+    vector_size: usize,
+    distance: super::memory_vector::config::DistanceType,
+) -> super::embedding_space::bootstrap::SpaceState {
+    use super::embedding_space::bootstrap::{VectorTable, run};
+    use super::embedding_space::rdb_targets::{RdbTargetSources, rdb_has_embedding_target};
+
+    if let Err(e) = super::embedding_space::workers::validate_base_name(
+        super::embedding_dispatch::MM_EMBEDDING_WORKER_ENV,
+        &super::embedding_dispatch::mm_embedding_worker_base(),
+    ) {
+        e.fatal();
+    }
+    let workers_yaml = super::memory_vector::dispatcher::workers_yaml_path_from_env();
+    let current = super::embedding_space::SpaceComponents::resolve(
+        &workers_yaml,
+        u32::try_from(vector_size).unwrap_or(u32::MAX),
+        distance.as_str(),
+    )
+    .unwrap_or_else(|e| {
+        StartupError::ConfigLoadFailed {
+            component: "embedding space (MEMORY_WORKERS_YAML)".into(),
+            message: format!("{e:#}"),
+        }
+        .fatal()
+    });
+
+    let chunking =
+        super::embedding_space::chunking_fingerprint(&workers_yaml).unwrap_or_else(|e| {
+            StartupError::ConfigLoadFailed {
+                component: "embedding chunking (MEMORY_WORKERS_YAML)".into(),
+                message: format!("{e:#}"),
+            }
+            .fatal()
+        });
+
+    let mut tables = Vec::new();
+    if let Some(r) = memory {
+        tables.push(VectorTable {
+            label: "memory",
+            table: r.table_handle(),
+        });
+    }
+    if let Some(r) = thread {
+        tables.push(VectorTable {
+            label: "thread",
+            table: r.table_handle(),
+        });
+    }
+    if let Some(r) = intent {
+        tables.push(VectorTable {
+            label: "reflection_intent",
+            table: r.table_handle(),
+        });
+    }
+
+    verify_storage_set(pool, &tables, memory, thread, intent).await;
+
+    let memory_repo = MemoryRepositoryImpl::new(id_generator.clone(), pool);
+    let media_repo = MediaObjectRepositoryImpl::new(id_generator.clone(), pool);
+    let thread_repo = ThreadRepositoryImpl::new(id_generator.clone(), pool);
+    let sources = RdbTargetSources {
+        memories: (memory.is_some() || intent.is_some()).then_some((&memory_repo, &media_repo)),
+        threads: thread.is_some().then_some(&thread_repo),
+        image_search_mode: super::embedding_dispatch::ImageSearchMode::from_env(),
+    };
+    let state = run(&tables, &current, &chunking, || {
+        rdb_has_embedding_target(&sources)
+    })
+    .await
+    .unwrap_or_else(|e| StartupError::fatal_anyhow("embedding_space", e));
+    tracing::info!(
+        space_id = %current.space_id(),
+        rebuilding_attempt = ?state.rebuilding_attempt,
+        "embedding space verified"
+    );
+    super::embedding_space::workers::set_current_space(Some(current.space_id()));
+    super::embedding_space::token::set_rebuilding_attempt(state.rebuilding_attempt.clone());
+    super::embedding_space::token::set_legacy_accept(state.accepts_legacy_writes());
+    state
+}
+
+/// Check that the RDB, the LanceDB directories, and the embedding state
+/// directory belong together, recording identifiers on first use.
+async fn verify_storage_set(
+    pool: &'static RdbPool,
+    tables: &[super::embedding_space::bootstrap::VectorTable],
+    memory: Option<&super::memory_vector::repository::MemoryVectorRepositoryImpl>,
+    thread: Option<&super::thread_vector::repository::ThreadVectorRepositoryImpl>,
+    intent: Option<&super::reflection_intent_vector::repository::ReflectionIntentVectorRepository>,
+) {
+    use super::embedding_space::storage;
+    let rdb_id = storage::read_rdb_id(pool).await.unwrap_or_else(|e| {
+        StartupError::Other {
+            component: "embedding storage identity".into(),
+            message: format!("{e:#}"),
+        }
+        .fatal()
+    });
+    let uri_of = |label: &str| -> &str {
+        match label {
+            "memory" => memory.map(|r| r.uri()),
+            "thread" => thread.map(|r| r.uri()),
+            _ => intent.map(|r| r.uri()),
+        }
+        .expect("a table is only listed when its repository exists")
+    };
+    let stores: Vec<storage::StoreTable> = tables
+        .iter()
+        .map(|t| storage::StoreTable {
+            table: t,
+            uri: uri_of(t.label),
+        })
+        .collect();
+    storage::verify_and_record(rdb_id, &storage::state_dir_from_env(), &stores)
+        .await
+        .unwrap_or_else(|e| StartupError::fatal_anyhow("embedding storage identity", e));
+}
+
 // module for DI
 pub struct RepositoryModule {
     pub memory_repository: MemoryRepositoryImpl,
@@ -100,6 +275,9 @@ pub struct RepositoryModule {
     /// when intent search is unavailable.
     pub reflection_intent_vector_repository:
         Option<super::reflection_intent_vector::repository::ReflectionIntentVectorRepository>,
+    /// Embedding space the vector tables were verified against at
+    /// startup. `None` when no vector store is enabled.
+    pub embedding_space: Option<super::embedding_space::bootstrap::SpaceState>,
     pool: &'static RdbPool,
     id_generator: IdGeneratorWrapper,
 }
@@ -108,9 +286,19 @@ impl RepositoryModule {
     pub async fn new_by_env() -> Self {
         let id_generator = IdGeneratorWrapper::new();
         let pool = super::resource::setup_rdb_by_env().await;
+        // Announce this writer before reading any migration state, so a
+        // migration command either sees it or this process waits for the
+        // command to finish.
+        super::embedding_space::writer_lock::hold_shared(pool)
+            .await
+            .unwrap_or_else(|e| StartupError::fatal_anyhow("embedding writer lock", e));
+        // Dimension and distance of the embedding space, taken from the
+        // first enabled vector store (memory, then reflection, then
+        // thread), all of which default to the `MEMORY_*` values.
+        let mut space_geometry: Option<(usize, super::memory_vector::config::DistanceType)> = None;
 
         let memory_vector_repository = {
-            if std::env::var("MEMORY_VECTOR_ENABLED").unwrap_or_default() == "true" {
+            if super::embedding_space::vector_store_enabled("MEMORY_VECTOR_ENABLED") {
                 let config = super::memory_vector::config::VectorDBConfig::from_env()
                     .unwrap_or_else(|e| {
                         StartupError::ConfigLoadFailed {
@@ -120,6 +308,7 @@ impl RepositoryModule {
                         .fatal()
                     });
                 let uri = config.uri.clone();
+                space_geometry.get_or_insert((config.vector_size, config.distance_type));
                 Some(
                     super::memory_vector::repository::MemoryVectorRepositoryImpl::new(config)
                         .await
@@ -137,8 +326,8 @@ impl RepositoryModule {
         // surface a clear error when an intent query arrives without
         // a configured store.
         let reflection_intent_vector_repository = {
-            if std::env::var("MEMORY_VECTOR_ENABLED").unwrap_or_default() == "true"
-                && std::env::var("REFLECTION_INTENT_VECTOR_ENABLED").unwrap_or_default() == "true"
+            if super::embedding_space::vector_store_enabled("MEMORY_VECTOR_ENABLED")
+                && super::embedding_space::vector_store_enabled("REFLECTION_INTENT_VECTOR_ENABLED")
             {
                 let config =
                     super::reflection_intent_vector::config::ReflectionIntentVectorConfig::from_env(
@@ -151,6 +340,7 @@ impl RepositoryModule {
                         .fatal()
                     });
                 let uri = config.uri.clone();
+                space_geometry.get_or_insert((config.vector_size, config.distance_type));
                 Some(
                     super::reflection_intent_vector::repository::ReflectionIntentVectorRepository::open(
                         config,
@@ -164,7 +354,7 @@ impl RepositoryModule {
         };
 
         let thread_vector_repository = {
-            if std::env::var("THREAD_VECTOR_ENABLED").unwrap_or_default() == "true" {
+            if super::embedding_space::vector_store_enabled("THREAD_VECTOR_ENABLED") {
                 let config = super::thread_vector::config::ThreadVectorDBConfig::from_env()
                     .unwrap_or_else(|e| {
                         StartupError::ConfigLoadFailed {
@@ -174,6 +364,7 @@ impl RepositoryModule {
                         .fatal()
                     });
                 let uri = config.uri.clone();
+                space_geometry.get_or_insert((config.vector_size, config.distance_type));
                 Some(
                     super::thread_vector::repository::ThreadVectorRepositoryImpl::new(config)
                         .await
@@ -182,6 +373,31 @@ impl RepositoryModule {
             } else {
                 None
             }
+        };
+        let (
+            memory_vector_repository,
+            thread_vector_repository,
+            reflection_intent_vector_repository,
+        ) = attach_embedding_indexes(
+            memory_vector_repository,
+            thread_vector_repository,
+            reflection_intent_vector_repository,
+        )
+        .await;
+        let embedding_space = match space_geometry {
+            None => None,
+            Some((vector_size, distance)) => Some(
+                bootstrap_embedding_space(
+                    pool,
+                    &id_generator,
+                    memory_vector_repository.as_ref(),
+                    thread_vector_repository.as_ref(),
+                    reflection_intent_vector_repository.as_ref(),
+                    vector_size,
+                    distance,
+                )
+                .await,
+            ),
         };
         let search_index_maintenance_executor = Arc::new(
             super::search_index_maintenance::repository_executor::RepositoryMaintenanceExecutor::new(
@@ -246,6 +462,7 @@ impl RepositoryModule {
             thread_vector_repository,
             search_index_maintenance_executor,
             reflection_intent_vector_repository,
+            embedding_space,
             pool,
             id_generator,
         }

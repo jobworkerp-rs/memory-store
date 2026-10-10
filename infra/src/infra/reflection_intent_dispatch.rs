@@ -11,9 +11,11 @@
 //! the JSON id field (`reflection_id`), and the YAML path.
 
 use crate::infra::embedding_dispatch::{DispatchSpec, EmbeddingConfig, EmbeddingDispatcherCore};
+use crate::infra::embedding_space::registration::WorkerRegistry;
 use anyhow::Result;
 use async_trait::async_trait;
 use jobworkerp_client::jobworkerp::data::JobId;
+use std::sync::Arc;
 
 pub use crate::infra::embedding_dispatch::{
     DispatchError, EmbeddingDispatch, EmbeddingDispatchStatus, EmbeddingJobId,
@@ -25,6 +27,7 @@ const SPEC: DispatchSpec = DispatchSpec {
     // distinct from memory_id used by the summary dispatcher to keep
     // the workflow input schemas explicit per spec §4.1.3.
     id_field_name: "reflection_id",
+    text_source: crate::infra::embedding_index::source_version::TextSource::ReflectionIntent,
 };
 
 const WORKERS_YAML_ENV: &str = "REFLECTION_INTENT_WORKERS_YAML";
@@ -33,24 +36,24 @@ const DEFAULT_WORKERS_YAML_PATH: &str = concat!(
     "/../workflows/thread-reflection/auto-reflection-intent-embedding-workers.yaml"
 );
 
+/// Workers YAML this dispatcher needs registered.
+pub fn workers_yaml_path() -> std::path::PathBuf {
+    std::env::var(WORKERS_YAML_ENV)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_WORKERS_YAML_PATH))
+}
+
 pub fn intent_dispatch_config_from_env() -> Result<EmbeddingConfig> {
-    let cfg = EmbeddingConfig::from_env(WORKERS_YAML_ENV, DEFAULT_WORKERS_YAML_PATH)?;
-    // Phase C lands the dispatcher ahead of the workflow YAML
-    // (Phase F). `EmbeddingDispatcherCore::ensure_initialized`
-    // would otherwise fail deep inside `register_workers_from_yaml`
-    // with a generic "no such file" error; surface it here so the
-    // operator can see exactly which env var to point at the
-    // workflow PR's YAML.
-    if !cfg.workers_yaml_path.exists() {
+    let path = workers_yaml_path();
+    // Fail at construction with the env var to fix, instead of a generic
+    // "no such file" from the background registration.
+    if !path.exists() {
         anyhow::bail!(
-            "reflection intent embedding workers YAML not found at {} \
-             (set {WORKERS_YAML_ENV} to override). The workflow ships in \
-             a follow-up PR; until then the reflection intent dispatcher \
-             cannot be initialised.",
-            cfg.workers_yaml_path.display()
+            "reflection intent embedding workers YAML not found at {} (set {WORKERS_YAML_ENV} to override)",
+            path.display()
         );
     }
-    Ok(cfg)
+    EmbeddingConfig::from_env()
 }
 
 pub struct ReflectionIntentDispatcher {
@@ -58,14 +61,10 @@ pub struct ReflectionIntentDispatcher {
 }
 
 impl ReflectionIntentDispatcher {
-    pub fn from_env() -> Result<Self> {
+    pub fn from_env(registry: Arc<WorkerRegistry>) -> Result<Self> {
         Ok(Self {
-            core: EmbeddingDispatcherCore::new(intent_dispatch_config_from_env()?, SPEC),
+            core: EmbeddingDispatcherCore::new(intent_dispatch_config_from_env()?, SPEC, registry),
         })
-    }
-
-    pub async fn ensure_initialized(&self) -> Result<()> {
-        self.core.ensure_initialized().await
     }
 
     pub async fn dispatch(

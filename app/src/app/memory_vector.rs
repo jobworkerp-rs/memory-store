@@ -442,66 +442,6 @@ impl MemoryVectorAppImpl {
         &self.vector_repo
     }
 
-    /// Startup dimension probe. Embeds a tiny
-    /// fixed text via the mm-embedding worker and compares the runner's
-    /// reported dimension to the configured `MEMORY_VECTOR_SIZE` (the
-    /// LanceDB FixedSizeList width).
-    ///
-    /// - `Ok(())` — match, or the probe could not run (no dispatcher /
-    ///   jobworkerp unreachable / probe error): a transient infra
-    ///   problem must NOT block startup before jobworkerp is up; the
-    ///   first real embedding still surfaces a true mismatch via the
-    ///   FixedSizeList INSERT. A warn is logged so it is visible.
-    /// - `Err` — the probe ran AND the dimensions disagree: a genuine
-    ///   model/config drift. The caller fails fast (panic) so every
-    ///   subsequent embedding is not silently rejected.
-    pub async fn verify_embedding_dimension(&self) -> Result<()> {
-        let Some(dispatcher) = self.embedding_dispatcher.as_ref() else {
-            tracing::warn!(
-                "embedding dimension probe skipped: no embedding dispatcher \
-                 configured (auto-embedding disabled)"
-            );
-            return Ok(());
-        };
-        let configured = self.vector_repo.vector_size();
-        match dispatcher.query_embed_text("dimension probe").await {
-            Ok(emb) => {
-                if emb.dimension != configured {
-                    // Surface as `StartupError::EmbeddingDimensionMismatch`
-                    // (wrapped in `anyhow::Error`) so the caller in
-                    // `grpc-admin/src/front/server.rs` can downcast and
-                    // route into the structured `fatal()` path — agent-app
-                    // matches on the `code` field, not the message text.
-                    return Err(anyhow::Error::new(
-                        infra::infra::startup_error::StartupError::EmbeddingDimensionMismatch {
-                            expected_dim: u32::try_from(configured).unwrap_or(u32::MAX),
-                            actual_dim: u32::try_from(emb.dimension).unwrap_or(u32::MAX),
-                            runner_name: emb.model_name.as_deref().unwrap_or("unknown").to_string(),
-                        },
-                    ));
-                }
-                tracing::info!(
-                    "embedding dimension probe ok: {} (model={})",
-                    configured,
-                    emb.model_name.as_deref().unwrap_or("unknown")
-                );
-                Ok(())
-            }
-            Err(e) => {
-                // jobworkerp may legitimately not be up yet at memories
-                // startup. Do not block — log and let the first real
-                // embedding catch a true mismatch via the FixedSizeList.
-                tracing::warn!(
-                    "embedding dimension probe could not run (jobworkerp \
-                     unreachable or worker not registered yet): {e}. \
-                     Skipping the startup check; a real mismatch will \
-                     still be rejected at the first embedding INSERT."
-                );
-                Ok(())
-            }
-        }
-    }
-
     // ===== Embedding management =====
 
     /// Upsert embedding: fetch Memory from RDB, then write to LanceDB
@@ -594,6 +534,7 @@ impl MemoryVectorAppImpl {
         embedding_model: Option<&str>,
         replace_kinds: &[String],
         rows: Vec<(String, i32, i32, i32, String, Vec<f32>)>,
+        token: Option<&infra::infra::embedding_space::token::DispatchToken>,
     ) -> Result<(u32, u32, Vec<String>)> {
         if replace_kinds.is_empty() {
             return Err(LlmMemoryError::InvalidArgument(
@@ -609,12 +550,46 @@ impl MemoryVectorAppImpl {
             .find(|m| m.id.as_ref().map(|i| i.value) == Some(memory_id))
             .and_then(|m| m.data)
         else {
+            if token.is_some() {
+                infra::infra::embedding_space::token::record_rejection(
+                    infra::infra::embedding_space::token::Rejection::SourceVersion,
+                );
+            }
             return Ok((
                 0,
                 rows.len() as u32,
                 vec![format!("memory_id={memory_id}: not found in RDB")],
             ));
         };
+
+        let current_version = match replace_kinds.first() {
+            Some(kind) => self.current_source_version(&data, kind).await?,
+            None => None,
+        };
+        let guarded = match infra::infra::embedding_index::write::guard(
+            infra::infra::embedding_index::TableLabel::Memory,
+            memory_id,
+            replace_kinds,
+            token,
+            current_version.as_ref(),
+            self.vector_repo.vector_size(),
+            rows.iter().map(|r| r.5.len()),
+        ) {
+            Ok(g) => g,
+            Err(r) => {
+                return Ok((
+                    0,
+                    rows.len() as u32,
+                    vec![format!(
+                        "memory_id={memory_id}: embedding write rejected ({})",
+                        r.as_str()
+                    )],
+                ));
+            }
+        };
+        let index = self.vector_repo.embedding_index();
+        guarded.before_rows(index).await?;
+        let chunk_count = rows.len();
 
         let mut records = Vec::with_capacity(rows.len());
         for (vector_kind, chunk_index, begin, end, content, embedding) in rows {
@@ -635,7 +610,98 @@ impl MemoryVectorAppImpl {
             .vector_repo
             .replace_kinds_upsert(memory_id, &replace_refs, records)
             .await? as u32;
+        if chunk_count > 0 {
+            guarded.after_rows(index, chunk_count).await?;
+        }
         Ok((success, 0, Vec::new()))
+    }
+
+    /// Record that generating `vector_kind` of a memory failed for good.
+    pub async fn report_embedding_failure(
+        &self,
+        memory_id: i64,
+        vector_kind: &str,
+        token: &infra::infra::embedding_space::token::DispatchToken,
+        reason: &str,
+        message: &str,
+    ) -> Result<infra::infra::embedding_index::write::FailureReport> {
+        use infra::infra::embedding_index::TableLabel;
+        let data = self
+            .memory_repo
+            .find_by_ids(&[memory_id], false)
+            .await?
+            .into_iter()
+            .find(|m| m.id.as_ref().map(|i| i.value) == Some(memory_id))
+            .and_then(|m| m.data);
+        let version = match &data {
+            Some(d) => self.current_source_version(d, vector_kind).await?,
+            None => None,
+        };
+        let chunks = infra::infra::embedding_index::scan::target_chunk_indexes(
+            &self.vector_repo.table_handle(),
+            TableLabel::Memory,
+            memory_id,
+            vector_kind,
+        )
+        .await?;
+        let repo = &self.vector_repo;
+        infra::infra::embedding_index::write::record_failure(
+            repo.embedding_index(),
+            TableLabel::Memory,
+            memory_id,
+            vector_kind,
+            token,
+            version.as_ref(),
+            &chunks,
+            reason,
+            message,
+            || async move {
+                repo.replace_kinds_upsert(memory_id, &[vector_kind], Vec::new())
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await
+    }
+
+    /// Source version of `vector_kind` of a memory as it is now, or `None`
+    /// when the memory no longer has that embedding target.
+    async fn current_source_version(
+        &self,
+        data: &protobuf::llm_memory::data::MemoryData,
+        vector_kind: &str,
+    ) -> Result<Option<infra::infra::embedding_index::SourceVersion>> {
+        let media = match (data.media_object_id, &self.media_object_repo) {
+            (Some(mid), Some(repo)) => {
+                use infra::infra::media_object::rdb::MediaObjectRepository as _;
+                repo.find_by_ids(&[mid.value]).await?.into_iter().next()
+            }
+            _ => None,
+        };
+        let linked = media
+            .as_ref()
+            .map(|m| infra::infra::embedding_target::LinkedMedia {
+                id: m.id,
+                kind: m.kind,
+                storage_backend: &m.storage_backend,
+                sha256: m.sha256.as_deref(),
+                url: m.storage_uri.as_deref(),
+            });
+        Ok(infra::infra::embedding_target::memory_targets(
+            &data.content,
+            data.role,
+            data.content_type,
+            data.metadata.as_deref(),
+            linked,
+            self.image_search_mode,
+            infra::infra::embedding_dispatch::max_content_len_from_env(),
+        )
+        .into_iter()
+        .find(|t| {
+            t.table == infra::infra::embedding_index::TableLabel::Memory
+                && t.vector_kind == vector_kind
+        })
+        .map(|t| t.version))
     }
 
     pub fn thread_filter_config(&self) -> &ThreadFilterConfig {
@@ -3876,6 +3942,7 @@ mod test {
                             random_embedding(dim),
                         ),
                     ],
+                    None,
                 )
                 .await?;
             assert_eq!((s, f, errs.len()), (2, 0, 0));
@@ -3894,6 +3961,7 @@ mod test {
                     Some("test-model"),
                     &["text".to_string()],
                     Vec::new(),
+                    None,
                 )
                 .await?;
             assert_eq!(
@@ -6511,6 +6579,268 @@ mod test {
                 hit.memory.media.is_none(),
                 "dangling media_object_id => media None (NotFound swallowed)"
             );
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
+mod write_token_tests {
+    use super::*;
+    use infra::infra::embedding_index::source_version::{self, TextSource};
+    use infra::infra::embedding_index::{EmbeddingIndex, EntryOutcome, TableLabel};
+    use infra::infra::embedding_space::token::{self, DispatchToken};
+    use infra::infra::embedding_space::{SpaceId, workers};
+    use infra::infra::memory::rdb::MemoryRepository;
+    use infra::infra::memory_vector::config::{DistanceType, VectorDBConfig};
+    use infra_utils::infra::rdb::UseRdbPool;
+    use infra_utils::infra::test::{TEST_RUNTIME, setup_test_rdb_from};
+    use protobuf::llm_memory::data::{ContentType, MemoryData, MemoryId, MessageRole, UserId};
+
+    const DIM: usize = 4;
+
+    fn space() -> SpaceId {
+        SpaceId("cd".repeat(32))
+    }
+
+    async fn setup() -> anyhow::Result<(MemoryVectorAppImpl, EmbeddingIndex, tempfile::TempDir)> {
+        let pool = if cfg!(feature = "postgres") {
+            let pool = setup_test_rdb_from("../infra/sql/postgres").await;
+            sqlx::query("TRUNCATE TABLE memory, thread, thread_memory, thread_label CASCADE;")
+                .execute(pool)
+                .await?;
+            pool
+        } else {
+            let pool = setup_test_rdb_from("../infra/sql/sqlite").await;
+            for tbl in ["thread_memory", "thread_label", "thread", "memory"] {
+                sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {tbl}")))
+                    .execute(pool)
+                    .await?;
+            }
+            pool
+        };
+        let dir = tempfile::tempdir()?;
+        let uri = dir.path().to_string_lossy().to_string();
+        let index = EmbeddingIndex::open(&uri).await?;
+        let vector_repo = MemoryVectorRepositoryImpl::new(VectorDBConfig {
+            uri,
+            table_name: "memories".to_string(),
+            vector_size: DIM,
+            distance_type: DistanceType::Cosine,
+            fts: infra::infra::memory_vector::config::FtsConfig::default(),
+            vector_index: infra::infra::memory_vector::config::VectorIndexConfig::default(),
+        })
+        .await?
+        .with_embedding_index(index.clone());
+        let idg = infra::test_helper::shared_id_generator();
+        let app = MemoryVectorAppImpl::new(
+            MemoryRepositoryImpl::new(idg.clone(), pool),
+            vector_repo,
+            ThreadMemoryRepositoryImpl::new(pool),
+            ThreadRepositoryImpl::new(idg, pool),
+            ThreadLabelRepositoryImpl::new(pool),
+            None,
+        );
+        workers::set_current_space(Some(space()));
+        token::set_rebuilding_attempt(None);
+        token::set_legacy_accept(false);
+        Ok((app, index, dir))
+    }
+
+    fn teardown() {
+        workers::set_current_space(None);
+        token::set_legacy_accept(false);
+    }
+
+    async fn memory(app: &MemoryVectorAppImpl, content: &str) -> anyhow::Result<i64> {
+        let data = MemoryData {
+            user_id: Some(UserId { value: 1 }),
+            content: content.to_string(),
+            content_type: ContentType::Text as i32,
+            role: MessageRole::RoleUser as i32,
+            ..Default::default()
+        };
+        let mut tx = app.memory_repo.db_pool().begin().await?;
+        let id = app.memory_repo.create(&mut *tx, &data).await?;
+        tx.commit().await?;
+        Ok(id.value)
+    }
+
+    fn token_for(text: &str) -> DispatchToken {
+        DispatchToken {
+            space_id: space().to_string(),
+            attempt_id: String::new(),
+            source_version: source_version::text(TextSource::MemoryText, text).to_string(),
+            generation_id: "gen-1".into(),
+        }
+    }
+
+    fn rows(n: i32) -> Vec<(String, i32, i32, i32, String, Vec<f32>)> {
+        (0..n)
+            .map(|i| ("text".to_string(), i, 0, 1, "c".to_string(), vec![0.5; DIM]))
+            .collect()
+    }
+
+    async fn write(
+        app: &MemoryVectorAppImpl,
+        id: i64,
+        rows: Vec<(String, i32, i32, i32, String, Vec<f32>)>,
+        token: Option<&DispatchToken>,
+    ) -> anyhow::Result<(u32, u32, Vec<String>)> {
+        app.batch_upsert_embeddings_rows(id, Some("m"), &["text".to_string()], rows, token)
+            .await
+    }
+
+    #[test]
+    fn matching_token_writes_rows_and_a_success_entry() -> anyhow::Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let (app, index, _dir) = setup().await?;
+            let id = memory(&app, "hello").await?;
+            assert_eq!(
+                write(&app, id, rows(2), Some(&token_for("hello"))).await?.0,
+                2
+            );
+            let entries = index.entries_in_range(TableLabel::Memory, id, id).await?;
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].outcome, EntryOutcome::Success { chunk_count: 2 });
+            assert_eq!(entries[0].generation_id, "gen-1");
+            teardown();
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn stale_or_foreign_results_are_rejected_without_touching_rows() -> anyhow::Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let (app, index, _dir) = setup().await?;
+            let id = memory(&app, "current").await?;
+            write(&app, id, rows(1), Some(&token_for("current"))).await?;
+
+            // Generated from an earlier body.
+            let (s, f, errors) = write(&app, id, rows(3), Some(&token_for("earlier"))).await?;
+            assert_eq!((s, f), (0, 3));
+            assert!(errors[0].contains("source_version_mismatch"), "{errors:?}");
+            // Generated in another space.
+            let mut foreign = token_for("current");
+            foreign.space_id = "ef".repeat(32);
+            assert!(
+                write(&app, id, rows(3), Some(&foreign)).await?.2[0].contains("space_mismatch")
+            );
+            // Generated for a rebuild attempt while none is pending.
+            let mut attempt = token_for("current");
+            attempt.attempt_id = "att".into();
+            assert!(
+                write(&app, id, rows(3), Some(&attempt)).await?.2[0].contains("attempt_mismatch")
+            );
+            // Wrong dimension.
+            let mut wide = rows(1);
+            wide[0].5 = vec![0.5; DIM + 1];
+            assert!(
+                write(&app, id, wide, Some(&token_for("current"))).await?.2[0]
+                    .contains("dimension_mismatch")
+            );
+            // Without a token, outside legacy acceptance.
+            assert!(write(&app, id, rows(3), None).await?.2[0].contains("missing_token"));
+
+            assert_eq!(app.vector_repo.get_stats().await?.total_records, 1);
+            let entries = index.entries_in_range(TableLabel::Memory, id, id).await?;
+            assert_eq!(entries[0].outcome, EntryOutcome::Success { chunk_count: 1 });
+            teardown();
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn results_for_deleted_memories_are_rejected_and_deletion_drops_entries() -> anyhow::Result<()>
+    {
+        TEST_RUNTIME.block_on(async {
+            let (app, index, _dir) = setup().await?;
+            let id = memory(&app, "bye").await?;
+            write(&app, id, rows(1), Some(&token_for("bye"))).await?;
+            app.vector_repo.delete(id).await?;
+            assert!(
+                index
+                    .entries_in_range(TableLabel::Memory, id, id)
+                    .await?
+                    .is_empty()
+            );
+
+            let mut tx = app.memory_repo.db_pool().begin().await?;
+            app.memory_repo
+                .delete_tx(&mut *tx, &MemoryId { value: id })
+                .await?;
+            tx.commit().await?;
+            let (s, f, _) = write(&app, id, rows(1), Some(&token_for("bye"))).await?;
+            assert_eq!((s, f), (0, 1));
+            assert_eq!(app.vector_repo.get_stats().await?.total_records, 0);
+            teardown();
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn failure_reports_are_recorded_and_superseded_by_a_success() -> anyhow::Result<()> {
+        use infra::infra::embedding_index::write::FailureReport;
+        TEST_RUNTIME.block_on(async {
+            let (app, index, _dir) = setup().await?;
+            let id = memory(&app, "text").await?;
+            write(&app, id, rows(1), Some(&token_for("old version"))).await?;
+            let mut failed = token_for("text");
+            failed.generation_id = "gen-f".into();
+            assert_eq!(
+                app.report_embedding_failure(id, "text", &failed, "workflow_error", "boom")
+                    .await?,
+                FailureReport::Recorded
+            );
+            let entry = &index.entries_in_range(TableLabel::Memory, id, id).await?[0];
+            assert!(matches!(entry.outcome, EntryOutcome::Failure { .. }));
+            assert_eq!(app.vector_repo.get_stats().await?.total_records, 0);
+            // A stale report (earlier version) is not recorded.
+            assert!(matches!(
+                app.report_embedding_failure(id, "text", &token_for("older"), "x", "")
+                    .await?,
+                FailureReport::Rejected(_)
+            ));
+            // The success of the same version replaces the failure.
+            write(&app, id, rows(1), Some(&token_for("text"))).await?;
+            let entry = &index.entries_in_range(TableLabel::Memory, id, id).await?[0];
+            assert_eq!(entry.outcome, EntryOutcome::Success { chunk_count: 1 });
+            teardown();
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn legacy_acceptance_writes_token_less_rows_without_an_entry() -> anyhow::Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let (app, index, _dir) = setup().await?;
+            token::set_legacy_accept(true);
+            let id = memory(&app, "old job").await?;
+            assert_eq!(write(&app, id, rows(1), None).await?.0, 1);
+            assert!(
+                index
+                    .entries_in_range(TableLabel::Memory, id, id)
+                    .await?
+                    .is_empty()
+            );
+            // A token-less write after a verified one drops its entry: the
+            // rows no longer match what the entry claims.
+            write(&app, id, rows(1), Some(&token_for("old job"))).await?;
+            assert_eq!(
+                index
+                    .entries_in_range(TableLabel::Memory, id, id)
+                    .await?
+                    .len(),
+                1
+            );
+            write(&app, id, rows(1), None).await?;
+            assert!(
+                index
+                    .entries_in_range(TableLabel::Memory, id, id)
+                    .await?
+                    .is_empty()
+            );
+            teardown();
             Ok(())
         })
     }

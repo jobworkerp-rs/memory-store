@@ -303,6 +303,10 @@ impl<T: ThreadVectorGrpc + Tracing + Send + Debug + Sync + 'static> ThreadVector
                 req.embedding_model.as_deref(),
                 &req.replace_kinds,
                 rows,
+                req.token
+                    .as_ref()
+                    .map(infra::infra::embedding_space::token::DispatchToken::from)
+                    .as_ref(),
             )
             .await
         {
@@ -381,6 +385,7 @@ impl<T: ThreadVectorGrpc + Tracing + Send + Debug + Sync + 'static> ThreadVector
                     fts_tokenizer: wire.fts_tokenizer,
                     fts_ngram_min: wire.fts_ngram_min,
                     fts_ngram_max: wire.fts_ngram_max,
+                    embedding_space: Some((&stats.embedding_space).into()),
                 }))
             }
             Err(e) => Err(handle_error(&e)),

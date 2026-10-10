@@ -289,6 +289,7 @@ pub trait ReflectionApp: Send + Sync {
         embedding_model: Option<&str>,
         replace_kinds: &[String],
         rows: Vec<(String, i32, i32, i32, String, Vec<f32>)>,
+        token: Option<&infra::infra::embedding_space::token::DispatchToken>,
     ) -> Result<(u32, u32, Vec<String>)>;
 
     // ===== Redispatch (F-G11) =====
@@ -376,6 +377,72 @@ pub struct ReflectionAppImpl {
 }
 
 impl ReflectionAppImpl {
+    /// Record that generating a reflection's intent embedding failed for
+    /// good.
+    pub async fn report_intent_embedding_failure(
+        &self,
+        memory_id: i64,
+        vector_kind: &str,
+        token: &infra::infra::embedding_space::token::DispatchToken,
+        reason: &str,
+        message: &str,
+    ) -> Result<infra::infra::embedding_index::write::FailureReport> {
+        use infra::infra::embedding_index::TableLabel;
+        use infra::infra::memory::rdb::MemoryRepository as _;
+        let Some(repo) = self.intent_vector_repo.as_ref() else {
+            return Err(infra::error::LlmMemoryError::Unimplemented(
+                "the reflection intent vector store is not configured".into(),
+            )
+            .into());
+        };
+        let version = self
+            .memory_repo
+            .find(
+                &protobuf::llm_memory::data::MemoryId { value: memory_id },
+                false,
+            )
+            .await?
+            .and_then(|m| m.data)
+            .and_then(|d| {
+                infra::infra::embedding_target::memory_targets(
+                    &d.content,
+                    d.role,
+                    d.content_type,
+                    d.metadata.as_deref(),
+                    None,
+                    infra::infra::embedding_dispatch::ImageSearchMode::None,
+                    infra::infra::embedding_dispatch::max_content_len_from_env(),
+                )
+                .into_iter()
+                .find(|t| t.table == TableLabel::ReflectionIntent && t.vector_kind == vector_kind)
+                .map(|t| t.version)
+            });
+        let chunks = infra::infra::embedding_index::scan::target_chunk_indexes(
+            &repo.table_handle(),
+            TableLabel::ReflectionIntent,
+            memory_id,
+            vector_kind,
+        )
+        .await?;
+        infra::infra::embedding_index::write::record_failure(
+            repo.embedding_index(),
+            TableLabel::ReflectionIntent,
+            memory_id,
+            vector_kind,
+            token,
+            version.as_ref(),
+            &chunks,
+            reason,
+            message,
+            || async move {
+                repo.replace_kinds_upsert(memory_id, &[vector_kind], Vec::new())
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await
+    }
+
     /// The signature-norm HashMap is loaded eagerly via the supplied
     /// `signature_norm_repo` so the F-S7 distance hot path stays
     /// allocation-free. A failed load surfaces as `tracing::warn!` and
@@ -721,7 +788,9 @@ impl ReflectionApp for ReflectionAppImpl {
         embedding_model: Option<&str>,
         replace_kinds: &[String],
         rows: Vec<(String, i32, i32, i32, String, Vec<f32>)>,
+        token: Option<&infra::infra::embedding_space::token::DispatchToken>,
     ) -> Result<(u32, u32, Vec<String>)> {
+        use infra::infra::memory::rdb::MemoryRepository as _;
         use infra::infra::reflection::rdb::ThreadReflectionIndexRepository;
         use infra::infra::reflection_intent_vector::record::{
             ReflectionIntentFilterContext, ReflectionIntentVectorRecord,
@@ -769,6 +838,57 @@ impl ReflectionApp for ReflectionAppImpl {
             created_at: row.created_at,
         };
 
+        // The intent text lives in the reflection memory's metadata.
+        let memory = self
+            .memory_repo
+            .find(
+                &protobuf::llm_memory::data::MemoryId { value: id.value },
+                false,
+            )
+            .await?
+            .and_then(|m| m.data);
+        let current_version = memory.and_then(|d| {
+            infra::infra::embedding_target::memory_targets(
+                &d.content,
+                d.role,
+                d.content_type,
+                d.metadata.as_deref(),
+                None,
+                infra::infra::embedding_dispatch::ImageSearchMode::None,
+                infra::infra::embedding_dispatch::max_content_len_from_env(),
+            )
+            .into_iter()
+            .find(|t| {
+                t.table == infra::infra::embedding_index::TableLabel::ReflectionIntent
+                    && replace_kinds.first().map(String::as_str) == Some(t.vector_kind)
+            })
+            .map(|t| t.version)
+        });
+        let guarded = match infra::infra::embedding_index::write::guard(
+            infra::infra::embedding_index::TableLabel::ReflectionIntent,
+            id.value,
+            replace_kinds,
+            token,
+            current_version.as_ref(),
+            repo.vector_size(),
+            rows.iter().map(|r| r.5.len()),
+        ) {
+            Ok(g) => g,
+            Err(r) => {
+                return Ok((
+                    0,
+                    rows.len() as u32,
+                    vec![format!(
+                        "reflection {}: embedding write rejected ({})",
+                        id.value,
+                        r.as_str()
+                    )],
+                ));
+            }
+        };
+        guarded.before_rows(repo.embedding_index()).await?;
+        let chunk_count = rows.len();
+
         let mut records = Vec::with_capacity(rows.len());
         for (vector_kind, chunk_index, begin, end, content, embedding) in rows {
             records.push(ReflectionIntentVectorRecord::from_chunk_with_content(
@@ -793,6 +913,11 @@ impl ReflectionApp for ReflectionAppImpl {
                     "reflection intent vector upsert failed: {e:#}"
                 ))
             })? as u32;
+        if chunk_count > 0 {
+            guarded
+                .after_rows(repo.embedding_index(), chunk_count)
+                .await?;
+        }
         Ok((success, 0, Vec::new()))
     }
 

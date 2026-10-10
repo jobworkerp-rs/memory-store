@@ -69,7 +69,7 @@ do:
   - generateEmbedding:
       run:
         worker:
-          name: "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}"
+          name: "%{MEMORY_MM_EMBEDDING_WORKER:-memories-mm-embedding}%{MEMORY_EMBEDDING_SPACE_SUFFIX}"
           using: embed_text
           arguments:
             # MEMORY_EMBEDDING_QUERY_PREFIX_JAQ is not an operator-facing env

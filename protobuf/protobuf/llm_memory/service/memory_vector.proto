@@ -3,6 +3,7 @@ syntax = "proto3";
 package llm_memory.service;
 
 import "llm_memory/data/common.proto";
+import "llm_memory/data/embedding_space.proto";
 import "llm_memory/data/highlight.proto";
 import "llm_memory/data/media.proto";
 import "llm_memory/data/memory.proto";
@@ -304,6 +305,9 @@ message BatchUpsertEmbeddingsRequest {
   // (design 1/3 §3.3.1 kind-isolation).
   repeated string replace_kinds = 4;
   repeated VectorRow rows = 5;
+  // Token of the generation request (rows path). Results without a token
+  // are accepted only while every vector table allows legacy writes.
+  optional llm_memory.data.DispatchToken token = 6;
 }
 
 message BatchUpsertEmbeddingsResponse {
@@ -384,6 +388,9 @@ message IndexStatsResponse {
   // the LanceDB FTS builder ignores them for every other kind.
   optional uint32 fts_ngram_min = 8;
   optional uint32 fts_ngram_max = 9;
+  // Embedding space recorded on this table and any in-progress
+  // embedding migration marker.
+  llm_memory.data.EmbeddingSpaceRecord embedding_space = 10;
 }
 
 // Vector search service for Memory semantic search

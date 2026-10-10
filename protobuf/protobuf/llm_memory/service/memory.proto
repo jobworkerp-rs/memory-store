@@ -3,6 +3,7 @@ syntax = "proto3";
 package llm_memory.service;
 
 import "llm_memory/data/common.proto";
+import "llm_memory/data/media.proto";
 import "llm_memory/data/memory.proto";
 import "llm_memory/data/search_filter.proto";
 import "llm_memory/data/thread.proto";
@@ -149,6 +150,32 @@ message UpdateContentNoDispatchRequest {
   string content = 2;
 }
 
+// Caption generated for an image memory with an empty body.
+message WriteBackCaptionRequest {
+  llm_memory.data.MemoryId memory_id = 1;
+  // Media object the caption was generated from.
+  llm_memory.data.MediaObjectId media_object_id = 2;
+  string caption = 3;
+}
+
+enum CaptionWriteBackOutcome {
+  CAPTION_WRITE_BACK_OUTCOME_UNSPECIFIED = 0;
+  // Stored as the body; its embedding was dispatched.
+  CAPTION_WRITE_BACK_OUTCOME_APPLIED = 1;
+  // The memory no longer exists.
+  CAPTION_WRITE_BACK_OUTCOME_MEMORY_NOT_FOUND = 2;
+  // The memory now links another media object (or none).
+  CAPTION_WRITE_BACK_OUTCOME_MEDIA_CHANGED = 3;
+  // The memory already has a body (user text or an earlier caption).
+  CAPTION_WRITE_BACK_OUTCOME_BODY_PRESENT = 4;
+  // The generated caption is empty.
+  CAPTION_WRITE_BACK_OUTCOME_EMPTY_CAPTION = 5;
+}
+
+message WriteBackCaptionResponse {
+  CaptionWriteBackOutcome outcome = 1;
+}
+
 // Service that exposes CRUD and search for memories. Used to
 // persist and retrieve LLM conversation history and context.
 service MemoryService {
@@ -200,4 +227,10 @@ service MemoryService {
   // content edits). It is deliberately kept off the RAG manifest
   // (workflows/rag-tools-manifest.yaml) so agents cannot misuse it.
   rpc UpdateContentNoDispatch(UpdateContentNoDispatchRequest) returns (SuccessResponse);
+  // Store a generated caption as the body of an image memory, only if the
+  // memory still exists, still links `media_object_id`, and has an empty
+  // body (one conditional update), then dispatch its embedding. A refused
+  // write-back is a normal outcome, not an error. Used by the caption
+  // generation workflow.
+  rpc WriteBackCaption(WriteBackCaptionRequest) returns (WriteBackCaptionResponse);
 }

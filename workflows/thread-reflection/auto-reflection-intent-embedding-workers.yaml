@@ -71,7 +71,7 @@ workers:
   # Same `embedding_workflow` channel as the summary path — both fan
   # out to the GPU-bound `embedding` channel so serializing them on
   # the workflow side keeps the GPU queue depth predictable.
-  - name: memories-auto-reflection-intent-embedding
+  - name: "memories-auto-reflection-intent-embedding%{MEMORY_EMBEDDING_SPACE_SUFFIX}"
     runner: WORKFLOW
     response_type: NO_RESULT
     channel: embedding_workflow

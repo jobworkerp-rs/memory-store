@@ -27,6 +27,8 @@ use anyhow::Result;
 use app::module::AppModule;
 use infra::infra::module::RepositoryModule;
 use protobuf::FILE_DESCRIPTOR_SET;
+use protobuf::llm_memory::service::embedding_maintenance_service_server::EmbeddingMaintenanceServiceServer;
+use protobuf::llm_memory::service::embedding_space_service_server::EmbeddingSpaceServiceServer;
 use protobuf::llm_memory::service::reflection_service_server::ReflectionServiceServer;
 use protobuf::llm_memory::service::reflection_vector_service_server::ReflectionVectorServiceServer;
 use std::net::SocketAddr;
@@ -181,6 +183,15 @@ pub async fn create_server(
     // the ThreadGroup service is RDB-only.
     let thread_group_pool = repository_module.pool();
     let mut app_module = AppModule::new_by_env(repository_module).await;
+    let embedding_maintenance_service = EmbeddingMaintenanceServiceServer::new(
+        crate::service::embedding_maintenance::EmbeddingMaintenanceGrpcImpl::new(
+            app_module.embedding_reconciler.clone(),
+        ),
+    );
+    let embedding_space_service = crate::service::embedding_space::EmbeddingSpaceGrpcImpl::new(
+        app_module.worker_registry.clone(),
+        app_module.embedding_space.clone(),
+    );
     let memory_rating = MemoryRatingGrpcImpl::new(app_module.memory_rating_app);
     // Share the one MediaApp Arc between MediaService and MemoryService
     // (the latter issues presigned URLs during Find enrich). No second
@@ -240,6 +251,13 @@ pub async fn create_server(
                 .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
                 .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE),
         )
+        .add_service(EmbeddingSpaceServiceServer::new(
+            embedding_space_service.with_apps(
+                vector_app_arc.clone(),
+                thread_vector_app_arc.clone(),
+                Some(reflection_app_arc.clone()),
+            ),
+        ))
         .add_service(
             ThreadGroupServiceServer::new(
                 ThreadGroupGrpcImpl::new(thread_group_pool)
@@ -253,19 +271,6 @@ pub async fn create_server(
     tracing::info!("ThreadGroupService registered");
 
     if let Some(va) = vector_app_arc {
-        // Startup fail-fast (b): embedding dimension probe. Runs in all
-        // modes — even `none`, the text path uses the same mm-embedding
-        // worker. A genuine MEMORY_VECTOR_SIZE vs runner-dimension drift
-        // exits via the structured `EmbeddingDimensionMismatch` so
-        // agent-app can offer the same recovery flow as a LanceDB dim
-        // mismatch; an unreachable jobworkerp at startup does NOT block
-        // (the probe self-skips with a warn).
-        if let Err(e) = va.verify_embedding_dimension().await {
-            infra::infra::startup_error::StartupError::fatal_anyhow(
-                "verify_embedding_dimension",
-                e,
-            );
-        }
         // Share the one MediaApp Arc so SearchByMedia can Resolve the
         // query media (same instance as MediaService / MemoryService —
         // no second storage backend).
@@ -305,7 +310,9 @@ pub async fn create_server(
         .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
     let maintenance_server = match maintenance_listener {
         MaintenanceListener::Cohosted => {
-            routes = routes.add_service(maintenance_service);
+            routes = routes
+                .add_service(maintenance_service)
+                .add_service(embedding_maintenance_service);
             MaintenanceServerTopology::Cohosted
         }
         MaintenanceListener::Separate(listener) => {
@@ -316,7 +323,8 @@ pub async fn create_server(
             MaintenanceServerTopology::Separate {
                 listener,
                 routes: tonic::service::Routes::new(maintenance_reflection)
-                    .add_service(maintenance_service),
+                    .add_service(maintenance_service)
+                    .add_service(embedding_maintenance_service),
             }
         }
     };

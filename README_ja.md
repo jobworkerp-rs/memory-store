@@ -108,6 +108,33 @@ CARGO_BUILD_JOBS=1 scripts/build-memories-db-migrate-sqlite.sh /path/to/memories
 SQL を適用したり Atlas を直接実行したりしてはいけません。
 契約の詳細は [docs/database-migration-tool-spec_ja.md](docs/database-migration-tool-spec_ja.md) を参照してください。
 
+### マイグレーションツールの E2E 試験
+
+`memories-db-migrate` の E2E 試験（`local`・`release`・`embedding` コマンド）は
+`#[ignore]` 付きで、リリースバイナリを一時 fixture の中で子プロセスとして実行します。
+対象のバックエンドのバイナリをビルドし、それとバンドルの Atlas を指定して実行します。
+
+```bash
+# SQLite
+scripts/build-memories-db-migrate-sqlite.sh /tmp/mdm-bundle
+MEMORIES_DB_MIGRATE_E2E_ATLAS_DIR=/tmp/mdm-bundle/atlas \
+MEMORIES_DB_MIGRATE_E2E_BINARY=/tmp/mdm-bundle/memories-db-migrate \
+  cargo test -p grpc-admin --bin memories-db-migrate -- --ignored --test-threads=1
+
+# PostgreSQL（各試験がこのデータベースに専用の schema を作り、終了時に削除する）
+cargo build --release -p grpc-admin --bin memories-db-migrate --no-default-features --features postgres
+cp target/release/memories-db-migrate /tmp/mdm-pg/
+TEST_POSTGRES_URL='postgres://postgres:postgres@127.0.0.1:5432/memories_e2e?sslmode=disable' \
+MEMORIES_DB_MIGRATE_E2E_ATLAS_DIR=/tmp/mdm-bundle/atlas \
+MEMORIES_DB_MIGRATE_E2E_BINARY=/tmp/mdm-pg/memories-db-migrate \
+  cargo test -p grpc-admin --bin memories-db-migrate --no-default-features --features postgres \
+  -- --ignored --test-threads=1
+```
+
+`sslmode=disable` は TLS のないローカルのサーバーにだけ使ってください。試験は環境変数を
+消去したうえで fixture の中でバイナリを実行するので、開発者の `.env`（実際の保存先を指すことがある）
+は読まれません。
+
 ## セットアップと実行
 
 ```bash
@@ -190,10 +217,17 @@ cargo run --release --features lindera --bin front
 ワーカー定義は YAML で管理されます。Memories 固有のワーカーは
 [yaml-workers.md](yaml-workers.md)、一般的な YAML 形式は
 [modules/jobworkerp-client/docs/worker-yaml.md](modules/jobworkerp-client/docs/worker-yaml.md)
-で説明しています。埋め込みモデルを変更するには、
-`workflows/auto-embedding-workers.yaml` を直接編集してください。ベクトル生成で実際に
-使用されるモデル名はランナーの `model_info.model_name` から読み取り、ベクトルメタデータに
-記録されます。
+で説明しています。埋め込みモデルは、`workflows/auto-embedding-workers.yaml` の
+`MultimodalEmbeddingRunner` ワーカー（1 つだけ）で定義します。その `model_id` /
+`tokenizer_model_id`、`MEMORY_EMBEDDING_MODEL_REVISION`、ベクトルの次元、距離関数で
+「embedding 空間」が決まり、各ベクトルテーブルに記録されます。設定の空間が記録と異なると
+サーバーは起動しません。別のモデルへの移行は `memories-db-migrate embedding`
+（`plan` → `switch` → 再構築 → `finalize`）で行います。詳細は
+[docs/embedding-space-management-spec_ja.md](docs/embedding-space-management-spec_ja.md)、
+サーバー運用の手順は [docs/vectordb-rebuild-runbook_ja.md](docs/vectordb-rebuild-runbook_ja.md)
+を参照してください。モデルに依存するワーカーは、空間ごとの名前
+（`<基底の名前>-<空間 ID の先頭 16 桁>`）で登録されるので、異なる空間が jobworkerp 上の
+同じワーカー定義を共有することはありません。
 
 | 変数 | デフォルト | 説明 |
 |---|---|---|
@@ -205,7 +239,10 @@ cargo run --release --features lindera --bin front
 | `MEMORY_THREAD_WORKERS_YAML` | `<infra crate>/../workflows/auto-thread-embedding-workers.yaml` | スレッドワーカー YAML |
 | `MEMORY_GRPC_HOST` | 必須 | 埋め込みワークフローがこのサーバーへコールバックするために使うホスト |
 | `MEMORY_GRPC_PORT` | 必須 | コールバックポート |
-| `MEMORY_MM_EMBEDDING_WORKER` | `memories-mm-embedding` | テキスト・画像・クエリの埋め込みで共有する jobworkerp ワーカー |
+| `MEMORY_MM_EMBEDDING_WORKER` | `memories-mm-embedding` | テキスト・画像・クエリの埋め込みで共有する jobworkerp ワーカーの基底の名前。登録される名前には空間の接尾辞が付く（`GetEmbeddingSpace` が返す） |
+| `MEMORY_EMBEDDING_MODEL_REVISION` | `unversioned` | モデルの配布物（重み・tokenizer）の revision の宣言。embedding 空間の構成要素 |
+| `MEMORY_EMBEDDING_STATE_DIR` | `<MEMORY_LANCEDB_URI>.embedding-state` | embedding 移行の管理ディレクトリ（試行記録、ストレージ識別子）。LanceDB のディレクトリと一緒にマウントする |
+| `MEMORY_EMBEDDING_REBUILD_STALL_SECS` | `900` | 再構築 task の投入後、進捗がこの秒数ないと進捗 RPC が `stalled` を返す |
 | `MEMORY_EMBEDDING_DOCUMENT_PREFIX` | 未設定 | 非対応: 現行ランナーではソースオフセットを維持しつつ各チャンクへ適用できないため、空でない値は起動時に拒否されます |
 | `MEMORY_EMBEDDING_QUERY_PREFIX` | 未設定 | 埋め込み前に意味検索、ハイブリッド検索、RAG、意図クエリのテキストへ付加する接頭辞。RAG は登録時に埋め込むため、jobworkerp 側での定義は不要 |
 | `MEMORY_IMAGE_WORKERS_YAML` | `workflows/auto-image-embedding-workers.yaml` | 画像埋め込みワーカー YAML |

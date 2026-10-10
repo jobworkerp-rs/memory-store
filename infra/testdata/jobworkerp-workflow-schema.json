@@ -1,0 +1,2018 @@
+{
+  "$id": "urn:jobworkerp-rs:schemas:open-workflow:1.0.0-jobworkerp:workflow",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkflowSchema",
+  "description": "Workflow schema supporting job execution with functions and tools.\nRuntime expressions are supported in fields marked in descriptions: - jq syntax: ${.key.subkey} for data access, ${$task.input} for context - liquid syntax: $${..} for templates\nAvailable context variables: - Task input data: direct key access via ${.key} (only within current task context) - Task output data: direct key access via ${.key} (only within current task context) - Context vars: set by task.export, setTask (access via $variable_name for jq, {{ variable_name }} for liquid) - Workflow: access via $workflow (e.g., $workflow.input.key, $workflow.id, $workflow.definition, $workflow.context_variables) - Task: access via $task (e.g., $task.definition, $task.input, $task.raw_output, $task.output, $task.flow_directive)",
+  "type": "object",
+  "required": [
+    "document",
+    "do"
+  ],
+  "properties": {
+    "checkpointing": {
+      "type": "object",
+      "title": "Checkpoint Config",
+      "description": "Checkpoint and restart configuration.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable checkpoint functionality.",
+          "default": false
+        },
+        "storage": {
+          "type": "string",
+          "enum": [
+            "memory",
+            "redis"
+          ],
+          "description": "Storage backend for checkpoints."
+        }
+      },
+      "required": [
+        "enabled"
+      ]
+    },
+    "document": {
+      "type": "object",
+      "title": "Document",
+      "description": "Workflow metadata and identification.",
+      "unevaluatedProperties": false,
+      "properties": {
+        "dsl": {
+          "type": "string",
+          "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$",
+          "title": "WorkflowDSL",
+          "description": "DSL version used by this workflow.",
+          "default": "0.0.1"
+        },
+        "namespace": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+          "title": "WorkflowNamespace",
+          "description": "Workflow namespace.",
+          "default": "default"
+        },
+        "name": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+          "title": "WorkflowName",
+          "description": "Workflow name."
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$",
+          "title": "WorkflowVersion",
+          "description": "Workflow semantic version.",
+          "default": "0.0.1"
+        },
+        "title": {
+          "type": "string",
+          "title": "WorkflowTitle",
+          "description": "Workflow title."
+        },
+        "summary": {
+          "type": "string",
+          "title": "WorkflowSummary",
+          "description": "Workflow summary in Markdown format."
+        },
+        "tags": {
+          "type": "object",
+          "title": "WorkflowTags",
+          "description": "Key/value tags for workflow classification.",
+          "additionalProperties": true
+        },
+        "metadata": {
+          "type": "object",
+          "title": "WorkflowMetadata",
+          "description": "Additional workflow metadata.",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "dsl",
+        "namespace",
+        "name",
+        "version"
+      ]
+    },
+    "input": {
+      "$ref": "#/$defs/input",
+      "title": "Input",
+      "description": "Workflow input configuration."
+    },
+    "use": {
+      "$ref": "#/$defs/reusableComponents",
+      "title": "Use",
+      "description": "Reusable workflow components supported by this implementation."
+    },
+    "do": {
+      "$ref": "#/$defs/taskList",
+      "title": "Do",
+      "description": "Tasks to execute in this workflow."
+    },
+    "timeout": {
+      "title": "DoTimeout",
+      "description": "Workflow-level timeout configuration. Applied to the implicit root task that wraps all tasks declared under `do`. Overrides the `WORKFLOW_TASK_DEFAULT_TIMEOUT_SEC` environment variable (default 3600s) and allows specifying durations longer than 1 hour.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/timeout",
+          "title": "TimeoutDefinition",
+          "description": "The workflow's timeout configuration."
+        },
+        {
+          "type": "string",
+          "title": "TimeoutReference",
+          "description": "The name of a named timeout defined in reusable components."
+        }
+      ]
+    },
+    "output": {
+      "$ref": "#/$defs/output",
+      "title": "Output",
+      "description": "Workflow output configuration."
+    }
+  },
+  "$defs": {
+    "reusableComponents": {
+      "type": "object",
+      "title": "ReusableComponents",
+      "description": "Reusable workflow components.",
+      "unevaluatedProperties": false,
+      "properties": {
+        "timeouts": {
+          "type": "object",
+          "title": "ReusableTimeouts",
+          "description": "Named timeout definitions.",
+          "additionalProperties": {
+            "$ref": "#/$defs/timeout"
+          }
+        },
+        "authentications": {
+          "type": "object",
+          "title": "ReusableAuthentications",
+          "description": "Named authentication policy definitions referenced via authentication.use.",
+          "additionalProperties": {
+            "$ref": "#/$defs/authenticationPolicy"
+          }
+        },
+        "secrets": {
+          "type": "array",
+          "title": "ReusableSecrets",
+          "description": "Declared secret names. Values are supplied at runtime via the WORKFLOW_SECRET_<UPPER_SNAKE_NAME> environment variable.",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "secretBasedAuthenticationPolicy": {
+      "title": "SecretBasedAuthenticationPolicy",
+      "description": "Reference to a declared secret (under use.secrets), resolved from the WORKFLOW_SECRET_<UPPER_SNAKE_NAME> environment variable.",
+      "type": "object",
+      "required": [
+        "use"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "use": {
+          "type": "string",
+          "title": "SecretBasedAuthenticationUse"
+        }
+      }
+    },
+    "authenticationPolicy": {
+      "title": "AuthenticationPolicy",
+      "description": "Inline authentication policy. Property values may be literals or runtime expressions, or the scheme may reference a declared secret via { use: <name> }.",
+      "type": "object",
+      "oneOf": [
+        {
+          "title": "BasicAuthenticationPolicy",
+          "required": [
+            "basic"
+          ],
+          "properties": {
+            "basic": {
+              "title": "BasicAuthentication",
+              "oneOf": [
+                {
+                  "title": "BasicAuthenticationProperties",
+                  "type": "object",
+                  "required": [
+                    "username",
+                    "password"
+                  ],
+                  "unevaluatedProperties": false,
+                  "properties": {
+                    "username": {
+                      "type": "string",
+                      "title": "BasicAuthenticationUsername"
+                    },
+                    "password": {
+                      "type": "string",
+                      "title": "BasicAuthenticationPassword"
+                    }
+                  }
+                },
+                {
+                  "$ref": "#/$defs/secretBasedAuthenticationPolicy"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "title": "BearerAuthenticationPolicy",
+          "required": [
+            "bearer"
+          ],
+          "properties": {
+            "bearer": {
+              "title": "BearerAuthentication",
+              "oneOf": [
+                {
+                  "title": "BearerAuthenticationProperties",
+                  "type": "object",
+                  "required": [
+                    "token"
+                  ],
+                  "unevaluatedProperties": false,
+                  "properties": {
+                    "token": {
+                      "type": "string",
+                      "title": "BearerAuthenticationToken"
+                    }
+                  }
+                },
+                {
+                  "$ref": "#/$defs/secretBasedAuthenticationPolicy"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "taskList": {
+      "title": "TaskList",
+      "description": "Ordered list of named tasks.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "title": "TaskItem",
+        "minProperties": 1,
+        "maxProperties": 1,
+        "additionalProperties": {
+          "$ref": "#/$defs/task"
+        }
+      }
+    },
+    "taskBase": {
+      "type": "object",
+      "title": "TaskBase",
+      "description": "Base properties inherited by all task types.",
+      "properties": {
+        "if": {
+          "type": "string",
+          "title": "TaskBaseIf",
+          "description": "Runtime expression to conditionally execute this task."
+        },
+        "input": {
+          "$ref": "#/$defs/input",
+          "title": "TaskBaseInput",
+          "description": "Task input configuration."
+        },
+        "output": {
+          "$ref": "#/$defs/output",
+          "title": "TaskBaseOutput",
+          "description": "Task output configuration."
+        },
+        "export": {
+          "$ref": "#/$defs/export",
+          "title": "TaskBaseExport",
+          "description": "Export task output to workflow context."
+        },
+        "timeout": {
+          "title": "TaskTimeout",
+          "oneOf": [
+            {
+              "$ref": "#/$defs/timeout",
+              "title": "TaskTimeoutDefinition",
+              "description": "Task timeout configuration."
+            },
+            {
+              "type": "string",
+              "title": "TaskTimeoutReference",
+              "description": "Reference to named timeout configuration."
+            }
+          ]
+        },
+        "then": {
+          "$ref": "#/$defs/flowDirective",
+          "title": "TaskBaseThen",
+          "description": "Flow control directive executed after task completion."
+        },
+        "metadata": {
+          "type": "object",
+          "title": "TaskMetadata",
+          "description": "Additional task metadata.",
+          "additionalProperties": true
+        },
+        "checkpoint": {
+          "type": "boolean",
+          "title": "Checkpoint",
+          "description": "Save workflow state after this task for checkpoint/restart.",
+          "default": false
+        }
+      }
+    },
+    "task": {
+      "title": "Task",
+      "description": "Single unit of work within a workflow.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/forkTask"
+        },
+        {
+          "$ref": "#/$defs/forTask"
+        },
+        {
+          "$ref": "#/$defs/raiseTask"
+        },
+        {
+          "$ref": "#/$defs/callTask"
+        },
+        {
+          "$ref": "#/$defs/runTask"
+        },
+        {
+          "$ref": "#/$defs/setTask"
+        },
+        {
+          "$ref": "#/$defs/switchTask"
+        },
+        {
+          "$ref": "#/$defs/tryTask"
+        },
+        {
+          "$ref": "#/$defs/doTask"
+        },
+        {
+          "$ref": "#/$defs/waitTask"
+        }
+      ]
+    },
+    "forkTask": {
+      "type": "object",
+      "title": "ForkTask",
+      "description": "Execute multiple tasks concurrently, optionally competing for single result.",
+      "required": [
+        "fork"
+      ],
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/taskBase"
+        },
+        {
+          "properties": {
+            "fork": {
+              "type": "object",
+              "title": "ForkTaskConfiguration",
+              "description": "Concurrent branch configuration.",
+              "unevaluatedProperties": false,
+              "required": [
+                "branches"
+              ],
+              "properties": {
+                "branches": {
+                  "$ref": "#/$defs/taskList",
+                  "title": "ForkBranches"
+                },
+                "compete": {
+                  "type": "boolean",
+                  "title": "ForkCompete",
+                  "description": "Enable competition mode where first completed task wins.",
+                  "default": false
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "doTask": {
+      "type": "object",
+      "title": "DoTask",
+      "description": "Execute tasks sequentially.",
+      "required": [
+        "do"
+      ],
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/taskBase"
+        },
+        {
+          "properties": {
+            "do": {
+              "$ref": "#/$defs/taskList",
+              "title": "DoTaskConfiguration",
+              "description": "Tasks to execute in sequence."
+            }
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "for"
+            ]
+          }
+        }
+      ]
+    },
+    "forTask": {
+      "type": "object",
+      "title": "ForTask",
+      "description": "Iterate over collection, executing subtasks for each item.",
+      "required": [
+        "for",
+        "do"
+      ],
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/taskBase"
+        },
+        {
+          "properties": {
+            "for": {
+              "type": "object",
+              "title": "ForTaskConfiguration",
+              "description": "Loop iteration configuration.",
+              "unevaluatedProperties": false,
+              "properties": {
+                "each": {
+                  "type": "string",
+                  "title": "ForEach",
+                  "description": "Variable name for current item (access via $variable_name for jq, {{ variable_name }} for liquid).",
+                  "default": "item"
+                },
+                "in": {
+                  "type": "string",
+                  "title": "ForIn",
+                  "description": "Runtime expression returning collection to iterate."
+                },
+                "at": {
+                  "type": "string",
+                  "title": "ForAt",
+                  "description": "Variable name for current index (access via $variable_name for jq, {{ variable_name }} for liquid).",
+                  "default": "index"
+                }
+              },
+              "required": [
+                "in"
+              ]
+            },
+            "while": {
+              "type": "string",
+              "title": "While",
+              "description": "Runtime expression for loop continuation condition."
+            },
+            "inParallel": {
+              "type": "boolean",
+              "title": "ForInParallel",
+              "description": "Execute subtasks in parallel.",
+              "default": false
+            },
+            "onError": {
+              "type": "string",
+              "title": "ForOnError",
+              "description": "Error handling strategy (continue to process remaining items or break the loop).",
+              "enum": [
+                "continue",
+                "break"
+              ],
+              "default": "break"
+            },
+            "do": {
+              "$ref": "#/$defs/taskList",
+              "title": "ForTaskDo"
+            }
+          }
+        }
+      ]
+    },
+    "raiseTask": {
+      "type": "object",
+      "title": "RaiseTask",
+      "description": "Trigger and propagate errors intentionally.",
+      "required": [
+        "raise"
+      ],
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/taskBase"
+        },
+        {
+          "properties": {
+            "raise": {
+              "type": "object",
+              "title": "RaiseTaskConfiguration",
+              "description": "Error to raise.",
+              "unevaluatedProperties": false,
+              "properties": {
+                "error": {
+                  "title": "RaiseTaskError",
+                  "oneOf": [
+                    {
+                      "$ref": "#/$defs/error",
+                      "title": "RaiseErrorDefinition",
+                      "description": "Inline error definition."
+                    },
+                    {
+                      "type": "string",
+                      "title": "RaiseErrorReference",
+                      "description": "Reference to named error definition."
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "error"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "callTask": {
+      "type": "object",
+      "title": "CallTask",
+      "description": "Invoke a service through an Open Workflow call task.",
+      "required": [
+        "call",
+        "with"
+      ],
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/taskBase"
+        },
+        {
+          "properties": {
+            "call": {
+              "type": "string",
+              "title": "CallTaskType",
+              "description": "Supported call types (HTTP and gRPC unary).",
+              "enum": [
+                "http",
+                "grpc"
+              ]
+            },
+            "with": {
+              "title": "CallTaskWith",
+              "description": "Call input. HTTP or gRPC parameters.",
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/callHttp"
+                },
+                {
+                  "$ref": "#/$defs/callGrpc"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "callHttp": {
+      "type": "object",
+      "title": "CallHttp",
+      "description": "HTTP call parameters supported by the jobworkerp adapter.",
+      "required": [
+        "method",
+        "endpoint"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "method": {
+          "type": "string",
+          "title": "HttpMethod",
+          "description": "HTTP method to execute."
+        },
+        "endpoint": {
+          "title": "HttpEndpoint",
+          "description": "Literal endpoint URI or endpoint object.",
+          "oneOf": [
+            {
+              "type": "string",
+              "title": "HttpEndpointUri"
+            },
+            {
+              "type": "object",
+              "title": "HttpEndpointObject",
+              "required": [
+                "uri"
+              ],
+              "unevaluatedProperties": false,
+              "properties": {
+                "uri": {
+                  "type": "string",
+                  "title": "HttpEndpointObjectUri"
+                },
+                "authentication": {
+                  "title": "HttpEndpointAuthentication",
+                  "description": "Endpoint authentication. Inline bearer/basic policy, or a reference to a named policy declared under use.authentications.",
+                  "oneOf": [
+                    {
+                      "$ref": "#/$defs/authenticationPolicy"
+                    },
+                    {
+                      "title": "AuthenticationPolicyReference",
+                      "type": "object",
+                      "required": [
+                        "use"
+                      ],
+                      "unevaluatedProperties": false,
+                      "properties": {
+                        "use": {
+                          "type": "string",
+                          "title": "AuthenticationPolicyUse",
+                          "description": "Name of a policy declared under use.authentications."
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        "headers": {
+          "type": "object",
+          "title": "HttpHeaders",
+          "description": "Header map. Values are converted to strings by the executor.",
+          "additionalProperties": true
+        },
+        "query": {
+          "type": "object",
+          "title": "HttpQuery",
+          "description": "Query parameter map. Values are converted to strings by the executor.",
+          "additionalProperties": true
+        },
+        "body": {
+          "title": "HttpBody",
+          "description": "Request body. Non-string values are serialized as JSON."
+        },
+        "output": {
+          "type": "string",
+          "title": "HttpOutput",
+          "description": "HTTP output shape.",
+          "enum": [
+            "content",
+            "response"
+          ],
+          "default": "content"
+        },
+        "redirect": {
+          "title": "HttpRedirect",
+          "description": "Accepted for validation but not executed in Phase 1."
+        }
+      }
+    },
+    "callGrpc": {
+      "type": "object",
+      "title": "CallGrpc",
+      "description": "gRPC unary call parameters supported by the jobworkerp adapter. The arguments map is sent as a JSON body resolved via server reflection.",
+      "required": [
+        "service",
+        "method"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "proto": {
+          "title": "GrpcProto",
+          "description": "Official proto resource reference. Accepted for validation but not executed by the jobworkerp adapter (reflection is used instead); rejected at execution time."
+        },
+        "service": {
+          "type": "object",
+          "title": "GrpcService",
+          "description": "gRPC service connection target.",
+          "required": [
+            "name",
+            "host"
+          ],
+          "unevaluatedProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "title": "GrpcServiceName",
+              "description": "Fully qualified gRPC service name (e.g. package.Service)."
+            },
+            "host": {
+              "type": "string",
+              "title": "GrpcServiceHost",
+              "description": "Hostname or IP of the gRPC server."
+            },
+            "port": {
+              "type": "integer",
+              "title": "GrpcServicePort",
+              "description": "Port of the gRPC server."
+            },
+            "authentication": {
+              "title": "GrpcServiceAuthentication",
+              "description": "Service authentication. Inline bearer policy, or a reference to a named policy declared under use.authentications. Only bearer is supported; basic is rejected at execution time.",
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/authenticationPolicy"
+                },
+                {
+                  "title": "AuthenticationPolicyReference",
+                  "type": "object",
+                  "required": [
+                    "use"
+                  ],
+                  "unevaluatedProperties": false,
+                  "properties": {
+                    "use": {
+                      "type": "string",
+                      "title": "AuthenticationPolicyUse",
+                      "description": "Name of a policy declared under use.authentications."
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "method": {
+          "type": "string",
+          "title": "GrpcMethod",
+          "description": "Name of the gRPC method to invoke on the service."
+        },
+        "arguments": {
+          "type": "object",
+          "title": "GrpcArguments",
+          "description": "Name/value mapping of the call arguments. Serialized to a JSON request body and converted to protobuf by the runner via reflection.",
+          "additionalProperties": true
+        }
+      }
+    },
+    "runTask": {
+      "type": "object",
+      "title": "RunTask",
+      "description": "Execute external processes, commands, or workflows.",
+      "required": [
+        "run"
+      ],
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/taskBase"
+        },
+        {
+          "properties": {
+            "useStreaming": {
+              "type": "boolean",
+              "default": false,
+              "title": "UseStreamingExecution",
+              "description": "Whether to use streaming execution mode.\nWhen true:\n- Job is executed with streaming enabled\n- Intermediate results are broadcast via JobResultService/ListenStream\n- Final result is collected using collect_stream and stored in raw_output\nUseful for LLM runners or other long-running processes where progress monitoring is needed.\n"
+            },
+            "run": {
+              "type": "object",
+              "title": "RunTaskConfiguration",
+              "description": "Process execution configuration.",
+              "unevaluatedProperties": false,
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/runWorker"
+                },
+                {
+                  "$ref": "#/$defs/runRunner"
+                },
+                {
+                  "$ref": "#/$defs/runFunction"
+                },
+                {
+                  "$ref": "#/$defs/runScript"
+                },
+                {
+                  "$ref": "#/$defs/runShell"
+                },
+                {
+                  "$ref": "#/$defs/runContainer"
+                },
+                {
+                  "$ref": "#/$defs/runWorkflow"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "properties": {
+        "run": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/runWorker"
+            },
+            {
+              "$ref": "#/$defs/runRunner"
+            },
+            {
+              "$ref": "#/$defs/runFunction"
+            },
+            {
+              "$ref": "#/$defs/runScript"
+            },
+            {
+              "$ref": "#/$defs/runShell"
+            },
+            {
+              "$ref": "#/$defs/runContainer"
+            },
+            {
+              "$ref": "#/$defs/runWorkflow"
+            }
+          ]
+        }
+      }
+    },
+    "runRunner": {
+      "type": "object",
+      "title": "RunRunner",
+      "description": "Execute using a runner configuration.",
+      "required": [
+        "runner"
+      ],
+      "properties": {
+        "await": {
+          "type": "boolean",
+          "default": true,
+          "title": "AwaitProcessCompletion",
+          "description": "Wait for process completion before continuing."
+        },
+        "runner": {
+          "type": "object",
+          "title": "RunJobRunner",
+          "description": "Executes a job using a specified runner.",
+          "unevaluatedProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "title": "RunnerName",
+              "description": "The name of the runner (runtime environment) that executes the job (e.g., COMMAND, HTTP, GRPC, PYTHON_COMMAND, LLM_CHAT, MCP server names, plugin names, etc.)"
+            },
+            "using": {
+              "type": "string",
+              "title": "Using",
+              "description": "Selects which implementation to use for runners with multiple tools.\n\n- **Required**: For runners with multiple tools (e.g., fetch server with \"fetch\" and \"fetch_html\")\n- **Optional**: For single-tool runners (auto-selected)\n\nExamples:\n- MCP fetch server: using: \"fetch_html\"\n- MCP time server (single tool): can be omitted\n- COMMAND runner: not needed\n"
+            },
+            "settings": {
+              "type": "object",
+              "title": "InitializeSettings",
+              "description": "The initialization settings, if any. Runtime expressions can be used to transform each value (not keys, no mixed plain text)."
+            },
+            "options": {
+              "$ref": "#/$defs/workerOptions"
+            },
+            "arguments": {
+              "type": "object",
+              "title": "JobArguments",
+              "description": "A key/value mapping of arguments to use when running the runner as job. Runtime expressions are supported for value transformation.",
+              "additionalProperties": true
+            }
+          },
+          "required": [
+            "name",
+            "arguments"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "workerOptions": {
+      "type": "object",
+      "title": "WorkerOptions",
+      "description": "The options to use when running the worker.",
+      "properties": {
+        "channel": {
+          "type": "string",
+          "title": "Channel",
+          "description": "The channel to use when running the worker (controls execution concurrency)."
+        },
+        "queueType": {
+          "type": "string",
+          "title": "QueueType",
+          "description": "Defines how jobs are queued and persisted. Values: NORMAL (default, in-memory only), WITH_BACKUP (in-memory with database backup), DB_ONLY (database only).",
+          "enum": [
+            "NORMAL",
+            "WITH_BACKUP",
+            "DB_ONLY"
+          ]
+        },
+        "responseType": {
+          "type": "string",
+          "title": "ResponseType",
+          "description": "Defines how job results should be returned to the client. Values: NO_RESULT (async, no wait), DIRECT (default, synchronous with result).",
+          "enum": [
+            "NO_RESULT",
+            "DIRECT"
+          ]
+        },
+        "storeSuccess": {
+          "type": "boolean",
+          "title": "StoreSuccessResult",
+          "description": "Whether to store successful results in the database."
+        },
+        "storeFailure": {
+          "type": "boolean",
+          "title": "StoreFailureResult",
+          "description": "Whether to store failure results in the database."
+        },
+        "useStatic": {
+          "type": "boolean",
+          "title": "UseStaticWorker",
+          "description": "Whether to use a static worker (persisted in database with pooled initialization)."
+        },
+        "retry": {
+          "$ref": "#/$defs/retryPolicy",
+          "title": "RetryPolicyDefinition",
+          "description": "The retry policy to use, if any, when catching errors."
+        },
+        "broadcastResults": {
+          "type": "boolean",
+          "title": "BroadcastResultsToListener",
+          "description": "Whether to broadcast results to listeners."
+        }
+      }
+    },
+    "runWorker": {
+      "type": "object",
+      "title": "RunWorker",
+      "description": "Execute using a worker configuration.",
+      "required": [
+        "worker"
+      ],
+      "properties": {
+        "await": {
+          "type": "boolean",
+          "default": true,
+          "title": "AwaitProcessCompletion",
+          "description": "Wait for process completion before continuing."
+        },
+        "worker": {
+          "type": "object",
+          "title": "RunJobWorker",
+          "description": "Executes a job using a specified worker (configured runner with settings and options).",
+          "unevaluatedProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "title": "WorkerName",
+              "description": "The name of the worker that executes this job (user-defined)."
+            },
+            "using": {
+              "type": "string",
+              "title": "Using",
+              "description": "Selects which method to use for multi-method runners.\n\nFor single-method runners, this field is optional (auto-selected if omitted).\n"
+            },
+            "arguments": {
+              "type": "object",
+              "title": "FunctionArguments",
+              "description": "A key/value mapping of arguments to use when running the function. Runtime expressions are supported for value transformation.",
+              "additionalProperties": true
+            }
+          },
+          "required": [
+            "name",
+            "arguments"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "runFunction": {
+      "type": "object",
+      "title": "RunFunction",
+      "description": "Execute using a function configuration.",
+      "required": [
+        "function"
+      ],
+      "properties": {
+        "await": {
+          "type": "boolean",
+          "default": true,
+          "title": "AwaitProcessCompletion",
+          "description": "Wait for process completion before continuing."
+        },
+        "function": {
+          "type": "object",
+          "title": "RunJobFunction",
+          "description": "Executes a job using a specified function(runner or worker).",
+          "unevaluatedProperties": false,
+          "oneOf": [
+            {
+              "type": "object",
+              "title": "RunnerFunction",
+              "description": "Execute using a runner with optional settings",
+              "properties": {
+                "runnerName": {
+                  "type": "string",
+                  "description": "The name of the runner that executes job"
+                },
+                "using": {
+                  "type": "string",
+                  "description": "Selects which implementation to use for runners with multiple tools.\n\n- **Required**: For runners with multiple tools\n- **Optional**: For single-tool runners (auto-selected)\n"
+                },
+                "settings": {
+                  "type": "object",
+                  "description": "The initialization settings JSON, if any. (ref. jobworkerp.data.RunnerData.runner_settings_proto schema) Runtime expression can be used to transform each value (not keys, no mixed plain text)."
+                },
+                "options": {
+                  "$ref": "#/$defs/workerOptions"
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "A key/value mapping of arguments JSON (ref. jobworkerp.data.RunnerData.job_args_proto schema) to use when running the function. Runtime expressions are supported for value transformation.",
+                  "additionalProperties": true
+                }
+              },
+              "required": [
+                "runnerName",
+                "arguments"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "title": "WorkerFunction",
+              "description": "Execute using a pre-configured worker",
+              "properties": {
+                "workerName": {
+                  "type": "string",
+                  "description": "The name of the worker that executes job"
+                },
+                "using": {
+                  "type": "string",
+                  "title": "Using",
+                  "description": "Selects which method to use for multi-method runners.\n\nFor single-method runners, this field is optional (auto-selected if omitted).\n"
+                },
+                "arguments": {
+                  "type": "object",
+                  "description": "A key/value mapping of arguments JSON to use when running the function. Runtime expressions are supported for value transformation.",
+                  "additionalProperties": true
+                }
+              },
+              "required": [
+                "workerName",
+                "arguments"
+              ],
+              "additionalProperties": false
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "runScript": {
+      "type": "object",
+      "title": "RunScript",
+      "description": "Execute inline or external scripts. This is close to Open Workflow\nv1.0.0 run.script. await is supported (await: false runs fire-and-forget),\nand return shapes the process result (stdout/stderr/code/all/none, default\nstdout). Unlike run.shell / run.container, run.script has no\ntreatNonzeroAsError / successExitCodes option: a non-zero exit always\nfails the task before return is applied, so return: code / all only\nobserve a successful exit (0).\n",
+      "required": [
+        "script"
+      ],
+      "properties": {
+        "await": {
+          "type": "boolean",
+          "default": true,
+          "title": "AwaitProcessCompletion",
+          "description": "Wait for process completion before continuing."
+        },
+        "return": {
+          "type": "string",
+          "title": "ProcessReturnType",
+          "description": "Process output type to return.",
+          "enum": [
+            "stdout",
+            "stderr",
+            "code",
+            "all",
+            "none"
+          ],
+          "default": "stdout"
+        },
+        "script": {
+          "type": "object",
+          "title": "ScriptConfiguration",
+          "description": "Script execution configuration. unevaluatedProperties is true to allow language-specific properties (e.g., virtualenv for Python, modulePaths for JavaScript).",
+          "unevaluatedProperties": true,
+          "required": [
+            "language"
+          ],
+          "properties": {
+            "language": {
+              "type": "string",
+              "title": "ScriptLanguage",
+              "description": "Script language identifier (e.g., 'python', 'javascript'). Validated at runtime."
+            },
+            "code": {
+              "type": "string",
+              "title": "InlineCode",
+              "description": "Inline script code to execute"
+            },
+            "source": {
+              "$ref": "#/$defs/externalResource",
+              "title": "ExternalSource",
+              "description": "External script resource reference"
+            },
+            "arguments": {
+              "type": "object",
+              "title": "ScriptArguments",
+              "description": "Arguments passed to the script. Runtime expressions are supported for value transformation. Each key becomes a variable in the script.",
+              "additionalProperties": true
+            },
+            "environment": {
+              "type": "object",
+              "title": "EnvironmentVariables",
+              "description": "Environment variables for script execution",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "oneOf": [
+            {
+              "required": [
+                "code"
+              ]
+            },
+            {
+              "required": [
+                "source"
+              ]
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "setTask": {
+      "type": "object",
+      "title": "SetTask",
+      "description": "Set data as context variables.",
+      "required": [
+        "set"
+      ],
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/taskBase"
+        },
+        {
+          "properties": {
+            "set": {
+              "type": "object",
+              "title": "SetTaskConfiguration",
+              "description": "Data to set as context variables.",
+              "minProperties": 1,
+              "additionalProperties": true
+            }
+          }
+        }
+      ]
+    },
+    "switchTask": {
+      "type": "object",
+      "title": "SwitchTask",
+      "description": "Conditional branching based on runtime conditions.",
+      "required": [
+        "switch"
+      ],
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/taskBase"
+        },
+        {
+          "properties": {
+            "switch": {
+              "type": "array",
+              "title": "SwitchTaskConfiguration",
+              "description": "Switch case definitions.",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "title": "SwitchItem",
+                "minProperties": 1,
+                "maxProperties": 1,
+                "additionalProperties": {
+                  "type": "object",
+                  "title": "SwitchCase",
+                  "description": "Case condition and action definition.",
+                  "unevaluatedProperties": false,
+                  "required": [
+                    "then"
+                  ],
+                  "properties": {
+                    "when": {
+                      "type": "string",
+                      "title": "SwitchCaseCondition",
+                      "description": "Runtime expression for case matching."
+                    },
+                    "then": {
+                      "$ref": "#/$defs/flowDirective",
+                      "title": "SwitchCaseOutcome",
+                      "description": "Flow directive for matching case."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "tryTask": {
+      "type": "object",
+      "title": "TryTask",
+      "description": "Error handling with retry and fallback mechanisms.",
+      "required": [
+        "try",
+        "catch"
+      ],
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/taskBase"
+        },
+        {
+          "properties": {
+            "try": {
+              "$ref": "#/$defs/taskList",
+              "title": "TryTaskConfiguration",
+              "description": "Tasks to attempt execution."
+            },
+            "catch": {
+              "type": "object",
+              "title": "TryTaskCatch",
+              "description": "Error handling configuration.",
+              "unevaluatedProperties": false,
+              "properties": {
+                "errors": {
+                  "type": "object",
+                  "title": "CatchErrors",
+                  "properties": {
+                    "with": {
+                      "$ref": "#/$defs/errorFilter"
+                    }
+                  },
+                  "description": "Static error filter configuration."
+                },
+                "as": {
+                  "type": "string",
+                  "title": "CatchAs",
+                  "description": "Variable name to store caught error (defaults to 'error')."
+                },
+                "when": {
+                  "type": "string",
+                  "title": "CatchWhen",
+                  "description": "Runtime expression to enable error catching."
+                },
+                "exceptWhen": {
+                  "type": "string",
+                  "title": "CatchExceptWhen",
+                  "description": "Runtime expression to disable error catching."
+                },
+                "retry": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/$defs/retryPolicy",
+                      "title": "RetryPolicyDefinition",
+                      "description": "Retry policy configuration."
+                    },
+                    {
+                      "type": "string",
+                      "title": "RetryPolicyReference",
+                      "description": "Reference to named retry policy."
+                    }
+                  ]
+                },
+                "do": {
+                  "$ref": "#/$defs/taskList",
+                  "title": "TryTaskCatchDo",
+                  "description": "Tasks to execute when error is caught."
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "waitTask": {
+      "type": "object",
+      "title": "WaitTask",
+      "description": "Pause workflow execution for specified duration.",
+      "required": [
+        "wait"
+      ],
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/taskBase"
+        },
+        {
+          "properties": {
+            "wait": {
+              "$ref": "#/$defs/duration",
+              "title": "WaitTaskConfiguration",
+              "description": "Duration to wait."
+            }
+          }
+        }
+      ]
+    },
+    "flowDirective": {
+      "title": "FlowDirective",
+      "description": "Control flow directive for workflow execution path. Either a reserved keyword or a runtime expression / target task name. Use anyOf (per Open Workflow v1.0.0 spec) instead of oneOf because reserved keywords also satisfy the unconstrained string branch.",
+      "anyOf": [
+        {
+          "title": "FlowDirectiveEnum",
+          "type": "string",
+          "enum": [
+            "continue",
+            "exit",
+            "end",
+            "wait"
+          ],
+          "default": "continue"
+        },
+        {
+          "type": "string",
+          "description": "Runtime expression evaluating to target task name."
+        }
+      ]
+    },
+    "duration": {
+      "oneOf": [
+        {
+          "type": "object",
+          "minProperties": 1,
+          "unevaluatedProperties": false,
+          "properties": {
+            "days": {
+              "type": "integer",
+              "title": "DurationDays",
+              "description": "Number of days."
+            },
+            "hours": {
+              "type": "integer",
+              "title": "DurationHours",
+              "description": "Number of hours."
+            },
+            "minutes": {
+              "type": "integer",
+              "title": "DurationMinutes",
+              "description": "Number of minutes."
+            },
+            "seconds": {
+              "type": "integer",
+              "title": "DurationSeconds",
+              "description": "Number of seconds."
+            },
+            "milliseconds": {
+              "type": "integer",
+              "title": "DurationMilliseconds",
+              "description": "Number of milliseconds."
+            }
+          },
+          "title": "DurationInline",
+          "description": "Inline duration specification using individual time units."
+        },
+        {
+          "type": "string",
+          "pattern": "^P(?!$)(\\d+(?:\\.\\d+)?Y)?(\\d+(?:\\.\\d+)?M)?(\\d+(?:\\.\\d+)?W)?(\\d+(?:\\.\\d+)?D)?(T(?=\\d)(\\d+(?:\\.\\d+)?H)?(\\d+(?:\\.\\d+)?M)?(\\d+(?:\\.\\d+)?S)?)?$",
+          "title": "DurationExpression",
+          "description": "Duration expressed in ISO 8601 format."
+        }
+      ]
+    },
+    "error": {
+      "type": "object",
+      "title": "Error",
+      "description": "Error definition.",
+      "unevaluatedProperties": false,
+      "properties": {
+        "type": {
+          "title": "ErrorType",
+          "description": "URI identifying error type.",
+          "$ref": "#/$defs/uriTemplate"
+        },
+        "status": {
+          "type": "integer",
+          "title": "ErrorStatus",
+          "description": "HTTP status code for this error."
+        },
+        "instance": {
+          "title": "ErrorInstance",
+          "description": "JSON Pointer to error source component.",
+          "type": "string",
+          "format": "json-pointer"
+        },
+        "title": {
+          "description": "Brief error summary.",
+          "title": "ErrorTitle",
+          "type": "string"
+        },
+        "detail": {
+          "title": "ErrorDetails",
+          "description": "Detailed error explanation.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "status"
+      ]
+    },
+    "errorFilter": {
+      "type": "object",
+      "title": "ErrorFilter",
+      "description": "Static error filtering configuration. For dynamic filtering, use catch.when property.",
+      "minProperties": 1,
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Filter by error type value."
+        },
+        "status": {
+          "type": "integer",
+          "description": "Filter by error status code."
+        },
+        "instance": {
+          "type": "string",
+          "description": "Filter by error instance path."
+        },
+        "title": {
+          "type": "string",
+          "description": "Filter by error title."
+        },
+        "details": {
+          "type": "string",
+          "description": "Filter by error details."
+        }
+      }
+    },
+    "uriTemplate": {
+      "title": "UriTemplate",
+      "anyOf": [
+        {
+          "title": "LiteralUriTemplate",
+          "type": "string",
+          "format": "uri-template",
+          "pattern": "^[A-Za-z][A-Za-z0-9+\\-.]*://.*"
+        }
+      ]
+    },
+    "endpoint": {
+      "title": "Endpoint",
+      "description": "Endpoint configuration.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/uriTemplate"
+        },
+        {
+          "title": "EndpointConfiguration",
+          "type": "object",
+          "unevaluatedProperties": false,
+          "properties": {
+            "uri": {
+              "title": "EndpointUri",
+              "description": "Endpoint URI.",
+              "$ref": "#/$defs/uriTemplate"
+            }
+          },
+          "required": [
+            "uri"
+          ]
+        }
+      ]
+    },
+    "externalResource": {
+      "type": "object",
+      "title": "ExternalResource",
+      "description": "External resource configuration.",
+      "unevaluatedProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "title": "ExternalResourceName",
+          "description": "Resource name."
+        },
+        "endpoint": {
+          "$ref": "#/$defs/endpoint",
+          "title": "ExternalResourceEndpoint",
+          "description": "Resource endpoint."
+        }
+      },
+      "required": [
+        "endpoint"
+      ]
+    },
+    "input": {
+      "type": "object",
+      "title": "Input",
+      "description": "Input configuration for workflow or task.",
+      "unevaluatedProperties": false,
+      "properties": {
+        "schema": {
+          "$ref": "#/$defs/schema",
+          "title": "InputSchema",
+          "description": "Schema for input validation."
+        },
+        "from": {
+          "title": "InputFrom",
+          "description": "Runtime expression to transform input data.",
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object"
+            }
+          ]
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "title": "Output",
+      "description": "Output configuration for workflow or task.",
+      "unevaluatedProperties": false,
+      "properties": {
+        "schema": {
+          "$ref": "#/$defs/schema",
+          "title": "OutputSchema",
+          "description": "Schema for output validation."
+        },
+        "as": {
+          "title": "OutputAs",
+          "description": "Runtime expression to transform output data.",
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object"
+            }
+          ]
+        }
+      }
+    },
+    "export": {
+      "type": "object",
+      "title": "Export",
+      "description": "Export configuration for context variables.",
+      "unevaluatedProperties": false,
+      "properties": {
+        "schema": {
+          "$ref": "#/$defs/schema",
+          "title": "ExportSchema",
+          "description": "Schema for context validation."
+        },
+        "as": {
+          "title": "ExportAs",
+          "description": "Runtime expression to export data to context.",
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object"
+            }
+          ]
+        }
+      }
+    },
+    "retryPolicy": {
+      "type": "object",
+      "title": "RetryPolicy",
+      "description": "Retry policy configuration.",
+      "unevaluatedProperties": false,
+      "properties": {
+        "delay": {
+          "$ref": "#/$defs/duration",
+          "title": "RetryDelay",
+          "description": "Delay between retry attempts."
+        },
+        "backoff": {
+          "type": "object",
+          "title": "RetryBackoff",
+          "description": "Backoff strategy for retry durations.",
+          "unevaluatedProperties": false,
+          "oneOf": [
+            {
+              "title": "ConstantBackoff",
+              "properties": {
+                "constant": {
+                  "type": "object",
+                  "description": "Constant backoff configuration (empty object)."
+                }
+              },
+              "required": [
+                "constant"
+              ]
+            },
+            {
+              "title": "ExponentialBackOff",
+              "properties": {
+                "exponential": {
+                  "type": "object",
+                  "description": "Exponential backoff configuration (empty object)."
+                }
+              },
+              "required": [
+                "exponential"
+              ]
+            },
+            {
+              "title": "LinearBackoff",
+              "properties": {
+                "linear": {
+                  "type": "object",
+                  "description": "Linear backoff configuration (empty object)."
+                }
+              },
+              "required": [
+                "linear"
+              ]
+            }
+          ]
+        },
+        "limit": {
+          "type": "object",
+          "title": "RetryLimit",
+          "unevaluatedProperties": false,
+          "properties": {
+            "attempt": {
+              "type": "object",
+              "title": "RetryLimitAttempt",
+              "unevaluatedProperties": false,
+              "properties": {
+                "count": {
+                  "type": "integer",
+                  "title": "RetryLimitAttemptCount",
+                  "description": "Maximum retry attempts."
+                },
+                "duration": {
+                  "$ref": "#/$defs/duration",
+                  "title": "RetryLimitAttemptDuration",
+                  "description": "Maximum duration per retry attempt."
+                }
+              }
+            }
+          },
+          "description": "Retry limits configuration."
+        }
+      }
+    },
+    "schema": {
+      "type": "object",
+      "title": "Schema",
+      "description": "Schema definition configuration.",
+      "unevaluatedProperties": false,
+      "properties": {
+        "format": {
+          "type": "string",
+          "default": "json",
+          "title": "SchemaFormat",
+          "description": "Schema format (defaults to 'json'). Use `{format}:{version}` for versioning."
+        }
+      },
+      "oneOf": [
+        {
+          "title": "SchemaInline",
+          "properties": {
+            "document": {
+              "description": "Inline schema definition."
+            }
+          },
+          "required": [
+            "document"
+          ]
+        },
+        {
+          "title": "SchemaExternal",
+          "properties": {
+            "resource": {
+              "$ref": "#/$defs/externalResource",
+              "title": "SchemaExternalResource",
+              "description": "External schema resource."
+            }
+          },
+          "required": [
+            "resource"
+          ]
+        }
+      ]
+    },
+    "timeout": {
+      "type": "object",
+      "title": "Timeout",
+      "description": "Timeout configuration.",
+      "unevaluatedProperties": false,
+      "properties": {
+        "after": {
+          "$ref": "#/$defs/duration",
+          "title": "TimeoutAfter",
+          "description": "Timeout duration."
+        }
+      },
+      "required": [
+        "after"
+      ]
+    },
+    "processResult": {
+      "type": "object",
+      "title": "ProcessResult",
+      "description": "Process execution result when return type is 'all'.",
+      "unevaluatedProperties": false,
+      "properties": {
+        "code": {
+          "type": "integer",
+          "title": "ProcessExitCode",
+          "description": "Process exit code."
+        },
+        "stdout": {
+          "type": "string",
+          "title": "ProcessStandardOutput",
+          "description": "Process STDOUT content."
+        },
+        "stderr": {
+          "type": "string",
+          "title": "ProcessStandardError",
+          "description": "Process STDERR content."
+        }
+      },
+      "required": [
+        "code",
+        "stdout",
+        "stderr"
+      ]
+    },
+    "plainString": {
+      "type": "string",
+      "title": "PlainString",
+      "description": "Plain string without runtime expressions.",
+      "minLength": 1,
+      "pattern": "^\\s*(?!.*\\$\\{).*$"
+    },
+    "runShell": {
+      "type": "object",
+      "title": "RunShell",
+      "description": "Execute a shell command. Some optional fields are jobworkerp extensions.",
+      "required": [
+        "shell"
+      ],
+      "properties": {
+        "await": {
+          "type": "boolean",
+          "default": true,
+          "title": "AwaitProcessCompletion",
+          "description": "Wait for process completion before continuing."
+        },
+        "return": {
+          "type": "string",
+          "title": "ProcessReturnType",
+          "description": "Process output type to return.",
+          "enum": [
+            "stdout",
+            "stderr",
+            "code",
+            "all",
+            "none"
+          ],
+          "default": "stdout"
+        },
+        "shell": {
+          "$ref": "#/$defs/shellConfiguration"
+        }
+      },
+      "additionalProperties": false
+    },
+    "shellConfiguration": {
+      "title": "ShellConfiguration",
+      "description": "Shell command configuration. A string is treated as the command.",
+      "oneOf": [
+        {
+          "type": "string",
+          "title": "ShellCommandLine"
+        },
+        {
+          "type": "object",
+          "title": "ShellCommand",
+          "required": [
+            "command"
+          ],
+          "properties": {
+            "command": {
+              "type": "string",
+              "title": "ShellCommandName"
+            },
+            "args": {
+              "type": "array",
+              "title": "ShellCommandArguments",
+              "default": [],
+              "items": {
+                "type": "string"
+              }
+            },
+            "workingDir": {
+              "type": "string",
+              "title": "ShellWorkingDirectory"
+            },
+            "withMemoryMonitoring": {
+              "type": "boolean",
+              "title": "ShellMemoryMonitoring",
+              "description": "Enable process memory observation. (jobworkerp extension)"
+            },
+            "treatNonzeroAsError": {
+              "type": "boolean",
+              "title": "ShellTreatNonzeroAsError",
+              "description": "Treat non-zero exit codes as task failure unless the code is listed in successExitCodes. (jobworkerp extension)"
+            },
+            "successExitCodes": {
+              "type": "array",
+              "title": "ShellSuccessExitCodes",
+              "description": "Additional process exit codes to treat as success. (jobworkerp extension)",
+              "default": [],
+              "items": {
+                "type": "integer",
+                "format": "int32"
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "runContainer": {
+      "type": "object",
+      "title": "RunContainer",
+      "description": "Execute a container. Some optional fields are jobworkerp extensions.",
+      "required": [
+        "container"
+      ],
+      "properties": {
+        "await": {
+          "type": "boolean",
+          "default": true,
+          "title": "AwaitProcessCompletion",
+          "description": "Wait for process completion before continuing."
+        },
+        "return": {
+          "type": "string",
+          "title": "ProcessReturnType",
+          "description": "Process output type to return.",
+          "enum": [
+            "stdout",
+            "stderr",
+            "code",
+            "all",
+            "none"
+          ],
+          "default": "stdout"
+        },
+        "container": {
+          "$ref": "#/$defs/containerConfiguration"
+        }
+      },
+      "additionalProperties": false
+    },
+    "containerConfiguration": {
+      "type": "object",
+      "title": "ContainerConfiguration",
+      "required": [
+        "image"
+      ],
+      "properties": {
+        "image": {
+          "type": "string",
+          "title": "ContainerImage"
+        },
+        "command": {
+          "type": "array",
+          "title": "ContainerCommand",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "entrypoint": {
+          "type": "array",
+          "title": "ContainerEntrypoint",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "env": {
+          "type": "object",
+          "title": "ContainerEnvironment",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "user": {
+          "type": "string",
+          "title": "ContainerUser"
+        },
+        "workingDir": {
+          "type": "string",
+          "title": "ContainerWorkingDirectory"
+        },
+        "timeoutSec": {
+          "type": "integer",
+          "format": "uint64",
+          "title": "ContainerTimeoutSec",
+          "description": "Job timeout in seconds. (jobworkerp extension)"
+        },
+        "treatNonzeroAsError": {
+          "type": "boolean",
+          "title": "ContainerTreatNonzeroAsError",
+          "description": "Treat non-zero exit codes as task failure unless the code is listed in successExitCodes. (jobworkerp extension)"
+        },
+        "successExitCodes": {
+          "type": "array",
+          "title": "ContainerSuccessExitCodes",
+          "description": "Additional container process exit codes to treat as success. (jobworkerp extension)",
+          "default": [],
+          "items": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "runWorkflow": {
+      "type": "object",
+      "title": "RunWorkflow",
+      "description": "Execute a nested workflow using jobworkerp's source-based workflow extension.",
+      "required": [
+        "workflow"
+      ],
+      "properties": {
+        "await": {
+          "type": "boolean",
+          "default": true,
+          "title": "AwaitProcessCompletion",
+          "description": "Wait for process completion before continuing."
+        },
+        "workflow": {
+          "$ref": "#/$defs/workflowConfiguration"
+        }
+      },
+      "additionalProperties": false
+    },
+    "workflowConfiguration": {
+      "type": "object",
+      "title": "WorkflowConfiguration",
+      "description": "Nested workflow source. Parent workflow_context is inherited implicitly; workflowContext is not a DSL field. (jobworkerp extension)",
+      "oneOf": [
+        {
+          "required": [
+            "workflowData"
+          ]
+        },
+        {
+          "required": [
+            "workflowUrl"
+          ]
+        }
+      ],
+      "properties": {
+        "workflowData": {
+          "type": "string",
+          "title": "WorkflowData",
+          "description": "Inline nested workflow definition as JSON or YAML. (jobworkerp extension)"
+        },
+        "workflowUrl": {
+          "type": "string",
+          "title": "WorkflowUrl",
+          "description": "Nested workflow definition URL or path. (jobworkerp extension)"
+        },
+        "input": {
+          "title": "WorkflowInput",
+          "description": "Input passed to the nested workflow. Non-string values are serialized as JSON."
+        },
+        "executionId": {
+          "type": "string",
+          "title": "WorkflowExecutionId"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

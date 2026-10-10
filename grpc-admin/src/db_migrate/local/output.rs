@@ -7,38 +7,8 @@
 use std::fmt;
 use std::path::PathBuf;
 
-macro_rules! vocabulary {
-    ($(#[$meta:meta])* $name:ident { $first:ident => $first_text:literal $(, $variant:ident => $text:literal)* $(,)? }) => {
-        $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-        pub enum $name {
-            #[default]
-            $first,
-            $($variant),*
-        }
-
-        impl $name {
-            pub const ALL: &'static [Self] = &[Self::$first $(, Self::$variant)*];
-
-            pub fn as_str(self) -> &'static str {
-                match self {
-                    Self::$first => $first_text,
-                    $(Self::$variant => $text),*
-                }
-            }
-
-            pub fn parse(text: &str) -> Option<Self> {
-                Self::ALL.iter().copied().find(|value| value.as_str() == text)
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str(self.as_str())
-            }
-        }
-    };
-}
+pub use crate::db_migrate::vocabulary::encode_value;
+use crate::db_migrate::vocabulary::vocabulary;
 
 vocabulary!(Command {
     Apply => "local_apply",
@@ -80,6 +50,12 @@ vocabulary!(ErrorCode {
     BackupFailed => "backup_failed",
     RestoreFailed => "restore_failed",
     BundleInvalid => "bundle_invalid",
+    // Refusals of the embedding migration guard (embedding space
+    // management spec §3.8, §3.13).
+    OperationInProgress => "operation_in_progress",
+    StorageMismatch => "storage_mismatch",
+    EmbeddingMigrationInProgress => "embedding_migration_in_progress",
+    BackupSpaceMismatch => "backup_space_mismatch",
 });
 
 vocabulary!(
@@ -91,8 +67,24 @@ vocabulary!(
         // The database predates what this release can adopt; an older
         // release must migrate it first.
         LegacyUpgradeRequired => "legacy_upgrade_required",
+        CheckEnvironment => "check_environment",
+        ManualRecovery => "manual_recovery",
+        // The next steps of an unfinished embedding migration, with the
+        // meaning of the embedding commands' resolution table.
+        AbandonRequired => "abandon_required",
+        ContinueOrRestore => "continue_or_restore",
+        ContinueOrAbandon => "continue_or_abandon",
+        FinalizeRequired => "finalize_required",
     }
 );
+
+/// The unfinished embedding migration a refusal refers to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingAttempt {
+    pub attempt: String,
+    pub attempt_stage: String,
+    pub backup_mode: String,
+}
 
 vocabulary!(Outcome {
     NoOp => "no_op",
@@ -102,20 +94,6 @@ vocabulary!(Outcome {
 /// Non-final progress line; callers may show it but never decide on it.
 pub fn progress_line(stage: Stage) -> String {
     format!("local_progress stage={stage}")
-}
-
-/// Percent-encode everything that could break `key=value` parsing or is not
-/// printable ASCII; path separators stay readable.
-pub fn encode_value(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
-                char::from(byte).to_string()
-            }
-            _ => format!("%{byte:02X}"),
-        })
-        .collect()
 }
 
 fn write_backup(formatter: &mut fmt::Formatter<'_>, backup: &Option<PathBuf>) -> fmt::Result {
@@ -165,6 +143,39 @@ pub struct FailureLine {
     pub error_code: ErrorCode,
     pub resolution: Resolution,
     pub backup: Option<PathBuf>,
+    pub embedding_attempt: Option<EmbeddingAttempt>,
+    pub cancel_operation: Option<&'static str>,
+}
+
+impl FailureLine {
+    pub fn new(
+        command: Command,
+        stage: Stage,
+        error_code: ErrorCode,
+        resolution: Resolution,
+        backup: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            command,
+            stage,
+            error_code,
+            resolution,
+            backup,
+            embedding_attempt: None,
+            cancel_operation: None,
+        }
+    }
+}
+
+impl FailureLine {
+    /// Add the embedding fields a classified failure carries.
+    pub fn with_embedding_fields(mut self, failure: Option<&LocalFailure>) -> Self {
+        if let Some(f) = failure {
+            self.embedding_attempt = f.embedding_attempt.clone();
+            self.cancel_operation = f.cancel_operation;
+        }
+        self
+    }
 }
 
 impl fmt::Display for FailureLine {
@@ -174,7 +185,20 @@ impl fmt::Display for FailureLine {
             "{} status=failed stage={} error_code={} resolution={}",
             self.command, self.stage, self.error_code, self.resolution
         )?;
-        write_backup(formatter, &self.backup)
+        if let Some(a) = &self.embedding_attempt {
+            write!(
+                formatter,
+                " attempt={} attempt_stage={} backup_mode={}",
+                encode_value(&a.attempt),
+                a.attempt_stage,
+                a.backup_mode
+            )?;
+        }
+        write_backup(formatter, &self.backup)?;
+        if let Some(op) = self.cancel_operation {
+            write!(formatter, " cancel_operation={op}")?;
+        }
+        Ok(())
     }
 }
 
@@ -185,6 +209,11 @@ pub struct LocalFailure {
     pub error_code: ErrorCode,
     pub resolution: Resolution,
     pub message: String,
+    /// Backup to report instead of the attempt's own (an embedding backup
+    /// for refusals of the embedding guard).
+    pub backup: Option<PathBuf>,
+    pub embedding_attempt: Option<EmbeddingAttempt>,
+    pub cancel_operation: Option<&'static str>,
 }
 
 impl LocalFailure {
@@ -193,6 +222,9 @@ impl LocalFailure {
             error_code,
             resolution,
             message: message.into(),
+            backup: None,
+            embedding_attempt: None,
+            cancel_operation: None,
         }
     }
 }
@@ -232,13 +264,13 @@ mod tests {
 
     #[test]
     fn failure_line_uses_fixed_vocabulary() {
-        let line = FailureLine {
-            command: Command::Apply,
-            stage: Stage::Backup,
-            error_code: ErrorCode::InsufficientSpace,
-            resolution: Resolution::Retry,
-            backup: None,
-        }
+        let line = FailureLine::new(
+            Command::Apply,
+            Stage::Backup,
+            ErrorCode::InsufficientSpace,
+            Resolution::Retry,
+            None,
+        )
         .to_string();
         assert_eq!(
             line,
@@ -266,16 +298,39 @@ mod tests {
             SuccessLine::Restore.to_string(),
             "local_restore status=completed next_action=apply"
         );
-        let failure = FailureLine {
-            command: Command::Restore,
-            stage: Stage::RestoreValidate,
-            error_code: ErrorCode::BackupIncomplete,
-            resolution: Resolution::Retry,
-            backup: Some("/b".into()),
-        };
+        let failure = FailureLine::new(
+            Command::Restore,
+            Stage::RestoreValidate,
+            ErrorCode::BackupIncomplete,
+            Resolution::Retry,
+            Some("/b".into()),
+        );
         assert_eq!(
             failure.to_string(),
             "local_restore status=failed stage=restore_validate error_code=backup_incomplete resolution=retry backup=/b"
+        );
+    }
+
+    #[test]
+    fn embedding_refusals_add_the_attempt_fields_in_contract_order() {
+        let mut line = FailureLine::new(
+            Command::Apply,
+            Stage::Preflight,
+            ErrorCode::EmbeddingMigrationInProgress,
+            Resolution::RestoreRequired,
+            Some("/e b".into()),
+        );
+        line.embedding_attempt = Some(EmbeddingAttempt {
+            attempt: "a1".into(),
+            attempt_stage: "restoring".into(),
+            backup_mode: "backup".into(),
+        });
+        line.cancel_operation = Some("restore");
+        assert_eq!(
+            line.to_string(),
+            "local_apply status=failed stage=preflight error_code=embedding_migration_in_progress \
+             resolution=restore_required attempt=a1 attempt_stage=restoring backup_mode=backup \
+             backup=/e%20b cancel_operation=restore"
         );
     }
 

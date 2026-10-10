@@ -16,6 +16,18 @@ pub enum DistanceType {
     Dot,
 }
 
+impl DistanceType {
+    /// The `MEMORY_DISTANCE_TYPE` spelling; also the embedding space
+    /// component value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cosine => "cosine",
+            Self::L2 => "l2",
+            Self::Dot => "dot",
+        }
+    }
+}
+
 impl VectorDBConfig {
     /// Build from environment variables. MEMORY_VECTOR_SIZE is required.
     pub fn from_env() -> anyhow::Result<Self> {

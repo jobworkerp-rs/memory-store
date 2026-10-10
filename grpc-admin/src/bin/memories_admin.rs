@@ -7,6 +7,7 @@ use infra::infra::module::RepositoryModule;
 use infra_utils::infra::rdb::UseRdbPool;
 use infra_utils::infra::rdb::{Rdb, RdbPool};
 use protobuf::llm_memory::data::{MemoryId, MemoryKind, MessageRole};
+use std::sync::Arc;
 
 #[cfg(feature = "postgres")]
 const METADATA_TEXT_EXPR: &str = "m.metadata::TEXT";
@@ -116,12 +117,26 @@ async fn run_backfill(args: BackfillArgs) -> Result<()> {
     let pool = repositories.pool();
     let memory_repo = repositories.create_memory_repository();
     let dispatcher = if args.redispatch_text && !args.dry_run {
-        let dispatcher = EmbeddingJobDispatcher::from_env()
-            .context("initializing generic embedding dispatcher")?;
-        dispatcher
-            .ensure_initialized()
+        use infra::infra::embedding_space::{plan, registration, workers};
+        let space = workers::current_space();
+        let registry = registration::WorkerRegistry::new(
+            Arc::new(infra::infra::jobworkerp_ops::EnvJobworkerpConnector::default()),
+            registration::RegistrationPlan {
+                worker_yamls: infra::infra::memory_vector::dispatcher::workers_yaml_paths(
+                    infra::infra::embedding_dispatch::ImageSearchMode::from_env(),
+                ),
+                ..Default::default()
+            },
+            space.clone(),
+            plan::registration_overrides(space.as_ref()),
+            registration::DEFAULT_RETRY_INTERVAL,
+        );
+        registry
+            .register_once()
             .await
-            .context("initializing generic embedding workers")?;
+            .context("registering generic embedding workers")?;
+        let dispatcher = EmbeddingJobDispatcher::from_env(registry)
+            .context("initializing generic embedding dispatcher")?;
         Some(dispatcher)
     } else {
         None

@@ -5,7 +5,8 @@ use crate::protobuf::llm_memory::service::FindRecentListByUserIdRequest;
 use crate::protobuf::llm_memory::service::{
     CountResponse, CreateMemoryResponse, FindCondition, FindListRequest, FindMemoryListRequest,
     MemoryCountCondition, MemoryListEntry, OptionalMemoryResponse, SuccessResponse,
-    UpdateContentNoDispatchRequest, memory_service_server::MemoryService,
+    UpdateContentNoDispatchRequest, WriteBackCaptionRequest, WriteBackCaptionResponse,
+    memory_service_server::MemoryService,
 };
 use crate::service::error_handle::handle_error;
 use crate::service::memory_kind::{normalize_memory_kinds, normalize_thread_search_filter};
@@ -394,6 +395,38 @@ impl<T: MemoryGrpc + Tracing + Send + Debug + Sync + 'static> MemoryService for 
             .await
         {
             Ok(ok) => Ok(Response::new(SuccessResponse { is_success: ok })),
+            Err(e) => Err(handle_error(&e)),
+        }
+    }
+
+    #[tracing::instrument]
+    async fn write_back_caption(
+        &self,
+        request: tonic::Request<WriteBackCaptionRequest>,
+    ) -> Result<tonic::Response<WriteBackCaptionResponse>, tonic::Status> {
+        use crate::protobuf::llm_memory::service::CaptionWriteBackOutcome as Outcome;
+        use app::app::memory::CaptionWriteBack;
+        let _s = Self::trace_request("memory", "write_back_caption", &request);
+        let req = request.get_ref();
+        let (Some(id), Some(media)) = (req.memory_id.as_ref(), req.media_object_id.as_ref()) else {
+            return Err(tonic::Status::invalid_argument(
+                "memory_id and media_object_id are required",
+            ));
+        };
+        match self
+            .app()
+            .write_back_caption(id, media.value, &req.caption)
+            .await
+        {
+            Ok(outcome) => Ok(Response::new(WriteBackCaptionResponse {
+                outcome: match outcome {
+                    CaptionWriteBack::Applied => Outcome::Applied,
+                    CaptionWriteBack::MemoryNotFound => Outcome::MemoryNotFound,
+                    CaptionWriteBack::MediaChanged => Outcome::MediaChanged,
+                    CaptionWriteBack::BodyPresent => Outcome::BodyPresent,
+                    CaptionWriteBack::EmptyCaption => Outcome::EmptyCaption,
+                } as i32,
+            })),
             Err(e) => Err(handle_error(&e)),
         }
     }

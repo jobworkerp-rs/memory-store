@@ -29,6 +29,8 @@ pub struct BackupInfo {
     pub schema_status: String,
     pub schema_version: Option<String>,
     pub bundle_digest: Option<String>,
+    /// Embedding space of the vector tables when the backup holds any.
+    pub embedding_space_id: Option<String>,
 }
 
 /// A directory, other than the SQLite database, that a selected task changes.
@@ -95,6 +97,10 @@ pub struct BackupManifest {
     pub bundle_digest: Option<String>,
     pub sqlite: SqliteEntry,
     pub resources: Vec<ResourceEntry>,
+    /// Embedding space of the backed-up vector tables (absent in backups
+    /// of earlier releases).
+    #[serde(default)]
+    pub embedding_space_id: Option<String>,
 }
 
 impl BackupManifest {
@@ -299,6 +305,7 @@ async fn write_backup(
         bundle_digest: info.bundle_digest.clone(),
         sqlite,
         resources: resource_entries,
+        embedding_space_id: info.embedding_space_id.clone(),
     };
     let bytes = serde_json::to_vec_pretty(&manifest).context("serializing backup manifest")?;
     write_atomically(&backup.join(MANIFEST_FILE), &bytes)
@@ -407,6 +414,7 @@ mod tests {
             schema_status: "managed".to_string(),
             schema_version: Some("20260930000001".to_string()),
             bundle_digest: Some("bundle".to_string()),
+            embedding_space_id: None,
         }
     }
 

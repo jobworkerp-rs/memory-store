@@ -1077,6 +1077,13 @@ async fn embed_intent_text_via_jobworkerp(
     // independent of that kill switch (see the `intent_dispatcher` vs
     // `jobworkerp_client` split in `app/src/module.rs`), so it uses the
     // always-available shared client directly.
+    if !infra::infra::embedding_space::registration::registration_complete() {
+        return Err(LlmMemoryError::OtherError(
+            "FindSimilarByIntentText: embedding workers are not registered in jobworkerp yet"
+                .to_string(),
+        )
+        .into());
+    }
     let worker_name = infra::infra::embedding_dispatch::mm_embedding_worker_name();
     let args = infra::infra::embedding_dispatch::query_embed_text_arguments(intent_text);
     let output = client

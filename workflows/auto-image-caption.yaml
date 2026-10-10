@@ -1,0 +1,72 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: auto-image-caption
+  version: "1.0.0"
+# Generates a caption for an image memory whose body is empty and hands
+# it to memories. memories stores it only if the memory still exists,
+# still links `media_object_id`, and still has an empty body, then
+# dispatches the caption embedding itself. A refused write-back is a
+# normal outcome (deleted memory, changed media, body already written),
+# not a failure.
+input:
+  schema:
+    document:
+      type: object
+      properties:
+        memory_id:
+          type: string
+        media_object_id:
+          type: string
+      required: [memory_id, media_object_id]
+do:
+  - resolveUrl:
+      run:
+        worker:
+          name: memories-media-resolve
+          using: unary
+          arguments:
+            json_body: >-
+              ${ {
+                media_object_id: { value: $workflow.input.media_object_id }
+              } | tojson }
+      output:
+        as:
+          image_url: "${ .jsonBody | fromjson | .url }"
+
+  # LLM chat args: MessageContent.content is a oneof (text XOR image),
+  # so the image and the instruction go in two separate USER messages
+  # (ChatRole USER = 2). The caption comes back in
+  # LLMChatResult.content.text.
+  - generateCaption:
+      run:
+        worker:
+          name: memories-vlm-caption
+          using: chat
+          arguments:
+            json_body: >-
+              ${ {
+                messages: [
+                  { role: 2,
+                    content: { image: { content_type: "image/png",
+                                        source: { url: .image_url } } } },
+                  { role: 2,
+                    content: { text: "Describe this image in detail in Japanese for retrieval." } }
+                ]
+              } | tojson }
+      output:
+        as:
+          caption: "${ .content.text }"
+
+  - writeBackCaption:
+      run:
+        worker:
+          name: memories-write-back-caption
+          using: unary
+          arguments:
+            json_body: >-
+              ${ {
+                memory_id: { value: $workflow.input.memory_id },
+                media_object_id: { value: $workflow.input.media_object_id },
+                caption: .caption
+              } | tojson }
