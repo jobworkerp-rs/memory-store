@@ -493,6 +493,14 @@ async fn resolve_or_create_aggregate_thread(
 
     let mut tx = app.pool.begin().await?;
     let new_thread_id = app.thread_repo.create(&mut *tx, &thread_data).await?;
+    crate::app::thread_group::assign_creation_canonical_key_tx(
+        &infra::infra::thread_group::canonical_key::ThreadCanonicalKeyRepositoryImpl::new(app.pool),
+        &mut tx,
+        new_thread_id.value,
+        user_id,
+        now,
+    )
+    .await?;
     for label in target_labels {
         app.thread_label_repo
             .add_labels_tx(&mut *tx, new_thread_id.value, label, now)

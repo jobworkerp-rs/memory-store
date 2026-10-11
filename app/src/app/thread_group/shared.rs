@@ -1,4 +1,5 @@
-//! Shared state gates and small conversions used across ThreadGroup services.
+//! Shared state gates, small conversions, and the creation-time canonical
+//! key assignment used across ThreadGroup and thread services.
 
 use super::domain::{MembershipRole, MembershipState};
 use super::prelude::*;
@@ -48,11 +49,56 @@ pub(crate) fn known_scope_value(scope: &IdentityScope) -> Option<String> {
 /// Random 64-hex material for a manual / non-source Thread canonical
 /// key. Generated once at thread creation (origin `creation_uuid`); the
 /// stored value is never regenerated.
-pub fn new_manual_thread_canonical_key() -> String {
+fn new_manual_thread_canonical_key() -> String {
     use rand::Rng;
     let mut bytes = [0_u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Assign a new manual / non-source Thread its `creation_uuid` canonical
+/// key inside the creating transaction. Every live Thread must carry a
+/// key: the canonical-key data migration re-verifies that on each
+/// release and stops the deploy on a keyless Thread.
+pub(crate) async fn assign_creation_canonical_key_tx(
+    canonical_keys: &impl ThreadCanonicalKeyRepository,
+    tx: &mut RdbTransaction<'_>,
+    thread_id: i64,
+    user_id: i64,
+    now: i64,
+) -> anyhow::Result<String> {
+    let key = new_manual_thread_canonical_key();
+    canonical_keys
+        .assign_tx(
+            &mut **tx,
+            thread_id,
+            user_id,
+            &key,
+            values::canonical_key_origin::CREATION_UUID,
+            now,
+        )
+        .await?;
+    Ok(key)
+}
+
+/// Asserts the invariant the canonical-key data migration verifies on
+/// every release: the thread has its canonical key (at most one row, by
+/// primary key). For a thread without a source identity it is a
+/// `creation_uuid` key owned by `user_id`; returns it.
+#[cfg(test)]
+pub(crate) async fn assert_creation_canonical_key(
+    pool: &'static RdbPool,
+    thread_id: i64,
+    user_id: i64,
+) -> anyhow::Result<String> {
+    let row = ThreadCanonicalKeyRepositoryImpl::new(pool)
+        .find_by_thread_id(thread_id)
+        .await?
+        .unwrap_or_else(|| panic!("thread {thread_id} has no canonical key"));
+    assert_eq!(row.origin, values::canonical_key_origin::CREATION_UUID);
+    assert_eq!(row.user_id, user_id);
+    assert_eq!(row.key.len(), 64);
+    Ok(row.key)
 }
 
 /// Immutable policy version recorded on every selected relation and

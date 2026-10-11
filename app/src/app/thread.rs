@@ -30,7 +30,7 @@ use crate::app::memory_kind::{
     validate_memory_kind_matches_thread,
 };
 use crate::app::thread_group::{
-    SourceIdentityInput, SuppressionDecision, decide_suppression, new_manual_thread_canonical_key,
+    SourceIdentityInput, SuppressionDecision, assign_creation_canonical_key_tx, decide_suppression,
 };
 use infra::infra::thread_group::canonical_key::{
     ThreadCanonicalKeyRepository, ThreadCanonicalKeyRepositoryImpl,
@@ -444,25 +444,17 @@ pub trait ThreadApp:
             .await?;
 
         // Every Thread gets an immutable canonical key at creation
-        // (design 3.1.1). A manually created / non-source Thread gets a
-        // random `creation_uuid` key persisted in the same transaction;
-        // source-backed imports assign their deterministic key later.
-        {
-            let now = command_utils::util::datetime::now_millis();
-            let canonical_keys =
-                ThreadCanonicalKeyRepositoryImpl::new(self.thread_repository().static_pool());
-            let user_id = to_insert.user_id.map(|u| u.value).unwrap_or(0);
-            canonical_keys
-                .assign_tx(
-                    &mut *tx,
-                    id.value,
-                    user_id,
-                    &new_manual_thread_canonical_key(),
-                    values::canonical_key_origin::CREATION_UUID,
-                    now,
-                )
-                .await?;
-        }
+        // (design 3.1.1). This path never carries a source identity
+        // (source-backed imports go through AddMemoriesBatch), so the key
+        // is always a random `creation_uuid` key.
+        assign_creation_canonical_key_tx(
+            &ThreadCanonicalKeyRepositoryImpl::new(self.thread_repository().static_pool()),
+            &mut tx,
+            id.value,
+            to_insert.user_id.map(|u| u.value).unwrap_or(0),
+            command_utils::util::datetime::now_millis(),
+        )
+        .await?;
 
         // Anchor the default system memory in the junction so that
         // delete_thread's orphan check (NOT EXISTS thread_memory) does
@@ -2678,6 +2670,7 @@ impl ThreadApp for ThreadAppImpl {
         // deleted placeholder and records the owner-local mapping, all in
         // the content transaction. Retracted / superseded relation states
         // are never revived by this step. -----
+        let mut keyed = false;
         if crate::app::thread_group::thread_group_writes_enabled()
             && let Some(identity) = source_identity.as_ref()
             && let Some(key) = identity.key()
@@ -2690,15 +2683,13 @@ impl ThreadApp for ThreadAppImpl {
                 .find_by_thread_id_tx(&mut *tx, thread_id.value)
                 .await?
                 .map(|row| row.key);
+            let already_keyed = assigned_key.is_some();
             let canonical_key = assigned_key
                 .or(marker_canonical_key)
                 .or_else(|| identity.canonical_key());
             if let Some(canonical_key) = canonical_key {
-                if canonical_keys
-                    .find_by_thread_id_tx(&mut *tx, thread_id.value)
-                    .await?
-                    .is_none()
-                {
+                keyed = true;
+                if !already_keyed {
                     canonical_keys
                         .assign_tx(
                             &mut *tx,
@@ -2729,6 +2720,19 @@ impl ThreadApp for ThreadAppImpl {
             source_repo
                 .upsert_resolved_tx(&mut *tx, &key, thread_id.value, now)
                 .await?;
+        }
+        // A Thread created here without a source key is a non-source
+        // Thread: there is no identity, its scope is unknown, or the write
+        // gate is closed so no source mapping backs a source key.
+        if thread_created && !keyed {
+            assign_creation_canonical_key_tx(
+                &ThreadCanonicalKeyRepositoryImpl::new(pool),
+                &mut tx,
+                thread_id.value,
+                target_user_id,
+                now_millis(),
+            )
+            .await?;
         }
 
         // ----- Phase 1 (cont.): user_id alignment between target thread and each memory -----
@@ -8323,14 +8327,9 @@ mod test {
                     ..Default::default()
                 })
                 .await?;
-            let repo = ThreadCanonicalKeyRepositoryImpl::new(pool);
-            let row = repo
-                .find_by_thread_id(thread_id.value)
-                .await?
-                .expect("manual key assigned at creation");
-            assert_eq!(row.origin, values::canonical_key_origin::CREATION_UUID);
-            assert_eq!(row.user_id, 1);
-            assert_eq!(row.key.len(), 64);
+            let key =
+                crate::app::thread_group::assert_creation_canonical_key(pool, thread_id.value, 1)
+                    .await?;
 
             // `ensure_thread_canonical_key` is stable and generates only
             // when missing (a legacy thread row inserted without a key).
@@ -8338,7 +8337,7 @@ mod test {
             let first = reconcile
                 .ensure_thread_canonical_key(thread_id.value, 1, 1_000)
                 .await?;
-            assert_eq!(first, row.key);
+            assert_eq!(first, key);
             infra::infra::thread_group::test_support::insert_thread(pool, 31_001, None).await;
             let generated = reconcile
                 .ensure_thread_canonical_key(31_001, 1, 1_000)
@@ -8348,6 +8347,213 @@ mod test {
                 .ensure_thread_canonical_key(31_001, 1, 1_001)
                 .await?;
             assert_eq!(generated, again, "key must be stable after generation");
+            Ok(())
+        })
+    }
+
+    /// Restores the environment-derived write gate even when the test
+    /// fails, so later tests see the default.
+    struct WriteGateOverride;
+    impl WriteGateOverride {
+        fn set(enabled: bool) -> Self {
+            crate::app::thread_group::set_thread_group_writes_enabled_override(Some(enabled));
+            Self
+        }
+    }
+    impl Drop for WriteGateOverride {
+        fn drop(&mut self) {
+            crate::app::thread_group::set_thread_group_writes_enabled_override(None);
+        }
+    }
+
+    fn channel_upsert_with_identity(
+        user_id: i64,
+        channel: &str,
+        external_id: &str,
+        identity: Option<SourceIdentityInput>,
+    ) -> AddMemoriesBatchInput {
+        AddMemoriesBatchInput {
+            source_identity: identity,
+            ..channel_upsert_input(
+                user_id,
+                channel,
+                vec![batch_memory_input(
+                    external_id,
+                    user_id,
+                    "hi",
+                    1_000,
+                    vec![],
+                )],
+                true,
+            )
+        }
+    }
+
+    fn codex_identity(
+        user_id: i64,
+        scope: common::thread_group_key::IdentityScope,
+        native_id: &str,
+    ) -> SourceIdentityInput {
+        SourceIdentityInput {
+            user_id,
+            source: "codex".to_string(),
+            identity_scope: scope,
+            native_id: native_id.to_string(),
+        }
+    }
+
+    /// A batch import that creates its thread without a source identity
+    /// (plain sessions) assigns a `creation_uuid` key in the same
+    /// transaction; later chunks keep it.
+    #[test]
+    fn run_test_batch_without_source_identity_assigns_creation_key() -> Result<()> {
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_pool().await;
+            let app = build_app(pool);
+            let user_id = 70_101;
+            let channel = &format!(
+                "import:test:creation-key-plain-{}",
+                command_utils::util::datetime::now_millis()
+            );
+            let created = app
+                .add_memories_batch(channel_upsert_with_identity(
+                    user_id, channel, "eid-ck-1", None,
+                ))
+                .await?;
+            assert!(created.thread_created);
+            let thread_id = created.thread_id.value;
+            let key =
+                crate::app::thread_group::assert_creation_canonical_key(pool, thread_id, user_id)
+                    .await?;
+
+            let by_channel = app
+                .add_memories_batch(channel_upsert_with_identity(
+                    user_id, channel, "eid-ck-2", None,
+                ))
+                .await?;
+            assert!(!by_channel.thread_created);
+            assert_eq!(by_channel.thread_id.value, thread_id);
+            let by_id = app
+                .add_memories_batch(AddMemoriesBatchInput {
+                    thread_target: BatchThreadTarget::ExistingThreadId(created.thread_id),
+                    ..channel_upsert_with_identity(user_id, channel, "eid-ck-3", None)
+                })
+                .await?;
+            assert!(!by_id.thread_created);
+            assert_eq!(
+                crate::app::thread_group::assert_creation_canonical_key(pool, thread_id, user_id)
+                    .await?,
+                key,
+                "later chunks must not replace the creation key"
+            );
+            Ok(())
+        })
+    }
+
+    /// An identity whose scope is unknown records no source mapping, so
+    /// its thread is a non-source thread and gets a `creation_uuid` key.
+    #[test]
+    fn run_test_batch_with_unknown_scope_identity_assigns_creation_key() -> Result<()> {
+        use common::thread_group_key::IdentityScope;
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_pool().await;
+            let app = build_app(pool);
+            let user_id = 70_102;
+            let identity = codex_identity(user_id, IdentityScope::unknown(), "ck-unknown");
+            let created = app
+                .add_memories_batch(channel_upsert_with_identity(
+                    user_id,
+                    &format!(
+                        "import:test:creation-key-unknown-{}",
+                        command_utils::util::datetime::now_millis()
+                    ),
+                    "eid-ck-unknown",
+                    Some(identity),
+                ))
+                .await?;
+            assert!(created.thread_created);
+            crate::app::thread_group::assert_creation_canonical_key(
+                pool,
+                created.thread_id.value,
+                user_id,
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    /// With the ThreadGroup write gate closed no source mapping is
+    /// recorded, so a source key would fail the migration's mapping
+    /// check: the new thread gets a `creation_uuid` key instead.
+    #[test]
+    fn run_test_batch_with_write_gate_closed_assigns_creation_key() -> Result<()> {
+        use common::thread_group_key::IdentityScope;
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_pool().await;
+            let _gate = WriteGateOverride::set(false);
+            let app = build_app(pool);
+            let user_id = 70_103;
+            let identity = codex_identity(
+                user_id,
+                IdentityScope::known(String::new()),
+                &format!(
+                    "ck-gate-closed-{}",
+                    command_utils::util::datetime::now_millis()
+                ),
+            );
+            let created = app
+                .add_memories_batch(channel_upsert_with_identity(
+                    user_id,
+                    &format!("import:test:creation-key-gate-{}", identity.native_id),
+                    "eid-ck-gate",
+                    Some(identity),
+                ))
+                .await?;
+            assert!(created.thread_created);
+            crate::app::thread_group::assert_creation_canonical_key(
+                pool,
+                created.thread_id.value,
+                user_id,
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    /// A known source identity keeps its deterministic source key; the
+    /// creation key is only the fallback.
+    #[test]
+    fn run_test_batch_with_source_identity_assigns_source_key() -> Result<()> {
+        use common::thread_group_key::IdentityScope;
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_pool().await;
+            let app = build_app(pool);
+            let user_id = 70_104;
+            let identity = codex_identity(
+                user_id,
+                IdentityScope::known(String::new()),
+                &format!("ck-source-{}", command_utils::util::datetime::now_millis()),
+            );
+            let expected = identity.canonical_key().expect("known scope key");
+            let created = app
+                .add_memories_batch(channel_upsert_with_identity(
+                    user_id,
+                    &format!("import:test:creation-key-source-{}", identity.native_id),
+                    "eid-ck-source",
+                    Some(identity),
+                ))
+                .await?;
+            assert!(created.thread_created);
+            let row = ThreadCanonicalKeyRepositoryImpl::new(pool)
+                .find_by_thread_id(created.thread_id.value)
+                .await?
+                .expect("source key assigned at creation");
+            assert_eq!(row.origin, values::canonical_key_origin::SOURCE_IDENTITY);
+            assert_eq!(row.key, expected);
             Ok(())
         })
     }

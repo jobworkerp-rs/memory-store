@@ -22,11 +22,13 @@ pub use operator::*;
 pub use outbox::*;
 pub use read_search::*;
 pub use reconcile::*;
+#[cfg(test)]
+pub(crate) use shared::assert_creation_canonical_key;
 pub use shared::{
-    EVIDENCE_FINGERPRINT_VERSION, THREAD_GROUP_POLICY_VERSION, new_manual_thread_canonical_key,
+    EVIDENCE_FINGERPRINT_VERSION, THREAD_GROUP_POLICY_VERSION,
     set_thread_group_writes_enabled_override, thread_group_writes_enabled,
 };
 pub(crate) use shared::{
-    ensure_thread_group_writes, known_scope_value, membership_role_of, membership_role_str,
-    membership_state_of, membership_state_str,
+    assign_creation_canonical_key_tx, ensure_thread_group_writes, known_scope_value,
+    membership_role_of, membership_role_str, membership_state_of, membership_state_str,
 };

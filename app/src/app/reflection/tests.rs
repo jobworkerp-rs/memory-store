@@ -96,6 +96,7 @@ async fn reset_reflection_state(pool: &'static RdbPool) {
         format!("DELETE FROM thread_memory WHERE thread_id IN ({thread_ids})"),
         format!("DELETE FROM thread_label WHERE thread_id IN ({thread_ids})"),
         format!("DELETE FROM thread_aggregate_key WHERE thread_id IN ({thread_ids})"),
+        format!("DELETE FROM thread_canonical_key WHERE thread_id IN ({thread_ids})"),
         format!("DELETE FROM thread WHERE id IN ({thread_ids})"),
         "DELETE FROM memory WHERE memory_kind = 7".to_string(),
     ];
@@ -248,7 +249,7 @@ async fn cleanup_finalize_state(
     // (sql template, bind value). Order matters: child rows before
     // their parent, derived stats by origin_user_id, and per-thread
     // junction/label cleanup last.
-    let tasks: [(String, i64); 14] = [
+    let tasks: [(String, i64); 15] = [
         (
             format!(
                 "DELETE FROM reflection_failure_mode WHERE memory_id IN ({by_aggregate_index})"
@@ -279,6 +280,10 @@ async fn cleanup_finalize_state(
         ),
         (
             format!("DELETE FROM memory WHERE id IN ({by_aggregate_index})"),
+            origin_user_id,
+        ),
+        (
+            format!("DELETE FROM thread_canonical_key WHERE thread_id IN ({by_aggregate})"),
             origin_user_id,
         ),
         (
@@ -1712,6 +1717,63 @@ fn run_finalize_origin_distinct_from_aggregate_thread() -> Result<()> {
             on_aggregate.is_empty(),
             "find_by_thread(aggregate) must NOT surface the sidecar — the aggregate \
              only carries the memory via the thread_memory junction"
+        );
+
+        cleanup_finalize_state(pool, origin_thread_id, origin_user_id, &[anchor_memory_id]).await;
+        Ok(())
+    })
+}
+
+/// The aggregate thread is created with a `creation_uuid` canonical key
+/// in the creating transaction (the canonical-key data migration
+/// verifies every thread), and a reused aggregate keeps it.
+#[test]
+fn run_finalize_aggregate_thread_gets_creation_canonical_key() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let pool = setup_pool().await;
+        let origin_user_id: i64 = 999_707;
+        let (origin_thread_id, anchor_memory_id) = seed_origin(pool, origin_user_id).await?;
+        let app = build_app(pool).await;
+        let aggregate_thread_id = || async {
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+                "SELECT thread_id FROM thread_aggregate_key WHERE user_id = {P1}"
+            )))
+            .bind(origin_user_id)
+            .fetch_one(pool)
+            .await
+        };
+
+        app.finalize_generated_reflection(&make_request(
+            origin_thread_id,
+            anchor_memory_id,
+            "reflector_key_first",
+            "20260510",
+            happy_parsed(anchor_memory_id),
+        ))
+        .await?;
+        let created = aggregate_thread_id().await?;
+        let key =
+            crate::app::thread_group::assert_creation_canonical_key(pool, created, origin_user_id)
+                .await?;
+
+        app.finalize_generated_reflection(&make_request(
+            origin_thread_id,
+            anchor_memory_id,
+            "reflector_key_second",
+            "20260510",
+            happy_parsed(anchor_memory_id),
+        ))
+        .await?;
+        assert_eq!(
+            aggregate_thread_id().await?,
+            created,
+            "same labels reuse the aggregate"
+        );
+        assert_eq!(
+            crate::app::thread_group::assert_creation_canonical_key(pool, created, origin_user_id)
+                .await?,
+            key,
+            "a reused aggregate keeps its key"
         );
 
         cleanup_finalize_state(pool, origin_thread_id, origin_user_id, &[anchor_memory_id]).await;

@@ -11,8 +11,8 @@ use super::observation::{
 };
 use super::prelude::*;
 use super::{
-    THREAD_GROUP_POLICY_VERSION, ensure_thread_group_writes, known_scope_value,
-    new_manual_thread_canonical_key,
+    THREAD_GROUP_POLICY_VERSION, assign_creation_canonical_key_tx, ensure_thread_group_writes,
+    known_scope_value,
 };
 use std::collections::HashMap;
 
@@ -1852,17 +1852,14 @@ impl ThreadGroupReconciliationService {
         {
             return Ok(row.key);
         }
-        let key = new_manual_thread_canonical_key();
-        self.canonical_keys
-            .assign_tx(
-                &mut *tx,
-                thread_id,
-                user_id,
-                &key,
-                values::canonical_key_origin::CREATION_UUID,
-                now,
-            )
-            .await?;
+        let key = assign_creation_canonical_key_tx(
+            &self.canonical_keys,
+            &mut tx,
+            thread_id,
+            user_id,
+            now,
+        )
+        .await?;
         tx.commit().await?;
         Ok(key)
     }

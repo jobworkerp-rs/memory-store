@@ -65,7 +65,9 @@ RUN cargo build --release -p grpc-admin --bin memories-db-migrate \
 
 # `front` is the server; `migrate-attachment-to-media` and
 # `cleanup-orphan-media` are operational batch jobs run as one-off k8s
-# Pods from this same image.
+# Pods from this same image. `memories-maintenance` is the client of the
+# maintenance listener (search index reconcile, embedding rebuild and
+# reconcile), run from a Pod inside the cluster.
 # Same feature set as `front` so they link the identical FTS tokenizer
 # (lindera) and postgres backend.
 RUN cargo build --release \
@@ -75,7 +77,8 @@ RUN cargo build --release \
         --bin front \
         --bin migrate-attachment-to-media \
         --bin cleanup-orphan-media \
-        --bin memories-db-migrate
+        --bin memories-db-migrate \
+        --bin memories-maintenance
 
 # ---------- Runtime stage ----------
 FROM debian:bookworm-slim AS runtime
@@ -117,6 +120,7 @@ COPY --from=builder --chown=memories:memories /build/target/release/front ./fron
 COPY --from=builder --chown=memories:memories /build/target/release/migrate-attachment-to-media ./migrate-attachment-to-media
 COPY --from=builder --chown=memories:memories /build/target/release/cleanup-orphan-media ./cleanup-orphan-media
 COPY --from=builder --chown=memories:memories /build/target/release/memories-db-migrate ./memories-db-migrate
+COPY --from=builder --chown=memories:memories /build/target/release/memories-maintenance ./memories-maintenance
 COPY --chown=memories:memories workflows ./workflows
 COPY --chown=memories:memories infra/sql/postgres ./sql/postgres
 COPY --chown=memories:memories infra/atlas ./atlas
