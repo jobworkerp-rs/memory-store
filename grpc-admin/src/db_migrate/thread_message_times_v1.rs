@@ -867,29 +867,49 @@ impl ThreadMessageTimesV1Task {
         Ok(())
     }
 
+    async fn audit_vector_table(
+        &self,
+        repository: &ThreadVectorRepositoryImpl,
+    ) -> Result<VectorScalarAudit> {
+        let mut audit = VectorScalarAudit::default();
+        for thread_id in unique_thread_ids(repository.get_all_thread_ids().await?) {
+            let bounds = message_bounds_for_existing_thread(&self.pool, thread_id).await?;
+            let (records, duplicates) =
+                normalize_vector_records(repository.find_records_by_thread_id(thread_id).await?)?;
+            audit.record_thread(thread_id, bounds, &records, duplicates);
+        }
+        Ok(audit)
+    }
+
+    /// Strict check for cutover phases, where the task owns all writes.
     async fn verify_vector_table_against_rdb(
         &self,
         repository: &ThreadVectorRepositoryImpl,
     ) -> Result<()> {
-        for thread_id in unique_thread_ids(repository.get_all_thread_ids().await?) {
-            let (first, last) = message_bounds_for_existing_thread(&self.pool, thread_id)
-                .await?
-                .context("ThreadVector contains a thread absent from RDB")?;
-            let (records, discarded_duplicates) =
-                normalize_vector_records(repository.find_records_by_thread_id(thread_id).await?)?;
-            if discarded_duplicates != 0 {
-                bail!(
-                    "ThreadVector verification found duplicate row identifiers for thread_id={thread_id}"
-                );
-            }
-            if records.is_empty() {
-                bail!("ThreadVector thread key has no records for thread_id={thread_id}");
-            }
-            for record in records {
-                if record.first_message_at != first || record.last_message_at != last {
-                    bail!("ThreadVector scalar verification failed for thread_id={thread_id}");
-                }
-            }
+        let audit = self.audit_vector_table(repository).await?;
+        if audit.drift_count() > 0 || audit.empty_threads > 0 {
+            bail!("ThreadVector scalar verification failed: {audit}");
+        }
+        Ok(())
+    }
+
+    /// Post-cutover check: only a table-wide reversion fails.
+    async fn verify_vector_not_reverted(
+        &self,
+        repository: &ThreadVectorRepositoryImpl,
+    ) -> Result<()> {
+        let audit = self.audit_vector_table(repository).await?;
+        if audit.reverted() {
+            bail!(
+                "ThreadVector table appears reverted to pre-migration message times: \
+                 no row of a thread with messages carries first/last_message_at ({audit})"
+            );
+        }
+        if audit.drift_count() > 0 {
+            tracing::warn!(
+                "ThreadVector scalars drifted from RDB after migration; \
+                 not a migration failure, resync the affected threads ({audit})"
+            );
         }
         Ok(())
     }
@@ -966,7 +986,7 @@ impl ThreadMessageTimesV1Task {
         if let Some(lease) = lease {
             self.renew_lease(lease).await?;
         }
-        self.verify_vector_table_against_rdb(&repository).await?;
+        self.verify_vector_not_reverted(&repository).await?;
         let outcomes = checkpoint
             .index_outcomes
             .context("migrated vector checkpoint is missing index outcomes")?;
@@ -1109,6 +1129,100 @@ fn verify_matching_vector_records(
         }
     }
     Ok(())
+}
+
+const DRIFT_SAMPLE_LIMIT: usize = 10;
+
+/// Table-wide audit of ThreadVector message-time scalars against the RDB.
+///
+/// RDB and LanceDB share no transaction and runtime scalar sync is
+/// best-effort, so after cutover individual rows can legitimately lag behind
+/// the RDB. Only a table where no row of a non-empty thread carries times at
+/// all indicates the migration itself was undone (e.g. a pre-migration
+/// backup restored); everything else is drift.
+#[derive(Debug, Default)]
+struct VectorScalarAudit {
+    migrated_rows: usize,
+    null_rows: usize,
+    stale_rows: usize,
+    orphan_threads: usize,
+    duplicate_rows: usize,
+    empty_threads: usize,
+    drifted_thread_ids: Vec<i64>,
+}
+
+impl VectorScalarAudit {
+    /// `bounds` is `None` when the thread is absent from the RDB.
+    fn record_thread(
+        &mut self,
+        thread_id: i64,
+        bounds: Option<(Option<i64>, Option<i64>)>,
+        records: &[ThreadVectorRecord],
+        duplicates: usize,
+    ) {
+        if records.is_empty() {
+            self.empty_threads += 1;
+        }
+        let mut drift = duplicates;
+        self.duplicate_rows += duplicates;
+        match bounds {
+            None => {
+                drift += 1;
+                self.orphan_threads += 1;
+            }
+            Some((None, None)) => {
+                let stale = records
+                    .iter()
+                    .filter(|r| r.first_message_at.is_some() || r.last_message_at.is_some())
+                    .count();
+                drift += stale;
+                self.stale_rows += stale;
+            }
+            Some(bounds) => {
+                for record in records {
+                    let row = (record.first_message_at, record.last_message_at);
+                    if row.0.is_none() || row.1.is_none() {
+                        drift += 1;
+                        self.null_rows += 1;
+                        continue;
+                    }
+                    self.migrated_rows += 1;
+                    if row != bounds {
+                        drift += 1;
+                        self.stale_rows += 1;
+                    }
+                }
+            }
+        }
+        if drift > 0 && self.drifted_thread_ids.len() < DRIFT_SAMPLE_LIMIT {
+            self.drifted_thread_ids.push(thread_id);
+        }
+    }
+
+    fn drift_count(&self) -> usize {
+        self.null_rows + self.stale_rows + self.orphan_threads + self.duplicate_rows
+    }
+
+    fn reverted(&self) -> bool {
+        self.migrated_rows == 0 && self.null_rows > 0
+    }
+}
+
+impl std::fmt::Display for VectorScalarAudit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "migrated_rows={} null_rows={} stale_rows={} orphan_threads={} \
+             duplicate_rows={} empty_threads={} sample_thread_ids={:?}",
+            self.migrated_rows,
+            self.null_rows,
+            self.stale_rows,
+            self.orphan_threads,
+            self.duplicate_rows,
+            self.empty_threads,
+            self.drifted_thread_ids
+        )
+    }
 }
 
 #[async_trait]
@@ -1850,6 +1964,280 @@ mod tests {
                     .await
                     .unwrap()
                     .is_none()
+            );
+        });
+    }
+
+    fn test_vector_record(
+        thread_id: i64,
+        chunk_index: i32,
+        first: Option<i64>,
+        last: Option<i64>,
+    ) -> ThreadVectorRecord {
+        ThreadVectorRecord {
+            thread_id,
+            vector_kind: "text".to_string(),
+            chunk_index,
+            begin_position: chunk_index * 3,
+            end_position: chunk_index * 3 + 3,
+            user_id: 7,
+            memory_kind: 1,
+            content: format!("thread-{thread_id}-chunk-{chunk_index}"),
+            description: Some("description".to_string()),
+            labels: vec!["keep".to_string()],
+            embedding: vec![0.1, 0.2, 0.3, 0.4],
+            embedding_model: Some("test-model".to_string()),
+            channel: Some("test".to_string()),
+            created_at: 10,
+            updated_at: 20,
+            first_message_at: first,
+            last_message_at: last,
+            indexed_at: 30,
+        }
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    fn test_vector_config(temp: &tempfile::TempDir) -> ThreadVectorDBConfig {
+        ThreadVectorDBConfig {
+            uri: temp.path().to_string_lossy().into_owned(),
+            table_name: "threads".to_string(),
+            vector_size: 4,
+            distance_type: DistanceType::Cosine,
+            fts: FtsConfig::default(),
+            vector_index: VectorIndexConfig {
+                enabled: false,
+                ..VectorIndexConfig::default()
+            },
+        }
+    }
+
+    #[test]
+    fn scalar_audit_reports_reversion_only_when_no_row_is_migrated() {
+        use super::VectorScalarAudit;
+        let audit = |migrated_rows, null_rows| VectorScalarAudit {
+            migrated_rows,
+            null_rows,
+            ..VectorScalarAudit::default()
+        };
+        assert!(!audit(0, 0).reverted());
+        assert!(audit(0, 1).reverted());
+        assert!(!audit(1, 1).reverted());
+        assert!(!audit(1, 0).reverted());
+    }
+
+    #[test]
+    fn scalar_audit_classifies_rows_against_rdb_bounds() {
+        use super::VectorScalarAudit;
+        let row = |first, last| test_vector_record(1, 0, first, last);
+        let mut audit = VectorScalarAudit::default();
+        audit.record_thread(
+            1,
+            Some((Some(100), Some(200))),
+            &[
+                row(Some(100), Some(200)),
+                row(Some(100), Some(150)),
+                row(None, None),
+            ],
+            0,
+        );
+        audit.record_thread(2, Some((None, None)), &[row(None, None)], 1);
+        audit.record_thread(3, Some((None, None)), &[row(Some(1), Some(2))], 0);
+        audit.record_thread(4, None, &[row(Some(1), Some(2))], 0);
+        audit.record_thread(5, Some((Some(1), Some(1))), &[], 0);
+        assert_eq!(audit.migrated_rows, 2);
+        assert_eq!(audit.null_rows, 1);
+        assert_eq!(audit.stale_rows, 2);
+        assert_eq!(audit.orphan_threads, 1);
+        assert_eq!(audit.duplicate_rows, 1);
+        assert_eq!(audit.empty_threads, 1);
+        assert_eq!(audit.drift_count(), 5);
+        assert_eq!(audit.drifted_thread_ids, vec![1, 2, 3, 4]);
+        assert!(!audit.reverted());
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    struct MigratedFixture {
+        pool: infra_utils::infra::rdb::RdbPool,
+        config: ThreadVectorDBConfig,
+        _temp: tempfile::TempDir,
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    impl MigratedFixture {
+        /// Thread 1 (two chunks) and thread 3 have messages; thread 2 is
+        /// empty. The task is applied to completion before tests mutate it.
+        async fn new() -> Self {
+            let pool = test_pool().await;
+            sqlx::raw_sql(
+                "INSERT INTO thread (id, created_at, updated_at) VALUES (1, 10, 20), (2, 11, 21), (3, 12, 22);\
+                 INSERT INTO memory (id, created_at) VALUES (101, 100), (102, 200), (103, 150);\
+                 INSERT INTO thread_memory (thread_id, memory_id) VALUES (1, 101), (1, 102), (3, 103);",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let config = test_vector_config(&temp);
+            let fixture = Self {
+                pool,
+                config,
+                _temp: temp,
+            };
+            fixture
+                .overwrite(vec![
+                    test_vector_record(1, 0, None, None),
+                    test_vector_record(1, 1, None, None),
+                    test_vector_record(2, 0, None, None),
+                    test_vector_record(3, 0, None, None),
+                ])
+                .await;
+            assert_eq!(
+                fixture
+                    .task()
+                    .apply("execution-1", "test")
+                    .await
+                    .unwrap()
+                    .vector_outcome,
+                "migrated"
+            );
+            fixture
+        }
+
+        fn task(&self) -> ThreadMessageTimesV1Task {
+            ThreadMessageTimesV1Task::new_with_vector_config(
+                self.pool.clone(),
+                catalog::thread_message_times_v1().unwrap(),
+                Some(self.config.clone()),
+            )
+            .unwrap()
+        }
+
+        async fn repository(&self) -> ThreadVectorRepositoryImpl {
+            ThreadVectorRepositoryImpl::new(self.config.clone())
+                .await
+                .unwrap()
+        }
+
+        async fn overwrite(&self, records: Vec<ThreadVectorRecord>) {
+            self.repository().await.batch_upsert(records).await.unwrap();
+        }
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn completed_reverification_tolerates_runtime_scalar_drift() {
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let fixture = MigratedFixture::new().await;
+            // A later message whose vector scalar sync never landed.
+            sqlx::raw_sql(
+                "INSERT INTO memory (id, created_at) VALUES (104, 300);\
+                 INSERT INTO thread_memory (thread_id, memory_id) VALUES (1, 104);\
+                 UPDATE thread SET last_message_at = 300 WHERE id = 1;",
+            )
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+
+            fixture.task().verify().await.unwrap();
+            assert_eq!(
+                fixture
+                    .task()
+                    .apply("execution-2", "test")
+                    .await
+                    .unwrap()
+                    .vector_outcome,
+                "already_completed"
+            );
+        });
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn completed_reverification_rejects_table_reverted_to_unmigrated_times() {
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let fixture = MigratedFixture::new().await;
+            fixture
+                .overwrite(vec![
+                    test_vector_record(1, 0, None, None),
+                    test_vector_record(1, 1, None, None),
+                    test_vector_record(3, 0, None, None),
+                ])
+                .await;
+
+            let error = fixture.task().verify().await.unwrap_err();
+            assert!(error.to_string().contains("reverted"), "{error:#}");
+        });
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn completed_reverification_tolerates_partial_null_rows() {
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let fixture = MigratedFixture::new().await;
+            fixture
+                .overwrite(vec![test_vector_record(3, 0, None, None)])
+                .await;
+
+            fixture.task().verify().await.unwrap();
+        });
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn completed_reverification_tolerates_orphan_rows() {
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let fixture = MigratedFixture::new().await;
+            fixture
+                .overwrite(vec![test_vector_record(99, 0, Some(1), Some(2))])
+                .await;
+
+            fixture.task().verify().await.unwrap();
+        });
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn completed_reverification_accepts_table_with_only_empty_thread_rows() {
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let fixture = MigratedFixture::new().await;
+            let empty_rows = fixture
+                .repository()
+                .await
+                .find_records_by_thread_id(2)
+                .await
+                .unwrap();
+            ThreadVectorRepositoryImpl::drop_table_if_exists(
+                &fixture.config,
+                &fixture.config.table_name,
+            )
+            .await
+            .unwrap();
+            fixture.overwrite(empty_rows).await;
+            // Recreating the table drops indexes; rebuild them so only the
+            // scalar audit is under test.
+            let repository = fixture.repository().await;
+            repository.maintenance_build_fts(false).await.unwrap();
+
+            fixture.task().verify().await.unwrap();
+        });
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn completed_reverification_rejects_missing_canonical_table() {
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            let fixture = MigratedFixture::new().await;
+            ThreadVectorRepositoryImpl::drop_table_if_exists(
+                &fixture.config,
+                &fixture.config.table_name,
+            )
+            .await
+            .unwrap();
+
+            let error = fixture.task().verify().await.unwrap_err();
+            assert!(
+                error.to_string().contains("canonical table is missing"),
+                "{error:#}"
             );
         });
     }

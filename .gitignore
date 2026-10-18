@@ -32,3 +32,8 @@ __pycache__/
 /lancedb-maintenance/
 /.serena/
 
+# Local-only operations material (production repair scripts, incident
+# records). It embeds cluster names, registry digests and private paths, and
+# tracked files are mirrored to the public repository, so it must never be
+# committed.
+/ops-local/
