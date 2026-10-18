@@ -212,7 +212,7 @@ prompt は `memories-import upsert-generation-workers` で登録する言語別 
 
 reflection のチューニング knob (`context_limit_tokens`, `window_size_turns` 等) は本ワークフローではデフォルト値のみ使う。きめ細かい調整が必要な場合は `thread-reflection-batch.yaml` を直接 enqueue する。
 
-ラベル / スレッド ID で reflection 範囲を絞りたい場合も `thread-reflection-batch.yaml` を直接呼ぶ (本ラッパは summary と同じ `updated_after_ms` 窓を使うため、label_filter / thread_ids を expose していない)。
+ラベル / スレッド ID で reflection 範囲を絞りたい場合も `thread-reflection-batch.yaml` を直接呼ぶ (本ラッパは summary と同じ `last_message_after_ms` 窓を使うため、label_filter / thread_ids を expose していない)。
 
 ### 短スパン (1時間おき) 運用
 
@@ -240,7 +240,7 @@ jobworkerp-client -a http://localhost:9000 job enqueue-workflow \
 ポイント:
 
 - `since_lookback_seconds` は **periodic 間隔より長め** に取る (1 時間 cron なら 3900 秒 = 65 分)。NTP / cron jitter / 書き込み中ファイルのマージン (memories-import 側 60 秒既定) をすべて吸収できる
-- `range_start_ms` は `since_iso` と独立に **処理範囲の起点 (`since_date` 00:00 +tz)** に固定されるので、`since_override` / `now_minus` で `--since` を前に進めても thread-summary-batch の `updated_after_ms` は range 全体をカバーし続ける (取りこぼし防止)。**これは「単一日の開始」ではなく「範囲の起点」**。range mode (`since_date` 指定時) では `range_start_ms` から `end_date` 24:00 in tz までが処理範囲
+- `range_start_ms` は `since_iso` と独立に **処理範囲の起点 (`since_date` 00:00 +tz)** に固定されるので、`since_override` / `now_minus` で `--since` を前に進めても thread-summary-batch の `last_message_after_ms` は range 全体をカバーし続ける (取りこぼし防止)。**これは「単一日の開始」ではなく「範囲の起点」**。range mode (`since_date` 指定時) では `range_start_ms` から `end_date` 24:00 in tz までが処理範囲
 - `since_override` を使う場合は **UTC 整数秒 ISO 8601 (`Z` 形式、`2026-05-08T08:00:00Z`)** のみ受理。`+HH:MM` オフセット付き / `.123Z` 小数秒付きは workflow 入力 schema (`pattern`) と runtime の両方で reject されるので、誤った形式が silent に range_start_ms へフォールバックすることはない
 → daily-work-summary は `scope=agent:claude_code` の独立した集約スレッド/メモリを生成。空配列で起動した「全 project 横断」版とは衝突しない。
 

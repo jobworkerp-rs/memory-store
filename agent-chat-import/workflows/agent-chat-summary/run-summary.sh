@@ -54,6 +54,15 @@
 #   --min-thread-count <n>             default: 1
 #   --max-context-chars <n>            default: 200000
 #
+# ThreadGroup summary stage (opt-in; off by default):
+#   --enable-thread-group-summary      run thread-group-summary-batch
+#                                      using sibling defaults
+#   --thread-group-summary-batch-yaml  <path|url>
+#   --thread-group-summary-channel <name>
+#                                      default: thread_group_summary
+#                                      (must not be llm_batch; register it
+#                                      in jobworkerp WORKER_CHANNELS)
+#
 # Reflection stage (opt-in; off by default):
 #   --enable-reflection                run thread-reflection-batch
 #                                      using sibling defaults
@@ -123,6 +132,11 @@ FORCE_RESUMMARIZE="false"
 MIN_THREAD_COUNT="1"
 MAX_CONTEXT_CHARS="200000"
 
+# ThreadGroup summary
+ENABLE_THREAD_GROUP_SUMMARY="false"
+THREAD_GROUP_SUMMARY_BATCH_YAML="${WORKFLOWS_DIR}/thread-group-summary/thread-group-summary-batch.yaml"
+THREAD_GROUP_SUMMARY_CHANNEL="thread_group_summary"
+
 # Reflection
 ENABLE_REFLECTION="false"
 THREAD_REFLECTION_BATCH_YAML="${WORKFLOWS_DIR}/thread-reflection/thread-reflection-batch.yaml"
@@ -183,6 +197,12 @@ while [[ $# -gt 0 ]]; do
         --force-resummarize)               FORCE_RESUMMARIZE="true"; shift 1 ;;
         --min-thread-count)                MIN_THREAD_COUNT="$2"; shift 2 ;;
         --max-context-chars)               MAX_CONTEXT_CHARS="$2"; shift 2 ;;
+        --enable-thread-group-summary)     ENABLE_THREAD_GROUP_SUMMARY="true"; shift 1 ;;
+        --thread-group-summary-batch-yaml)
+            THREAD_GROUP_SUMMARY_BATCH_YAML="$2"
+            ENABLE_THREAD_GROUP_SUMMARY="true"
+            shift 2 ;;
+        --thread-group-summary-channel)    THREAD_GROUP_SUMMARY_CHANNEL="$2"; shift 2 ;;
         --enable-reflection)               ENABLE_REFLECTION="true"; shift 1 ;;
         --thread-reflection-batch-yaml)
             THREAD_REFLECTION_BATCH_YAML="$2"
@@ -283,6 +303,9 @@ fi
 
 # Path validation.
 WORKFLOW_LABELS=(SUMMARY_YAML THREAD_SUMMARY_BATCH_YAML DAILY_WORK_SUMMARY_BATCH_YAML)
+if [[ "$ENABLE_THREAD_GROUP_SUMMARY" == "true" ]]; then
+    WORKFLOW_LABELS+=(THREAD_GROUP_SUMMARY_BATCH_YAML)
+fi
 if [[ "$ENABLE_REFLECTION" == "true" ]]; then
     WORKFLOW_LABELS+=(THREAD_REFLECTION_BATCH_YAML)
 fi
@@ -322,6 +345,8 @@ INPUT_JSON=$(python3 - <<'PY' \
     "$FORCE_RESUMMARIZE" "$MIN_THREAD_COUNT" "$MAX_CONTEXT_CHARS" \
     "$THREAD_SUMMARY_BATCH_YAML" \
     "$DAILY_WORK_SUMMARY_BATCH_YAML" \
+    "$ENABLE_THREAD_GROUP_SUMMARY" "$THREAD_GROUP_SUMMARY_BATCH_YAML" \
+    "$THREAD_GROUP_SUMMARY_CHANNEL" \
     "$ENABLE_REFLECTION" \
     "$THREAD_REFLECTION_BATCH_YAML" \
     "$REFLECTOR_MODEL" "$REFLECTOR_BASE_URL" "$PROMPT_VERSION" "$OUTPUT_LANGUAGE" \
@@ -340,6 +365,7 @@ import json, sys
  label_prefix, daily_label, extra_filter_csv,
  force, min_thread, max_chars,
  ts_batch, dws_batch,
+ enable_thread_group_summary, tgs_batch, tgs_channel,
  enable_reflection,
  tr_batch,
  reflector_model, reflector_base_url, prompt_version, output_language,
@@ -389,6 +415,10 @@ if grpc_port:
     payload["memories_grpc_port"] = int(grpc_port)
 if extra_filter_csv:
     payload["extra_labels_filter"] = [s.strip() for s in extra_filter_csv.split(",") if s.strip()]
+
+if enable_thread_group_summary == "true":
+    payload["thread_group_summary_batch_yaml"] = tgs_batch
+    payload["thread_group_summary_channel"] = tgs_channel
 
 if enable_reflection == "true":
     payload["thread_reflection_batch_yaml"] = tr_batch

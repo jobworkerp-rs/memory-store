@@ -1,0 +1,541 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: thread-group-summary-batch
+  version: "1.0.0"
+
+input:
+  schema:
+    document:
+      type: object
+      required: [group_owner_user_id, memories_grpc_host, memories_grpc_port, per_thread_batch_yaml]
+      properties:
+        group_owner_user_id:
+          type: integer
+          minimum: 1
+          description: Explicit owner used to select and publish groups.
+        memories_grpc_host: { type: string, default: "localhost" }
+        memories_grpc_port: { type: integer, default: 9100 }
+        memories_grpc_tls: { type: boolean, default: false }
+        per_thread_batch_yaml:
+          type: string
+          description: >-
+            Workflow URL or path of thread-summary-batch.yaml, invoked per
+            member owner to refresh member summaries before aggregation.
+        target_group_ids:
+          type: array
+          items: { type: string, pattern: "^[1-9][0-9]*$" }
+          description: When specified, only these active groups are summarized.
+        target_group_id:
+          type: string
+          pattern: "^[1-9][0-9]*$"
+          description: When specified, only this active group is summarized.
+        expected_membership_snapshot_digest:
+          type: string
+          description: Reject the dispatch if the target group snapshot changed.
+        output_language:
+          type: string
+          enum: ["ja", "en"]
+          default: "ja"
+        max_context_chars: { type: integer, default: 200000 }
+        min_message_count: { type: integer, default: 4 }
+        summary_model: { type: string, default: "qwen3.6:27b" }
+        ollama_base_url: { type: string, default: "http://localhost:11434" }
+        force_resummarize: { type: boolean, default: false }
+        memory_thread_label_prefix:
+          type: string
+          default: "summary"
+          description: Forwarded to the per-thread batch; must match its summary label.
+        activity_after_ms:
+          type: integer
+          minimum: 0
+          description: >-
+            Exclusive lower bound (epoch ms). With activity_before_ms, only
+            groups having a current member whose conversation overlaps the
+            window are summarized; each group is still aggregated from all of
+            its current members. Ignored when target_group_id is given.
+        activity_before_ms:
+          type: integer
+          minimum: 0
+          description: Exclusive upper bound (epoch ms) paired with activity_after_ms.
+
+do:
+  # Fail fast on servers whose ThreadGroup ownership is not scoped per user.
+  - verifyGroupOwnerCapability:
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadGroupService/GetThreadGroupCapabilities"
+            json_body: "{}"
+            as_json: true
+      export:
+        as:
+          group_owner_capability: "${ .jsonBody | fromjson }"
+
+  - requireGroupOwnerCapability:
+      if: "${ ($group_owner_capability.supportsIndependentGroupOwnerScope // $group_owner_capability.supports_independent_group_owner_scope // false) != true }"
+      raise:
+        error:
+          type: "https://memories.local/errors/thread-group-summary/owner-scope-unsupported"
+          status: 412
+          title: "Memories server does not support independent ThreadGroup group ownership"
+
+  - initState:
+      set:
+        generated_groups: "${ [] }"
+        skipped_groups: "${ [] }"
+        stale_groups: "${ [] }"
+        incomplete_groups: "${ [] }"
+        failed_groups: "${ [] }"
+        last_error: "${ null }"
+        group_member_thread_ids: "${ {} }"
+        owner_member_entries: "${ [] }"
+        insufficient_message_thread_ids: "${ [] }"
+        refresh_failed_thread_ids: "${ [] }"
+        refresh_error: "${ null }"
+        single_result: "${ null }"
+
+  # Group summaries consume persisted per-thread summaries. The dependency
+  # refresh below is deliberately in this workflow so a direct group dispatch
+  # cannot aggregate an old per-thread body by accident.
+  - resolveGroupScope:
+      set:
+        browse_by_activity: >-
+          ${ ($workflow.input | has("target_group_id") | not)
+             and (($workflow.input.activity_after_ms // null) != null)
+             and (($workflow.input.activity_before_ms // null) != null) }
+        all_groups: "${ [] }"
+        group_page_token: "${ \"\" }"
+        group_pages_exhausted: "${ false }"
+
+  - fetchGroups:
+      if: "${ $browse_by_activity | not }"
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadGroupService/FindThreadGroupList"
+            json_body: "${ { include_inactive: false, user_id: $workflow.input.group_owner_user_id } | tojson }"
+            as_json: true
+      export:
+        as:
+          all_groups: "${ (.jsonBody // \"[]\") | fromjson }"
+
+  # A member matches when its own conversation overlaps the window: it started
+  # before the window ends and its last message is after the window starts.
+  # The browse filter evaluates every condition against the same member.
+  # All pages are collected before any summary is written, because a write
+  # invalidates the cursor snapshot.
+  - browseGroupsByActivity:
+      if: "${ $browse_by_activity }"
+      for:
+        each: group_page_number
+        in: "${ [range(0; 1000)] }"
+      while: "${ $group_pages_exhausted | not }"
+      do:
+        - readGroupPage:
+            run:
+              function:
+                runnerName: GRPC
+                using: unary
+                settings:
+                  host: "${$workflow.input.memories_grpc_host}"
+                  port: ${$workflow.input.memories_grpc_port}
+                  tls: ${$workflow.input.memories_grpc_tls}
+                  useReflection: true
+                arguments:
+                  method: "/llm_memory.service.ThreadGroupService/SearchThreadGroups"
+                  json_body: >-
+                    ${ {
+                         user_id: $workflow.input.group_owner_user_id,
+                         page_size: 100,
+                         browse_filter: {
+                           last_message_after: $workflow.input.activity_after_ms,
+                           first_message_before: $workflow.input.activity_before_ms
+                         }
+                       }
+                       + (if $group_page_token == "" then {} else { page_token: $group_page_token } end)
+                       | tojson }
+                  as_json: true
+            export:
+              as:
+                group_page_groups: "${ .jsonBody | fromjson | (.results // []) | map(.group) }"
+                group_page_next_token: >-
+                  ${ .jsonBody | fromjson
+                     | (.nextPageToken // .next_page_token // "") | tostring }
+        - collectGroupPage:
+            set:
+              all_groups: "${ $all_groups + $group_page_groups }"
+              group_page_token: "${ $group_page_next_token }"
+              group_pages_exhausted: "${ $group_page_next_token == \"\" }"
+
+  - failIfGroupBrowseIncomplete:
+      if: "${ $browse_by_activity and ($group_pages_exhausted | not) }"
+      raise:
+        error:
+          type: "https://memories.local/errors/thread-group-summary/browse-incomplete"
+          status: 500
+          title: "ThreadGroup activity browse did not reach its last page"
+
+  - dedupeBrowsedGroups:
+      if: "${ $browse_by_activity }"
+      set:
+        all_groups: "${ $all_groups | unique_by(.id.value) }"
+
+  - selectTargetGroups:
+      set:
+        target_groups: >-
+           ${ if ($workflow.input | has("target_group_id"))
+              then ($all_groups // [] | map(select(
+                (.id.value | tostring) == ($workflow.input.target_group_id | tostring)
+                 )))
+              elif ($workflow.input | has("target_group_ids"))
+              then ($all_groups // [] | map(select(
+                .id.value as $gid
+                | $workflow.input.target_group_ids | any(. == ($gid | tostring))
+             )))
+                else ($all_groups // [])
+                end }
+
+  - validateTargetGroup:
+      if: >-
+        ${ ($workflow.input | has("target_group_id"))
+           and (($target_groups | length) != 1) }
+      raise:
+        error:
+          type: "https://memories.local/errors/thread-group-summary/target-not-found"
+          status: 404
+          title: "target ThreadGroup was not found or is inactive"
+
+  # Failure records carry the digest a caller should send when retrying.
+  - resolveRetryDigests:
+      set:
+        retry_digest_by_group: >-
+          ${ $target_groups
+             | map({ key: (.id.value | tostring),
+                     value: ($workflow.input.expected_membership_snapshot_digest
+                             // .membershipSnapshotDigest // null) })
+             | from_entries }
+
+  # Phase 1: read every target group's active members.
+  - collectGroupMembers:
+      for:
+        each: group
+        at: group_index
+        in: "${ $target_groups }"
+      do:
+        - readGroupMembers:
+            try:
+              - validateTargetSnapshot:
+                  if: >-
+                    ${ ($workflow.input | has("expected_membership_snapshot_digest"))
+                       and (($group.membershipSnapshotDigest // "")
+                            != $workflow.input.expected_membership_snapshot_digest) }
+                  raise:
+                    error:
+                      type: "https://memories.local/errors/thread-group-summary/snapshot-changed"
+                      status: 409
+                      title: "membership snapshot changed before generation"
+              - fetchLineage:
+                  run:
+                    function:
+                      runnerName: GRPC
+                      using: unary
+                      settings:
+                        host: "${$workflow.input.memories_grpc_host}"
+                        port: ${$workflow.input.memories_grpc_port}
+                        tls: ${$workflow.input.memories_grpc_tls}
+                        useReflection: true
+                      arguments:
+                        method: "/llm_memory.service.ThreadGroupService/FindThreadGroupLineage"
+                        json_body: "${ { value: $group.id.value, user_id: $workflow.input.group_owner_user_id } | tojson }"
+                        as_json: true
+                  export:
+                    as:
+                      lineage: "${ .jsonBody | fromjson }"
+              - recordGroupMembers:
+                  set:
+                    group_member_thread_ids: >-
+                      ${ $group_member_thread_ids
+                         + { ($group.id.value | tostring):
+                               (($lineage.members // [])
+                                | map(select(.state == "THREAD_GROUP_MEMBER_STATE_ACTIVE"
+                                             and .threadId != null)
+                                      | .threadId | tostring)
+                                | unique) } }
+                    # ProtoJSON encodes int64 fields as strings, while the child
+                    # workflow input schema requires an integer. Reject invalid
+                    # or out-of-range IDs instead of rounding them. Canonical
+                    # decimal parsing keeps numeric int64 bounds exact.
+                    owner_member_entries: >-
+                      ${ def int64_user_id:
+                           (if type == "number" then tostring
+                            elif type == "string" then .
+                            else error("member userId must be an int64")
+                            end)
+                           | if test("^-?(0|[1-9][0-9]*)$") then tonumber
+                             else error("member userId must be an int64")
+                             end
+                           | if (. >= -9223372036854775808
+                                 and . <= 9223372036854775807)
+                             then .
+                             else error("member userId must be an int64")
+                             end;
+                         $owner_member_entries
+                         + (($lineage.members // [])
+                            | map(select(.state == "THREAD_GROUP_MEMBER_STATE_ACTIVE"
+                                         and .threadId != null and .userId != null)
+                                  | { user_id: (.userId | int64_user_id),
+                                      thread_id: (.threadId | tostring) })) }
+            catch:
+              as: error
+              do:
+                - recordGroupReadFailure:
+                    set:
+                      failed_groups: >-
+                        ${ $failed_groups + [{
+                            group_id: ($group.id.value | tostring),
+                            expected_membership_snapshot_digest: $retry_digest_by_group[$group.id.value | tostring],
+                            reason_code: "workflow_failed",
+                            detail: ($error | tostring)
+                          }] }
+                      last_error: "${ $error }"
+
+  # Phase 2: refresh member summaries once per owner, so a thread shared by
+  # several groups is not re-summarized per group. A failed refresh marks
+  # only that owner's threads; groups without them still aggregate.
+  - buildMemberOwnerBatches:
+      set:
+        member_owner_batches: >-
+          ${ $owner_member_entries
+             | group_by(.user_id)
+             | map({ user_id: .[0].user_id, thread_ids: (map(.thread_id) | unique) }) }
+
+  - refreshMemberSummaries:
+      for:
+        each: member_owner
+        at: member_owner_index
+        in: "${ $member_owner_batches }"
+      do:
+        - refreshOwner:
+            try:
+              - refreshOwnerThreadSummaries:
+                  run:
+                    function:
+                      runnerName: WORKFLOW
+                      settings:
+                        workflow_url: "${ $workflow.input.per_thread_batch_yaml }"
+                      options:
+                        channel: llm_batch
+                      arguments:
+                        input: >-
+                          ${ {
+                            user_id: $member_owner.user_id,
+                            target_thread_ids: $member_owner.thread_ids,
+                            memories_grpc_host: $workflow.input.memories_grpc_host,
+                            memories_grpc_port: $workflow.input.memories_grpc_port,
+                            memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                            output_language: $workflow.input.output_language,
+                            summary_model: $workflow.input.summary_model,
+                            ollama_base_url: $workflow.input.ollama_base_url,
+                            min_message_count: $workflow.input.min_message_count,
+                            max_context_chars: $workflow.input.max_context_chars,
+                            memory_thread_label_prefix: $workflow.input.memory_thread_label_prefix,
+                            force_resummarize: $workflow.input.force_resummarize
+                          } | tojson }
+                  export:
+                    as:
+                      owner_refresh_result: "${ .output | fromjson }"
+              # thread-summary-single skips threads below min_message_count
+              # without persisting a summary; the single drops those members.
+              - collectOwnerRefreshResult:
+                  set:
+                    insufficient_message_thread_ids: >-
+                      ${ $insufficient_message_thread_ids
+                         + (($owner_refresh_result.insufficient_message_threads // []) | map(tostring)) }
+                    refresh_failed_thread_ids: >-
+                      ${ $refresh_failed_thread_ids
+                         + (if ($owner_refresh_result.completed // false) == true
+                               and ($owner_refresh_result.failed_count // 0) == 0
+                            then []
+                            elif (($owner_refresh_result.failed_threads // []) | length) > 0
+                            then ($owner_refresh_result.failed_threads | map(tostring))
+                            else $member_owner.thread_ids
+                            end) }
+                    refresh_error: >-
+                      ${ $refresh_error // $owner_refresh_result.last_error }
+            catch:
+              as: error
+              do:
+                - recordOwnerRefreshFailure:
+                    set:
+                      refresh_failed_thread_ids: "${ $refresh_failed_thread_ids + $member_owner.thread_ids }"
+                      refresh_error: "${ $refresh_error // ($error | tostring) }"
+
+  # Phase 3: aggregate each readable group with the language-specific single.
+  - summarizeEachGroup:
+      for:
+        each: group
+        at: group_index
+        in: "${ $target_groups }"
+      onError: continue
+      do:
+        # Mirror thread-summary-batch: the streamed context carries this
+        # (current/total) counter through the long-running group workflow.
+        - reportProgress:
+            set:
+              progress_processed: "${ $group_index + 1 }"
+              progress_total: "${ $target_groups | length }"
+        - summarizeGroup:
+            if: "${ $group_member_thread_ids | has($group.id.value | tostring) }"
+            try:
+              # Never aggregate a member whose refresh failed: its stored
+              # summary may be stale.
+              - rejectRefreshFailedMembers:
+                  if: >-
+                    ${ $group_member_thread_ids[$group.id.value | tostring]
+                       | any(. as $thread_id | $refresh_failed_thread_ids | index([$thread_id]) != null) }
+                  raise:
+                    error:
+                      type: "https://memories.local/errors/thread-group-summary/thread-refresh-failed"
+                      status: 500
+                      title: "per-thread summary refresh failed"
+                      detail: "${ ($refresh_error // \"one or more member summaries failed\") | tostring }"
+
+              # The single worker's registered channel keeps it off the slot
+              # this batch holds while waiting.
+              - invokeSingle:
+                  run:
+                    function:
+                      workerName: '${ "memories-thread-group-summary-single-" + $workflow.input.output_language }'
+                      arguments:
+                        input: >-
+                          ${ {
+                            group_id: ($group.id.value | tostring),
+                            group_owner_user_id: $workflow.input.group_owner_user_id,
+                            memories_grpc_host: $workflow.input.memories_grpc_host,
+                            memories_grpc_port: $workflow.input.memories_grpc_port,
+                            memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                            expected_membership_snapshot_digest: ($workflow.input.expected_membership_snapshot_digest // ""),
+                            insufficient_message_thread_ids: ($insufficient_message_thread_ids | unique),
+                            output_language: $workflow.input.output_language,
+                            summary_model: $workflow.input.summary_model,
+                            ollama_base_url: $workflow.input.ollama_base_url,
+                            force_resummarize: $workflow.input.force_resummarize
+                          } | tojson }
+                  export:
+                    as:
+                      single_result: "${ .output | fromjson }"
+
+              - rejectIncompleteInput:
+                  if: "${ ($single_result.outcome // null) == \"incomplete_input\" }"
+                  raise:
+                    error:
+                      type: "https://memories.local/errors/thread-group-summary/thread-summary-missing"
+                      status: 500
+                      title: "one or more live member threads have no persisted summary"
+                      detail: "${ ($single_result.detail // \"thread-summary-missing\") | tostring }"
+
+              - rejectLogicalFailure:
+                  if: "${ ($single_result.completed // false) | not }"
+                  raise:
+                    error:
+                      type: "https://memories.local/errors/thread-group-summary/single-failed"
+                      status: 500
+                      title: "thread group summary single returned no outcome"
+                      detail: "${ $single_result | tojson }"
+
+              - recordOutcome:
+                  set:
+                    generated_groups: >-
+                      ${ if $single_result.outcome == "generated"
+                         then $generated_groups + [($group.id.value | tostring)]
+                         else $generated_groups end }
+                    stale_groups: >-
+                      ${ if $single_result.outcome == "stale"
+                         then $stale_groups + [($group.id.value | tostring)]
+                         else $stale_groups end }
+                    skipped_groups: >-
+                      ${ if $single_result.outcome == "skipped"
+                         then $skipped_groups + [($group.id.value | tostring)]
+                         else $skipped_groups end }
+            catch:
+              as: error
+              do:
+                - classifyFailure:
+                    set:
+                      is_incomplete_input: >-
+                        ${ ($error | tostring) as $message
+                           | ($message | contains("thread-refresh-failed"))
+                             or ($message | contains("thread-summary-missing")) }
+                - recordFailed:
+                    set:
+                      incomplete_groups: >-
+                        ${ if $is_incomplete_input
+                           then $incomplete_groups + [($group.id.value | tostring)]
+                           else $incomplete_groups end }
+                      failed_groups: >-
+                        ${ $failed_groups + [{
+                            group_id: ($group.id.value | tostring),
+                            expected_membership_snapshot_digest: $retry_digest_by_group[$group.id.value | tostring],
+                            reason_code: (if $is_incomplete_input then "incomplete_input" else "workflow_failed" end),
+                            detail: ($error | tostring)
+                          }] }
+                      last_error: "${ $error }"
+
+  # An item whose own try timed out is skipped by `onError: continue` without
+  # reaching its catch. Count such items as failed so an incomplete run is
+  # never reported as completed.
+  - collectUnaccountedGroups:
+      set:
+        unaccounted_groups: >-
+          ${ ($generated_groups + $skipped_groups + $stale_groups
+              + ($failed_groups | map(.group_id))) as $accounted
+             | $target_groups
+             | map(select((.id.value | tostring) as $id
+                           | $accounted | index($id) | not)) }
+  - recordUnaccountedGroups:
+      if: "${ ($unaccounted_groups | length) > 0 }"
+      set:
+        failed_groups: >-
+          ${ $failed_groups + ($unaccounted_groups | map({
+               group_id: (.id.value | tostring),
+               expected_membership_snapshot_digest: $retry_digest_by_group[.id.value | tostring],
+               reason_code: "workflow_failed",
+               detail: "group ended without an outcome (timed out or aborted)"
+             })) }
+        last_error: >-
+          ${ $last_error // ((($unaccounted_groups | length) | tostring)
+             + " group(s) ended without an outcome (timed out or aborted)") }
+
+output:
+  as:
+    completed: >-
+      ${ ($failed_groups | length) == 0
+         and (($generated_groups | length) + ($skipped_groups | length) + ($stale_groups | length)
+               + ($failed_groups | length)) == ($target_groups | length) }
+    processed_groups: "${ ($generated_groups | length) + ($skipped_groups | length) + ($stale_groups | length) + ($failed_groups | length) }"
+    expected_group_count: "${ $target_groups | length }"
+    generated_count: "${ $generated_groups | length }"
+    skipped_count: "${ $skipped_groups | length }"
+    failed_count: "${ $failed_groups | length }"
+    stale_count: "${ $stale_groups | length }"
+    generated_groups: "${ $generated_groups }"
+    skipped_groups: "${ $skipped_groups }"
+    stale_groups: "${ $stale_groups }"
+    incomplete_groups: "${ $incomplete_groups }"
+    failed_groups: "${ $failed_groups }"
+    last_error: "${ $last_error }"

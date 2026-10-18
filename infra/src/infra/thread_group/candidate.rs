@@ -14,7 +14,7 @@ use super::rows::{
 };
 use crate::error::LlmMemoryError;
 use crate::infra::{IdGeneratorWrapper, UseIdGenerator, fill_timestamps, fill_updated_at};
-use crate::sql::p;
+use crate::sql::{IN_LIST_CHUNK_SIZE, build_in_placeholders, p};
 use anyhow::Result;
 use async_trait::async_trait;
 use infra_utils::infra::rdb::{Rdb, RdbPool, UseRdbPool};
@@ -207,8 +207,20 @@ pub trait ThreadGroupCandidateAssociationRepository:
         )
     }
 
+    /// Row count for one state, without loading rows.
+    async fn count_by_state(&self, state: &str) -> Result<i64> {
+        Ok(sqlx::query_scalar::<Rdb, i64>(concat!(
+            "SELECT COUNT(*) FROM thread_group_candidate_association WHERE state = ",
+            p!(1)
+        ))
+        .bind(state)
+        .fetch_one(self.db_pool())
+        .await
+        .map_err(LlmMemoryError::DBError)?)
+    }
+
     /// Unresolved-candidate work queue (`pending` / `ambiguous` /
-    /// `conflict` / … scans), most recently touched first.
+    /// `conflict` / … scans), least recently touched first.
     async fn list_by_state(
         &self,
         state: &str,
@@ -242,6 +254,64 @@ pub trait ThreadGroupCandidateAssociationRepository:
     /// Candidate rows recorded for one owner-local subject identity —
     /// the app-layer idempotency inspection point (no storage-level
     /// uniqueness by design).
+    /// Rows in `states` whose candidate group is in `group_ids` or whose
+    /// subject thread is in `subject_thread_ids`, each once. States are
+    /// visited in the given order and rows within a state keep the
+    /// `list_by_state` order, so a page-scoped read sees the same order as
+    /// a full scan filtered afterwards. One query per column (not one `OR`)
+    /// keeps each on its single-column index and lets the lists chunk
+    /// independently.
+    async fn list_by_states_for_groups_or_subject_threads(
+        &self,
+        states: &[&str],
+        group_ids: &[i64],
+        subject_thread_ids: &[i64],
+    ) -> Result<Vec<ThreadGroupCandidateAssociationRow>> {
+        if states.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut by_id = std::collections::HashMap::new();
+        for (column, ids) in [
+            ("candidate_group_id", group_ids),
+            ("subject_thread_id", subject_thread_ids),
+        ] {
+            for chunk in ids.chunks(IN_LIST_CHUNK_SIZE) {
+                let cols = CANDIDATE_ASSOCIATION_COLUMNS!();
+                let state_placeholders = build_in_placeholders(states.len(), 1);
+                let id_placeholders = build_in_placeholders(chunk.len(), 1 + states.len());
+                let sql = format!(
+                    "SELECT {cols} FROM thread_group_candidate_association \
+                     WHERE state IN ({state_placeholders}) AND {column} IN ({id_placeholders})"
+                );
+                let mut query = sqlx::query_as::<Rdb, ThreadGroupCandidateAssociationRow>(
+                    sqlx::AssertSqlSafe(sql),
+                );
+                for state in states {
+                    query = query.bind(*state);
+                }
+                for id in chunk {
+                    query = query.bind(id);
+                }
+                for row in query
+                    .fetch_all(self.db_pool())
+                    .await
+                    .map_err(LlmMemoryError::DBError)?
+                {
+                    by_id.insert(row.id, row);
+                }
+            }
+        }
+        let mut rows = by_id.into_values().collect::<Vec<_>>();
+        rows.sort_by_key(|row| {
+            (
+                states.iter().position(|state| *state == row.state),
+                row.updated_at,
+                row.id,
+            )
+        });
+        Ok(rows)
+    }
+
     async fn list_by_subject_identity_tx<'c, E: Executor<'c, Database = Rdb>>(
         &self,
         tx: E,
@@ -493,6 +563,139 @@ mod tests {
         TEST_RUNTIME.block_on(async {
             let pool = setup_thread_group_pool().await;
             _test_candidate_flow(pool).await
+        })
+    }
+
+    #[test]
+    fn scoped_unresolved_listing_matches_filtered_state_scans_sqlite() -> Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_thread_group_pool().await;
+            let repo = ThreadGroupCandidateAssociationRepositoryImpl::new(
+                crate::test_helper::shared_id_generator(),
+                pool,
+            );
+            let (group, other_group, thread, other_thread) =
+                (9_400_001, 9_400_002, 9_400_101, 9_400_102);
+            for (n, state, candidate_group, subject_thread, updated_at) in [
+                (
+                    9_400_201,
+                    values::candidate_state::PENDING,
+                    Some(group),
+                    None,
+                    T0 + 3,
+                ),
+                (
+                    9_400_202,
+                    values::candidate_state::AMBIGUOUS,
+                    None,
+                    Some(thread),
+                    T0 + 1,
+                ),
+                // Matches both lists but must be returned once.
+                (
+                    9_400_203,
+                    values::candidate_state::PENDING,
+                    Some(group),
+                    Some(thread),
+                    T0 + 2,
+                ),
+                (
+                    9_400_204,
+                    values::candidate_state::CONFLICT,
+                    Some(other_group),
+                    None,
+                    T0,
+                ),
+                (
+                    9_400_205,
+                    values::candidate_state::SUPERSEDED,
+                    Some(group),
+                    None,
+                    T0,
+                ),
+                (
+                    9_400_206,
+                    values::candidate_state::PENDING,
+                    None,
+                    Some(other_thread),
+                    T0,
+                ),
+            ] {
+                let mut candidate = new_candidate(n);
+                candidate.state = state.to_string();
+                candidate.candidate_group_id = candidate_group;
+                candidate.subject_thread_id = subject_thread;
+                candidate.updated_at = updated_at;
+                repo.insert_tx(pool, &candidate).await?;
+            }
+            let states = [
+                values::candidate_state::PENDING,
+                values::candidate_state::AMBIGUOUS,
+                values::candidate_state::CONFLICT,
+            ];
+
+            // Same rows and order as scanning each state and filtering.
+            let mut expected = Vec::new();
+            for state in states {
+                expected.extend(
+                    repo.list_by_state(state, None, None)
+                        .await?
+                        .into_iter()
+                        .filter(|row| {
+                            row.candidate_group_id == Some(group)
+                                || row.subject_thread_id == Some(thread)
+                        })
+                        .map(|row| row.id),
+                );
+            }
+            let scoped = repo
+                .list_by_states_for_groups_or_subject_threads(&states, &[group], &[thread])
+                .await?
+                .into_iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>();
+            assert_eq!(scoped.len(), 3);
+            assert_eq!(scoped, expected);
+
+            assert!(
+                repo.list_by_states_for_groups_or_subject_threads(&states, &[], &[])
+                    .await?
+                    .is_empty()
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn count_by_state_matches_list_length_sqlite() -> Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_thread_group_pool().await;
+            let repo = ThreadGroupCandidateAssociationRepositoryImpl::new(
+                crate::test_helper::shared_id_generator(),
+                pool,
+            );
+            for (n, state) in [
+                (9_300_001, values::candidate_state::PENDING),
+                (9_300_002, values::candidate_state::AMBIGUOUS),
+                (9_300_003, values::candidate_state::AMBIGUOUS),
+            ] {
+                let mut candidate = new_candidate(n);
+                candidate.state = state.to_string();
+                repo.insert_tx(pool, &candidate).await?;
+            }
+            for state in [
+                values::candidate_state::PENDING,
+                values::candidate_state::AMBIGUOUS,
+                values::candidate_state::CONFLICT,
+                values::candidate_state::SUPERSEDED,
+            ] {
+                assert_eq!(
+                    repo.count_by_state(state).await?,
+                    repo.list_by_state(state, None, None).await?.len() as i64,
+                    "state {state}"
+                );
+            }
+            Ok(())
         })
     }
 }

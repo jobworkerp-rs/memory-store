@@ -1879,6 +1879,15 @@ pub trait ThreadApp:
             .await
     }
 
+    async fn count_by_user_id(&self, user_id: UserId, memory_kinds: &[i32]) -> Result<i64>
+    where
+        Self: Send + 'static,
+    {
+        self.thread_repository()
+            .count_by_user_id(user_id, memory_kinds)
+            .await
+    }
+
     // Helper to delete memory cache entries
     async fn delete_memory_cache(&self, key: &Arc<String>) -> bool;
 }

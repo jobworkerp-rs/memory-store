@@ -50,7 +50,7 @@ reflection を致命にしている理由: コーディング作業ログ処理�
 | `memories_grpc_url` | memories gRPC エンドポイント URL |
 | `since_date` | `YYYY-MM-DD`。処理範囲の起点 |
 | `end_date` | `YYYY-MM-DD`。処理範囲の終点 |
-| `range_start_ms` | `since_date 00:00 +tz` の epoch ms。`updated_after_ms` の lower bound に使う |
+| `range_start_ms` | `since_date 00:00 +tz` の epoch ms。`last_message_after_ms` の lower bound に使う |
 | `since_ms_utc` | UTC `--since` cutoff の epoch ms (day_start mode では 0) |
 | `thread_summary_batch_yaml` | `thread-summary-batch.yaml` の絶対パスまたは URL |
 | `daily_work_summary_batch_yaml` | `daily-work-summary-batch.yaml` の絶対パスまたは URL |
@@ -71,6 +71,17 @@ reflection を致命にしている理由: コーディング作業ログ処理�
 | `force_resummarize` | `false` | thread-summary / daily-summary 両方に伝達 |
 | `min_thread_count` | `1` | daily-work-summary のスキップ閾値 |
 | `max_context_chars` | `200000` | LLM コンテキスト上限 |
+
+### ThreadGroup 要約段 (任意)
+
+**`thread_group_summary_batch_yaml` を指定すると有効化される。** thread-summary 段の後、daily 段の前に実行する。
+
+| パラメータ | 既定値 | 説明 |
+|---|---|---|
+| `thread_group_summary_batch_yaml` | `""` | `thread-group-summary-batch.yaml` の絶対パス / URL。空で段全体を skip |
+| `thread_group_summary_channel` | `thread_group_summary` | group batch を流す channel。`llm_batch` 以外を jobworkerp の `WORKER_CHANNELS` に登録しておく ([channel 構成](../../README_ja.md#channel-構成) 参照) |
+
+対象は、summary と同じ `last_message_after_ms` 窓から実行時刻までに活動したメンバーを持つ group。`group_owner_user_id` には `user_id` を渡す。group batch の失敗は thread/daily と同じく `outcome: partial` として報告する。
 
 ### reflection 段 (任意)
 
@@ -93,7 +104,7 @@ reflection を致命にしている理由: コーディング作業ログ処理�
 | `experiment_id` | (未指定) | 任意の実験コホートタグ。値が無いと thread-reflection-batch にも渡らない |
 | `experiment_variant` | (未指定) | 任意のバリアントタグ。同上 |
 
-reflection は summary と同じ `updated_after_ms` 窓 (= `max(since_ms_utc, range_start_ms) - 1`) で動く。**ラベル / 個別スレッド絞り込みが必要な場合は本ワークフロー経由ではなく `thread-reflection-batch.yaml` を直接 enqueue すること。**
+reflection は summary と同じ `last_message_after_ms` 窓 (= `max(since_ms_utc, range_start_ms) - 1`) で動く。**ラベル / 個別スレッド絞り込みが必要な場合は本ワークフロー経由ではなく `thread-reflection-batch.yaml` を直接 enqueue すること。**
 
 ### personality 段 (任意)
 
@@ -113,10 +124,13 @@ reflection は summary と同じ `updated_after_ms` 窓 (= `max(since_ms_utc, ra
 
 | キー | 説明 |
 |---|---|
-| `completed` | thread/daily の個別失敗がなく、daily が有効なら成功し、reflection が有効なら成功したとき `true`。個別失敗があると `false` |
-| `outcome` | `succeeded` または `partial`。thread/daily batch が個別失敗を返した場合は `partial` |
+| `completed` | thread/group/daily の個別失敗がなく、daily が有効なら成功し、reflection が有効なら成功したとき `true`。個別失敗があると `false` |
+| `outcome` | `succeeded` または `partial`。thread/group/daily batch が個別失敗を返した場合は `partial` |
 | `thread_summary_succeeded` | bool |
 | `thread_summary_failed` | thread-summary batch が個別スレッドの失敗を返したか |
+| `thread_group_summary_enabled` | bool |
+| `thread_group_summary_succeeded` | bool。group batch が完走したか |
+| `thread_group_summary_failed` | group batch が失敗または未完了の group を返したか |
 | `daily_summary_succeeded` | bool |
 | `daily_summary_failed` | daily-work-summary batch が個別日の失敗を返したか |
 | `reflection_enabled` | bool |

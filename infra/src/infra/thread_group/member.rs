@@ -171,14 +171,11 @@ const DELETE_BY_GROUP_SQL: &str =
 // Read-model helper (design 5.1): latest_activity_at is derived, never
 // stored — max conversation time over current *active* members whose
 // thread row still exists. Deleted placeholders contribute nothing by
-// construction (thread_id is NULL, so the join drops them).
-const FIND_LATEST_ACTIVITY_SQL: &str = concat!(
-    "SELECT MAX(t.last_message_at) FROM thread_group_member m \
-     JOIN thread t ON t.id = m.thread_id \
-     WHERE m.group_id = ",
-    p!(1),
-    " AND m.state = 'active'"
-);
+// construction (thread_id is NULL, so the join drops them). Groups
+// without an active live member produce no row (NULL activity).
+const FIND_LATEST_ACTIVITY_BY_GROUPS_SQL_PREFIX: &str = "SELECT m.group_id, MAX(t.last_message_at) \
+     FROM thread_group_member m JOIN thread t ON t.id = m.thread_id \
+     WHERE m.state = 'active' AND m.group_id IN (";
 
 #[async_trait]
 pub trait ThreadGroupMemberRepository: UseRdbPool + Send + Sync {
@@ -400,6 +397,64 @@ pub trait ThreadGroupMemberRepository: UseRdbPool + Send + Sync {
         Ok(rows)
     }
 
+    /// Current membership of many groups in one round trip per chunk.
+    /// A group never spans two chunks, so each group's rows keep the
+    /// database's `thread_canonical_key` order of `list_current_by_group_id`.
+    async fn list_current_by_group_ids(
+        &self,
+        group_ids: &[i64],
+    ) -> Result<Vec<ThreadGroupMemberRow>> {
+        let mut rows = Vec::new();
+        for chunk in group_ids.chunks(IN_LIST_CHUNK_SIZE) {
+            let placeholders = build_in_placeholders(chunk.len(), 1);
+            let cols = THREAD_GROUP_MEMBER_COLUMNS!();
+            let sql = format!(
+                "SELECT {cols} FROM thread_group_member \
+                 WHERE group_id IN ({placeholders}) AND state IN ('active', 'deleted') \
+                 ORDER BY group_id, thread_canonical_key"
+            );
+            let mut query = sqlx::query_as::<Rdb, ThreadGroupMemberRow>(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(id);
+            }
+            rows.extend(
+                query
+                    .fetch_all(self.db_pool())
+                    .await
+                    .map_err(LlmMemoryError::DBError)?,
+            );
+        }
+        Ok(rows)
+    }
+
+    /// Derived `latest_activity_at` per group (design 5.1). A missing entry
+    /// or a `None` value both mean NULL activity: no current active member
+    /// has a live thread row with a conversation time. Sorting NULLs last
+    /// is the read model's concern, not this query's.
+    async fn find_latest_activity_by_group_ids(
+        &self,
+        group_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, Option<i64>>> {
+        let mut activity = std::collections::HashMap::new();
+        for chunk in group_ids.chunks(IN_LIST_CHUNK_SIZE) {
+            let sql = format!(
+                "{FIND_LATEST_ACTIVITY_BY_GROUPS_SQL_PREFIX}{}) GROUP BY m.group_id",
+                build_in_placeholders(chunk.len(), 1)
+            );
+            let mut query = sqlx::query_as::<Rdb, (i64, Option<i64>)>(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(id);
+            }
+            activity.extend(
+                query
+                    .fetch_all(self.db_pool())
+                    .await
+                    .map_err(LlmMemoryError::DBError)?,
+            );
+        }
+        Ok(activity)
+    }
+
     /// `active -> deleted` placeholder (thread row removal keeps the
     /// node in the lineage tree). Returns false when the current
     /// membership is not active.
@@ -499,24 +554,6 @@ pub trait ThreadGroupMemberRepository: UseRdbPool + Send + Sync {
             .map_err(LlmMemoryError::DBError)?;
         Ok(res.rows_affected())
     }
-
-    /// Derived `latest_activity_at` for one group (design 5.1): NULL
-    /// when no current active member has a live thread row with a
-    /// conversation time. Sorting NULLs last is the read model's
-    /// concern, not this query's.
-    async fn find_latest_activity_at_tx<'c, E: Executor<'c, Database = Rdb>>(
-        &self,
-        tx: E,
-        group_id: i64,
-    ) -> Result<Option<i64>> {
-        Ok(
-            sqlx::query_scalar::<Rdb, Option<i64>>(FIND_LATEST_ACTIVITY_SQL)
-                .bind(group_id)
-                .fetch_one(tx)
-                .await
-                .map_err(LlmMemoryError::DBError)?,
-        )
-    }
 }
 
 pub struct ThreadGroupMemberRepositoryImpl {
@@ -594,12 +631,17 @@ mod tests {
             members.count_current_by_group_id_tx(&mut *tx, g_a).await?,
             1
         );
+        tx.commit().await?;
         // …and contributes nothing to the derived latest activity.
         assert_eq!(
-            members.find_latest_activity_at_tx(&mut *tx, g_a).await?,
+            members
+                .find_latest_activity_by_group_ids(&[g_a])
+                .await?
+                .get(&g_a)
+                .copied()
+                .flatten(),
             None
         );
-        tx.commit().await?;
         let current = members
             .find_current_by_thread_canonical_key(&k)
             .await?
@@ -619,12 +661,17 @@ mod tests {
                 .revive_current_tx(&mut *tx, &k, 1100, T0 + 2)
                 .await?
         );
+        tx.commit().await?;
         // Active member of a live thread carries the conversation time.
         assert_eq!(
-            members.find_latest_activity_at_tx(&mut *tx, g_a).await?,
+            members
+                .find_latest_activity_by_group_ids(&[g_a])
+                .await?
+                .get(&g_a)
+                .copied()
+                .flatten(),
             Some(T0 + 5)
         );
-        tx.commit().await?;
 
         // Move (merge/split step): redirect then insert on destination.
         // The deleted placeholder state was just exercised above; the
@@ -702,6 +749,77 @@ mod tests {
         TEST_RUNTIME.block_on(async {
             let pool = setup_thread_group_pool().await;
             _test_membership_lifecycle(pool).await
+        })
+    }
+
+    async fn _test_batch_reads(pool: &'static RdbPool) -> Result<()> {
+        let groups =
+            ThreadGroupRepositoryImpl::new(crate::test_helper::shared_id_generator(), pool);
+        let members = ThreadGroupMemberRepositoryImpl::new(pool);
+        let g_two = groups.create_tx(pool, &new_group(9_100_001)).await?;
+        let g_deleted = groups.create_tx(pool, &new_group(9_100_002)).await?;
+        let g_empty = groups.create_tx(pool, &new_group(9_100_003)).await?;
+        let g_null = groups.create_tx(pool, &new_group(9_100_004)).await?;
+        insert_thread(pool, 9_100_011, Some(T0 + 50)).await;
+        insert_thread(pool, 9_100_012, Some(T0 + 70)).await;
+        insert_thread(pool, 9_100_013, None).await;
+        // Insert out of key order to prove the batch keeps per-group key order.
+        members
+            .insert_tx(pool, &new_member(g_two, Some(9_100_012), key(9_100_012)))
+            .await?;
+        members
+            .insert_tx(pool, &new_member(g_two, Some(9_100_011), key(9_100_011)))
+            .await?;
+        let mut deleted = new_member(g_deleted, None, key(9_100_021));
+        deleted.state = values::member_state::DELETED.to_string();
+        deleted.deleted_at = Some(T0);
+        members.insert_tx(pool, &deleted).await?;
+        let mut history = new_member(g_deleted, Some(9_100_013), key(9_100_022));
+        history.state = values::member_state::REDIRECTED.to_string();
+        members.insert_tx(pool, &history).await?;
+        members
+            .insert_tx(pool, &new_member(g_null, Some(9_100_013), key(9_100_013)))
+            .await?;
+
+        assert!(members.list_current_by_group_ids(&[]).await?.is_empty());
+        assert!(
+            members
+                .find_latest_activity_by_group_ids(&[])
+                .await?
+                .is_empty()
+        );
+
+        // More ids than one IN-list chunk, including unknown ones.
+        let mut ids: Vec<i64> = (0..IN_LIST_CHUNK_SIZE as i64 + 7).map(|n| -1 - n).collect();
+        ids.extend([g_null, g_empty, g_deleted, g_two]);
+        let batch = members.list_current_by_group_ids(&ids).await?;
+        let activity = members.find_latest_activity_by_group_ids(&ids).await?;
+        for group_id in [g_two, g_deleted, g_empty, g_null] {
+            let expected = members.list_current_by_group_id(group_id).await?;
+            let actual: Vec<_> = batch
+                .iter()
+                .filter(|member| member.group_id == group_id)
+                .cloned()
+                .collect();
+            assert_eq!(actual, expected, "group {group_id}");
+        }
+        assert_eq!(batch.len(), 4);
+        assert_eq!(activity.get(&g_two).copied().flatten(), Some(T0 + 70));
+        for group_id in [g_deleted, g_empty, g_null] {
+            assert_eq!(
+                activity.get(&group_id).copied().flatten(),
+                None,
+                "latest activity of group {group_id}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn batch_reads_match_per_group_reads_sqlite() -> Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_thread_group_pool().await;
+            _test_batch_reads(pool).await
         })
     }
 }

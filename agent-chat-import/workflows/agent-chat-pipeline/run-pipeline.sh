@@ -95,6 +95,15 @@
 #                                      needed when you want all-defaults
 #                                      with no path overrides).
 #
+# ThreadGroup summary stage (opt-in; off by default):
+#   --enable-thread-group-summary      run thread-group-summary-batch
+#                                      after thread summaries
+#   --thread-group-summary-batch-yaml  <path|url>
+#   --thread-group-summary-channel <name>
+#                                      default: thread_group_summary
+#                                      (must not be llm_batch; register it
+#                                      in jobworkerp WORKER_CHANNELS)
+#
 # Reflection stage (opt-in; off by default):
 #   --enable-reflection                run thread-reflection-batch at
 #                                      the end of summaryBranch using
@@ -235,6 +244,10 @@ FORCE_REEXTRACT="false"
 FORCE_REMERGE="false"
 MAX_SIGNALS="200"
 
+ENABLE_THREAD_GROUP_SUMMARY="false"
+THREAD_GROUP_SUMMARY_BATCH_YAML="${WORKFLOWS_DIR}/thread-group-summary/thread-group-summary-batch.yaml"
+THREAD_GROUP_SUMMARY_CHANNEL="thread_group_summary"
+
 # Reflection stage is opt-in. Passing the reflection batch YAML path
 # flag (or `--enable-reflection`) flips it on. Reflection failure is
 # fatal: unlike personality, it is wired without branch-level try/catch
@@ -325,6 +338,12 @@ while [[ $# -gt 0 ]]; do
         --force-reextract)                 FORCE_REEXTRACT="true"; shift 1 ;;
         --force-remerge)                   FORCE_REMERGE="true"; shift 1 ;;
         --max-signals)                     MAX_SIGNALS="$2"; shift 2 ;;
+        --enable-thread-group-summary)     ENABLE_THREAD_GROUP_SUMMARY="true"; shift 1 ;;
+        --thread-group-summary-batch-yaml)
+            THREAD_GROUP_SUMMARY_BATCH_YAML="$2"
+            ENABLE_THREAD_GROUP_SUMMARY="true"
+            shift 2 ;;
+        --thread-group-summary-channel)    THREAD_GROUP_SUMMARY_CHANNEL="$2"; shift 2 ;;
         --enable-reflection)               ENABLE_REFLECTION="true"; shift 1 ;;
         --thread-reflection-batch-yaml)
             THREAD_REFLECTION_BATCH_YAML="$2"
@@ -471,6 +490,9 @@ fi
 if [[ "$ENABLE_REFLECTION" == "true" ]]; then
     WORKFLOW_LABELS+=(THREAD_REFLECTION_BATCH_YAML)
 fi
+if [[ "$ENABLE_THREAD_GROUP_SUMMARY" == "true" ]]; then
+    WORKFLOW_LABELS+=(THREAD_GROUP_SUMMARY_BATCH_YAML)
+fi
 for label in "${WORKFLOW_LABELS[@]}"; do
     val="${!label}"
     case "$val" in
@@ -507,6 +529,8 @@ INPUT_JSON=$(python3 - <<'PY' \
     "$USER_PERSONALITY_MERGE_YAML" \
     "$PERSONALITY_MODEL" "$MIN_USER_MESSAGES" \
     "$FORCE_REEXTRACT" "$FORCE_REMERGE" "$MAX_SIGNALS" \
+    "$ENABLE_THREAD_GROUP_SUMMARY" "$THREAD_GROUP_SUMMARY_BATCH_YAML" \
+    "$THREAD_GROUP_SUMMARY_CHANNEL" \
     "$ENABLE_REFLECTION" \
     "$THREAD_REFLECTION_BATCH_YAML" \
     "$REFLECTOR_MODEL" "$REFLECTOR_BASE_URL" "$PROMPT_VERSION" "$OUTPUT_LANGUAGE" \
@@ -527,6 +551,7 @@ import json, sys
  tp_batch, upm,
  personality_model, min_user_msgs,
  force_reextract, force_remerge, max_signals,
+ enable_thread_group_summary, tgs_batch, tgs_channel,
  enable_reflection,
  tr_batch,
  reflector_model, reflector_base_url, prompt_version, output_language,
@@ -598,6 +623,10 @@ if enable_personality == "true":
     payload["force_reextract"] = force_reextract == "true"
     payload["force_remerge"] = force_remerge == "true"
     payload["max_signals"] = int(max_signals)
+
+if enable_thread_group_summary == "true":
+    payload["thread_group_summary_batch_yaml"] = tgs_batch
+    payload["thread_group_summary_channel"] = tgs_channel
 
 # Reflection stage. Same opt-in pattern as personality. Empty model /
 # base_url / non-default reflector_id are omitted so the summary

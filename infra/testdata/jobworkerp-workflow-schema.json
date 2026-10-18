@@ -112,7 +112,7 @@
     },
     "timeout": {
       "title": "DoTimeout",
-      "description": "Workflow-level timeout configuration. Applied to the implicit root task that wraps all tasks declared under `do`. Overrides the `WORKFLOW_TASK_DEFAULT_TIMEOUT_SEC` environment variable (default 3600s) and allows specifying durations longer than 1 hour.",
+      "description": "Workflow-level timeout configuration. Applied to the implicit root task that wraps all tasks declared under `do`. When omitted, the workflow has no overall timeout (timeouts are optional in the Open Workflow Specification).",
       "oneOf": [
         {
           "$ref": "#/$defs/timeout",

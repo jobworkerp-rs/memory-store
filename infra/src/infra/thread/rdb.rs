@@ -164,6 +164,24 @@ impl From<i32> for ThreadSort {
     }
 }
 
+/// `memory_kind` filter shared by every kind-scoped thread read so they
+/// agree on which rows RAW covers (legacy NULL / 0 kinds included).
+/// Placeholders start at `first_idx`; one bind per kind follows.
+fn memory_kind_clause(memory_kinds: &[i32], first_idx: usize) -> Option<String> {
+    if memory_kinds.is_empty() {
+        return None;
+    }
+    let kind_clause = format!(
+        "memory_kind IN ({})",
+        build_in_placeholders(memory_kinds.len(), first_idx)
+    );
+    Some(if memory_kinds.contains(&(MemoryKind::Raw as i32)) {
+        format!("({kind_clause} OR memory_kind IS NULL OR memory_kind = 0)")
+    } else {
+        kind_clause
+    })
+}
+
 /// Build a `LIMIT ? OFFSET ?` (or `LIMIT $N OFFSET $N+1`) tail for a
 /// dynamic SQL whose WHERE clause already consumed `next_idx - 1`
 /// placeholders. The `next_idx` argument is unused on the sqlite path
@@ -508,7 +526,7 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
     /// and unset all 5 P1 fields.
     ///
     /// Empty input short-circuits. Chunk size 500 mirrors `find_by_ids`
-    /// (well below the 900-parameter SQLite ceiling).
+    /// (below the 999-parameter SQLite default; see `IN_LIST_CHUNK_SIZE`).
     async fn find_thread_summaries(
         &self,
         thread_ids: &[i64],
@@ -577,16 +595,10 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         offset: Option<&i64>,
         memory_kinds: &[i32],
     ) -> Result<Vec<Thread>> {
-        if memory_kinds.is_empty() {
+        let Some(kind_clause) = memory_kind_clause(memory_kinds, 1) else {
             return self.find_list(limit, offset).await;
-        }
-        let placeholders = crate::sql::build_in_placeholders(memory_kinds.len(), 1);
-        let kind_clause = format!("memory_kind IN ({placeholders})");
-        let where_clause = if memory_kinds.contains(&(MemoryKind::Raw as i32)) {
-            format!(" WHERE ({kind_clause} OR memory_kind IS NULL OR memory_kind = 0)")
-        } else {
-            format!(" WHERE {kind_clause}")
         };
+        let where_clause = format!(" WHERE {kind_clause}");
         let mut sql = format!(
             "SELECT {} FROM thread{where_clause} ORDER BY last_message_at DESC NULLS LAST, id DESC",
             thread_columns!()
@@ -668,23 +680,9 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
         if last_message_before.is_some() {
             push_clause("last_message_at", "<=");
         }
-        if !memory_kinds.is_empty() {
-            #[cfg(feature = "postgres")]
-            let placeholders = (0..memory_kinds.len())
-                .map(|offset| format!("${}", placeholder_idx + offset))
-                .collect::<Vec<_>>();
-            #[cfg(not(feature = "postgres"))]
-            let placeholders =
-                std::iter::repeat_n("?".to_string(), memory_kinds.len()).collect::<Vec<_>>();
+        if let Some(clause) = memory_kind_clause(memory_kinds, placeholder_idx) {
+            clauses.push(clause);
             placeholder_idx += memory_kinds.len();
-            let kind_clause = format!("memory_kind IN ({})", placeholders.join(", "));
-            if memory_kinds.contains(&(MemoryKind::Raw as i32)) {
-                clauses.push(format!(
-                    "({kind_clause} OR memory_kind IS NULL OR memory_kind = 0)"
-                ));
-            } else {
-                clauses.push(kind_clause);
-            }
         }
         let where_sql = format!(" WHERE {}", clauses.join(" AND "));
         let order_sql = order_by_thread(sort);
@@ -738,6 +736,29 @@ pub trait ThreadRepository: UseRdbPool + UseIdGenerator + Sync + Send {
                 "error in find_by_user_id: ({:?}, {:?})",
                 user_id, limit
             ))
+    }
+
+    /// Row count of `find_by_user_id` without time-range filters, computed
+    /// in the database instead of streaming every row to count it.
+    async fn count_by_user_id(&self, user_id: UserId, memory_kinds: &[i32]) -> Result<i64> {
+        let mut sql = format!(
+            "SELECT COUNT(*) FROM thread WHERE user_id = {}",
+            crate::sql::dyn_placeholder(1)
+        );
+        if let Some(clause) = memory_kind_clause(memory_kinds, 2) {
+            sql.push_str(" AND ");
+            sql.push_str(&clause);
+        }
+        let mut query =
+            sqlx::query_scalar::<Rdb, i64>(sqlx::AssertSqlSafe(sql)).bind(user_id.value);
+        for kind in memory_kinds {
+            query = query.bind(*kind);
+        }
+        query
+            .fetch_one(self.db_pool())
+            .await
+            .map_err(LlmMemoryError::DBError)
+            .context(format!("error in count_by_user_id: {user_id:?}"))
     }
 
     /// Find threads by channel and user_id (no pagination — expected result set is small).
@@ -2182,6 +2203,74 @@ mod test {
         TEST_RUNTIME.block_on(async {
             let rdb_pool = setup_pool().await;
             _test_find_thread_summaries(rdb_pool).await
+        })
+    }
+}
+
+#[cfg(all(test, not(feature = "postgres")))]
+mod count_by_user_tests {
+    use super::{ThreadRepository, ThreadRepositoryImpl, ThreadSort};
+    use crate::infra::thread_group::test_support::setup_thread_group_pool;
+    use anyhow::Result;
+    use infra_utils::infra::test::TEST_RUNTIME;
+    use protobuf::llm_memory::data::{MemoryKind, UserId};
+
+    #[test]
+    fn count_by_user_id_matches_find_by_user_id_length() -> Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_thread_group_pool().await;
+            let repo = ThreadRepositoryImpl::new(crate::test_helper::shared_id_generator(), pool);
+            // Legacy rows may carry kind 0, which RAW must still match.
+            for (id, user_id, kind) in [
+                (9_600_001_i64, 61_i64, MemoryKind::Raw as i32),
+                (9_600_002, 61, 0),
+                (9_600_004, 61, MemoryKind::ThreadSummary as i32),
+                (9_600_005, 62, MemoryKind::Raw as i32),
+            ] {
+                sqlx::query(
+                    "INSERT INTO thread (id, user_id, created_at, updated_at, memory_kind) \
+                     VALUES (?, ?, 1, 1, ?)",
+                )
+                .bind(id)
+                .bind(user_id)
+                .bind(kind)
+                .execute(pool)
+                .await?;
+            }
+            for user_id in [61, 62, 63] {
+                for kinds in [
+                    vec![],
+                    vec![MemoryKind::Raw as i32],
+                    vec![MemoryKind::ThreadSummary as i32],
+                    vec![MemoryKind::Raw as i32, MemoryKind::ThreadSummary as i32],
+                ] {
+                    let expected = repo
+                        .find_by_user_id(
+                            UserId { value: user_id },
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            ThreadSort::default(),
+                            &kinds,
+                        )
+                        .await?
+                        .len() as i64;
+                    assert_eq!(
+                        repo.count_by_user_id(UserId { value: user_id }, &kinds)
+                            .await?,
+                        expected,
+                        "user {user_id} kinds {kinds:?}"
+                    );
+                }
+            }
+            Ok(())
         })
     }
 }

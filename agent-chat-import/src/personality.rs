@@ -1,7 +1,7 @@
-use crate::common::workflow_input::reject_removed_fields;
+use crate::common::workflow_input::merge_thread_batch_template;
 use anyhow::{Context, Result, anyhow};
 use jobworkerp_client::client::wrapper::JobworkerpClientWrapper;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use std::sync::Arc;
 ///    to rerun.
 /// 2. Nothing was actually imported (every session was Skipped or all
 ///    `memories_imported == 0`). Without `--since`, `merge_template`
-///    does not inject `updated_after_ms`, so a "0-imported" run would
+///    does not inject `last_message_after_ms`, so a "0-imported" run would
 ///    dispatch a workflow whose effective scope is the *entire user
 ///    history*. That is both expensive and semantically wrong — the
 ///    import did nothing this run, so the extraction should not run
@@ -38,32 +38,20 @@ pub(crate) fn skip_reason(import_errors: usize, memories_imported: usize) -> Opt
     None
 }
 
-/// Apply import-derived overrides on top of the user-supplied template.
-/// The template MUST be a JSON object — this is enforced at startup so
-/// the workflow input shape is correct before any import work begins.
-///
-/// `updated_after_ms` is forwarded as an absolute lower bound for
-/// the latest message time so the extraction window aligns exactly with the
-/// imported set. Same rationale as the summary path: a relative
-/// `updated_within_hours` would re-anchor the window at workflow
-/// execution time and drift past the import boundary on dispatch
-/// delay.
 fn merge_template(
-    mut template: Value,
+    template: Value,
     user_id: i64,
-    updated_after_ms: Option<i64>,
+    last_message_after_ms: Option<i64>,
     output_language: &str,
 ) -> Result<Value> {
-    let obj = template
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("--extract-personality-after-* must be a JSON object"))?;
-    reject_removed_fields(obj, &["personality_user_id", "summary_user_id"])?;
-    obj.insert("user_id".into(), json!(user_id));
-    obj.insert("output_language".into(), json!(output_language));
-    if let Some(ms) = updated_after_ms {
-        obj.insert("updated_after_ms".into(), json!(ms));
-    }
-    Ok(template)
+    merge_thread_batch_template(
+        template,
+        "--extract-personality-after-*",
+        &["personality_user_id", "summary_user_id"],
+        user_id,
+        last_message_after_ms,
+        output_language,
+    )
 }
 
 /// Validate the JSON the user provided for the workflow before any
@@ -153,58 +141,6 @@ mod tests {
     // ---- merge_template ----
 
     #[test]
-    fn merge_overrides_user_id() {
-        let tmpl = json!({
-            "user_id": 999,
-            "memories_grpc_host": "localhost",
-        });
-        let out = merge_template(tmpl, 1, None, "ja").unwrap();
-        assert_eq!(out["user_id"], json!(1));
-        assert_eq!(out["output_language"], json!("ja"));
-        assert_eq!(out["memories_grpc_host"], json!("localhost"));
-    }
-
-    #[test]
-    fn merge_keeps_existing_updated_after_ms_when_none() {
-        let tmpl = json!({
-            "updated_after_ms": 1_700_000_000_000_i64,
-            "custom_field": "/x.yaml",
-        });
-        let out = merge_template(tmpl, 1, None, "ja").unwrap();
-        assert_eq!(out["updated_after_ms"], json!(1_700_000_000_000_i64));
-        assert_eq!(out["custom_field"], json!("/x.yaml"));
-    }
-
-    #[test]
-    fn merge_inserts_updated_after_ms_when_some() {
-        let tmpl = json!({});
-        let out = merge_template(tmpl, 1, Some(1_700_000_000_000), "ja").unwrap();
-        assert_eq!(out["updated_after_ms"], json!(1_700_000_000_000_i64));
-        assert_eq!(out["user_id"], json!(1));
-    }
-
-    #[test]
-    fn merge_overrides_updated_after_ms_when_some() {
-        let tmpl = json!({"updated_after_ms": 100});
-        let out = merge_template(tmpl, 1, Some(2_000_000_000_000), "ja").unwrap();
-        assert_eq!(out["updated_after_ms"], json!(2_000_000_000_000_i64));
-    }
-
-    #[test]
-    fn merge_overrides_output_language() {
-        let tmpl = json!({"output_language": "ja"});
-        let out = merge_template(tmpl, 1, None, "en").unwrap();
-        assert_eq!(out["output_language"], json!("en"));
-    }
-
-    #[test]
-    fn merge_does_not_emit_updated_within_hours() {
-        let tmpl = json!({});
-        let out = merge_template(tmpl, 1, Some(1_700_000_000_000), "ja").unwrap();
-        assert!(out.get("updated_within_hours").is_none());
-    }
-
-    #[test]
     fn merge_rejects_legacy_personality_owners() {
         let tmpl = json!({
             "memories_grpc_host": "h",
@@ -246,9 +182,19 @@ mod tests {
         assert!(merge.contains(
             "thread_filter: {\n                  user_id: $effective_personality_user_id,\n                  memory_kinds: [\"MEMORY_KIND_PERSONALITY\"]"
         ));
-        assert!(!merge.contains(
-            "user_id: { value: $effective_personality_user_id },\n                memory_kinds: [\"MEMORY_KIND_PERSONALITY\"],\n                external_id_prefix"
-        ));
+        // Count and list must share one row scope so the derived
+        // no-signal count cannot go negative.
+        assert_eq!(
+            merge
+                .matches(
+                    "user_id: { value: $effective_personality_user_id },\n                memory_kinds: [\"MEMORY_KIND_PERSONALITY\"],\n                external_id_prefix: \"personality:\""
+                )
+                .count(),
+            2
+        );
+        assert!(
+            merge.contains("method: \"/llm_memory.service.MemoryService/FindListByCondition\"")
+        );
     }
 
     #[test]
@@ -263,8 +209,9 @@ mod tests {
             "thread-personality-single must distinguish raw fetched messages from visible conversation messages"
         );
         for marker in [
-            "# AGENTS.md instructions for ",
-            "# CLAUDE.md instructions for ",
+            "# AGENTS.md instructions",
+            "# CLAUDE.md instructions",
+            "contains(\"<INSTRUCTIONS>\")",
             "<environment_context>",
             "<permissions instructions>",
             "<turn_aborted>",
@@ -325,30 +272,6 @@ mod tests {
         assert!(!agent_summary.contains("thread_personality_user_tail"));
         assert!(!agent_summary.contains("user_personality_merge_system_prompt"));
         assert!(!agent_summary.contains("user_personality_merge_user_tail"));
-    }
-
-    #[test]
-    fn merge_rejects_non_object_array() {
-        let err = merge_template(json!([1, 2, 3]), 1, None, "ja").unwrap_err();
-        assert!(err.to_string().contains("JSON object"));
-    }
-
-    #[test]
-    fn merge_rejects_non_object_string() {
-        let err = merge_template(json!("nope"), 1, None, "ja").unwrap_err();
-        assert!(err.to_string().contains("JSON object"));
-    }
-
-    #[test]
-    fn merge_rejects_non_object_number() {
-        let err = merge_template(json!(42), 1, None, "ja").unwrap_err();
-        assert!(err.to_string().contains("JSON object"));
-    }
-
-    #[test]
-    fn merge_rejects_non_object_null() {
-        let err = merge_template(Value::Null, 1, None, "ja").unwrap_err();
-        assert!(err.to_string().contains("JSON object"));
     }
 
     // ---- parse_template ----

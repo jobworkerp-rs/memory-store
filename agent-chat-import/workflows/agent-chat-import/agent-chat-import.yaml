@@ -78,7 +78,7 @@ input:
             seconds) are rejected here even though memories-import
             itself would accept them — downstream summary stages rely
             on the `Z` form to derive a precise `since_ms_utc` for
-            `updated_after_ms`, and silently falling back to day_start
+            `last_message_after_ms`, and silently falling back to day_start
             would mask the misconfiguration.
         since_mode:
           type: string
@@ -260,17 +260,17 @@ do:
   # marks the start of the processing range (since_date 00:00 in tz)
   # and stays fixed there even when --since is pushed forward by
   # short-span runs. It is used as the lower bound for the downstream
-  # thread-summary-batch's `updated_after_ms` filter.
+  # thread-summary-batch's `last_message_after_ms` filter.
   #
   # `floor` here matters: jaq's `now` returns a float (sub-second
   # precision). Without it, since_ms_utc carries the fractional part
-  # into thread-summary-batch's `updated_after_ms`, whose schema is
+  # into thread-summary-batch's `last_message_after_ms`, whose schema is
   # `type: integer` — input validation would reject a value like
   # `1778194252007.4082`.
   #
   # `since_override` is validated explicitly: on parse failure we
   # `error` rather than silently falling back to 0 (which would widen
-  # `updated_after_ms` to range_start_ms - 1, masking the misconfig).
+  # `last_message_after_ms` to range_start_ms - 1, masking the misconfig).
   - buildSinceEpoch:
       set:
         since_epoch_seconds: >-

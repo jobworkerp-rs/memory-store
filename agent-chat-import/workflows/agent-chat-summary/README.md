@@ -16,7 +16,8 @@ result (`completed: false`). A runner-level stage failure remains fatal.
 ```text
 fork:
   summaryBranch (fatal, serial):
-    threadSummaryBatch -> dailyWorkSummary -> reflectionStage (optional)
+    threadSummaryBatch -> threadGroupSummaryBatch (optional)
+      -> dailyWorkSummary -> reflectionStage (optional)
   personalityBranch (optional, non-fatal):
     threadPersonalityBatch -> userPersonalityMerge
 ```
@@ -46,8 +47,12 @@ fork:
 | `daily_work_summary_batch_yaml` | Daily work summary batch YAML path/URL |
 | `since_date`, `end_date`, `range_start_ms`, `since_ms_utc` | Processing window values |
 
-Optional inputs enable reflection and personality:
+Optional inputs enable ThreadGroup summaries, reflection, and personality:
 
+- `thread_group_summary_batch_yaml` (runs after thread summaries and before
+  daily summaries, on `thread_group_summary_channel`, default
+  `thread_group_summary`, which must not be `llm_batch`; see
+  [Channels](../../README.md#channels))
 - `thread_reflection_batch_yaml`
 - `thread_personality_batch_yaml`
 - `user_personality_merge_yaml`

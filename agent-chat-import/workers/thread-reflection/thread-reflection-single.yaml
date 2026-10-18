@@ -40,7 +40,6 @@ input:
         memories_grpc_host: { type: string, default: "localhost" }
         memories_grpc_port: { type: integer, default: 9010 }
         memories_grpc_tls: { type: boolean, default: false }
-        llm_worker_name: { type: string, default: "memories-llm" }
         reflector_model: { type: string }
         reflector_base_url: { type: string }
         prompt_version: { type: string }
@@ -171,9 +170,8 @@ do:
   # ============================================================
   # Step 3: fetch the full chat history. Use all message roles so
   # the reflector can see tool calls and system context — the
-  # generic-search exclusion of ROLE_REFLECTION still applies
-  # (reflections live under a different user and never attach to the
-  # origin thread).
+  # generic-search exclusion of ROLE_REFLECTION still applies because
+  # reflections never attach to the origin thread.
   # ============================================================
   - fetchMemoriesAll:
       run:
@@ -300,6 +298,15 @@ do:
                     end) )
              else $indexed_turns
              end }
+
+  # The thread's createdAt is a server audit time (an import time for
+  # imported conversations); the LLM needs when the conversation started.
+  - resolveConversationStart:
+      set:
+        conversation_started_at: >-
+          ${ if (($thread.data.firstMessageAt // "") | tostring) == "" then "unknown"
+             else ($thread.data.firstMessageAt | tonumber / 1000 | floor
+                   | strftime("%Y-%m-%dT%H:%M:%SZ")) end }
 
   # ============================================================
   # Step 7-8: call the reflector LLM, wrapped in try/catch so that
@@ -447,7 +454,7 @@ do:
                   prompt: >-
                     $${## Thread context
                     - Labels: {{ thread.data.labels | join: ", " }}
-                    - Created: {{ thread.data.createdAt }}
+                    - Started: {{ conversation_started_at }}
                     - Truncated: {{ truncated }}
 
                     ## Turns
@@ -468,13 +475,13 @@ do:
                                    "lessons","success_factors","key_decisions",
                                    "facts"],
                       "properties": {
-                        "outcome": {"enum":["SUCCESS","PARTIAL","FAILURE","ABORTED","UNKNOWN"]},
+                        "outcome": {"type":"string","enum":["SUCCESS","PARTIAL","FAILURE","ABORTED","UNKNOWN"]},
                         "score_self": {"type":"number","minimum":0.0,"maximum":1.0},
                         "summary": {"type":"string"},
                         "task_intent": {"type":"string","maxLength":1000},
-                        "task_category": {"enum":["coding","consultation","research","creative","general"]},
-                        "reflection_aspect": {"enum":["TASK_OUTCOME","INTERACTION_STYLE","BOTH"]},
-                        "failure_modes": {"type":"array","items":{"enum":["tool_misuse","loop","scope_drift","hallucination","context_overflow","data_loss","permission_issue","ambiguous_instruction","conflicting_requirements","missing_context","misleading_premise","goal_drift_by_user","tool_unavailable","external_service_failure","rate_limit","OTHER"]},"maxItems":8},
+                        "task_category": {"type":"string","enum":["coding","consultation","research","creative","general"]},
+                        "reflection_aspect": {"type":"string","enum":["TASK_OUTCOME","INTERACTION_STYLE","BOTH"]},
+                        "failure_modes": {"type":"array","items":{"type":"string","enum":["tool_misuse","loop","scope_drift","hallucination","context_overflow","data_loss","permission_issue","ambiguous_instruction","conflicting_requirements","missing_context","misleading_premise","goal_drift_by_user","tool_unavailable","external_service_failure","rate_limit","OTHER"]},"maxItems":8},
                         "failure_modes_other": {"type":"array","items":{"type":"string","maxLength":100},"maxItems":5},
                         "tools_used": {"type":"array","items":{"type":"string","maxLength":100},"maxItems":50},
                         "success_factors": {"type":"array","items":{"type":"string","maxLength":200},"maxItems":8},
@@ -488,7 +495,7 @@ do:
                             "required":["tool","contribution"],
                             "properties":{
                               "tool":{"type":"string","maxLength":100},
-                              "contribution":{"enum":["POSITIVE","NEGATIVE","NEUTRAL"]},
+                              "contribution":{"type":"string","enum":["POSITIVE","NEGATIVE","NEUTRAL"]},
                               "error_kind":{"type":"string","maxLength":100}
                             }
                           },
@@ -501,7 +508,7 @@ do:
                             "required":["turn_index","kind"],
                             "properties":{
                               "turn_index":{"type":"integer","minimum":0},
-                              "kind":{"enum":["OUTCOME_EVIDENCE","SCORE_DRIVER","LESSON_SOURCE",
+                              "kind":{"type":"string","enum":["OUTCOME_EVIDENCE","SCORE_DRIVER","LESSON_SOURCE",
                                               "KEY_DECISION_POINT","EXEMPLAR","COUNTER_EXAMPLE",
                                               "CONTEXT_PIVOT"]},
                               "weight":{"type":"number","minimum":0.0,"maximum":1.0},
@@ -511,7 +518,7 @@ do:
                                 "items":{
                                   "type":"object",
                                   "properties":{
-                                    "field":{"enum":["lesson","failure_mode","key_decision","success_factor"]},
+                                    "field":{"type":"string","enum":["lesson","failure_mode","key_decision","success_factor"]},
                                     "index":{"type":"integer","minimum":0}
                                   }
                                 }

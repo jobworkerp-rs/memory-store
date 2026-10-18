@@ -37,6 +37,9 @@
 #                                       set the worker's TZ (e.g.
 #                                       TZ=Asia/Tokyo).
 #   --force-resummarize                 flag (default off)
+#   --stop-on-error                     flag (default off): stop at the first failed period/path
+#   --llm-context-window-tokens <n>     default: 131072 (model context hard limit)
+#   --summary-max-completion-tokens <n> default: 32768
 #
 # Workflow paths:
 #   --batch-yaml <path|url>             default: ./monthly-work-summary-batch.yaml (this dir)
@@ -91,6 +94,9 @@ OLLAMA_BASE_URL="http://192.168.1.2:11434"
 OUTPUT_LANGUAGE="${MEMORY_DEFAULT_LANGUAGE:-ja}"
 TIMEZONE_OFFSET_HOURS="9"
 FORCE_RESUMMARIZE="false"
+STOP_ON_ERROR="false"
+LLM_CONTEXT_WINDOW_TOKENS="131072"
+SUMMARY_MAX_COMPLETION_TOKENS="32768"
 
 BATCH_YAML="${SCRIPT_DIR}/monthly-work-summary-batch.yaml"
 
@@ -138,6 +144,9 @@ while [[ $# -gt 0 ]]; do
         --output-language)          OUTPUT_LANGUAGE="$2"; shift 2 ;;
         --timezone-offset-hours)    TIMEZONE_OFFSET_HOURS="$2"; shift 2 ;;
         --force-resummarize)        FORCE_RESUMMARIZE="true"; shift 1 ;;
+        --stop-on-error)            STOP_ON_ERROR="true"; shift 1 ;;
+        --llm-context-window-tokens) LLM_CONTEXT_WINDOW_TOKENS="$2"; shift 2 ;;
+        --summary-max-completion-tokens) SUMMARY_MAX_COMPLETION_TOKENS="$2"; shift 2 ;;
         --batch-yaml)               BATCH_YAML="$2"; shift 2 ;;
         --jobworkerp-addr)          JOBWORKERP_ADDR="$2"; shift 2 ;;
         --memories-grpc-host)       MEMORIES_GRPC_HOST="$2"; shift 2 ;;
@@ -271,11 +280,12 @@ fi
 # ----------------------------------------------------------------
 # Build workflow input JSON
 # ----------------------------------------------------------------
-INPUT_JSON=$(python3 - <<'PY' "$USER_ID" "$MEMORIES_GRPC_HOST" "$MEMORIES_GRPC_PORT" "$START_MONTH" "$END_MONTH" "$LAST_N_MONTHS" "$TIMEZONE_OFFSET_HOURS" "$WEEKLY_LABEL" "$MONTHLY_LABEL" "$EXTRA_LABELS_CSV" "$MIN_THREAD_COUNT" "$MAX_CONTEXT_CHARS" "$SUMMARY_MODEL" "$OLLAMA_BASE_URL" "$OUTPUT_LANGUAGE" "$FORCE_RESUMMARIZE"
+INPUT_JSON=$(python3 - <<'PY' "$USER_ID" "$MEMORIES_GRPC_HOST" "$MEMORIES_GRPC_PORT" "$START_MONTH" "$END_MONTH" "$LAST_N_MONTHS" "$TIMEZONE_OFFSET_HOURS" "$WEEKLY_LABEL" "$MONTHLY_LABEL" "$EXTRA_LABELS_CSV" "$MIN_THREAD_COUNT" "$MAX_CONTEXT_CHARS" "$SUMMARY_MODEL" "$OLLAMA_BASE_URL" "$OUTPUT_LANGUAGE" "$FORCE_RESUMMARIZE" "$STOP_ON_ERROR" "$LLM_CONTEXT_WINDOW_TOKENS" "$SUMMARY_MAX_COMPLETION_TOKENS"
 import json, sys
 (_, user_id, host, port, start_month, end_month, last_n,
  tz, weekly_label, monthly_label, extra_csv, min_thread, max_chars,
- model, ollama, output_language, force) = sys.argv
+ model, ollama, output_language, force, stop_on_error, ctx_window,
+ max_completion) = sys.argv
 
 payload = {
     "user_id": int(user_id),
@@ -290,6 +300,9 @@ payload = {
     "output_language": output_language,
     "timezone_offset_hours": int(tz),
     "force_resummarize": force == "true",
+    "stop_on_error": stop_on_error == "true",
+    "llm_context_window_tokens": int(ctx_window),
+    "summary_max_completion_tokens": int(max_completion),
 }
 if start_month and end_month:
     payload["start_month"] = start_month

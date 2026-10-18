@@ -42,10 +42,10 @@ worker を登録しておく（後述）。
 | 集約スレッドのラベル | `weekly_summary`, `iso_week:YYYY-Www`, `scope:<scope_key>`, `extra_labels_filter` の各値 (sort 済み) | `weekly_summary` で一覧、`iso_week:` で週絞り込み、`scope:` で同週内の異 scope を分離 |
 | 集約メモリの `external_id` | `weekly:<user_id>:YYYY-Www:<scope_key>` | `memory.external_id` は DB 全体で UNIQUE。所有者と scope を含め、同週に異なるユーザーまたは `extra_labels_filter` で並列実行しても衝突しないようにする |
 | `scope_key` の算出 | `extra_labels_filter` を `sort \| join(",")`。空なら `_all` | 呼び出し側のラベル順に依存しない (`["b","a"]` も `["a","b"]` も `scope_key="a,b"`) |
-| 入力の取得方法 | `MemoryService.FindListByCondition` で **日次要約メモリ自身**を絞り込む (`external_id_prefix="daily:"` + `roles=[ROLE_ASSISTANT]` + `updated_after/before` + `thread_filter.labels=[daily_summary]+extra` の AND マッチ) | スレッドの `updated_at` はサーバが `AddMemory` 時に `now` で bump されるため、要約 *スレッド* 単位で絞ると元の会話日付ではなく要約実行日でヒットしてしまう。要約 *メモリ* の `updated_at` は元の日次集計時刻を保持しているため、メモリ単位で絞ることで正しく「会話があった週」で絞れる |
+| 入力の取得方法 | `MemoryService.FindListByCondition` で **日次要約メモリ自身**を絞り込む (`memory_kinds=[MEMORY_KIND_DAILY_SUMMARY]` + `roles=[ROLE_ASSISTANT]` + `updated_after/before` + `thread_filter.labels=[daily_summary]+extra` の AND マッチ) | スレッドの `updated_at` はサーバが `AddMemory` 時に `now` で bump されるため、要約 *スレッド* 単位で絞ると元の会話日付ではなく要約実行日でヒットしてしまう。要約 *メモリ* の `updated_at` は元の日次集計時刻を保持しているため、メモリ単位で絞ることで正しく「会話があった週」で絞れる |
 
 | LLM 入力 | `memory.data.content` (構造化要約 JSON: overall_purpose / purpose_groups / by_topic / carryover) + `thread_description` の組み合わせ | 日次要約の構造を引き継いで動向 (trends) を推論 |
-| コンテキスト圧縮 | `max_context_chars` を超えたら updated_at desc 順の prefix を保持して末尾を切り捨て | 通常 1 週間で 7 件しか入力がないため発火することはほぼない |
+| コンテキスト圧縮 | `token_count` で計測し、収まるまで古い入力から外す。正確に数えられないプロバイダは `summary_input_byte_budget` で updated_at desc 順に詰める | 下記「パス単位集約と生成時の保護」を参照 |
 | 週境界 | ISO 8601 (月曜始まり) | 国際標準。jaq の `strptime("%G-W%V-%u")` で堅牢にパース可能 |
 
 ## 上位の動向抽出（このワークフローの価値）
@@ -198,7 +198,12 @@ jobworkerp-client job enqueue-workflow \
 | `weekly_label` | - | `weekly_summary` | 出力スレッドのマーカーラベル |
 | `extra_labels_filter` | - | `[]` | 入力に AND マッチする追加ラベル（全 project 横断が既定） |
 | `min_thread_count` | - | `1` | 入力 memory 数がこれ未満なら skip （名称は daily と互換、実態は memory 件数） |
-| `max_context_chars` | - | `200000` | LLM 入力の上限文字数 |
+| `max_context_chars` | - | `200000` | 互換のため受け付けるのみ（未使用）。入力上限は `summary_input_byte_budget` と `token_count` で決まる |
+| `llm_context_window_tokens` | - | `131072` | モデルのコンテキスト長（ハードリミット） |
+| `summary_max_completion_tokens` | - | `32768` | 出力トークン上限 |
+| `summary_input_byte_budget` | - | `200000` | token_count 不可時の入力バイト上限 |
+| `llm_expected_model` | - | `""` | 指定時は token_count の解決済みモデル名と一致を要求 |
+| `extra_labels_match_mode` | - | `LABEL_ALL` | `extra_labels_filter` の照合方法 |
 | `summary_model` / `ollama_base_url` | - | daily と同じ | LLM 設定 |
 | `timezone_offset_hours` | - | `9` | 週の境界を切るタイムゾーン（JST 既定） |
 | `force_resummarize` | - | `false` | `true` で既存週次要約も再生成 |
@@ -219,12 +224,45 @@ batch 経由で `workerName` 指定の言語別 worker に渡る）:
 |-----------|------|-----------|------|
 | `start_week` / `end_week` | - | - | 両方指定で範囲モード（包含） |
 | `last_n_weeks` | - | - | 直近 N 週モード（先週終わり） |
+| `target_weeks` | - | `[]` | 対象期間の明示列挙。指定時は範囲・直近 N より優先 |
+| `stop_on_error` | - | `false` | `true` で最初の失敗で停止 |
+| `source_scope_digest` | - | 絞り込みなし範囲の digest | path 単位集約（v2）の入力範囲識別子 |
+| `generation_id` / `generation_started_at` | - | `""` | 生成世代の識別子（空なら実行時刻）。metadata に記録 |
 
 `(start_week, end_week)` と `last_n_weeks` の両方が省略されたときは「先週のみ」のフォールバック。両方指定されたときは `(start_week, end_week)` が勝つ。
 batch は `output_language` に応じて `memories-weekly-work-summary-single-ja` /
 `memories-weekly-work-summary-single-en` を `workerName` で呼ぶ。事前に
 `memories-import upsert-generation-workers --feature weekly-work-summary --language all`
 などで言語別 single worker を登録しておく。
+
+## パス単位集約と生成時の保護
+
+batch は各週について、まず single を `plan_only: true` で呼び、入力の日次要約メモリを
+path bucket（入力スレッドの `path:*` ラベル。0 個なら `unassigned`、複数なら `ambiguous`）に分類する。
+次に bucket ごとの path 要約
+（`weekly:v2:<user_id>:YYYY-Www:<source_scope_digest>:path:<digest>`、ラベル
+`summary_scope:path` / `source_scope:<digest>`）を書き、最後にそれらを入力とした全体要約
+（`...:overall`、ラベル `summary_scope:overall`）を書く。計画から消えた bucket の path 要約は
+メモリ行だけ削除する（スレッドは残す）。入力が 1 件だけのときは LLM を呼ばずにそのまま転記する。
+
+- `source_scope_digest` は入力ラベル範囲の識別子。既定値は絞り込みなし範囲の digest。
+  `extra_labels_match_mode`（`LABEL_ALL` / `LABEL_ANY`）で `extra_labels_filter` の照合方法を選ぶ。
+- `target_weeks` は対象期間を明示列挙するモードで、範囲指定・直近 N 指定より優先される。
+- LLM リクエストはまず LLM runner の `token_count` メソッドで計測し、
+  `llm_context_window_tokens` と `summary_max_completion_tokens` に収まるまで古い入力から外す。
+  正確に数えられないプロバイダ（Ollama など）は `summary_input_byte_budget` によるバイト上限に
+  フォールバックする。`llm_expected_model` を指定した場合は解決済みモデル名と一致しなければ失敗する。
+  `max_context_chars` は互換のために受け付けるだけで使われない。
+- JSON として不正、または空欄の LLM 出力は `.../invalid-output` として拒否し、最大 2 回再生成する。
+  空の要約は保存しない。
+- 再生成は source fingerprint、path 計画の fingerprint、（LLM で生成した要約では）
+  モデル契約の fingerprint（prompt・モデル・予算）のいずれかが変わったときに行う。
+- `stop_on_error: true` で最初に失敗した path / 期間で停止する。既定はベストエフォート。
+  batch 出力の `outcome` は `succeeded`、`completed_with_errors`（path が失敗したが全体要約は書けた。
+  `failed_path_buckets` を参照）、`failed` のいずれか。
+- batch 全体と期間ループには 7 日の timeout がある。結果を返さずに終わった項目
+  （timeout / 中断）は失敗として数える。個々の run/call タスクは worker が
+  `WORKFLOW_TASK_DEFAULT_TIMEOUT_SEC` を設定していればそれに従う。
 
 ## 差分実行
 
@@ -233,6 +271,7 @@ batch は `output_language` に応じて `memories-weekly-work-summary-single-ja
 1. 同 (user_id, week, scope) の `external_id = "weekly:<user_id>:YYYY-Www:<scope_key>"` 集約メモリが存在
 2. その集約メモリの `updated_at` が、当週の入力日次要約群の最大 `updated_at` 以上
 3. 入力日次要約の ID・`updated_at`・各 metadata の `source_fingerprint` から作る source fingerprint が、保存済み metadata の fingerprint と一致する
+4. path 計画の fingerprint と、LLM で生成した要約ではモデル契約の fingerprint も一致する
 
 日次要約が元の時刻を保持したまま再生成された場合も、上流 fingerprint の変化により週次要約を再生成する。
 
@@ -249,6 +288,7 @@ batch は `output_language` に応じて `memories-weekly-work-summary-single-ja
 - `content`: 下記 JSON 構造を `tojson` した文字列
 - `external_id`: `weekly:<user_id>:YYYY-Www:<scope_key>`
 - `metadata`: `{iso_week, scope, extra_labels[], source_memory_count, source_snapshot_version, source_max_updated_at, source_fingerprint_algorithm, source_fingerprint, summary_version}`
+  - 上記は `v2_rollup_scope` 未指定（直接呼び出し）時の形式。batch が書く path / overall 要約は `schema_version=2` 形式で、`period_kind`・`period_key`・`rollup_scope`・`source_scope_digest`・`path_bucket_kind`・`aggregation_mode`（`llm` / `passthrough`）・`completion_status`・`source_plan_fingerprint`・`model_contract_fingerprint`・`generation_id` などを持つ
   - `source_snapshot_version=2` の fingerprint は **日次要約メモリ** の ID・`updated_at`・上流 fingerprint を含むため、時刻を変えない日次再生成も検知する
 
 ```json
@@ -283,7 +323,7 @@ batch は `output_language` に応じて `memories-weekly-work-summary-single-ja
 - **ISO W53 の入力検証**: `2027-W53-1` のように該当年に W53 が存在しない場合、jaq の strptime が `invalid ISO 8601 week date` エラーで失敗する。batch では `onError: continue` により他の週は影響を受けず `failed_weeks` に記録される
 - **`extra_labels_filter` を変えると別スレッドができる**。daily と同じ仕様
 - **タイムゾーンの取り扱い**。週境界は jq を評価する jobworkerp worker の `TZ` 環境変数（例 `TZ=Asia/Tokyo`）で決まり、夏時間 (DST) と負オフセットに対応する。`TZ` 未設定時のフォールバック `timezone_offset_hours` は時単位（0..23）なので半端なオフセットや負オフセットには未対応
-- **LLM のコンテキスト長**。週 7 日分の日次 JSON が入るので daily より小さく済む。`max_context_chars=200000` は十分すぎる既定値
+- **LLM のコンテキスト長**。`llm_context_window_tokens` を使用モデルのコンテキスト長に合わせること（Ollama では token_count が使えないため `summary_input_byte_budget` で入力量を調整する）。
 - **monthly との連携**: 本ワークフローの出力 (`weekly_summary` ラベル) は `monthly-work-summary-single` の入力になる。週次の生成完了後に月次を回す cron 順序が望ましい
 
 ## バッチ結果

@@ -20,7 +20,16 @@ input:
         memories_grpc_host: { type: string, default: "localhost" }
         memories_grpc_port: { type: integer, default: 9100 }
         memories_grpc_tls: { type: boolean, default: false }
-        llm_worker_name: { type: string, default: "memories-llm" }
+        summary_model: { type: string, default: "qwen3.6:27b" }
+        ollama_base_url: { type: string, default: "http://localhost:11434" }
+        output_language:
+          type: string
+          enum: ["ja", "en"]
+          default: "ja"
+          description: >-
+            Output language for generated free-text. Selects the
+            language-specific single worker
+            (`memories-daily-work-summary-single-<lang>`) per fan-out.
         start_date:
           type: string
           default: ""
@@ -32,6 +41,11 @@ input:
           type: string
           default: ""
           description: Inclusive end date (YYYY-MM-DD) or empty.
+        target_dates:
+          type: array
+          items: { type: string }
+          default: []
+          description: Explicit YYYY-MM-DD periods. When non-empty, this exact sorted set takes precedence over range and last-N modes.
         last_n_days:
           type: integer
           default: 0
@@ -45,13 +59,30 @@ input:
           type: array
           items: { type: string }
           default: []
+        extra_labels_match_mode:
+          type: string
+          enum: ["LABEL_ALL", "LABEL_ANY"]
+          default: "LABEL_ALL"
         min_thread_count: { type: integer, default: 1 }
         max_context_chars: { type: integer, default: 200000 }
-        summary_model: { type: string, default: "qwen3.6:27b" }
-        ollama_base_url: { type: string, default: "http://localhost:11434" }
-        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
+        summary_output_guidance: { type: object, default: {daily: {item_chars: 300, total_chars: 12000}, max_purpose_groups: {daily: 10}, max_source_memory_ids: 10} }
+        llm_context_window_tokens: { type: integer, minimum: 1024, default: 131072 }
+        llm_expected_model: { type: string, default: "" }
+        summary_max_completion_tokens: { type: integer, minimum: 1, default: 32768 }
+        summary_input_byte_budget: { type: integer, minimum: 0, default: 200000 }
         force_resummarize: { type: boolean, default: false }
+        # Default remains best-effort. Callers requiring a strict run can
+        # forward the explicit "stop on error" switch.
+        stop_on_error: { type: boolean, default: false }
+        # SHA-256 of canonical {"labels":[],"match_mode":"LABEL_ALL","version":1}.
+        # Keep direct jobworkerp callers valid even when they omit the new v2 field.
+        source_scope_digest: { type: string, default: "999b928053067e9fc9369c99aa2ef91b5d096fabee5c34e90097fa937820524a" }
+        generation_id: { type: string, default: "" }
+        generation_started_at: { type: string, default: "" }
 
+# The whole range is bounded so a stuck child cannot hold the batch
+# forever. Individual run/call tasks follow jobworkerp's
+# WORKFLOW_TASK_DEFAULT_TIMEOUT_SEC when the worker sets it.
 timeout:
   after:
     days: 31
@@ -88,7 +119,9 @@ do:
   - resolveDateRange:
       set:
         date_list: >-
-          ${ if $workflow.input.start_date != ""
+          ${ if ($workflow.input.target_dates // [] | length) > 0
+             then ($workflow.input.target_dates | unique | sort)
+             elif $workflow.input.start_date != ""
                 and $workflow.input.end_date != ""
              then
                # Range mode. Convert both ends to epoch, step by day.
@@ -116,6 +149,7 @@ do:
         generated_dates: "${ [] }"
         skipped_dates: "${ [] }"
         failed_dates: "${ [] }"
+        failed_path_buckets: "${ [] }"
         last_error: "${ null }"
 
   # Step 2: For each date, dispatch daily-work-summary-single. Failures
@@ -128,15 +162,35 @@ do:
           days: 31
       for:
         each: target_date
+        at: date_index
         in: "${ $date_list }"
       onError: continue
       do:
-        - invokeSingleWithRetry:
+        - reportProgress:
+            set:
+              progress_processed: "${ $date_index + 1 }"
+              progress_total: "${ $date_list | length }"
+        # The outer loop remains best-effort for the default, but after a
+        # path failure strict mode must not start work for another period.
+        - abortBeforeNextDateAfterPathFailure:
+            if: "${ $workflow.input.stop_on_error and ($failed_path_buckets | length) > 0 }"
+            raise:
+              error:
+                type: "https://memories.local/errors/daily-work-summary/path"
+                status: 500
+                title: "daily path summary failed"
+                detail: "stop_on_error is enabled; no later period was started"
+        - initPathOutcome:
+            set:
+              path_failed_for_date: "${ false }"
+              planned_daily_path_bucket_digests: "${ [] }"
+        - discoverPathPlan:
+            # The enclosing loop is best-effort, so a strict-mode raise is
+            # recorded and swallowed there.  This guard is the actual fence
+            # that prevents any later period dispatch.
+            if: "${ (($failed_dates | index($target_date)) == null) and (($workflow.input.stop_on_error and ((($failed_path_buckets | length) > 0) or (($failed_dates | length) > 0))) | not) }"
             try:
-              - invokeSingle:
-                  timeout:
-                    after:
-                      minutes: 120
+              - runPathPlan:
                   run:
                     function:
                       workerName: '${ "memories-daily-work-summary-single-" + $workflow.input.output_language }'
@@ -149,18 +203,304 @@ do:
                             memories_grpc_host: $workflow.input.memories_grpc_host,
                             memories_grpc_port: $workflow.input.memories_grpc_port,
                             memories_grpc_tls: $workflow.input.memories_grpc_tls,
-                            llm_worker_name: $workflow.input.llm_worker_name,
-
-
                             summary_label: $workflow.input.summary_label,
                             daily_label: $workflow.input.daily_label,
                             extra_labels_filter: $workflow.input.extra_labels_filter,
-                            min_thread_count: $workflow.input.min_thread_count,
-                            max_context_chars: $workflow.input.max_context_chars,
+                            extra_labels_match_mode: ($workflow.input.extra_labels_match_mode // "LABEL_ALL"),
+                            source_memory_kind: "MEMORY_KIND_THREAD_SUMMARY",
+                            source_thread_label: $workflow.input.summary_label,
+                            plan_only: true
+                          } | tojson }
+                  export:
+                    as:
+                      daily_path_plan: "${ .output | fromjson }"
+            catch:
+              as: error
+              do:
+                - recordPathPlanFailure:
+                    set:
+                      failed_dates: "${ $failed_dates + [$target_date] }"
+                      last_error: "${ $error }"
+                - abortImmediatelyAfterPathPlanFailure:
+                    if: "${ $workflow.input.stop_on_error }"
+                    raise:
+                      error:
+                        type: "https://memories.local/errors/daily-work-summary/path-plan"
+                        status: 500
+                        title: "daily path plan failed before summary generation"
+                        detail: "stop_on_error is enabled; remaining paths were not started"
+
+        - derivePlannedPathBucketDigests:
+            if: "${ (($failed_dates | index($target_date)) == null) and (($workflow.input.stop_on_error and ((($failed_path_buckets | length) > 0) or (($failed_dates | length) > 0))) | not) }"
+            for:
+              each: planned_path_bucket
+              in: "${ $daily_path_plan.path_buckets // [] }"
+            do:
+              - derivePlannedPathBucketDigest:
+                  run:
+                    function:
+                      runnerName: COMMAND
+                      settings: {}
+                      arguments:
+                        command: "/bin/sh"
+                        args: ["-c", "if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi | awk '{print $1}'"]
+                        stdin: >-
+                          ${ if $planned_path_bucket.path_bucket_kind == "label"
+                             then ({kind: "label", label: $planned_path_bucket.path_label, version: 1} | tojson)
+                             else ({kind: $planned_path_bucket.path_bucket_kind, version: 1} | tojson)
+                             end }
+                        treat_nonzero_as_error: true
+                  export:
+                    as:
+                      planned_path_bucket_digest: "${ .stdout | split(\" \")[0] }"
+              - recordPlannedPathBucketDigest:
+                  set:
+                    planned_daily_path_bucket_digests: "${ $planned_daily_path_bucket_digests + [$planned_path_bucket_digest] }"
+
+        # A path that disappeared from the authoritative discovery plan is
+        # stale derived data. Delete only its v2 Memory row (never the backing
+        # Thread and never a legacy row): the thread is intentionally retained
+        # as an orphan for the user's manual inspection/deletion policy.
+        - findExistingPathThreads:
+            if: "${ (($failed_dates | index($target_date)) == null) and (($workflow.input.stop_on_error and ((($failed_path_buckets | length) > 0) or (($failed_dates | length) > 0))) | not) }"
+            run:
+              function:
+                runnerName: GRPC
+                using: streaming
+                settings:
+                  host: "${$workflow.input.memories_grpc_host}"
+                  port: ${$workflow.input.memories_grpc_port}
+                  tls: ${$workflow.input.memories_grpc_tls}
+                  useReflection: true
+                arguments:
+                  method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
+                  json_body: >-
+                    ${ {labels: [$workflow.input.daily_label, "date:" + $target_date,
+                                  "summary_scope:path", "source_scope:" + $workflow.input.source_scope_digest],
+                        match_mode: "LABEL_ALL", user_id: $workflow.input.user_id,
+                        memory_kinds: ["MEMORY_KIND_DAILY_SUMMARY"]} | tojson }
+                  as_json: true
+            export:
+              as:
+                existing_daily_path_threads: "${ .jsonBody | fromjson }"
+
+        - identifyStalePathThreads:
+            if: "${ (($failed_dates | index($target_date)) == null) and (($workflow.input.stop_on_error and ((($failed_path_buckets | length) > 0) or (($failed_dates | length) > 0))) | not) }"
+            set:
+              stale_daily_path_threads: >-
+                ${ ($daily_path_plan.path_buckets // []
+                    | map(if .path_bucket_kind == "label" then "label:" + .path_label
+                          else .path_bucket_kind + ":" end)) as $planned
+                   | $existing_daily_path_threads
+                   | map(select((.data.labels // []) as $labels
+                                | ($labels | map(select(startswith("path:"))) | unique) as $paths
+                                | (if ($labels | index("summary_path:ambiguous")) != null then "ambiguous:"
+                                   elif ($labels | index("summary_path:unassigned")) != null then "unassigned:"
+                                   elif ($paths | length) == 1 then "label:" + $paths[0]
+                                   else "ambiguous:" end) as $bucket_key
+                                | ($planned | index($bucket_key)) == null)) }
+
+        - cleanupStalePathMemories:
+            if: "${ (($failed_dates | index($target_date)) == null) and (($workflow.input.stop_on_error and ((($failed_path_buckets | length) > 0) or (($failed_dates | length) > 0))) | not) }"
+            for:
+              each: stale_thread
+              in: "${ $stale_daily_path_threads }"
+            onError: continue
+            do:
+              - findStaleMemories:
+                  run:
+                    function:
+                      runnerName: GRPC
+                      using: streaming
+                      settings:
+                        host: "${$workflow.input.memories_grpc_host}"
+                        port: ${$workflow.input.memories_grpc_port}
+                        tls: ${$workflow.input.memories_grpc_tls}
+                        useReflection: true
+                      arguments:
+                        method: "/llm_memory.service.ThreadService/FindMemoriesByThreadId"
+                        json_body: >-
+                          ${ {thread_id: {value: $stale_thread.id.value},
+                              roles: ["ROLE_ASSISTANT"], content_types: ["TEXT"]} | tojson }
+                        as_json: true
+                  export:
+                    as:
+                      stale_daily_path_memories: >-
+                        ${ (.jsonBody // "[]") | fromjson
+                           | map(select((.data.externalId // "") | startswith("daily:v2:"))) }
+              - deleteStaleMemories:
+                  for:
+                    each: stale_memory
+                    in: "${ $stale_daily_path_memories }"
+                  do:
+                    - deleteStaleMemory:
+                        run:
+                          function:
+                            runnerName: GRPC
+                            using: unary
+                            settings:
+                              host: "${$workflow.input.memories_grpc_host}"
+                              port: ${$workflow.input.memories_grpc_port}
+                              tls: ${$workflow.input.memories_grpc_tls}
+                              useReflection: true
+                            arguments:
+                              method: "/llm_memory.service.MemoryService/Delete"
+                              json_body: "${ $stale_memory.id | tojson }"
+                              as_json: true
+
+        - summarizeEachPath:
+            if: "${ (($failed_dates | index($target_date)) == null) and (($workflow.input.stop_on_error and ((($failed_path_buckets | length) > 0) or (($failed_dates | length) > 0))) | not) }"
+            for:
+              each: path_bucket
+              in: "${ $daily_path_plan.path_buckets // [] }"
+            do:
+              - derivePathBucketDigest:
+                  run:
+                    function:
+                      runnerName: COMMAND
+                      settings: {}
+                      arguments:
+                        command: "/bin/sh"
+                        args: ["-c", "if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi | awk '{print $1}'"]
+                        stdin: >-
+                          ${ if $path_bucket.path_bucket_kind == "label"
+                             then ({kind: "label", label: $path_bucket.path_label, version: 1} | tojson)
+                             else ({kind: $path_bucket.path_bucket_kind, version: 1} | tojson)
+                             end }
+                        treat_nonzero_as_error: true
+                  export:
+                    as:
+                      path_bucket_digest: "${ .stdout | split(\" \")[0] }"
+              - invokePathSingle:
+                  try:
+                    - runPathSingle:
+                        run:
+                          function:
+                            workerName: '${ "memories-daily-work-summary-single-" + $workflow.input.output_language }'
+                            arguments:
+                              input: >-
+                                ${ {
+                                  user_id: $workflow.input.user_id,
+                                  target_date: $target_date,
+                                  timezone_offset_hours: $workflow.input.timezone_offset_hours,
+                                  memories_grpc_host: $workflow.input.memories_grpc_host,
+                                  memories_grpc_port: $workflow.input.memories_grpc_port,
+                                  memories_grpc_tls: $workflow.input.memories_grpc_tls,
+                                  summary_model: $workflow.input.summary_model,
+                                  ollama_base_url: $workflow.input.ollama_base_url,
+                                  output_language: $workflow.input.output_language,
+                                  summary_label: $workflow.input.summary_label,
+                                  daily_label: $workflow.input.daily_label,
+                                  extra_labels_filter: $workflow.input.extra_labels_filter,
+                                  extra_labels_match_mode: ($workflow.input.extra_labels_match_mode // "LABEL_ALL"),
+                                  min_thread_count: 1,
+                                  max_context_chars: $workflow.input.max_context_chars,
+                                  summary_output_guidance: $workflow.input.summary_output_guidance,
+                                  llm_context_window_tokens: $workflow.input.llm_context_window_tokens,
+                                  llm_expected_model: $workflow.input.llm_expected_model,
+                                  summary_max_completion_tokens: $workflow.input.summary_max_completion_tokens,
+                                  summary_input_byte_budget: $workflow.input.summary_input_byte_budget,
+                                  force_resummarize: $workflow.input.force_resummarize,
+                                  v2_source_scope_digest: $workflow.input.source_scope_digest,
+                                  v2_rollup_scope: "path",
+                                  v2_path_bucket_digest: $path_bucket_digest,
+                                  v2_path_bucket_kind: $path_bucket.path_bucket_kind,
+                                  v2_path_label: $path_bucket.path_label,
+                                  generation_id: $workflow.input.generation_id,
+                                  generation_started_at: $workflow.input.generation_started_at,
+                                  planned_source_memory_ids: $path_bucket.source_memory_ids
+                                } | tojson }
+                        export:
+                          as:
+                            path_single_result: "${ .output | fromjson }"
+                    - rejectEmptyPlannedPathResult:
+                        if: >-
+                          ${ ($path_single_result.skipped // false)
+                             and (($path_single_result.source_memory_count // 0) == 0) }
+                        raise:
+                          error:
+                            type: "https://memories.local/errors/daily-work-summary/path-source-disappeared"
+                            status: 409
+                            title: "daily path source memories disappeared after planning"
+                            detail: "the planned Path bucket no longer has source memories"
+                  catch:
+                    as: error
+                    do:
+                      - recordPathFailure:
+                          set:
+                            path_failed_for_date: "${ true }"
+                            failed_path_buckets: >-
+                              ${ $failed_path_buckets + [{period_key: $target_date,
+                                  path_bucket_digest: $path_bucket_digest,
+                                  path_bucket_kind: $path_bucket.path_bucket_kind,
+                                  path_label: $path_bucket.path_label,
+                                  error: $error}] }
+                      - abortImmediatelyAfterPathFailure:
+                          if: "${ $workflow.input.stop_on_error }"
+                          raise:
+                            error:
+                              type: "https://memories.local/errors/daily-work-summary/path"
+                              status: 500
+                              title: "daily path summary failed"
+                              detail: "stop_on_error is enabled; remaining paths were not started"
+
+        - abortBeforeOverallOnPathFailure:
+            if: "${ $workflow.input.stop_on_error and $path_failed_for_date }"
+            raise:
+              error:
+                type: "https://memories.local/errors/daily-work-summary/path"
+                status: 500
+                title: "daily path summary failed"
+                detail: "stop_on_error is enabled; overall generation was not attempted"
+
+        - invokeSingleWithRetry:
+            if: "${ (($failed_dates | index($target_date)) == null) and (($workflow.input.stop_on_error and ((($failed_path_buckets | length) > 0) or (($failed_dates | length) > 0))) | not) }"
+            try:
+              - invokeSingle:
+                  run:
+                    function:
+                      # Resolve the language-specific single worker by name.
+                      # Register it on a channel separate from `llm` (see
+                      # `upsert-generation-workers --channel`) so it does not
+                      # hold the slot its inner LLM job needs (no deadlock).
+                      workerName: '${ "memories-daily-work-summary-single-" + $workflow.input.output_language }'
+                      arguments:
+                        input: >-
+                          ${ {
+                            user_id: $workflow.input.user_id,
+                            target_date: $target_date,
+                            timezone_offset_hours: $workflow.input.timezone_offset_hours,
+                            memories_grpc_host: $workflow.input.memories_grpc_host,
+                            memories_grpc_port: $workflow.input.memories_grpc_port,
+                            memories_grpc_tls: $workflow.input.memories_grpc_tls,
                             summary_model: $workflow.input.summary_model,
                             ollama_base_url: $workflow.input.ollama_base_url,
                             output_language: $workflow.input.output_language,
-                            force_resummarize: $workflow.input.force_resummarize
+                            summary_label: $workflow.input.summary_label,
+                            daily_label: $workflow.input.daily_label,
+                            extra_labels_filter: $workflow.input.extra_labels_filter,
+                            extra_labels_match_mode: ($workflow.input.extra_labels_match_mode // "LABEL_ALL"),
+                            min_thread_count: $workflow.input.min_thread_count,
+                            max_context_chars: $workflow.input.max_context_chars,
+                            summary_output_guidance: $workflow.input.summary_output_guidance,
+                            llm_context_window_tokens: $workflow.input.llm_context_window_tokens,
+                            llm_expected_model: $workflow.input.llm_expected_model,
+                            summary_max_completion_tokens: $workflow.input.summary_max_completion_tokens,
+                            summary_input_byte_budget: $workflow.input.summary_input_byte_budget,
+                            force_resummarize: $workflow.input.force_resummarize,
+                            v2_source_scope_digest: $workflow.input.source_scope_digest,
+                            v2_rollup_scope: "overall",
+                            source_memory_kind: "MEMORY_KIND_DAILY_SUMMARY",
+                            source_thread_labels_override: [$workflow.input.daily_label,
+                                                            "date:" + $target_date,
+                                                            "summary_scope:path",
+                                                            "source_scope:" + $workflow.input.source_scope_digest],
+                            source_thread_match_mode: "LABEL_ALL",
+                            expected_path_bucket_count: ($daily_path_plan.path_buckets | length),
+                            planned_path_bucket_digests: $planned_daily_path_bucket_digests,
+                            v2_failed_path_buckets: ($failed_path_buckets | map(select(.period_key == $target_date))),
+                            generation_id: $workflow.input.generation_id,
+                            generation_started_at: $workflow.input.generation_started_at
                           } | tojson }
                   export:
                     as:
@@ -192,11 +532,41 @@ do:
                       failed_dates: "${ $failed_dates + [$target_date] }"
                       last_error: "${ $error }"
 
+  # An item whose own try timed out is skipped by `onError: continue` without
+  # reaching its catch. Count such items as failed so an incomplete run is
+  # never reported as completed.
+  - collectUnaccountedDates:
+      set:
+        unaccounted_dates: >-
+          ${ ($date_list) - $generated_dates - $skipped_dates - $failed_dates }
+  - recordUnaccountedDates:
+      if: "${ ($unaccounted_dates | length) > 0 }"
+      set:
+        failed_dates: "${ $failed_dates + $unaccounted_dates }"
+        last_error: >-
+          ${ $last_error // ((($unaccounted_dates | length) | tostring)
+             + " item(s) ended without an outcome (timed out or aborted)") }
+
+  - abortBatchOnPathFailure:
+      if: "${ $workflow.input.stop_on_error and ((($failed_path_buckets | length) > 0) or (($failed_dates | length) > 0)) }"
+      raise:
+        error:
+          type: "https://memories.local/errors/daily-work-summary/path"
+          status: 500
+          title: "daily path summary failed"
+          detail: "one or more path summaries failed"
+
 output:
   as:
     # `completed` reflects "all attempted dates succeeded".
     # When false, inspect `failed_dates` to know what to re-run.
     completed: ${ ($failed_dates | length) == 0 }
+    # A partial overall can be durably materialized after an individual path
+    # failed.  That is a completed best-effort run, not a clean success.
+    outcome: >-
+      ${ if ($failed_dates | length) > 0 then "failed"
+         elif ($failed_path_buckets | length) > 0 then "completed_with_errors"
+         else "succeeded" end }
     processed_dates: ${ $date_list | length }
     generated_count: ${ $generated_dates | length }
     skipped_count: ${ $skipped_dates | length }
@@ -208,3 +578,4 @@ output:
     succeeded_dates: ${ $generated_dates + $skipped_dates }
     failed_dates: ${ $failed_dates }
     last_error: ${ $last_error }
+    failed_path_buckets: ${ $failed_path_buckets }

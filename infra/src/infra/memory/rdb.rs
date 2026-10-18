@@ -237,6 +237,16 @@ const FIND_SURROUNDING_AFTER_SQL: &str = concat!(
     ";"
 );
 
+/// `external_id IN (..) AND memory_kind = ..` for one IN-list chunk; binds
+/// the ids first, then the kind.
+fn external_ids_and_kind_predicate(id_count: usize) -> String {
+    format!(
+        "external_id IN ({}) AND memory_kind = {}",
+        crate::sql::build_in_placeholders(id_count, 1),
+        crate::sql::dyn_placeholder(id_count + 1)
+    )
+}
+
 #[async_trait]
 pub trait MemoryRepository: UseRdbPool + UseIdGenerator + Sync + Send {
     async fn create<'c, E: Executor<'c, Database = Rdb>>(
@@ -526,6 +536,62 @@ pub trait MemoryRepository: UseRdbPool + UseIdGenerator + Sync + Send {
             .context(format!(
                 "error in find_by_external_id_and_kind: {external_id}"
             ))
+    }
+
+    /// Batch form of `find_by_external_id_and_kind`; `external_id` is
+    /// UNIQUE, so each id yields at most one row. Order is unspecified.
+    async fn find_by_external_ids_and_kind(
+        &self,
+        external_ids: &[String],
+        memory_kind: MemoryKind,
+    ) -> Result<Vec<Memory>> {
+        let mut memories = Vec::new();
+        for chunk in external_ids.chunks(IN_LIST_CHUNK_SIZE) {
+            let sql = format!(
+                "SELECT {} FROM memory WHERE {}",
+                memory_columns!(),
+                external_ids_and_kind_predicate(chunk.len())
+            );
+            let mut query = sqlx::query_as::<Rdb, MemoryRow>(sqlx::AssertSqlSafe(sql));
+            for external_id in chunk {
+                query = query.bind(external_id);
+            }
+            let rows = query
+                .bind(memory_kind as i32)
+                .fetch_all(self.db_pool())
+                .await
+                .map_err(LlmMemoryError::DBError)
+                .context("error in find_by_external_ids_and_kind")?;
+            memories.extend(rows.into_iter().map(|row| row.to_proto()));
+        }
+        Ok(memories)
+    }
+
+    /// Row count `find_by_external_ids_and_kind` would return, without
+    /// loading memory bodies.
+    async fn count_by_external_ids_and_kind(
+        &self,
+        external_ids: &[String],
+        memory_kind: MemoryKind,
+    ) -> Result<i64> {
+        let mut count = 0;
+        for chunk in external_ids.chunks(IN_LIST_CHUNK_SIZE) {
+            let sql = format!(
+                "SELECT COUNT(*) FROM memory WHERE {}",
+                external_ids_and_kind_predicate(chunk.len())
+            );
+            let mut query = sqlx::query_scalar::<Rdb, i64>(sqlx::AssertSqlSafe(sql));
+            for external_id in chunk {
+                query = query.bind(external_id);
+            }
+            count += query
+                .bind(memory_kind as i32)
+                .fetch_one(self.db_pool())
+                .await
+                .map_err(LlmMemoryError::DBError)
+                .context("error in count_by_external_ids_and_kind")?;
+        }
+        Ok(count)
     }
 
     /// Bulk variant of `find_by_external_id` joined with `thread_memory`
@@ -4128,6 +4194,79 @@ mod test {
         TEST_RUNTIME.block_on(async {
             let rdb_pool = setup_pool().await;
             _test_update_content_only(rdb_pool).await
+        })
+    }
+}
+
+#[cfg(all(test, not(feature = "postgres")))]
+mod batch_lookup_tests {
+    use super::{MemoryRepository, MemoryRepositoryImpl};
+    use crate::infra::thread_group::test_support::setup_thread_group_pool;
+    use crate::sql::IN_LIST_CHUNK_SIZE;
+    use anyhow::Result;
+    use infra_utils::infra::test::TEST_RUNTIME;
+    use protobuf::llm_memory::data::{ContentType, MemoryData, MemoryKind, UserId};
+
+    #[test]
+    fn external_id_batch_lookup_matches_single_lookup() -> Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_thread_group_pool().await;
+            let repo = MemoryRepositoryImpl::new(crate::test_helper::shared_id_generator(), pool);
+            for (external_id, kind) in [
+                ("batch-lookup:1", MemoryKind::DerivedSummary),
+                ("batch-lookup:2", MemoryKind::ThreadSummary),
+                ("batch-lookup:3", MemoryKind::DerivedSummary),
+            ] {
+                repo.create(
+                    pool,
+                    &MemoryData {
+                        user_id: Some(UserId { value: 1 }),
+                        content: external_id.to_string(),
+                        content_type: ContentType::Text as i32,
+                        external_id: Some(external_id.to_string()),
+                        memory_kind: kind as i32,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            }
+            let mut external_ids: Vec<String> = (0..IN_LIST_CHUNK_SIZE + 2)
+                .map(|n| format!("batch-lookup:missing-{n}"))
+                .collect();
+            external_ids
+                .extend(["batch-lookup:3", "batch-lookup:2", "batch-lookup:1"].map(String::from));
+            assert!(
+                repo.find_by_external_ids_and_kind(&[], MemoryKind::DerivedSummary)
+                    .await?
+                    .is_empty()
+            );
+            assert_eq!(
+                repo.count_by_external_ids_and_kind(&[], MemoryKind::DerivedSummary)
+                    .await?,
+                0
+            );
+            for kind in [MemoryKind::DerivedSummary, MemoryKind::ThreadSummary] {
+                let mut expected = Vec::new();
+                for external_id in &external_ids {
+                    expected.extend(repo.find_by_external_id_and_kind(external_id, kind).await?);
+                }
+                let mut actual = repo
+                    .find_by_external_ids_and_kind(&external_ids, kind)
+                    .await?;
+                let id_of = |memory: &protobuf::llm_memory::data::Memory| {
+                    memory.id.as_ref().map(|id| id.value)
+                };
+                expected.sort_by_key(id_of);
+                actual.sort_by_key(id_of);
+                assert_eq!(
+                    repo.count_by_external_ids_and_kind(&external_ids, kind)
+                        .await?,
+                    expected.len() as i64,
+                    "count of kind {kind:?}"
+                );
+                assert_eq!(actual, expected, "kind {kind:?}");
+            }
+            Ok(())
         })
     }
 }

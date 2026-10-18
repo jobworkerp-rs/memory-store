@@ -18,57 +18,100 @@ input:
         user_id: { type: integer }
         memories_grpc_host: { type: string, default: "localhost" }
         memories_grpc_port: { type: integer, default: 9100 }
+        memories_grpc_tls: { type: boolean, default: false }
         thread_ids:
           type: array
           items: { type: string }
           description: When specified, only these threads are processed.
+        target_thread_ids:
+          type: array
+          items: { type: string, pattern: "^[1-9][0-9]*$" }
+          description: >-
+            Authoritative import target set. Presence takes precedence over
+            thread_ids; an explicitly empty array targets zero threads.
         labels_filter:
           type: array
           items: { type: string }
           description: When specified, only threads carrying these labels are targeted.
-        updated_within_hours:
+        labels_filter_match_mode:
+          type: string
+          enum: ["LABEL_ALL", "LABEL_ANY"]
+          default: "LABEL_ALL"
+          description: Match mode for labels_filter. Defaults to legacy LABEL_ALL.
+        last_message_within_hours:
           type: integer
           minimum: 1
           description: >-
-            When specified, only threads whose latest message is within the
+            When specified, only threads whose `last_message_at` is within the
             past N hours measured from this workflow's execution time
-            are targeted. `updated_after_ms` takes precedence when both
+            are targeted. `last_message_after_ms` takes precedence when both
             are set.
-        updated_after_ms:
+        last_message_after_ms:
           type: integer
           minimum: 0
           description: >-
-            Absolute lower bound (epoch ms) for the latest message time. Takes
-            precedence over `updated_within_hours`. memories-import
-            forwards `--since` here so the window stays exactly aligned
-            with the imported set.
+            Absolute lower bound (epoch ms) for `last_message_at`. Takes
+            precedence over `last_message_within_hours`.
+        thread_created_after_ms:
+          type: integer
+          minimum: 0
+          description: Import candidate lower bound (epoch ms, strict `>`).
+        thread_created_before_ms:
+          type: integer
+          minimum: 0
+          description: Import candidate upper bound (epoch ms, inclusive `<=`).
+        # Output language for generated free-text. Selects the
+        # language-specific single + merge workers
+        # (`memories-thread-personality-single-<lang>` /
+        # `memories-user-personality-merge-<lang>`) per fan-out.
+        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
         merge_enabled:
           type: boolean
           default: false
           description: >-
             When true, invoke the registered user-personality-merge
-            language worker once after the per-thread signal pass.
-            False runs layer-1 signals only.
-        memories_grpc_tls: { type: boolean, default: false }
-        llm_worker_name:
-          type: string
-          default: "memories-llm"
-          description: >-
-            Named worker for LLM completion, forwarded to single +
-            merge invocations.
+            language worker once after the per-thread signal pass to
+            aggregate the layer-1 signals into the layer-2 profile.
+            False runs layer-1 signals only (legacy behaviour). The
+            merge is internally idempotent: it skips when there are no
+            new signals or the profile is already up to date.
         min_message_count: { type: integer, default: 4 }
         min_user_messages: { type: integer, default: 2 }
         max_context_chars: { type: integer, default: 200000 }
+        # Forwarded to the single and merge invocations, which call the
+        # built-in LLM runner (Ollama) directly with these settings.
         personality_model: { type: string, default: "qwen3.6:27b" }
         ollama_base_url: { type: string, default: "http://localhost:11434" }
-        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
         force_reextract: { type: boolean, default: false }
-
-timeout:
-  after:
-    hours: 24
+        target_signal_count:
+          type: integer
+          default: 100
+          minimum: 1
+          description: >-
+            Upper bound on the layer-1 signals required to drive the merge.
+            Threads are processed newest-first; once the cumulative number of
+            valid (`no_signal == false`) signals — existing ones already
+            stored with `PERSONALITY` kind plus those produced by this
+            run — reaches this value, the per-thread loop short-circuits.
+            Older threads beyond the cap are left untouched so a re-run can
+            backfill them later, and the merge layer trims its own LLM
+            context further (via `max_signals`). When `force_reextract` is
+            true the cap is ignored and every eligible thread is re-processed.
 
 do:
+  # Batches ignore unknown inputs, so a caller still sending a renamed
+  # message-window key would silently process the whole history.
+  - rejectRenamedMessageWindowInputs:
+      if: >-
+        ${ ["updated_after_ms", "updated_before_ms", "updated_within_hours"]
+           | any(. as $key | $workflow.input | has($key)) }
+      raise:
+        error:
+          type: "https://memories.local/errors/configuration/renamed-input"
+          status: 400
+          title: "Renamed message-window input"
+          detail: "Use last_message_after_ms or last_message_within_hours instead; this batch has no upper bound."
+
   - rejectLegacyPersonalityOwners:
       if: "${ $workflow.input.personality_user_id != null or $workflow.input.summary_user_id != null }"
       raise:
@@ -85,23 +128,31 @@ do:
         # Default false; flipped to true only when invokeMerge exports it,
         # so a `try/catch` swallow of merge failure surfaces as merged=false.
         merge_invoked: "${ false }"
+        merge_error: "${ null }"
 
-  # Resolve effective latest-message lower bound (epoch ms): absolute
+  # Resolve effective `last_message_after` lower bound (epoch ms): absolute
   # wins over relative, null clears the field so the server applies
   # no lower bound. Same shape as thread-summary-batch.
-  - resolveUpdatedAfter:
+  - resolveLastMessageAfter:
       set:
-        updated_after_ms: >-
-          ${ if $workflow.input.updated_after_ms != null
-             then $workflow.input.updated_after_ms
-             elif $workflow.input.updated_within_hours == null
+        last_message_after_ms: >-
+          ${ if $workflow.input.last_message_after_ms != null
+             then $workflow.input.last_message_after_ms
+             elif $workflow.input.last_message_within_hours == null
              then null
-             else ((now - ($workflow.input.updated_within_hours * 3600))
+             else ((now - ($workflow.input.last_message_within_hours * 3600))
                    * 1000 | floor)
              end }
 
+  - initThreadCandidates:
+      set:
+        all_threads: "${ [] }"
+
   - fetchByLabels:
-      if: "${ ($workflow.input.labels_filter // []) | length > 0 }"
+      if: >-
+        ${ (($workflow.input | has("target_thread_ids")) | not
+             or ($workflow.input.target_thread_ids | length) > 0)
+           and (($workflow.input.labels_filter // []) | length > 0) }
       run:
         function:
           runnerName: GRPC
@@ -109,19 +160,23 @@ do:
           settings:
             host: "${$workflow.input.memories_grpc_host}"
             port: ${$workflow.input.memories_grpc_port}
-            tls: false
+            tls: ${$workflow.input.memories_grpc_tls}
             useReflection: true
           arguments:
             method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
             json_body: >-
               ${ ({
                    labels: $workflow.input.labels_filter,
-                   match_mode: "LABEL_ALL",
+                   match_mode: ($workflow.input.labels_filter_match_mode // "LABEL_ALL"),
                    user_id: $workflow.input.user_id,
                    memory_kinds: ["MEMORY_KIND_RAW"],
-                   last_message_after: $updated_after_ms
+                   last_message_after: $last_message_after_ms,
+                   thread_created_after: $workflow.input.thread_created_after_ms,
+                   thread_created_before: $workflow.input.thread_created_before_ms
                  }
-                 | if $updated_after_ms == null then del(.last_message_after) else . end
+                 | if $last_message_after_ms == null then del(.last_message_after) else . end
+                 | if $workflow.input.thread_created_after_ms == null then del(.thread_created_after) else . end
+                 | if $workflow.input.thread_created_before_ms == null then del(.thread_created_before) else . end
                  | tojson) }
             as_json: true
       export:
@@ -129,7 +184,10 @@ do:
           all_threads: ${ .jsonBody | fromjson }
 
   - fetchByUser:
-      if: "${ ($workflow.input.labels_filter // []) | length == 0 }"
+      if: >-
+        ${ (($workflow.input | has("target_thread_ids")) | not
+             or ($workflow.input.target_thread_ids | length) > 0)
+           and (($workflow.input.labels_filter // []) | length == 0) }
       run:
         function:
           runnerName: GRPC
@@ -137,7 +195,7 @@ do:
           settings:
             host: "${$workflow.input.memories_grpc_host}"
             port: ${$workflow.input.memories_grpc_port}
-            tls: false
+            tls: ${$workflow.input.memories_grpc_tls}
             useReflection: true
           arguments:
             method: "/llm_memory.service.ThreadService/FindThreadListByUserId"
@@ -145,9 +203,13 @@ do:
               ${ ({
                    user_id: { value: $workflow.input.user_id },
                    memory_kinds: ["MEMORY_KIND_RAW"],
-                   last_message_after: $updated_after_ms
+                   last_message_after: $last_message_after_ms,
+                   thread_created_after: $workflow.input.thread_created_after_ms,
+                   thread_created_before: $workflow.input.thread_created_before_ms
                  }
-                 | if $updated_after_ms == null then del(.last_message_after) else . end
+                 | if $last_message_after_ms == null then del(.last_message_after) else . end
+                 | if $workflow.input.thread_created_after_ms == null then del(.thread_created_after) else . end
+                 | if $workflow.input.thread_created_before_ms == null then del(.thread_created_before) else . end
                  | tojson) }
             as_json: true
       export:
@@ -173,32 +235,235 @@ do:
                        and ($lbls | any(startswith("thread:")))
                      ) | not
                  )) ) as $clean
-             | if ($workflow.input.thread_ids // []) | length > 0
+             | if ($workflow.input | has("target_thread_ids"))
+               then $clean | map(select(
+                 .id.value as $tid | $workflow.input.target_thread_ids | any(. == ($tid | tostring))
+               ))
+               elif ($workflow.input.thread_ids // []) | length > 0
                then $clean | map(select(
                  .id.value as $tid | $workflow.input.thread_ids | any(. == $tid)
                ))
                else $clean
                end }
 
+  # Process newest threads first so the per-thread loop's signal-count
+  # short-circuit (see `personalityEach.while`) keeps the most recent
+  # personality state. Server-side ordering is not guaranteed across
+  # FindThreadListByUserId / FindThreadListByLabels, so sort here.
+  # Protobuf encodes int64 fields as JSON strings. Compare canonical positive
+  # decimals by digit count and then lexicographically so adjacent values above
+  # JavaScript's safe-integer limit remain distinct. Thread ID descending is
+  # the deterministic tie-break for equal conversation timestamps.
+  - sortTargetThreadsNewestFirst:
+      set:
+        target_threads: >-
+          ${ $target_threads
+             | sort_by([
+                 (((.data.lastMessageAt // "0") | tostring) | length),
+                 ((.data.lastMessageAt // "0") | tostring),
+                 (((.id.value // "0") | tostring) | length),
+                 ((.id.value // "0") | tostring)
+               ])
+             | reverse }
+
+  # Resolve the set of source threads that ALREADY have a VALID layer-1
+  # personality signal (i.e. were processed AND produced a non-no_signal
+  # result on the most recent extraction). Used in two places:
+  #   1. Initial `valid_signal_count` baseline for the budget cap
+  #      (matches the population the merge actually consumes).
+  #   2. The per-iteration `processed_thread_id_set` membership check
+  #      below, so the cap only suppresses re-extraction of already
+  #      processed-and-valid threads — NEW threads (or previously
+  #      no_signal ones that might now succeed) always proceed
+  #      regardless of the cap.
+  #
+  # `MemoryService.FindListByCondition` with `external_id_prefix=
+  # "personality:"` + thread_filter LABEL_ALL `[personality, user:<X>,
+  # personality_signal]` pulls every signal memory in one RPC. The
+  # `personality_signal` label is sticky (kept even on later
+  # no_signal=true flips, per the single workflow's design), so we
+  # MUST filter on the row's current `metadata.no_signal` ourselves;
+  # without that the budget is inflated by threads whose stored signal
+  # is now no_signal=true and the cap stops the loop early. The
+  # filtered rows give both:
+  #   - existing_valid_signal_count (= length after the no_signal drop)
+  #   - processed_thread_id_set (= source_thread_ids of survivors)
+  - fetchProcessedSignalMemories:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryService/FindListByCondition"
+            json_body: >-
+              ${ {
+                roles: ["ROLE_ASSISTANT"],
+                user_id: { value: $effective_personality_user_id },
+                external_id_prefix: "personality:",
+                memory_kinds: ["MEMORY_KIND_PERSONALITY"],
+                content_types: ["TEXT"],
+                thread_filter: {
+                  user_id: $effective_personality_user_id,
+                  memory_kinds: ["MEMORY_KIND_PERSONALITY"],
+                  labels: ["personality",
+                           "user:" + ($workflow.input.user_id | tostring),
+                           "personality_signal"],
+                  label_match_mode: "LABEL_ALL"
+                }
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          # Drop entries whose CURRENT metadata.no_signal is true (the
+          # personality_signal label stays sticky after a flip, so the
+          # gRPC-side filter is not sufficient). The fallback to the
+          # content payload's no_signal keeps legacy rows without the
+          # metadata flag classified consistently.
+          valid_signal_memories: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | map(.memory // null)
+               | map(select(. != null))
+               | map(select(
+                   ((.data.metadata // "{}") | fromjson | .no_signal // false) == false
+                   and ((.data.content // "{}") | fromjson | .no_signal // false) == false
+                 )) }
+          # Map of `source_thread_id (string) -> true`. Built via
+          # from_entries so per-iteration membership is an O(1) hash
+          # lookup. `source_thread_id` rides on metadata; fall back to
+          # the `personality:<id>` external_id suffix for legacy rows.
+          processed_thread_id_set: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | map(.memory // null)
+               | map(select(. != null))
+               | map(select(
+                   ((.data.metadata // "{}") | fromjson | .no_signal // false) == false
+                   and ((.data.content // "{}") | fromjson | .no_signal // false) == false
+                 ))
+               | map(((.data.metadata // "{}") | fromjson | .source_thread_id // null)
+                     // ((.data.externalId // "") | sub("^personality:"; "")))
+               | map(select(. != null and . != ""))
+               | map({key: tostring, value: true})
+               | from_entries }
+          existing_valid_signal_count: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | map(.memory // null)
+               | map(select(. != null))
+               | map(select(
+                   ((.data.metadata // "{}") | fromjson | .no_signal // false) == false
+                   and ((.data.content // "{}") | fromjson | .no_signal // false) == false
+                 ))
+               | length }
+
+  # Loop accumulator + early-break budget. `valid_signal_count` starts
+  # at the baseline so subsequent successful re-extractions are not
+  # double-counted. `force_reextract` skips the cap entirely: a reset
+  # of the personality store needs the whole eligible set re-extracted,
+  # not just the newest N.
+  - initSignalBudget:
+      set:
+        valid_signal_count: "${ $existing_valid_signal_count }"
+        target_signal_count: "${ $workflow.input.target_signal_count // 100 }"
+        force_reextract_flag: "${ $workflow.input.force_reextract // false }"
+        budget_skipped_count: "${ 0 }"
+        # Per-thread outcome accumulators so callers can tell full
+        # failure from partial success. `succeeded_count` counts iterations that ran the
+        # single workflow without throwing (including no-signal / skipped
+        # outcomes — they "succeeded" at deciding nothing was needed);
+        # `failed_count` counts caught errors (LLM 429 etc.).
+        succeeded_count: "${ 0 }"
+        failed_count: "${ 0 }"
+        last_error: "${ null }"
+
   # Per-thread fan-out. `onError: continue` isolates failures so one
   # bad thread does not block the rest of the batch.
+  #
+  # NOTE: the loop has NO `while:` guard. The prior implementation used
+  # `while: force or (valid_signal_count < target_signal_count)` to
+  # short-circuit once the budget was met, but the guard is evaluated
+  # before EVERY iteration including the first — so a user already at
+  # capacity (e.g. 100 existing signals, default cap 100) would have
+  # the entire loop skipped, silently dropping any newly imported
+  # source thread on the floor. The cap now lives inside the loop body
+  # (`isAlreadyProcessed` + `if` guards) so new threads always run
+  # regardless of the cap; only already-processed re-extractions are
+  # gated by the budget.
   - personalityEach:
-      timeout:
-        after:
-          hours: 24
       for:
         each: thread
+        # `at` exposes the 0-based loop index for the (processed/total)
+        # progress signal.
+        at: thread_index
         in: "${ $target_threads }"
       onError: continue
       do:
+        # Publish progress first so this iteration's streamed WorkflowResult
+        # carries `progress_processed` / `progress_total`.
+        - reportProgress:
+            set:
+              progress_processed: "${ $thread_index + 1 }"
+              progress_total: "${ $target_threads | length }"
+        # Classify this iteration's thread: a NEW thread (not in the
+        # processed_thread_id_set built from existing personality
+        # signal threads) ALWAYS runs; a previously-processed thread
+        # only runs when force_reextract is set or the budget has
+        # headroom. `is_already_processed` is keyed by stringified
+        # int64 to dodge JS Number rounding (the proto JSON for
+        # ThreadId.value is also a string).
+        # `should_run_iteration` is true when ANY of:
+        #   - force_reextract is set (full reset of the personality store), or
+        #   - this is a NEW thread (not in processed_thread_id_set — it
+        #     has never been extracted, so the budget cap must not
+        #     suppress it), or
+        #   - the budget still has headroom (valid_signal_count <
+        #     target_signal_count).
+        # Written as an explicit if/elif ladder to dodge the same
+        # jaq multi-arm `or` evaluation quirk that broke
+        # `checkEligibility` in thread-personality-single (see that
+        # file's checkEligibility comment block).
+        - classifyThread:
+            set:
+              is_already_processed: >-
+                ${ ($processed_thread_id_set
+                     // {})[$thread.id.value | tostring] // false }
+              should_run_iteration: >-
+                ${ if $force_reextract_flag == true then true
+                   elif (($processed_thread_id_set
+                            // {})[$thread.id.value | tostring] // false) == false then true
+                   elif $valid_signal_count < $target_signal_count then true
+                   else false
+                   end }
+        # Budget gate ONLY for already-processed threads when force is
+        # off and the cap is reached. New threads bypass the gate
+        # unconditionally (the precise behavior the prior `while:`
+        # broke). On skip we only bump a counter and let the iteration
+        # fall through `invokeSingleWithRetry` via its own `if:` guard
+        # below — `then: continue` cannot jump to the next iteration of
+        # the surrounding `for`, only the next sibling task, so we
+        # gate the invoke instead of trying to early-exit.
+        - skipIfBudgetExhausted:
+            if: "${ ($should_run_iteration | not) }"
+            set:
+              budget_skipped_count: "${ $budget_skipped_count + 1 }"
         - invokeSingleWithRetry:
+            # `if: should_run_iteration` skips the WORKFLOW dispatch +
+            # recordSignalOutcome for budget-exhausted iterations. The
+            # `for.do` keeps walking, so progress (`progress_processed
+            # / progress_total`) still ticks, but no LLM job is
+            # enqueued and `valid_signal_count` stays put.
+            if: "${ $should_run_iteration == true }"
             try:
               - invokeSingle:
-                  timeout:
-                    after:
-                      minutes: 30
                   run:
                     function:
+                      # Resolve the language-specific single worker by name.
+                      # Its registered channel (llm_workflow, concurrency=1)
+                      # keeps the LLM-containing single workflows off the
+                      # `llm` slot the inner LLM job needs (no deadlock).
                       workerName: '${ "memories-thread-personality-single-" + $workflow.input.output_language }'
                       arguments:
                         input: >-
@@ -208,41 +473,90 @@ do:
                             memories_grpc_host: $workflow.input.memories_grpc_host,
                             memories_grpc_port: $workflow.input.memories_grpc_port,
                             memories_grpc_tls: $workflow.input.memories_grpc_tls,
-                            llm_worker_name: $workflow.input.llm_worker_name,
-                            min_message_count: $workflow.input.min_message_count,
-                            min_user_messages: $workflow.input.min_user_messages,
-                            max_context_chars: $workflow.input.max_context_chars,
                             personality_model: $workflow.input.personality_model,
                             ollama_base_url: $workflow.input.ollama_base_url,
                             output_language: $workflow.input.output_language,
+                            min_message_count: $workflow.input.min_message_count,
+                            min_user_messages: $workflow.input.min_user_messages,
+                            max_context_chars: $workflow.input.max_context_chars,
                             force_reextract: $workflow.input.force_reextract
                           } | tojson }
+                  # WORKFLOW runner wraps the nested workflow output in a
+                  # `WorkflowResult` envelope `{id, output, position, status,
+                  # errorMessage}` where `output` is a JSON-encoded string.
+                  # Stage the unwrapped output as a context variable here so
+                  # the next `set` step can reason over it without relying
+                  # on `.` (which only resolves to the previous run's output
+                  # inside an `export.as:`).
+                  export:
+                    as:
+                      single_result: >-
+                        ${ ((.output // "{}") | fromjson) }
+              # Bump the budget only on an extraction that produced a
+              # usable signal (`completed && !no_signal && !skipped`).
+              # Re-runs of already-up-to-date threads return `skipped:true`
+              # and are already counted in `existing_valid_signal_count`,
+              # so they leave the budget unchanged. Threads whose
+              # extraction returned `no_signal:true` never reach the
+              # `personality_signal` label and so were never in the
+              # baseline either — also a no-op for the budget.
+              - recordSignalOutcome:
+                  set:
+                    valid_signal_count: >-
+                      ${ if (($single_result.completed // false)
+                              and (($single_result.no_signal // true) | not)
+                              and (($single_result.skipped // false) | not))
+                           then $valid_signal_count + 1
+                           else $valid_signal_count
+                           end }
+                    succeeded_count: "${ $succeeded_count + 1 }"
             catch:
               as: error
               do:
                 - logError:
                     set:
+                      failed_count: "${ $failed_count + 1 }"
                       last_error: "${ $error }"
 
-  # Layer 2: aggregate the per-thread signals into the single user-level
-  # profile. Lives inside the batch so both dispatch paths — the import
-  # pipeline and a standalone batch invocation (UI "regenerate
-  # personality" button) — produce a profile without external two-step
-  # orchestration. The merge is internally idempotent, so it can be
-  # invoked unconditionally whenever `merge_enabled` is true.
+  # An item whose own try timed out is skipped by `onError: continue` without
+  # reaching its catch. Count such items as failed so an incomplete run is
+  # never reported as completed.
+  - collectUnaccountedThreads:
+      set:
+        unaccounted_count: >-
+          ${ [($target_threads | length) - $succeeded_count - $failed_count - $budget_skipped_count, 0] | max }
+  - recordUnaccountedThreads:
+      if: "${ $unaccounted_count > 0 }"
+      set:
+        failed_count: "${ $failed_count + $unaccounted_count }"
+        last_error: >-
+          ${ $last_error // (($unaccounted_count | tostring)
+             + " item(s) ended without an outcome (timed out or aborted)") }
+
+  # Layer 2: aggregate the per-thread signals just written into the single
+  # user-level profile. Runs here (inside the batch) so both dispatch paths
+  # — a standalone batch invocation and the import pipeline — produce a
+  # profile without external two-step orchestration. The merge
+  # is internally idempotent (skips on no new signals / up-to-date profile),
+  # so it is invoked unconditionally whenever `merge_enabled` is true.
   #
-  # `try/catch` keeps a merge failure non-fatal: layer-1 signals are
-  # already persisted, so the batch still reports success and the merge
-  # can be retried on the next run.
+  # The merge worker (`memories-user-personality-merge-<lang>`) is
+  # registered on the `llm_workflow` channel (concurrency 1), mirroring how
+  # `personalityEach` invokes the single worker above: the merge contains a
+  # direct LLM step, so it belongs to the `llm_workflow` tier which is
+  # strictly below this batch's `llm_batch` (concurrency 2) — no
+  # parent-holds-slot deadlock.
+  #
+  # `try/catch` keeps a merge failure non-fatal: the layer-1 signals are
+  # already persisted, so the batch still reports success and the merge can
+  # be retried on the next run.
   - userPersonalityMerge:
       if: "${ $merge_enabled }"
-      timeout:
-        after:
-          hours: 1
       try:
         - invokeMerge:
             run:
               function:
+                # Resolve the language-specific merge worker by name.
                 workerName: '${ "memories-user-personality-merge-" + $workflow.input.output_language }'
                 arguments:
                   input: >-
@@ -251,11 +565,22 @@ do:
                       memories_grpc_host: $workflow.input.memories_grpc_host,
                       memories_grpc_port: $workflow.input.memories_grpc_port,
                       memories_grpc_tls: $workflow.input.memories_grpc_tls,
-                      llm_worker_name: $workflow.input.llm_worker_name,
-                      max_context_chars: $workflow.input.max_context_chars,
+                      merge_model: $workflow.input.personality_model,
+                      ollama_base_url: $workflow.input.ollama_base_url,
                       output_language: $workflow.input.output_language,
-                      force_remerge: false,
-                      max_signals: 200
+                      max_context_chars: $workflow.input.max_context_chars,
+                      # Cascade the batch's `force_reextract` flag into the
+                      # merge's `force_remerge`. The single-thread re-extract
+                      # path stamps each signal's `updated_at` with the
+                      # source thread's last message time (unchanged on re-run),
+                      # so `max(signal.updated_at)` never exceeds the
+                      # existing profile's `updated_at` and the merge's
+                      # eligibility short-circuit would skip the merge. A
+                      # force re-extract therefore MUST force the re-merge
+                      # too, or the freshly re-extracted signal content
+                      # never lands in the profile.
+                      force_remerge: ($workflow.input.force_reextract // false),
+                      max_signals: $target_signal_count
                     } | tojson }
             export:
               as:
@@ -269,7 +594,25 @@ do:
 
 output:
   as:
-    completed: true
+    # `completed` mirrors thread-summary-batch: true when no per-thread
+    # extraction failed. Callers read failed_count / succeeded_count /
+    # processed_threads to tell full failure from partial success — a
+    # `merge_error` (layer-2) is a separate concern and does not flip
+    # `completed`.
+    completed: ${ ($failed_count // 0) == 0 }
     processed_threads: ${ $target_threads | length }
+    succeeded_count: ${ $succeeded_count // 0 }
+    failed_count: ${ $failed_count // 0 }
+    last_error: ${ $last_error // null }
     merge_enabled: ${ $merge_enabled }
+    # True only when the merge ran without error.
     merged: ${ $merge_invoked }
+    merge_error: ${ $merge_error }
+    target_signal_count: ${ $target_signal_count }
+    existing_valid_signal_count: ${ $existing_valid_signal_count }
+    valid_signal_count: ${ $valid_signal_count }
+    # Number of already-processed source threads we skipped because the
+    # budget was already at capacity (`force_reextract=false`,
+    # is_already_processed=true, valid_signal_count >= target). New
+    # threads are NEVER counted here.
+    budget_skipped_count: ${ $budget_skipped_count // 0 }

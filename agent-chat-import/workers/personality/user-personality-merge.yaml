@@ -7,7 +7,7 @@ document:
 # Layer 2: aggregate per-thread personality signals into a single
 # user-level profile memory.
 #
-# Reads layer-1 signals owned by the source user with PERSONALITY kind,
+# Reads layer-1 signals with `PERSONALITY` kind for the real user,
 # filters by `metadata.source_user_id == input.user_id` (invariant I6),
 # asks an LLM to merge them, then post-processes per-entry first/last
 # seen timestamps in jq so the LLM cannot fabricate dates. The result
@@ -27,23 +27,22 @@ input:
         memories_grpc_host: { type: string, default: "localhost" }
         memories_grpc_port: { type: integer, default: 9100 }
         memories_grpc_tls: { type: boolean, default: false }
-        llm_worker_name: { type: string, default: "memories-llm" }
         max_context_chars: { type: integer, default: 200000 }
         merge_model: { type: string, default: "qwen3.6:27b" }
         ollama_base_url: { type: string, default: "http://localhost:11434" }
+        # Output language for free-text fields. The system_prompt / user_tail
+        # context are baked per-language into the registered lang-worker, so
+        # this is logging/validation metadata only — the worker name already
+        # pins the language. Kept in schema so batch-supplied input validates.
         output_language: { type: string, enum: ["ja", "en"], default: "ja" }
         force_remerge: { type: boolean, default: false }
         max_signals:
           type: integer
-          default: 200
+          default: 100
           description: >-
             Upper bound on layer-1 signals fed into the LLM. Excess
             signals are dropped from the oldest end (signal_updated_at
             ascending) so the most recent preferences always win.
-
-timeout:
-  after:
-    hours: 6
 
 do:
   - rejectLegacyPersonalityOwners:
@@ -139,41 +138,6 @@ do:
                      == ("personality_profile:" + ($workflow.input.user_id | tostring))))
                | (if length > 0 then .[0] else null end) }
 
-  # Invariant I6: the LABEL_ALL filter pre-narrows to this source
-  # user; the metadata.source_user_id check below is a belt-and-braces
-  # against label mistagging.
-  #
-  # Including `personality_signal` here drops no_signal threads at
-  # the gRPC boundary instead of fetching their memories only to
-  # filter them out client-side. thread-personality-single tags
-  # threads with this label whenever it stores a signal whose
-  # `no_signal == false`.
-  - findSignalThreads:
-      run:
-        function:
-          runnerName: GRPC
-          using: streaming
-          settings:
-            host: "${$workflow.input.memories_grpc_host}"
-            port: ${$workflow.input.memories_grpc_port}
-            tls: ${$workflow.input.memories_grpc_tls}
-            useReflection: true
-          arguments:
-            method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
-            json_body: >-
-              ${ {
-                labels: ["personality",
-                         "user:" + ($workflow.input.user_id | tostring),
-                         "personality_signal"],
-                match_mode: "LABEL_ALL",
-                user_id: $effective_personality_user_id,
-                memory_kinds: ["MEMORY_KIND_PERSONALITY"]
-              } | tojson }
-            as_json: true
-      export:
-        as:
-          signal_threads: ${ .jsonBody | fromjson }
-
   # Total personality memory count (signal + no_signal) for this
   # source user, scoped through `thread_filter` so we don't pull in
   # other users' personality memories. Used to derive
@@ -195,6 +159,7 @@ do:
               ${ {
                 roles: ["ROLE_ASSISTANT"],
                 user_id: { value: $effective_personality_user_id },
+                memory_kinds: ["MEMORY_KIND_PERSONALITY"],
                 external_id_prefix: "personality:",
                 content_types: ["TEXT"],
                 thread_filter: {
@@ -211,67 +176,71 @@ do:
           total_personality_memory_count: >-
             ${ ((.jsonBody // "{}") | fromjson | (.total // 0) | tonumber) }
 
-  # `signal_threads` is empty for users that have never had a layer-1
-  # personality memory written. In that case the for-loop below never
-  # runs, so its export.as never binds `$accumulated_signals` —
-  # and the downstream `filterAndDedupeSignals` would then trip on
-  # "undefined variable $accumulated_signals". Pre-bind it here so
-  # both the empty-loop path and the populated-loop path leave the
-  # variable defined.
-  - initAccumulatedSignals:
-      set:
-        accumulated_signals: "${ [] }"
-
-  # Each personality thread produces at most one signal memory
-  # (deterministic external_id), so the per-thread fetch is a union;
-  # we still dedupe defensively below to absorb the rare case where
-  # two threads share the same `source_thread_id`.
-  - fetchSignalMemories:
-      for:
-        each: t
-        in: "${ $signal_threads }"
-      do:
-        - fetchOne:
-            run:
-              function:
-                runnerName: GRPC
-                using: streaming
-                settings:
-                  host: "${$workflow.input.memories_grpc_host}"
-                  port: ${$workflow.input.memories_grpc_port}
-                  tls: ${$workflow.input.memories_grpc_tls}
-                  useReflection: true
-                arguments:
-                  method: "/llm_memory.service.ThreadService/FindMemoriesByThreadId"
-                  json_body: >-
-                    ${ {
-                      thread_id: { value: $t.id.value },
-                      roles: ["ROLE_ASSISTANT"],
-                      content_types: ["TEXT"]
-                    } | tojson }
-                  as_json: true
-            export:
-              as:
-                accumulated_signals: >-
-                  ${ $accumulated_signals
-                     + ((.jsonBody // "[]") | fromjson) }
-
-  # Invariant I6 second leg: filter by metadata.source_user_id.
-  # `accumulated_signals` already contains only `personality_signal`-
-  # tagged threads (filtered at findSignalThreads), so every entry
-  # surviving the source_user_id check should have
-  # `metadata.no_signal == false`. The metadata.no_signal filter in
-  # `buildSignalEntries` below stays as a belt-and-braces guard
-  # against the rare retro-tagging case (a thread originally signal,
-  # later re-extracted as no_signal but still carrying the
-  # `personality_signal` label since we never strip it).
-  - filterAndDedupeSignals:
-      set:
-        all_personality_memories: >-
-          ${ ($accumulated_signals // [])
-             | map(select(.data.externalId != null
-                          and ((.data.metadata // "{}") | fromjson | .source_user_id // null)
-                              == ($workflow.input.user_id | tostring))) }
+  # Single-RPC replacement for the legacy
+  # "FindThreadListByLabels → per-thread FindMemoriesByThreadId" pass:
+  # MemoryService/FindListByCondition lets us push `external_id_prefix`,
+  # the same LABEL_ALL thread filter, sort, and limit into one call
+  # while the server applies them in the right order. We deliberately
+  # over-fetch by 2x `max_signals` so the downstream
+  # metadata.source_user_id and metadata.no_signal guards (Invariant I6
+  # second leg) still have headroom to drop a few rows without our
+  # short-circuit eating into the LLM-visible signal budget. The server
+  # returns up to `limit` rows ordered by updated_at descending, so the
+  # final `signal_entries` cap in `capSignals` keeps the newest
+  # max_signals; older rows are simply left for a later run to
+  # incorporate (no information loss, just deferred work).
+  #
+  # Invariant I6 first leg (the LABEL_ALL filter) is enforced by the
+  # thread_filter below; the second leg (metadata.source_user_id ==
+  # input.user_id) is still applied in jq as belt-and-braces against
+  # label mistagging — without it a stray cross-user label edit would
+  # leak another user's signals into this merge.
+  - findRecentSignals:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryService/FindListByCondition"
+            json_body: >-
+              ${ {
+                roles: ["ROLE_ASSISTANT"],
+                user_id: { value: $effective_personality_user_id },
+                memory_kinds: ["MEMORY_KIND_PERSONALITY"],
+                external_id_prefix: "personality:",
+                content_types: ["TEXT"],
+                thread_filter: {
+                  user_id: $effective_personality_user_id,
+                  memory_kinds: ["MEMORY_KIND_PERSONALITY"],
+                  labels: ["personality",
+                           "user:" + ($workflow.input.user_id | tostring),
+                           "personality_signal"],
+                  label_match_mode: "LABEL_ALL"
+                },
+                limit: (($workflow.input.max_signals // 100) * 2)
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          # FindListByCondition streams `MemoryListEntry` objects, which
+          # wrap the actual memory under `.memory`. Unwrap to a flat
+          # `[{id, data}, ...]` list so downstream jq mirrors the legacy
+          # accumulated_signals shape and `buildSignalEntries` stays
+          # untouched. Drop entries lacking `.memory` defensively (a
+          # representative-thread-only row should never occur for this
+          # filter, but the field is `optional` in proto).
+          all_personality_memories: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | map(.memory // null)
+               | map(select(. != null
+                            and .data.externalId != null
+                            and ((.data.metadata // "{}") | fromjson | .source_user_id // null)
+                                == ($workflow.input.user_id | tostring))) }
 
   # Workflow-side ISO8601 conversion keeps the LLM out of date math.
   # Dedupe by source_thread_id (retain max updatedAt). `no_signal`
@@ -330,9 +299,13 @@ do:
   # report a wrong eligibility result.
   #
   # Written as an explicit if/elif/else ladder rather than a multi-arm
-  # `or` so jaq cannot return a non-boolean from `null.data.updatedAt`
-  # in the third arm when `$existing_profile` is null. Same defensive
-  # shape as thread-personality-single.yaml's `checkEligibility`.
+  # `or` for the same reason thread-personality-single.yaml's
+  # `checkEligibility` was rewritten: jaq evaluates every `or` arm,
+  # and the third arm dereferences `$existing_profile.data.updatedAt`
+  # which is `null.data.updatedAt` when no profile exists. The `// 0`
+  # fallback masks the dereference today, but the defensive shape
+  # across the two workflows must stay consistent so a future jaq
+  # behavior change cannot silently make `eligible` non-boolean again.
   - checkEligibility:
       set:
         max_signal_updated_at: >-
@@ -354,6 +327,10 @@ do:
           result: "skipped: no valid layer-1 signals"
       then: exit
 
+  # Mirrors thread-personality-single's `skipIfNotEligible`: the
+  # `(... // false) == false` form is robust to `eligible` ending up
+  # null (e.g. via a jaq runtime quirk), where `$eligible | not` would
+  # be `true` and silently skip the merge on a first run.
   - skipIfNotEligible:
       if: "${ ($eligible // false) == false }"
       set:
@@ -378,8 +355,8 @@ do:
   #
   # Split into three steps because jaq evaluates keys in a single
   # `set` block in parallel — sibling keys cannot reference one
-  # another. Same constraint as `resolvePersonalityWiring` in
-  # agent-chat-pipeline.yaml.
+  # another. The other multi-step workflows in this bundle have the same
+  # constraint.
   - capSignals:
       set:
         capped_signals: >-
@@ -415,13 +392,21 @@ do:
   # per-entry date computation below has something to anchor on) and
   # excludes `first_seen_at` / `last_seen_at` from required (we
   # overwrite them after the LLM call).
-  - validatePromptContext:
+  #
+  # Fail closed if the language-specific prompt context was not baked into
+  # the worker (registration mistake). Running the LLM with an empty
+  # system_prompt / user_tail would silently produce off-language or
+  # malformed output, so reject instead.
+  # `$user_personality_merge_system_prompt` and
+  # `$user_personality_merge_user_tail` come from the worker's
+  # `workflow_context`.
+  - validateUserPersonalityMergePromptContext:
       if: "${ (($user_personality_merge_system_prompt // \"\") | length) == 0 or (($user_personality_merge_user_tail // \"\") | length) == 0 }"
       raise:
         error:
-          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
-          status: 500
-          title: "prompt_context_missing"
+          type: "https://memories.local/errors/personality/prompt_context_missing"
+          status: 422
+          title: "User personality merge prompt context is missing"
           detail: >-
             ${ if (($user_personality_merge_system_prompt // "") | length) == 0
                then "user_personality_merge_system_prompt is missing"
@@ -640,13 +625,13 @@ do:
             json_body: >-
               ${ {
                 user_id: { value: $effective_personality_user_id },
-                memory_kind: "MEMORY_KIND_PERSONALITY",
                 description: ("personality profile for user "
                               + ($workflow.input.user_id | tostring)),
                 labels: ["personality_profile",
                          "user:" + ($workflow.input.user_id | tostring)],
                 created_at: $max_signal_updated_at,
-                updated_at: $max_signal_updated_at
+                updated_at: $max_signal_updated_at,
+                memory_kind: "MEMORY_KIND_PERSONALITY"
               } | tojson }
             as_json: true
       export:
@@ -739,14 +724,14 @@ do:
                 thread_id: { value: $profile_thread_id },
                 memory: {
                   user_id: { value: $effective_personality_user_id },
-                  memory_kind: "MEMORY_KIND_PERSONALITY",
                   content: ($profile_json | tojson),
                   content_type: "TEXT",
                   role: "ROLE_ASSISTANT",
                   metadata: $profile_metadata_json,
                   external_id: $profile_external_id,
                   created_at: $max_signal_updated_at,
-                  updated_at: $max_signal_updated_at
+                  updated_at: $max_signal_updated_at,
+                  memory_kind: "MEMORY_KIND_PERSONALITY"
                 }
               } | tojson }
             as_json: true

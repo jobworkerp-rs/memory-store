@@ -30,11 +30,21 @@ service ThreadGroupService {
     // Read model: one group's current memberships, canonical relations,
     // and unresolved candidate associations.
     rpc FindThreadGroupLineage(llm_memory.data.ThreadGroupId) returns (llm_memory.data.ThreadGroupLineage);
+    // DEPRECATED: use FindThreadGroupSummaries (batch). Retained for
+    // clients/servers that predate it.
     // Lookup the durable group summary by its group-scoped external id and
     // dedicated memory kind. Missing summaries return an empty response.
-    rpc FindThreadGroupSummary(FindThreadGroupSummaryRequest) returns (ThreadGroupSummaryResponse);
+    rpc FindThreadGroupSummary(FindThreadGroupSummaryRequest) returns (ThreadGroupSummaryResponse) {
+        option deprecated = true;
+    }
+    // Batch form of FindThreadGroupSummary: one entry per requested id, in
+    // request order, each with exactly the single-id lookup semantics.
+    rpc FindThreadGroupSummaries(FindThreadGroupSummariesRequest) returns (FindThreadGroupSummariesResponse);
     // Count summaries belonging to active groups that still have live members.
     rpc CountThreadGroupSummaries(CountThreadGroupSummariesRequest) returns (CountThreadGroupSummariesResponse);
+    // Number of ACTIVE groups FindThreadGroupList returns for the same
+    // user_id (include_inactive = false), computed without streaming them.
+    rpc CountThreadGroups(CountThreadGroupsRequest) returns (CountThreadGroupsResponse);
     // Import path: record adapter observations for an imported subject
     // thread and reconcile its canonical parent / membership.
     rpc RecordThreadGroupObservations(RecordThreadGroupObservationsRequest) returns (RecordThreadGroupObservationsResponse);
@@ -278,6 +288,33 @@ message CountThreadGroupSummariesRequest {
 }
 
 message CountThreadGroupSummariesResponse {
+    int64 count = 1;
+}
+
+message FindThreadGroupSummariesRequest {
+    // 1..=100 group ids; duplicates are allowed and answered per entry.
+    repeated int64 group_ids = 1;
+    // Same owner check as FindThreadGroupSummary.
+    optional int64 user_id = 2;
+}
+
+message ThreadGroupSummaryEntry {
+    int64 group_id = 1;
+    // Absent exactly when FindThreadGroupSummary would return no summary.
+    optional llm_memory.data.Memory summary = 2;
+}
+
+message FindThreadGroupSummariesResponse {
+    // Same length and order as FindThreadGroupSummariesRequest.group_ids.
+    repeated ThreadGroupSummaryEntry entries = 1;
+}
+
+message CountThreadGroupsRequest {
+    // ACTIVE groups only; unset counts every owner.
+    optional int64 user_id = 1;
+}
+
+message CountThreadGroupsResponse {
     int64 count = 1;
 }
 

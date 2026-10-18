@@ -6,9 +6,9 @@ use crate::protobuf::llm_memory::service::thread_service_server::ThreadService;
 use crate::protobuf::llm_memory::service::{
     AddLabelsRequest, AddMemoriesBatchRequest, AddMemoriesBatchResponse,
     AddMemoryOutcome as AddMemoryOutcomeProto, AddMemoryRequest, AddMemoryResponse, CountResponse,
-    CreateThreadResponse, DeleteThreadWithPolicyRequest, DeleteThreadWithPolicyResponse,
-    FindCoOccurringLabelsRequest, FindCoOccurringLabelsResponse, FindCondition,
-    FindDistinctLabelsRequest, FindDistinctLabelsResponse, FindListRequest,
+    CountThreadsByUserIdRequest, CreateThreadResponse, DeleteThreadWithPolicyRequest,
+    DeleteThreadWithPolicyResponse, FindCoOccurringLabelsRequest, FindCoOccurringLabelsResponse,
+    FindCondition, FindDistinctLabelsRequest, FindDistinctLabelsResponse, FindListRequest,
     FindMemoriesByThreadIdRequest, FindThreadListByLabelsRequest, FindThreadListByUserIdRequest,
     MemoryWithPosition as MemoryWithPositionProto, OptionalThreadResponse, RemoveLabelsRequest,
     ResolveAncestorClosureRequest, ResolveAncestorClosureResponse, SearchLabelsRequest,
@@ -400,6 +400,26 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
         let _s = Self::trace_request("thread", "count", &request);
         match self.app().count().await {
             Ok(res) => Ok(Response::new(CountResponse { total: res })),
+            Err(e) => Err(handle_error(&e)),
+        }
+    }
+
+    #[tracing::instrument]
+    async fn count_by_user_id(
+        &self,
+        request: tonic::Request<CountThreadsByUserIdRequest>,
+    ) -> Result<tonic::Response<CountResponse>, tonic::Status> {
+        let _s = Self::trace_request("thread", "count_by_user_id", &request);
+        let req = request.into_inner();
+        let Some(user_id) = req.user_id else {
+            return Err(tonic::Status::invalid_argument("user_id is required"));
+        };
+        match self
+            .app()
+            .count_by_user_id(user_id, &req.memory_kinds)
+            .await
+        {
+            Ok(total) => Ok(Response::new(CountResponse { total })),
             Err(e) => Err(handle_error(&e)),
         }
     }

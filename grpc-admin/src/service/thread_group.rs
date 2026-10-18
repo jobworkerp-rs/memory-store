@@ -33,15 +33,16 @@ use crate::protobuf::llm_memory::data::{
 use crate::protobuf::llm_memory::service::thread_group_service_server::ThreadGroupService;
 use crate::protobuf::llm_memory::service::{
     AttachManualCollectionMemberRequest, AttachThreadGroupMemberRequest,
-    CountThreadGroupSummariesRequest, CountThreadGroupSummariesResponse,
-    CreateManualCollectionRequest, CreateManualCollectionResponse, DeleteManualCollectionRequest,
-    DeleteThreadGroupInactiveHistoryRequest, DeleteThreadGroupInactiveHistoryResponse,
-    DetachManualCollectionMemberRequest, ExecuteGlobalOrphanCleanupRequest,
-    FindManualCollectionListRequest, FindManualCollectionMembersRequest,
-    FindThreadGroupListRequest, FindThreadGroupReconciliationReportRequest,
-    FindThreadGroupSummaryRequest, GlobalOrphanCleanupPreview, GlobalOrphanCleanupResponse,
-    LinkThreadGroupMemoryRequest, MergeThreadGroupsRequest, MergeThreadGroupsResponse,
-    PreviewGlobalOrphanCleanupRequest, PreviewThreadGroupImportRequest,
+    CountThreadGroupSummariesRequest, CountThreadGroupSummariesResponse, CountThreadGroupsRequest,
+    CountThreadGroupsResponse, CreateManualCollectionRequest, CreateManualCollectionResponse,
+    DeleteManualCollectionRequest, DeleteThreadGroupInactiveHistoryRequest,
+    DeleteThreadGroupInactiveHistoryResponse, DetachManualCollectionMemberRequest,
+    ExecuteGlobalOrphanCleanupRequest, FindManualCollectionListRequest,
+    FindManualCollectionMembersRequest, FindThreadGroupListRequest,
+    FindThreadGroupReconciliationReportRequest, FindThreadGroupSummariesRequest,
+    FindThreadGroupSummariesResponse, FindThreadGroupSummaryRequest, GlobalOrphanCleanupPreview,
+    GlobalOrphanCleanupResponse, LinkThreadGroupMemoryRequest, MergeThreadGroupsRequest,
+    MergeThreadGroupsResponse, PreviewGlobalOrphanCleanupRequest, PreviewThreadGroupImportRequest,
     PreviewThreadGroupImportResponse, ProcessThreadGroupEventRequest,
     ProcessThreadGroupEventResponse, RecordThreadGroupObservationsRequest,
     RecordThreadGroupObservationsResponse, RecordThreadGroupOperatorDecisionRequest,
@@ -50,7 +51,7 @@ use crate::protobuf::llm_memory::service::{
     SplitThreadGroupResponse, SuccessResponse, ThreadGroupCapabilitiesRequest,
     ThreadGroupCapabilitiesResponse, ThreadGroupPurgePreview, ThreadGroupReconciliationReport,
     ThreadGroupSearchMode, ThreadGroupSearchTarget, ThreadGroupSearchWitness,
-    ThreadGroupSummaryResponse,
+    ThreadGroupSummaryEntry, ThreadGroupSummaryResponse,
 };
 use crate::service::error_handle::handle_error;
 use async_stream::stream;
@@ -904,6 +905,40 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
             .await
             .map_err(|e| handle_error(&e))?;
         Ok(Response::new(ThreadGroupSummaryResponse { summary }))
+    }
+
+    #[tracing::instrument(skip(self, request))]
+    async fn find_thread_group_summaries(
+        &self,
+        request: tonic::Request<FindThreadGroupSummariesRequest>,
+    ) -> Result<Response<FindThreadGroupSummariesResponse>, tonic::Status> {
+        let request = request.into_inner();
+        let summaries = self
+            .read_app
+            .find_group_summaries(&request.group_ids, request.user_id)
+            .await
+            .map_err(|e| handle_error(&e))?;
+        Ok(Response::new(FindThreadGroupSummariesResponse {
+            entries: request
+                .group_ids
+                .into_iter()
+                .zip(summaries)
+                .map(|(group_id, summary)| ThreadGroupSummaryEntry { group_id, summary })
+                .collect(),
+        }))
+    }
+
+    #[tracing::instrument(skip(self, request))]
+    async fn count_thread_groups(
+        &self,
+        request: tonic::Request<CountThreadGroupsRequest>,
+    ) -> Result<Response<CountThreadGroupsResponse>, tonic::Status> {
+        let count = self
+            .read_app
+            .count_groups(request.into_inner().user_id)
+            .await
+            .map_err(|e| handle_error(&e))?;
+        Ok(Response::new(CountThreadGroupsResponse { count }))
     }
 
     #[tracing::instrument(skip(self, request))]
@@ -1866,5 +1901,84 @@ mod tests {
         assert_eq!(mapped.thread_canonical_key, "canonical-key");
         assert_eq!(mapped.source.as_deref(), Some("codex"));
         assert_eq!(mapped.deleted_at, Some(42));
+    }
+}
+
+#[cfg(all(test, not(feature = "postgres")))]
+mod batch_read_rpc_tests {
+    use super::*;
+    use infra::infra::thread_group::group::{ThreadGroupRepository, ThreadGroupRepositoryImpl};
+    use infra::infra::thread_group::test_support::{new_group, setup_thread_group_pool};
+    use infra_utils::infra::test::TEST_RUNTIME;
+
+    #[test]
+    fn summary_batch_answers_in_request_order_and_bounds_its_size() {
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_thread_group_pool().await;
+            let groups =
+                ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+            let first = groups.create_tx(pool, &new_group(9_700_001)).await.unwrap();
+            let second = groups.create_tx(pool, &new_group(9_700_002)).await.unwrap();
+            let service = ThreadGroupGrpcImpl::new(pool);
+
+            let group_ids = vec![second, -1, first, second];
+            let response = service
+                .find_thread_group_summaries(tonic::Request::new(FindThreadGroupSummariesRequest {
+                    group_ids: group_ids.clone(),
+                    user_id: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                response
+                    .entries
+                    .iter()
+                    .map(|entry| entry.group_id)
+                    .collect::<Vec<_>>(),
+                group_ids
+            );
+            assert!(response.entries.iter().all(|entry| entry.summary.is_none()));
+
+            for group_ids in [Vec::new(), vec![first; 101]] {
+                let status = service
+                    .find_thread_group_summaries(tonic::Request::new(
+                        FindThreadGroupSummariesRequest {
+                            group_ids,
+                            user_id: None,
+                        },
+                    ))
+                    .await
+                    .unwrap_err();
+                assert_eq!(status.code(), tonic::Code::InvalidArgument);
+            }
+        })
+    }
+
+    #[test]
+    fn group_count_matches_the_active_group_listing() {
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_thread_group_pool().await;
+            let groups =
+                ThreadGroupRepositoryImpl::new(infra::test_helper::shared_id_generator(), pool);
+            let mut owned = new_group(9_700_011);
+            owned.user_id = 97;
+            groups.create_tx(pool, &owned).await.unwrap();
+            let service = ThreadGroupGrpcImpl::new(pool);
+            for user_id in [None, Some(97), Some(98)] {
+                let count = service
+                    .count_thread_groups(tonic::Request::new(CountThreadGroupsRequest { user_id }))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .count;
+                let listed = ThreadGroupReadService::new(pool)
+                    .list_groups(false, None, None, user_id)
+                    .await
+                    .unwrap()
+                    .len() as i64;
+                assert_eq!(count, listed, "user {user_id:?}");
+            }
+        })
     }
 }

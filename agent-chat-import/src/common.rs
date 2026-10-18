@@ -22,7 +22,7 @@ pub mod path;
 
 pub mod workflow_input {
     use anyhow::{Result, anyhow};
-    use serde_json::Map;
+    use serde_json::{Map, Value, json};
 
     /// Reject removed owner-routing fields before dispatching a workflow.
     pub(crate) fn reject_removed_fields(
@@ -37,6 +37,116 @@ pub mod workflow_input {
             }
         }
         Ok(())
+    }
+
+    /// Absolute lower bound on a thread's last message time accepted by the
+    /// thread-level batch workflows.
+    const LAST_MESSAGE_AFTER_MS: &str = "last_message_after_ms";
+
+    /// Message-window inputs renamed in the thread-level batch workflows.
+    /// The batches ignore unknown keys, so a stale template would silently
+    /// widen the window to the whole history instead of failing.
+    const RENAMED_MESSAGE_WINDOW_FIELDS: [(&str, &str); 3] = [
+        ("updated_after_ms", LAST_MESSAGE_AFTER_MS),
+        (
+            "updated_before_ms",
+            "last_message_before_ms (thread-summary batch only)",
+        ),
+        ("updated_within_hours", "last_message_within_hours"),
+    ];
+
+    fn reject_renamed_message_window_fields(input: &Map<String, Value>) -> Result<()> {
+        for (old, new) in RENAMED_MESSAGE_WINDOW_FIELDS {
+            if input.contains_key(old) {
+                return Err(anyhow!("{old} is no longer supported; use {new}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Overlay import-derived values on a user template for a thread-level
+    /// batch dispatched after import. `--since` becomes an absolute
+    /// `last_message_after_ms` rather than a relative window, because a
+    /// relative window is re-anchored at workflow start and drifts past the
+    /// import boundary whenever the job waits in the queue.
+    pub(crate) fn merge_thread_batch_template(
+        mut template: Value,
+        flag: &str,
+        removed_fields: &[&str],
+        user_id: i64,
+        last_message_after_ms: Option<i64>,
+        output_language: &str,
+    ) -> Result<Value> {
+        let obj = template
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("{flag} must be a JSON object"))?;
+        reject_removed_fields(obj, removed_fields)?;
+        reject_renamed_message_window_fields(obj)?;
+        obj.insert("user_id".into(), json!(user_id));
+        obj.insert("output_language".into(), json!(output_language));
+        if let Some(ms) = last_message_after_ms {
+            obj.insert(LAST_MESSAGE_AFTER_MS.into(), json!(ms));
+        }
+        Ok(template)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn merge(template: Value, since: Option<i64>) -> Result<Value> {
+            merge_thread_batch_template(template, "--flag", &["legacy_owner"], 1, since, "ja")
+        }
+
+        #[test]
+        fn overrides_user_and_language_and_keeps_other_fields() {
+            let out = merge(json!({"user_id": 999, "custom": "x"}), None).unwrap();
+            assert_eq!(out["user_id"], json!(1));
+            assert_eq!(out["output_language"], json!("ja"));
+            assert_eq!(out["custom"], json!("x"));
+        }
+
+        #[test]
+        fn since_sets_or_overrides_last_message_after_ms() {
+            let out = merge(json!({"last_message_after_ms": 100}), Some(2_000)).unwrap();
+            assert_eq!(out["last_message_after_ms"], json!(2_000));
+            let out = merge(json!({}), Some(2_000)).unwrap();
+            assert_eq!(out["last_message_after_ms"], json!(2_000));
+            assert!(out.get("last_message_within_hours").is_none());
+        }
+
+        #[test]
+        fn without_since_keeps_template_window() {
+            let out = merge(json!({"last_message_after_ms": 100}), None).unwrap();
+            assert_eq!(out["last_message_after_ms"], json!(100));
+        }
+
+        #[test]
+        fn rejects_every_renamed_message_window_field() {
+            for (old, new) in RENAMED_MESSAGE_WINDOW_FIELDS {
+                let mut template = json!({});
+                template[old] = json!(1);
+                let message = merge(template, Some(2_000)).unwrap_err().to_string();
+                assert!(
+                    message.contains(old) && message.contains(new),
+                    "renamed field {old} must point to {new}: {message}"
+                );
+            }
+        }
+
+        #[test]
+        fn rejects_removed_fields_and_non_objects() {
+            let error = merge(json!({"legacy_owner": 1}), None).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("legacy_owner is no longer supported")
+            );
+            for template in [json!([1]), json!("x"), json!(42), Value::Null] {
+                let error = merge(template, None).unwrap_err();
+                assert!(error.to_string().contains("--flag must be a JSON object"));
+            }
+        }
     }
 }
 

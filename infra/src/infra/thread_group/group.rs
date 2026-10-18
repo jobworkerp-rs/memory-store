@@ -292,6 +292,55 @@ pub trait ThreadGroupRepository: UseRdbPool + UseIdGenerator + Send + Sync {
             .map_err(LlmMemoryError::DBError)?)
     }
 
+    /// `list_by_status` narrowed to one owner in SQL (served by the
+    /// `thread_group_user_status_created` index) instead of filtering every
+    /// row of the status in Rust. Same `ORDER BY id`.
+    async fn list_by_status_for_user(
+        &self,
+        status: &str,
+        user_id: Option<i64>,
+    ) -> Result<Vec<ThreadGroupRow>> {
+        let Some(user_id) = user_id else {
+            return self.list_by_status(status, None, None).await;
+        };
+        let sql = format!(
+            "SELECT {} FROM thread_group WHERE status = {} AND user_id = {} ORDER BY id",
+            THREAD_GROUP_COLUMNS!(),
+            dyn_placeholder(1),
+            dyn_placeholder(2)
+        );
+        Ok(
+            sqlx::query_as::<Rdb, ThreadGroupRow>(sqlx::AssertSqlSafe(sql))
+                .bind(status)
+                .bind(user_id)
+                .fetch_all(self.db_pool())
+                .await
+                .map_err(LlmMemoryError::DBError)?,
+        )
+    }
+
+    async fn count_by_status(&self, status: &str, user_id: Option<i64>) -> Result<i64> {
+        let query = match user_id {
+            None => sqlx::query_scalar::<Rdb, i64>(concat!(
+                "SELECT COUNT(*) FROM thread_group WHERE status = ",
+                p!(1)
+            ))
+            .bind(status),
+            Some(user_id) => sqlx::query_scalar::<Rdb, i64>(concat!(
+                "SELECT COUNT(*) FROM thread_group WHERE status = ",
+                p!(1),
+                " AND user_id = ",
+                p!(2)
+            ))
+            .bind(status)
+            .bind(user_id),
+        };
+        Ok(query
+            .fetch_one(self.db_pool())
+            .await
+            .map_err(LlmMemoryError::DBError)?)
+    }
+
     async fn update_title_tx<'c, E: Executor<'c, Database = Rdb>>(
         &self,
         tx: E,
@@ -568,6 +617,53 @@ mod tests {
         TEST_RUNTIME.block_on(async {
             let pool = setup_thread_group_pool().await;
             _test_group_lifecycle(pool).await
+        })
+    }
+
+    async fn _test_owner_scoped_listing_and_counts(pool: &'static RdbPool) -> Result<()> {
+        let repo = ThreadGroupRepositoryImpl::new(crate::test_helper::shared_id_generator(), pool);
+        for (n, user_id) in [(9_200_001, 1), (9_200_002, 2), (9_200_003, 2)] {
+            let mut group = new_group(n);
+            group.user_id = user_id;
+            repo.create_tx(pool, &group).await?;
+        }
+        let mut split = new_group(9_200_004);
+        split.status = values::group_status::SPLIT.to_string();
+        split.user_id = 2;
+        repo.create_tx(pool, &split).await?;
+
+        for status in [
+            values::group_status::ACTIVE,
+            values::group_status::REDIRECTED,
+            values::group_status::SPLIT,
+        ] {
+            let all = repo.list_by_status(status, None, None).await?;
+            assert_eq!(repo.list_by_status_for_user(status, None).await?, all);
+            assert_eq!(repo.count_by_status(status, None).await?, all.len() as i64);
+            for user_id in [1, 2, 3] {
+                let expected: Vec<_> = all
+                    .iter()
+                    .filter(|group| group.user_id == user_id)
+                    .cloned()
+                    .collect();
+                assert_eq!(
+                    repo.list_by_status_for_user(status, Some(user_id)).await?,
+                    expected
+                );
+                assert_eq!(
+                    repo.count_by_status(status, Some(user_id)).await?,
+                    expected.len() as i64
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn owner_scoped_listing_and_counts_sqlite() -> Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_thread_group_pool().await;
+            _test_owner_scoped_listing_and_counts(pool).await
         })
     }
 }

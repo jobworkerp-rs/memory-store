@@ -15,11 +15,14 @@ input:
         memories_grpc_host: { type: string, default: "localhost" }
         memories_grpc_port: { type: integer, default: 9100 }
         memories_grpc_tls: { type: boolean, default: false }
-        llm_worker_name: { type: string, default: "memories-llm" }
         min_message_count: { type: integer, default: 4 }
         max_context_chars: { type: integer, default: 200000 }
         summary_model: { type: string, default: "qwen3.6:27b" }
         ollama_base_url: { type: string, default: "http://localhost:11434" }
+        # Output language for free-text fields. The system_prompt / user_tail
+        # context are baked per-language into the registered lang-worker, so
+        # this is logging/validation metadata only — the worker name already
+        # pins the language. Kept in schema so batch-supplied input validates.
         output_language: { type: string, enum: ["ja", "en"], default: "ja" }
         memory_thread_label_prefix: { type: string, default: "summary" }
         force_resummarize: { type: boolean, default: false }
@@ -205,7 +208,7 @@ do:
           ${ $workflow.input.force_resummarize
              or ($thread.data.description // "") == ""
              or ($existing_summary_memory == null)
-             or ($thread.data.updatedAt
+             or ($thread.data.lastMessageAt
                  > $existing_summary_memory.data.updatedAt) }
 
   # Same setTask shape as the other skip gates above.
@@ -235,6 +238,12 @@ do:
              else $messages
              end }
 
+  # Step 7.5: Fail closed if the language-specific prompt context was not
+  # baked into the worker (registration mistake). Running the LLM with an
+  # empty system_prompt / user_tail would silently produce off-language or
+  # malformed output, so reject instead. `$summary_system_prompt` and
+  # `$summary_user_tail` come from the worker's `workflow_context` (set by
+  # `memories-import upsert-generation-workers`).
   - validateSummaryPromptContext:
       if: "${ (($summary_system_prompt // \"\") | length) == 0 or (($summary_user_tail // \"\") | length) == 0 }"
       raise:
@@ -248,51 +257,99 @@ do:
                else "summary_user_tail is missing"
                end }
 
-  # Step 8: Generate summary via LLM completion
-  - generateSummary:
-      run:
-        function:
-          runnerName: LLM
-          using: completion
-          settings:
-            ollama:
-              base_url: "${$workflow.input.ollama_base_url}"
-              model: "${$workflow.input.summary_model}"
-          options:
-            channel: llm
-            storeSuccess: false
-            storeFailure: true
-          arguments:
-            system_prompt: "${ $summary_system_prompt }"
-            prompt: >-
-              $${## Thread info
-              - labels: {{ thread.data.labels | join: ", " }}
-              - createdAt: {{ thread.data.createdAt }}
+  # The thread's createdAt is a server audit time (an import time for
+  # imported conversations); the LLM needs when the conversation started.
+  - resolveConversationStart:
+      set:
+        conversation_started_at: >-
+          ${ if (($thread.data.firstMessageAt // "") | tostring) == "" then "unknown"
+             else ($thread.data.firstMessageAt | tonumber / 1000 | floor
+                   | strftime("%Y-%m-%dT%H:%M:%SZ")) end }
 
-              ## Conversation history
-              {% for msg in truncated_messages %}
-              [{{ msg.data.role }}] {{ msg.data.content }}
-              {% endfor %}
+  # Step 8: Generate summary via LLM completion. The language-specific
+  # system_prompt and user_tail come from the worker's baked
+  # `workflow_context` so the same YAML serves both ja and en (the
+  # lang-worker name pins the language).
+  - generateSummaryWithRetry:
+      try:
+        - generateSummary:
+            run:
+              function:
+                runnerName: LLM
+                using: completion
+                settings:
+                  ollama:
+                    base_url: "${$workflow.input.ollama_base_url}"
+                    model: "${$workflow.input.summary_model}"
+                options:
+                  channel: llm
+                  storeSuccess: false
+                  storeFailure: true
+                arguments:
+                  system_prompt: "${ $summary_system_prompt }"
+                  prompt: >-
+                    $${## Thread info
+                    - labels: {{ thread.data.labels | join: ", " }}
+                    - startedAt: {{ conversation_started_at }}
 
-              {{ summary_user_tail }}}
-            options:
-              max_tokens: 20000
-              temperature: 0.3
-            json_schema: |
-              {
-                "type": "object",
-                "required": ["category", "title", "summary", "key_decisions", "status"],
-                "properties": {
-                  "category": {"type": "string", "enum": ["coding","consultation","research","creative","general"]},
-                  "title": {"type": "string"},
-                  "summary": {"type": "string"},
-                  "key_decisions": {"type": "array", "items": {"type": "string"}},
-                  "status": {"type": "string", "enum": ["resolved", "ongoing", "in_review", "blocked", "deferred", "abandoned"]}
-                }
-              }
-      export:
-        as:
-          summary_json: ${ .content.text | fromjson }
+                    ## Conversation history
+                    {% for msg in truncated_messages %}
+                    [{{ msg.data.role }}] {{ msg.data.content }}
+                    {% endfor %}
+
+                    {{ summary_user_tail }}}
+                  options:
+                    max_tokens: 20000
+                    temperature: 0.3
+                    # Thinking inside schema-constrained output can collapse to blank JSON.
+                    extract_reasoning_content: false
+                  json_schema: |
+                    {
+                      "type": "object",
+                      "required": ["category", "title", "summary", "key_decisions", "status"],
+                      "properties": {
+                        "category": {"type": "string", "enum": ["coding","consultation","research","creative","general"]},
+                        "title": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "key_decisions": {"type": "array", "items": {"type": "string"}},
+                        "status": {"type": "string", "enum": ["resolved", "ongoing", "in_review", "blocked", "deferred", "abandoned"]}
+                      }
+                    }
+            export:
+              as:
+                summary_json: >-
+                  ${ try (.content.text | fromjson) catch null }
+        - validateThreadSummaryOutput:
+            if: >-
+              ${ (($summary_json | type) != "object")
+                 or (($summary_json.title | type) != "string")
+                 or (($summary_json.summary | type) != "string")
+                 or (($summary_json.title | gsub("\\s"; "")) == "")
+                 or (($summary_json.summary | gsub("\\s"; "")) == "") }
+            raise:
+              error:
+                type: "https://memories.local/errors/thread-summary/invalid-output"
+                status: 422
+                title: "Thread summary output does not match its contract"
+                detail: "The LLM returned malformed, incomplete, or blank JSON."
+      # Blank or malformed LLM output is usually transient; retry only that.
+      catch:
+        errors:
+          with:
+            type: "https://memories.local/errors/thread-summary/invalid-output"
+        retry:
+          limit:
+            attempt:
+              count: 2
+        do:
+          # Retries are exhausted: fail instead of persisting the output.
+          - rejectThreadSummaryOutput:
+              raise:
+                error:
+                  type: "https://memories.local/errors/thread-summary/invalid-output"
+                  status: 422
+                  title: "Thread summary output does not match its contract"
+                  detail: "The LLM returned malformed, incomplete, or blank JSON."
 
   # Step 9: Update ThreadData.description with summary title + text
   - updateThreadDescription:
@@ -339,15 +396,15 @@ do:
             json_body: >-
               ${ {
                 user_id: { value: $workflow.input.user_id },
-                memory_kind: "MEMORY_KIND_THREAD_SUMMARY",
                 description: (($thread.data.labels
                                // ["thread_" + ($workflow.input.thread_id | tostring)])
                               | join(", ")) + " の要約集",
                 labels: ( ($thread.data.labels
                            // ["thread_" + ($workflow.input.thread_id | tostring)])
                           + [$workflow.input.memory_thread_label_prefix] ),
-                created_at: $thread.data.createdAt,
-                updated_at: $thread.data.updatedAt
+                created_at: $thread.data.firstMessageAt,
+                updated_at: $thread.data.lastMessageAt,
+                memory_kind: "MEMORY_KIND_THREAD_SUMMARY"
               } | tojson }
             as_json: true
       export:
@@ -358,6 +415,15 @@ do:
   - resolveMemoryThreadId:
       set:
         memory_thread_id: "${ $existing_memory_thread_id // $created_memory_thread_id }"
+
+  - prepareSummaryMetadata:
+      set:
+        summary_metadata: >-
+          ${ {
+               source_thread_id: ($workflow.input.thread_id | tostring),
+               category: $summary_json.category,
+               summary_version: "1.0"
+             } | tojson }
 
   # Step 11.5: Clean up stale summaries from old memory threads
   # (label-change scenario). Must run BEFORE Step 12-b because the
@@ -452,7 +518,9 @@ do:
                                 ${ $stale.id | tojson }
                               as_json: true
 
-  # Step 12-a: Update existing summary memory
+  # Step 12-a: Update existing summary memory. updated_at stays on the
+  # conversation's last message (as in Step 12-b): daily summaries bucket
+  # by it and re-summarization compares against it.
   - updateSummary:
       if: "${ $existing_summary_memory != null }"
       run:
@@ -468,16 +536,12 @@ do:
             method: "/llm_memory.service.MemoryService/Update"
             json_body: >-
               ${ {
-                id: $existing_summary_memory.id,
-                data: ($existing_summary_memory.data
-                  | .content = ($summary_json | tojson)
-                  | .metadata = ({
-                      source_thread_id: ($workflow.input.thread_id | tostring),
-                      category: $summary_json.category,
-                      summary_version: "1.0"
-                    } | tojson)
-                  | .externalId = ("summary:" + ($workflow.input.thread_id | tostring))
-                  | .updatedAt = $thread.data.updatedAt)
+                 id: $existing_summary_memory.id,
+                 data: ($existing_summary_memory.data
+                   | .content = ($summary_json | tojson)
+                   | .metadata = $summary_metadata
+                   | .externalId = ("summary:" + ($workflow.input.thread_id | tostring))
+                   | .updatedAt = $thread.data.lastMessageAt)
               } | tojson }
             as_json: true
 
@@ -500,18 +564,14 @@ do:
                 thread_id: { value: $memory_thread_id },
                 memory: {
                   user_id: { value: $workflow.input.user_id },
-                  memory_kind: "MEMORY_KIND_THREAD_SUMMARY",
                   content: ($summary_json | tojson),
                   content_type: "TEXT",
                   role: "ROLE_ASSISTANT",
-                  metadata: ({
-                    source_thread_id: ($workflow.input.thread_id | tostring),
-                    category: $summary_json.category,
-                    summary_version: "1.0"
-                  } | tojson),
+                  metadata: $summary_metadata,
                   external_id: ("summary:" + ($workflow.input.thread_id | tostring)),
-                  created_at: $thread.data.createdAt,
-                  updated_at: $thread.data.updatedAt
+                  created_at: $thread.data.firstMessageAt,
+                  updated_at: $thread.data.lastMessageAt,
+                  memory_kind: "MEMORY_KIND_THREAD_SUMMARY"
                 }
               } | tojson }
             as_json: true

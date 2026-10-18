@@ -59,12 +59,38 @@ jobworkerp-client job enqueue-workflow \
 
 ## Run a Batch
 
-Filter by user, labels, explicit thread IDs, or updated time. The workflow
+Filter by user, labels, explicit thread IDs, or conversation time. The workflow
 stores summary outputs under the source `user_id` with `THREAD_SUMMARY` and
 labels them for downstream daily/weekly/monthly aggregation.
 
 `onError: continue` isolates per-thread failures, so inspect jobworkerp per-job
 logs for individual thread errors.
+
+Batch-only inputs:
+
+| Input | Default | Description |
+|---|---|---|
+| `thread_ids` | all | Summarize only these thread IDs. |
+| `target_thread_ids` | unset | Authoritative target set (string IDs). Takes precedence over `thread_ids`; an empty array targets zero threads. |
+| `labels_filter` | none | Only threads with these labels. |
+| `labels_filter_match_mode` | `LABEL_ALL` | `LABEL_ALL` or `LABEL_ANY` for `labels_filter`. |
+| `last_message_within_hours` | unset | Only threads whose last message is within the past N hours of workflow start. |
+| `last_message_after_ms` | unset | Absolute lower bound (epoch ms, `>`) on `last_message_at`; wins over `last_message_within_hours`. |
+| `last_message_before_ms` | unset | Absolute upper bound (epoch ms, `<=`) on `last_message_at`. |
+| `thread_created_after_ms` / `thread_created_before_ms` | unset | Thread creation-time bounds (epoch ms, `>` / `<=`). |
+
+The former `updated_within_hours` / `updated_after_ms` / `updated_before_ms`
+inputs were renamed to the `last_message_*` names above.
+
+Summary memories carry the source conversation's `first_message_at` /
+`last_message_at` as `created_at` / `updated_at` (thread audit times are not
+used); daily summaries bucket by that `updated_at`, and re-summarization runs
+only when `last_message_at` is newer. Malformed or blank LLM output is
+regenerated up to twice and is never persisted.
+
+The YAML sets no document/loop/try timeouts. To cut off a hung LLM or single
+call, configure `WORKFLOW_TASK_DEFAULT_TIMEOUT_SEC` (applies to run/call tasks
+only, e.g. `3600`) on the jobworkerp server.
 
 ## Status Values
 
@@ -87,4 +113,9 @@ skip and remains part of `succeeded_count`, allowing a serial parent workflow
 to continue to daily aggregation. Only `completed=false, skipped=false` is a
 logical failure. Up-to-date summaries are detected in one preflight query;
 only missing, stale, relabeled, forced, or description-less threads dispatch
-the single worker.
+the single worker. Items that end without an outcome (timeout or abort) are
+counted in `failed_threads`. `insufficient_message_threads` lists skipped
+threads below `min_message_count`, which the
+[thread-group summary](../thread-group-summary/README.md) uses to tell "too
+short to summarize" apart from a missing summary. Each iteration publishes
+`progress_processed` / `progress_total` in its streamed output context.

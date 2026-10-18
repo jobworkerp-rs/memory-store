@@ -158,7 +158,8 @@ memories-import upsert-generation-workers \
 特定の channel が必要な場合だけ `--channel <CHANNEL>` を指定する。
 
 登録される worker 名は `memories-thread-reflection-single-ja/en`,
-`memories-thread-summary-single-ja/en`, `memories-daily-work-summary-single-ja/en`,
+`memories-thread-summary-single-ja/en`, `memories-thread-group-summary-single-ja/en`,
+`memories-daily-work-summary-single-ja/en`,
 `memories-weekly-work-summary-single-ja/en`, `memories-monthly-work-summary-single-ja/en`,
 `memories-thread-personality-single-ja/en`,
 `memories-user-personality-merge-ja/en`。
@@ -187,11 +188,31 @@ MEMORY_REPO_ROOT=/opt/memories/agent-chat-import \
   memories-import upsert-generation-workers --feature all
 ```
 
+### channel 構成
+
+親 workflow は、子が必要とする channel で実行してはいけない。親が slot を握ったまま子の完了を待つため、空き slot がないと子が開始できずデッドロックする。各 batch は子を次の channel で起動するので、親はそれと異なる channel に登録する。
+
+| 親 | 子が使う channel |
+|---|---|
+| 言語別 `*-single` worker | `llm`（インラインの LLM 呼び出し） |
+| `*-batch` workflow | single worker の登録 channel（`--channel`） |
+| `agent-chat-summary` の各段 | `llm_batch` |
+| `thread-group-summary-batch` | `llm_batch`（内部の thread-summary batch）。本 batch は `thread_group_summary` など別 channel で実行する |
+
+### workflow YAML のスキーマ検証
+
+`workers/` と `workflows/` 配下の YAML はすべて、infra のテストが jobworkerp の workflow スキーマで検証する。
+テストが使うスキーマのコピーは、jobworkerp-rs のチェックアウトがあれば `runner/schema/workflow_minimal_fix.json` と一致するかも検査される。
+
+```bash
+cargo test -p infra workflow_schema -- --test-threads=1
+```
+
 ## 取り込み + 要約 (`--summarize-after-*`)
 
 import 完了 (および embedding redispatch) のあとに `agent-chat-import/workflows/thread-summary/thread-summary-batch.yaml` を jobworkerp 経由で起動する。`summarize-after` feature が有効 (default) かつ `JOBWORKERP_ADDR` 指定時のみ動作する。
 
-`user_id` / `updated_after_ms` は memories-import の引数 (`--user-id` と `--since`) から自動的に上書きされる。`updated_after_ms` は workflow 入力の互換名であり、thread 一覧では `last_message_after` に変換される。`--since` 未指定なら `updated_after_ms` は touch しない (テンプレ側の値を尊重)。`--since` を絶対値 (epoch ms) として workflow にそのまま渡すため、jobworkerp のキュー待ち時間が長くても要約対象の下限が import 範囲と揃う。
+`user_id` / `last_message_after_ms` は memories-import の引数 (`--user-id` と `--since`) から自動的に上書きされる。thread 一覧では `last_message_after` として扱われる。旧名 `updated_after_ms` / `updated_before_ms` / `updated_within_hours` をテンプレに含めると、要約・personality の dispatch 前にエラーになる（batch が未知キーを無視して全履歴を対象にするのを防ぐため）。`--since` 未指定なら `last_message_after_ms` は touch しない (テンプレ側の値を尊重)。`--since` を絶対値 (epoch ms) として workflow にそのまま渡すため、jobworkerp のキュー待ち時間が長くても要約対象の下限が import 範囲と揃う。
 
 import が `summary.errors > 0` で終わった場合、要約 dispatch は skip される (中途半端なスレッドを要約してしまわないためのガード)。
 
@@ -223,7 +244,7 @@ memories-import --user-id 1 \
   claude-code --all-projects
 ```
 
-### import + 要約 (`--since` で `updated_after_ms` 自動算出)
+### import + 要約 (`--since` で `last_message_after_ms` 自動算出)
 
 ```bash
 JOBWORKERP_ADDR=http://localhost:9000 \
@@ -236,7 +257,7 @@ memories-import --user-id 1 \
   claude-code --all-projects
 ```
 
-`--since` の epoch ms (この例では `1745884800000`) が `updated_after_ms` として batch input にセットされ、workflow 内では会話時刻の `last_message_after` filter に使われる。
+`--since` の epoch ms (この例では `1745884800000`) が `last_message_after_ms` として batch input にセットされ、workflow 内では会話時刻の `last_message_after` filter に使われる。
 
 ### インライン JSON + チャンネル + 短い timeout
 
@@ -283,7 +304,7 @@ memories-import --user-id 1 -v \
 
 import 完了 (および embedding redispatch) のあとに `agent-chat-import/workflows/personality/thread-personality-batch.yaml` を jobworkerp 経由で起動する。`personality-after` feature が有効 (default) かつ `JOBWORKERP_ADDR` 指定時のみ動作する。
 
-`--summarize-after-*` と独立した別系統で、両方を同時に指定すると **summarize と personality を並列に dispatch** する (失敗は片方ずつ独立して扱われる)。`user_id` / `updated_after_ms` の自動上書き、`--since` の絶対 epoch ms 渡し（thread 一覧では `last_message_after` に変換）、`summary.errors > 0` 時の skip ガードはすべて summarize 系と同じ挙動。
+`--summarize-after-*` と独立した別系統で、両方を同時に指定すると **summarize と personality を並列に dispatch** する (失敗は片方ずつ独立して扱われる)。`user_id` / `last_message_after_ms` の自動上書き、`--since` の絶対 epoch ms 渡し（thread 一覧では `last_message_after` に変換）、`summary.errors > 0` 時の skip ガードはすべて summarize 系と同じ挙動。
 
 import 完了後の dispatch 関係:
 
@@ -571,7 +592,7 @@ channel / `external_id` / `agent:<source-name>` ラベルすべての prefix に
 | オプション | 必須 | デフォルト | 備考 |
 |---|---|---|---|
 | `-u, --user-id` | import 系で ○ | — | i64。`upsert-generation-workers` では不要 |
-| `-s, --since` | — | (なし) | ISO 8601。要約時は `updated_after_ms` (絶対 epoch ms) として workflow に渡され、thread 一覧の `last_message_after` に変換される |
+| `-s, --since` | — | (なし) | ISO 8601。要約時は `last_message_after_ms` (絶対 epoch ms) として workflow に渡され、thread 一覧の `last_message_after` に変換される |
 | `--mtime-margin-seconds` | — | `60` | `--since` 指定時、`since - margin` より古い session ファイルは parse skip する保守側マージン (秒)。書き込み中ファイルの誤 skip を防ぐ |
 | `--no-mtime-filter` | — | `false` | `--since` 指定時の session-level mtime filter を完全 disable。NFS / クラウドストレージ等 mtime が信頼できない環境向け |
 | `-l, --labels` | — | (なし) | 追加ラベル (カンマ区切り)。多重指定可 (`ArgAction::Append`)、512 byte 超は parse error |

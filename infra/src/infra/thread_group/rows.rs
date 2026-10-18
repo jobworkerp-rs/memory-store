@@ -152,7 +152,7 @@ pub struct SourceIdentityKey<'a> {
     pub native_id: &'a str,
 }
 
-#[derive(sqlx::FromRow, Debug, Clone)]
+#[derive(sqlx::FromRow, Debug, Clone, PartialEq, Eq)]
 pub struct ThreadGroupRow {
     pub id: i64,
     pub user_id: i64,
@@ -180,7 +180,7 @@ pub struct NewThreadGroup {
     pub updated_at: i64,
 }
 
-#[derive(sqlx::FromRow, Debug, Clone)]
+#[derive(sqlx::FromRow, Debug, Clone, PartialEq, Eq)]
 pub struct ThreadGroupMemberRow {
     pub group_id: i64,
     pub thread_id: Option<i64>,
@@ -219,7 +219,7 @@ pub struct NewThreadGroupMember {
     pub updated_at: i64,
 }
 
-#[derive(sqlx::FromRow, Debug, Clone)]
+#[derive(sqlx::FromRow, Debug, Clone, PartialEq, Eq)]
 pub struct ThreadRelationRow {
     pub id: i64,
     pub parent_thread_id: Option<i64>,

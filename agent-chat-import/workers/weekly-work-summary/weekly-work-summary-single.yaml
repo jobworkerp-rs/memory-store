@@ -7,7 +7,7 @@ document:
 # Aggregates per-day summaries (produced by daily-work-summary-single)
 # for one ISO 8601 week into a single "weekly work summary" memory.
 #
-# Input is the set of DAILY_SUMMARY memories owned by `user_id` carrying the
+# Input is the set of memories owned by `user_id` carrying the
 # `daily_label` marker AND whose memory.updated_at falls within
 # [week_start, week_end) (Monday 00:00 local — next Monday 00:00 local).
 # Output is one memory under a weekly_summary thread keyed by
@@ -15,8 +15,9 @@ document:
 # idempotent and concurrent invocations with different
 # `extra_labels_filter` produce disjoint aggregates.
 #
-# Thread creator user is shared with daily summaries. The input and output layers are
-# separated by memory_kind as well as their labels.
+# Owner user is shared with daily summaries. The two layers are distinguished by the
+# `weekly_summary` label, which monthly callers MUST use to list
+# weekly source memories without leaking other layers.
 #
 # Requires jaq >= 3.x runtime: ISO week strptime "%G-W%V-%u" is not
 # supported by vanilla jq.
@@ -28,9 +29,7 @@ input:
       required:
         - user_id
       properties:
-        user_id:
-          type: integer
-          description: Creator of per-day summaries and weekly aggregates.
+        user_id: { type: integer }
         target_week:
           type: string
           default: ""
@@ -50,7 +49,13 @@ input:
         memories_grpc_host: { type: string, default: "localhost" }
         memories_grpc_port: { type: integer, default: 9100 }
         memories_grpc_tls: { type: boolean, default: false }
-        llm_worker_name: { type: string, default: "memories-llm" }
+        summary_model: { type: string, default: "qwen3.6:27b" }
+        ollama_base_url: { type: string, default: "http://localhost:11434" }
+        # Output language for free-text fields. The system_prompt / user_tail
+        # context are baked per-language into the registered lang-worker, so
+        # this is logging/validation metadata only — the worker name already
+        # pins the language. Kept in schema so batch-supplied input validates.
+        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
         daily_label:
           type: string
           default: "daily_summary"
@@ -72,6 +77,11 @@ input:
           description: >-
             Additional labels AND-matched against the per-day summary
             listing. Empty (default) = aggregate across all projects.
+        extra_labels_match_mode:
+          type: string
+          enum: ["LABEL_ALL", "LABEL_ANY"]
+          default: "LABEL_ALL"
+          description: Match mode for extra_labels_filter.
         min_thread_count:
           type: integer
           default: 1
@@ -86,10 +96,43 @@ input:
             Hard cap on combined per-day summary text. Daily summaries
             are already ordered by updated_at desc; trailing entries
             are truncated when the cap is exceeded.
-        summary_model: { type: string, default: "qwen3.6:27b" }
-        ollama_base_url: { type: string, default: "http://localhost:11434" }
-        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
         force_resummarize: { type: boolean, default: false }
+        summary_output_guidance: { type: object, default: {weekly: {item_chars: 500, total_chars: 30000}, max_purpose_groups: {weekly: 20}, max_source_memory_ids: 10} }
+        llm_context_window_tokens: { type: integer, minimum: 1024, default: 131072 }
+        llm_expected_model: { type: string, default: "" }
+        summary_max_completion_tokens: { type: integer, minimum: 1, default: 32768 }
+        summary_input_byte_budget: { type: integer, minimum: 0, default: 200000 }
+        # v2 fields are forwarded by the common batch contract. The weekly
+        # path planner uses them when materializing a path or overall row.
+        v2_source_scope_digest: { type: string, default: "" }
+        v2_rollup_scope: { type: string, enum: ["", "overall", "path"], default: "" }
+        v2_path_bucket_digest: { type: string, default: "" }
+        v2_path_bucket_kind: { type: string, default: "" }
+        v2_path_label: { type: string, default: "" }
+        generation_id: { type: string, default: "" }
+        generation_started_at: { type: string, default: "" }
+        planned_source_memory_ids:
+          type: array
+          items: { type: string }
+          default: []
+        source_memory_kind: { type: string, default: "MEMORY_KIND_DAILY_SUMMARY" }
+        source_thread_labels_override:
+          type: array
+          items: { type: string }
+          default: []
+        source_thread_match_mode: { type: string, enum: ["LABEL_ALL", "LABEL_ANY"], default: "LABEL_ALL" }
+        plan_only: { type: boolean, default: false }
+        # See daily single: the batch carries the discovered bucket count so
+        # best-effort overall generation can explicitly mark missing children.
+        expected_path_bucket_count: { type: integer, default: 0 }
+        planned_path_bucket_digests:
+          type: array
+          items: { type: string }
+          default: []
+        v2_failed_path_buckets:
+          type: array
+          items: { type: object }
+          default: []
 
 do:
   # Step 0: Initialize variables referenced by `output.as` so early
@@ -104,6 +147,11 @@ do:
         target_memories: "${ [] }"
         source_snapshot_json: "${ \"[]\" }"
         source_fingerprint: "${ \"\" }"
+        source_plan_fingerprint: "${ \"\" }"
+        model_contract_fingerprint: "${ \"\" }"
+        path_buckets: "${ [] }"
+        summary_max_tokens: "${ 0 }"
+        token_count_result: "${ null }"
 
   # Step 0.5: Expose the fallback fixed offset (seconds). The TZ-vs-offset
   # choice is read inline via `env.TZ` per expression (see
@@ -140,9 +188,9 @@ do:
 
   # Step 2: Compute [week_start_ms, week_end_ms) for the wall-clock week.
   # `mktime` interprets broken-down time AS IF UTC. Offset path: subtract
-  # tz_offset. TZ path: normalize the Monday to YYYY-MM-DD first (date is
-  # tz-invariant), then apply the localtime offset correction to turn its
-  # local 00:00 into a DST-aware UTC epoch.
+  # tz_offset. TZ path: normalize the Monday to YYYY-MM-DD first, correct
+  # the UTC-as-if wall epoch, then re-evaluate the offset at that candidate
+  # because some real zones move clocks at local 00:00.
   # Requires jaq's strptime("%G-W%V-%u") — vanilla jq returns 1899.
   - computeWeekStart:
       set:
@@ -151,9 +199,15 @@ do:
               then (($target_week_resolved + "-1")
                     | strptime("%G-W%V-%u")
                     | strftime("%Y-%m-%dT00:00:00")
-                    | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $e
-                   | ($e | localtime | mktime) as $b
-                   | ($e - ($b - $e))
+                   | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $wall_epoch
+                   | ($wall_epoch | localtime | mktime) as $first_local_epoch
+                   | ($wall_epoch - ($first_local_epoch - $wall_epoch)) as $candidate_epoch
+                   | ($wall_epoch | strftime("%Y-%m-%d")) as $target_day
+                   | if ($candidate_epoch | strflocaltime("%Y-%m-%d")) == $target_day
+                     then $candidate_epoch
+                     else (($candidate_epoch | localtime | mktime) as $candidate_local_epoch
+                           | ($wall_epoch - ($candidate_local_epoch - $candidate_epoch)))
+                     end
               else ((($target_week_resolved + "-1")
                      | strptime("%G-W%V-%u")
                      | mktime) - $tz_offset_seconds)
@@ -161,7 +215,29 @@ do:
 
   - computeWeekEnd:
       set:
-        week_end_ms: "${ $week_start_ms + 7 * 86400000 }"
+        week_end_ms: >-
+          ${ (if (env.TZ // "") != ""
+              then (($target_week_resolved + "-1")
+                    | strptime("%G-W%V-%u")
+                    | strftime("%Y-%m-%dT12:00:00Z")
+                    | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime
+                    | (. + 7 * 86400) | strftime("%G-W%V")) as $next_week
+                   | (($next_week + "-1")
+                    | strptime("%G-W%V-%u")
+                    | strftime("%Y-%m-%dT00:00:00")
+                   | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $wall_epoch
+                   | ($wall_epoch | localtime | mktime) as $first_local_epoch
+                   | ($wall_epoch - ($first_local_epoch - $wall_epoch)) as $candidate_epoch
+                   | ($wall_epoch | strftime("%Y-%m-%d")) as $target_day
+                   | if ($candidate_epoch | strflocaltime("%Y-%m-%d")) == $target_day
+                     then $candidate_epoch
+                     else (($candidate_epoch | localtime | mktime) as $candidate_local_epoch
+                           | ($wall_epoch - ($candidate_local_epoch - $candidate_epoch)))
+                     end
+              else ((($target_week_resolved + "-1")
+                     | strptime("%G-W%V-%u")
+                     | mktime) + (7 * 86400) - $tz_offset_seconds)
+              end) * 1000 }
 
   # Step 3: Alias for readability.
   - normalizeUserId:
@@ -180,18 +256,83 @@ do:
              else ($workflow.input.extra_labels_filter | sort | join(","))
              end }
 
+  - resolveV2Generation:
+      set:
+        effective_generation_id: >-
+          ${ if $workflow.input.generation_id != "" then $workflow.input.generation_id else (now | strftime("%Y%m%d%H%M%S")) end }
+        effective_generation_started_at: >-
+          ${ if $workflow.input.generation_started_at != "" then $workflow.input.generation_started_at else (now | strftime("%Y-%m-%dT%H:%M:%SZ")) end }
+
+  - initV2PathBucketDigest:
+      set:
+        effective_v2_path_bucket_digest: "${ $workflow.input.v2_path_bucket_digest }"
+
+  - deriveV2PathBucketDigest:
+      if: "${ $workflow.input.v2_rollup_scope == \"path\" and $effective_v2_path_bucket_digest == \"\" }"
+      run:
+        function:
+          runnerName: COMMAND
+          settings: {}
+          arguments:
+            command: "/bin/sh"
+            args: ["-c", "if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi | awk '{print $1}'"]
+            stdin: >-
+              ${ if $workflow.input.v2_path_bucket_kind == "label"
+                 then ({kind:"label",label:$workflow.input.v2_path_label,version:1}|tojson)
+                 else ({kind:$workflow.input.v2_path_bucket_kind,version:1}|tojson) end }
+            treat_nonzero_as_error: true
+      export:
+        as:
+          effective_v2_path_bucket_digest: "${ .stdout | split(\" \")[0] }"
+
   # Step 3b: Compose external_id. Split from deriveScopeKey because
   # jaq evaluates `set` keys in parallel — same-block references would
   # see undefined.
   - composeWeeklyExternalId:
       set:
         weekly_external_id: >-
-          ${ "weekly:" + ($effective_user_id | tostring) + ":" + $target_week_resolved + ":" + $scope_key }
+          ${ if $workflow.input.v2_rollup_scope == "overall"
+             then "weekly:v2:" + ($effective_user_id | tostring) + ":" + $target_week_resolved + ":" + $workflow.input.v2_source_scope_digest + ":overall"
+             elif $workflow.input.v2_rollup_scope == "path"
+             then "weekly:v2:" + ($effective_user_id | tostring) + ":" + $target_week_resolved + ":" + $workflow.input.v2_source_scope_digest + ":path:" + $effective_v2_path_bucket_digest
+             else "weekly:" + ($effective_user_id | tostring) + ":" + $target_week_resolved + ":" + $scope_key
+             end }
         weekly_thread_labels: >-
-          ${ [$workflow.input.weekly_label,
-              "iso_week:" + $target_week_resolved,
-              "scope:" + $scope_key]
-             + $sorted_extra_labels }
+          ${ if $workflow.input.v2_rollup_scope == "overall"
+             then [$workflow.input.weekly_label, "iso_week:" + $target_week_resolved,
+                   "summary_scope:overall", "source_scope:" + $workflow.input.v2_source_scope_digest]
+             elif $workflow.input.v2_rollup_scope == "path"
+             then ([$workflow.input.weekly_label, "iso_week:" + $target_week_resolved,
+                    "summary_scope:path", "source_scope:" + $workflow.input.v2_source_scope_digest]
+                   + (if $workflow.input.v2_path_bucket_kind == "label" then [$workflow.input.v2_path_label]
+                      else ["summary_path:" + $workflow.input.v2_path_bucket_kind] end))
+             else ([$workflow.input.weekly_label, "iso_week:" + $target_week_resolved,
+                    "scope:" + $scope_key] + $sorted_extra_labels)
+             end }
+        weekly_identity_labels: >-
+          ${ if $workflow.input.v2_rollup_scope == "overall"
+             then [$workflow.input.weekly_label, "iso_week:" + $target_week_resolved,
+                   "summary_scope:overall", "source_scope:" + $workflow.input.v2_source_scope_digest]
+             elif $workflow.input.v2_rollup_scope == "path"
+             then ([$workflow.input.weekly_label, "iso_week:" + $target_week_resolved,
+                    "summary_scope:path", "source_scope:" + $workflow.input.v2_source_scope_digest]
+                   + (if $workflow.input.v2_path_bucket_kind == "label" then [$workflow.input.v2_path_label]
+                      else ["summary_path:" + $workflow.input.v2_path_bucket_kind] end))
+             else [$workflow.input.weekly_label, "iso_week:" + $target_week_resolved, "scope:" + $scope_key]
+             end }
+
+  - resolveDailyThreadFilter:
+      set:
+        daily_thread_filter_labels: >-
+          ${ if ($workflow.input.source_thread_labels_override | length) > 0
+             then $workflow.input.source_thread_labels_override
+             else [$workflow.input.daily_label, "scope:" + $scope_key]
+             end }
+        daily_thread_filter_match_mode: >-
+          ${ if ($workflow.input.source_thread_labels_override | length) > 0
+             then $workflow.input.source_thread_match_mode
+             else "LABEL_ALL"
+             end }
 
   # Step 4: Fetch daily summary memories in the week window.
   # Filter on memories (not threads): ThreadService.AddMemory bumps
@@ -214,7 +355,7 @@ do:
               ${ {
                 roles: ["ROLE_ASSISTANT"],
                 user_id: { value: $effective_user_id },
-                external_id_prefix: "daily:",
+                memory_kinds: [$workflow.input.source_memory_kind],
                 # API: updated_after is strict (>), updated_before is
                 # inclusive (<=). To express the half-open interval
                 # [week_start_ms, week_end_ms): pass start-1 (becomes >=)
@@ -226,10 +367,9 @@ do:
                 content_types: ["TEXT"],
                 thread_filter: {
                   user_id: $effective_user_id,
-                  memory_kinds: ["MEMORY_KIND_DAILY_SUMMARY"],
-                  labels: ([$workflow.input.daily_label]
-                           + $sorted_extra_labels),
-                  label_match_mode: "LABEL_ALL"
+                  memory_kinds: [$workflow.input.source_memory_kind],
+                  labels: $daily_thread_filter_labels,
+                  label_match_mode: $daily_thread_filter_match_mode
                 }
               } | tojson }
             as_json: true
@@ -237,24 +377,93 @@ do:
         as:
           target_memories: ${ .jsonBody | fromjson }
 
-  # Step 5: Skip if too few source daily summary memories.
-  - checkMemoryCount:
-      if: "${ ($target_memories | length) < $workflow.input.min_thread_count }"
+  - applyPlannedSourceMemories:
+      if: "${ ($workflow.input.planned_source_memory_ids | length) > 0 }"
       set:
-        skipped: true
+        target_memories: >-
+          ${ $target_memories
+             | map(select((.memory.id.value | tostring) as $id
+                          | $workflow.input.planned_source_memory_ids | index($id))) }
+
+  - applyPlannedPathBucketDigests:
+      if: "${ $workflow.input.v2_rollup_scope == \"overall\" and ($workflow.input.planned_path_bucket_digests | length) > 0 }"
+      set:
+        target_memories: >-
+          ${ $target_memories
+             | map(select((.memory.data.externalId // "") as $external_id
+                          | $workflow.input.planned_path_bucket_digests
+                            | any(. as $digest | $external_id | endswith(":path:" + $digest)))) }
+
+  - initializePathBuckets:
+      set:
+        path_buckets: "${ [] }"
+
+  - fetchSourceThreadsForPathPlan:
+      if: "${ $workflow.input.plan_only }"
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
+            json_body: >-
+              ${ { labels: $daily_thread_filter_labels, match_mode: $daily_thread_filter_match_mode,
+                   user_id: $effective_user_id, memory_kinds: [$workflow.input.source_memory_kind] } | tojson }
+            as_json: true
       export:
         as:
-          result: "skipped: not enough source summary memories for the week"
+          path_plan_threads: ${ .jsonBody | fromjson }
+
+  - buildPathPlan:
+      if: "${ $workflow.input.plan_only }"
+      set:
+        path_buckets: >-
+          ${ (reduce $path_plan_threads[] as $thread
+                ({}; .[($thread.id.value | tostring)] = ($thread.data.labels // []))) as $labels_by_thread
+             | (reduce $target_memories[] as $entry
+                ({};
+                 ($entry.threadId.value // null) as $thread_id
+                 | if $thread_id == null or ($labels_by_thread[($thread_id | tostring)] // null) == null then .
+                   else ($labels_by_thread[($thread_id | tostring)] // []) as $labels
+                         | ($labels | map(select(startswith("path:"))) | unique) as $paths
+                         | ($entry.memory.id.value | tostring) as $memory_id
+                         | (if ($labels | index("summary_path:ambiguous")) != null then "ambiguous:"
+                            elif ($labels | index("summary_path:unassigned")) != null then "unassigned:"
+                            elif ($paths | length) == 0 then "unassigned:"
+                            elif ($paths | length) == 1 then "label:" + $paths[0] else "ambiguous:" end) as $bucket_key
+                         | .[$bucket_key] = ((.[$bucket_key] // { ids: [] }) + { ids: ((.[$bucket_key].ids // []) + [$memory_id]) })
+                   end))
+             | to_entries
+             | map(if (.key | startswith("label:")) then {path_bucket_kind:"label",path_label:(.key|sub("^label:";"")),source_memory_ids:.value.ids}
+                   elif (.key | startswith("ambiguous:")) then {path_bucket_kind:"ambiguous",path_label:"",source_memory_ids:.value.ids}
+                   else {path_bucket_kind:"unassigned",path_label:"",source_memory_ids:.value.ids} end) }
+
+  - exitAfterPathPlan:
+      if: "${ $workflow.input.plan_only }"
+      # Keep a concrete task here: jobworkerp cannot deserialize a bare
+      # conditional `then: exit` as a workflow task.
+      set:
+        result: "${ \"path plan completed\" }"
       then: exit
 
+  # Version 2 includes each source's own fingerprint so a re-summarized
+  # lower layer changes this snapshot even when its updated_at is unchanged.
   - buildSourceSnapshot:
       set:
         source_snapshot_json: >-
-          ${ ($target_memories | map({
-                id: (.memory.id.value | tostring),
-                updated_at: .memory.data.updatedAt,
-                source_fingerprint: (((.memory.data.metadata // "{}") | fromjson | .source_fingerprint) // "")
-              }) | sort_by(.id) | tojson) }
+          ${ ($target_memories
+              | map({
+                  id: (.memory.id.value | tostring),
+                  updated_at: .memory.data.updatedAt,
+                  source_fingerprint: (((.memory.data.metadata // "{}") | fromjson | .source_fingerprint) // "")
+                })
+              | sort_by(.id)
+              | tojson) }
 
   - fingerprintSourceSnapshot:
       run:
@@ -263,12 +472,112 @@ do:
           settings: {}
           arguments:
             command: "/bin/sh"
-            args: ["-c", "if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi | awk '{print $1}'"]
+            args:
+              - "-c"
+              - "if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi | awk '{print $1}'"
             stdin: "${ $source_snapshot_json }"
             treat_nonzero_as_error: true
       export:
         as:
           source_fingerprint: "${ .stdout | split(\" \")[0] }"
+
+  - buildSourcePlanSnapshot:
+      set:
+        source_plan_snapshot_json: >-
+          ${ ({version: 1,
+               rollup_scope: $workflow.input.v2_rollup_scope,
+               entries: (if $workflow.input.v2_rollup_scope == "overall"
+                         then (($workflow.input.v2_failed_path_buckets
+                                | map(.path_bucket_digest // "")
+                                | map(select(type == "string" and length > 0)) | unique) as $failed
+                               | ($target_memories
+                                  | map((.memory.data.externalId // (.memory.id.value | tostring))
+                                        | sub("^.*:path:"; ""))) as $available
+                               | (($available
+                                   | map(. as $identity
+                                         | {identity: $identity, status: (if ($failed | index($identity)) != null then "fallback" else "available" end)}))
+                                  + ($failed | map(. as $identity
+                                                   | select(($available | index($identity)) == null)
+                                                   | {identity: $identity, status: "missing"})))
+                               | sort_by(.identity))
+                         else ($target_memories
+                               | map({identity: (.memory.id.value | tostring), status: "available"})
+                               | sort_by(.identity))
+                         end)} | tojson) }
+
+  - fingerprintSourcePlan:
+      run:
+        function:
+          runnerName: COMMAND
+          settings: {}
+          arguments:
+            command: "/bin/sh"
+            args: ["-c", "if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi | awk '{print $1}'"]
+            stdin: "${ $source_plan_snapshot_json }"
+            treat_nonzero_as_error: true
+      export:
+        as:
+          source_plan_fingerprint: "${ .stdout | split(\" \")[0] }"
+
+  - deriveSummaryTokenBudget:
+      set:
+        summary_max_tokens: "${ $workflow.input.summary_max_completion_tokens }"
+        summary_target_tokens: "${ ($workflow.input.summary_max_completion_tokens * 0.75 | floor) }"
+        summary_output_guidance: "${ $workflow.input.summary_output_guidance }"
+
+  - buildModelContractSnapshot:
+      set:
+        model_contract_snapshot_json: >-
+          ${ if ($target_memories | length) == 1 then ""
+             else ({version: 3, output_budget_policy: 1,
+                    summary_model: $workflow.input.summary_model,
+                    ollama_base_url: $workflow.input.ollama_base_url,
+                    llm_expected_model: $workflow.input.llm_expected_model,
+                    llm_context_window_tokens: $workflow.input.llm_context_window_tokens,
+                    system_prompt: ($weekly_work_summary_system_prompt // ""),
+                    user_tail: ($weekly_work_summary_user_tail // ""),
+                    temperature: 0.3,
+                    max_tokens: $summary_max_tokens,
+                    structured_output: "weekly-work-summary-v1",
+                    summary_input_byte_budget: $workflow.input.summary_input_byte_budget,
+                    context_selection_version: 1} | tojson)
+             end }
+
+  - fingerprintModelContract:
+      if: "${ $model_contract_snapshot_json != \"\" }"
+      run:
+        function:
+          runnerName: COMMAND
+          settings: {}
+          arguments:
+            command: "/bin/sh"
+            args: ["-c", "if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi | awk '{print $1}'"]
+            stdin: "${ $model_contract_snapshot_json }"
+            treat_nonzero_as_error: true
+      export:
+        as:
+          model_contract_fingerprint: "${ .stdout | split(\" \")[0] }"
+
+  - inspectInputGenerations:
+      set:
+        input_generation_ids: >-
+          ${ $target_memories
+             | map(try ((.memory.data.metadata // "{}") | fromjson | .generation_id) catch null)
+             | map(select(type == "string" and length > 0)) | unique }
+        input_without_generation_id_count: >-
+          ${ $target_memories
+             | map(try ((.memory.data.metadata // "{}") | fromjson | .generation_id) catch null)
+             | map(select((type != "string") or length == 0)) | length }
+        input_generation_consistency: >-
+          ${ ($target_memories
+              | map(try ((.memory.data.metadata // "{}") | fromjson | .generation_id) catch null)
+              | map(select(type == "string" and length > 0)) | unique) as $ids
+             | ($target_memories
+                | map(try ((.memory.data.metadata // "{}") | fromjson | .generation_id) catch null)
+                | map(select((type != "string") or length == 0)) | length) as $without
+             | if $without > 0 then "partial"
+               elif ($ids | length) == 1 and $ids[0] == $effective_generation_id then "aligned"
+               else "mixed" end }
 
   # Step 6: Build LLM input. FindListByCondition defaults to
   # `MemoryListSort = UPDATED_DESC`, so a greedy prefix walk drops the
@@ -285,16 +594,19 @@ do:
   # inferred from purpose_groups.status transitions across days.
   - buildContext:
       set:
-        truncated_entries: >-
-          ${ ($target_memories | map(.memory.data.content // "" | length) | add // 0) as $total
-             | if $total > $workflow.input.max_context_chars
+        # Exact-capable workers must see every candidate first. The bounded
+        # list is retained solely for providers that explicitly cannot count.
+        truncated_entries: "${ $target_memories }"
+        fallback_byte_budget_entries: >-
+          ${ ($target_memories | map(. as $e | ("---\nmemory_id: " + ($e.memory.id.value // "") + "\nthread_id: " + ($e.threadId.value // "") + "\nthread_description: " + ($e.threadDescription // "") + "\nmemory_updated_at: " + (($e.memory.data.updatedAt // "") | tostring) + "\nsummary_json: " + ($e.memory.data.content // "") + "\n") | utf8bytelength) | add // 0) as $total
+             | if $total > $workflow.input.summary_input_byte_budget
                then
                  ($target_memories | reduce .[] as $e (
                     {acc: [], used: 0};
-                    if .used + ($e.memory.data.content // "" | length)
-                       <= $workflow.input.max_context_chars
+                    if .used + (("---\nmemory_id: " + ($e.memory.id.value // "") + "\nthread_id: " + ($e.threadId.value // "") + "\nthread_description: " + ($e.threadDescription // "") + "\nmemory_updated_at: " + (($e.memory.data.updatedAt // "") | tostring) + "\nsummary_json: " + ($e.memory.data.content // "") + "\n") | utf8bytelength)
+                       <= $workflow.input.summary_input_byte_budget
                     then {acc: (.acc + [$e]),
-                          used: (.used + ($e.memory.data.content // "" | length))}
+                          used: (.used + (("---\nmemory_id: " + ($e.memory.id.value // "") + "\nthread_id: " + ($e.threadId.value // "") + "\nthread_description: " + ($e.threadDescription // "") + "\nmemory_updated_at: " + (($e.memory.data.updatedAt // "") | tostring) + "\nsummary_json: " + ($e.memory.data.content // "") + "\n") | utf8bytelength))}
                     else .
                     end
                   )).acc
@@ -318,9 +630,7 @@ do:
             method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
             json_body: >-
               ${ {
-                labels: [$workflow.input.weekly_label,
-                         "iso_week:" + $target_week_resolved,
-                         "scope:" + $scope_key],
+                labels: $weekly_identity_labels,
                 match_mode: "LABEL_ALL",
                 user_id: $effective_user_id,
                 memory_kinds: ["MEMORY_KIND_WEEKLY_SUMMARY"],
@@ -341,7 +651,8 @@ do:
       set:
         existing_weekly_memory: "${ null }"
 
-  # Step 9: Look up the existing weekly memory inside that thread.
+  # Step 9: Look up the existing weekly memory inside that thread,
+  # keyed by external_id = "weekly:<user_id>:<YYYY-Www>:<scope_key>".
   - findExistingWeeklyMemory:
       if: "${ $existing_weekly_thread_id != null }"
       run:
@@ -367,7 +678,32 @@ do:
           existing_weekly_memory: >-
             ${ ((.jsonBody // "[]") | fromjson)
                | map(select(.data.externalId == $weekly_external_id))
-               | if length > 0 then .[0] else null end }
+               | (if length > 0 then .[0] else null end) }
+
+  - deleteEmptyV2WeeklySummary:
+      if: "${ ($target_memories | length) < $workflow.input.min_thread_count and $workflow.input.v2_rollup_scope != \"\" and $existing_weekly_memory != null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryService/Delete"
+            json_body: "${ $existing_weekly_memory.id | tojson }"
+            as_json: true
+
+  - checkMemoryCount:
+      if: "${ ($target_memories | length) < $workflow.input.min_thread_count }"
+      set:
+        skipped: true
+      export:
+        as:
+          result: "skipped: not enough source summary memories for the week"
+      then: exit
 
   # Step 10: Eligibility — skip when an up-to-date weekly summary
   # already exists. "Up to date" = weekly memory's updated_at is at
@@ -386,7 +722,13 @@ do:
           ${ $workflow.input.force_resummarize
              or ($existing_weekly_memory == null)
              or ($existing_weekly_memory.data.updatedAt < $max_source_updated_at)
-             or ((($existing_weekly_memory.data.metadata // "{}") | fromjson | .source_fingerprint // "") != $source_fingerprint) }
+             or ((($existing_weekly_memory.data.metadata // "{}") | fromjson
+                  | .source_fingerprint // "") != $source_fingerprint)
+             or ((($existing_weekly_memory.data.metadata // "{}") | fromjson
+                  | .source_plan_fingerprint // "") != $source_plan_fingerprint)
+             or ((($target_memories | length) != 1)
+                 and (((($existing_weekly_memory.data.metadata // "{}") | fromjson
+                        | .model_contract_fingerprint) // "") != $model_contract_fingerprint)) }
 
   - skipIfNotEligible:
       if: "${ $eligible | not }"
@@ -397,8 +739,14 @@ do:
           result: "skipped: weekly summary already up to date"
       then: exit
 
+  # Fail closed if the language-specific prompt context was not baked into
+  # the worker (registration mistake). Running the LLM with an empty
+  # system_prompt / user_tail would silently produce off-language or
+  # malformed output, so reject instead. `$weekly_work_summary_system_prompt`
+  # and `$weekly_work_summary_user_tail` come from the worker's
+  # `workflow_context`.
   - validateWeeklyWorkSummaryPromptContext:
-      if: "${ (($weekly_work_summary_system_prompt // \"\") | length) == 0 or (($weekly_work_summary_user_tail // \"\") | length) == 0 }"
+      if: "${ ($target_memories | length) != 1 and (((($weekly_work_summary_system_prompt // \"\") | length) == 0) or ((($weekly_work_summary_user_tail // \"\") | length) == 0)) }"
       raise:
         error:
           type: "https://memories.local/errors/weekly-work-summary/prompt_context_missing"
@@ -410,93 +758,248 @@ do:
                else "weekly_work_summary_user_tail is missing"
                end }
 
+  - initializePassthroughSummary:
+      if: "${ ($target_memories | length) == 1 }"
+      set:
+        summary_json: "${ $target_memories[0].memory.data.content | fromjson }"
+
+  # Count the complete candidate set first, then remove the oldest entries
+  # only until an exact rendered request fits.
+  - initializeWeeklyEffectiveContextWindow:
+      set:
+        effective_context_window_tokens: "${ $workflow.input.llm_context_window_tokens }"
+
+  - fitWeeklyInputToExactBudget:
+      for:
+        each: exact_budget_attempt
+        in: "${ [range(0; ($truncated_entries | length))] }"
+      do:
+        - countWeeklySummaryInput:
+              if: >-
+                ${ ($target_memories | length) != 1 and
+                   (($token_count_result == null)
+                    or ((($token_count_result.renderedRequestSuccess // null) != null)
+                        and ((($token_count_result.renderedRequestSuccess.renderedInputTokens | tonumber) + $summary_max_tokens + 512) > $effective_context_window_tokens))) }
+              run:
+                function:
+                  runnerName: LLM
+                  using: token_count
+                  settings:
+                    ollama:
+                      base_url: "${$workflow.input.ollama_base_url}"
+                      model: "${$workflow.input.summary_model}"
+                  options:
+                    channel: llm
+                    storeSuccess: false
+                    storeFailure: true
+                  arguments:
+                    completion:
+                      system_prompt: "${ $weekly_work_summary_system_prompt }"
+                      prompt: >-
+                        $${## Target week
+                        {{ target_week_resolved }}
+
+                        ## Weekly daily summaries ({{ truncated_entries | size }} entries / {{ target_memories | size }} source entries)
+
+                        {% for e in truncated_entries %}
+                        ---
+                        memory_id: {{ e.memory.id.value }}
+                        thread_id: {{ e.threadId.value }}
+                        thread_description: {{ e.threadDescription }}
+                        memory_updated_at: {{ e.memory.data.updatedAt }}
+                        summary_json: {{ e.memory.data.content }}
+                        {% endfor %}
+
+                        ## Output size guidance
+                        Aim for at most {{ summary_target_tokens }} output tokens for the complete JSON, including text, source IDs, and structure. The generation allowance is {{ summary_max_tokens }} tokens; leave room to finish the JSON. This token target takes priority over the character guides below: shorten text and use fewer representative source IDs as needed.
+                        This is a writing target, not permission to truncate JSON. Keep each free-text item near {{ summary_output_guidance.weekly.item_chars }} characters and the whole summary near {{ summary_output_guidance.weekly.total_chars }} characters. Use at most {{ summary_output_guidance.max_purpose_groups.weekly }} purpose groups and at most {{ summary_output_guidance.max_source_memory_ids }} source memory IDs per item. Return one complete JSON object.
+
+                        {{ weekly_work_summary_user_tail }}}
+                      options: { max_tokens: "${ $summary_max_tokens }", temperature: 0.3 }
+                      json_schema: |
+                        {"type":"object","required":["overall_purpose","purpose_groups","by_topic","trends","carryover"],"properties":{"overall_purpose":{"type":"string"},"purpose_groups":{"type":"array","items":{"type":"object","required":["purpose","bullets","source_memory_ids","status"],"properties":{"purpose":{"type":"string"},"bullets":{"type":"array","items":{"type":"string"}},"source_memory_ids":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["resolved","ongoing","in_review","blocked","deferred","abandoned"]}}}},"by_topic":{"type":"array","items":{"type":"object","required":["topic","bullets"],"properties":{"topic":{"type":"string"},"bullets":{"type":"array","items":{"type":"string"}}}}},"trends":{"type":"array","maxItems":20,"items":{"type":"object","required":["kind","topic","summary"],"properties":{"kind":{"type":"string","enum":["continued","new","completed"]},"topic":{"type":"string"},"summary":{"type":"string"},"source_memory_ids":{"type":"array","items":{"type":"string"}}}}},"carryover":{"type":"array","items":{"type":"string"}}}}
+              export:
+                as:
+                  token_count_result: "${ . }"
+        - captureWeeklyEffectiveContextWindow:
+              if: "${ ($token_count_result.renderedRequestSuccess // null) != null }"
+              set:
+                effective_context_window_tokens: >-
+                  ${ [$workflow.input.llm_context_window_tokens,
+                      (($token_count_result.renderedRequestSuccess.contextWindowTokens // $workflow.input.llm_context_window_tokens) | tonumber)] | min }
+        - discardOldestWeeklyEntryAfterExactOverflow:
+              if: >-
+                ${ (($token_count_result.renderedRequestSuccess // null) != null)
+                   and ((($token_count_result.renderedRequestSuccess.renderedInputTokens | tonumber) + $summary_max_tokens + 512) > $effective_context_window_tokens)
+                   and (($truncated_entries | length) > 1) }
+              set:
+                truncated_entries: "${ $truncated_entries[0:-1] }"
+
+  - fallbackToWeeklyByteBudget:
+      if: >-
+        ${ (($token_count_result.error.code // "") == "TOKEN_COUNT_EXACT_UNAVAILABLE")
+           or (($token_count_result.error.code // "") == "PROVIDER_CAPABILITY_UNAVAILABLE") }
+      set:
+        truncated_entries: "${ $fallback_byte_budget_entries }"
+
+  - rejectEmptyWeeklyFallbackContext:
+      if: "${ ($target_memories | length) != 1 and ($target_memories | length) >= $workflow.input.min_thread_count and ($truncated_entries | length) == 0 }"
+      raise:
+        error:
+          type: "https://memories.local/errors/weekly-work-summary/input-budget"
+          status: 422
+          title: "Weekly summary source input does not fit the model context"
+          detail: "No complete source summary fits the conservative fallback input budget."
+
+  - validateWeeklyExactBudget:
+      if: >-
+        ${ ($target_memories | length) != 1 and
+           (((($token_count_result.renderedRequestSuccess // null) == null)
+             and ((($token_count_result.error.code // "") != "TOKEN_COUNT_EXACT_UNAVAILABLE")
+                  and (($token_count_result.error.code // "") != "PROVIDER_CAPABILITY_UNAVAILABLE")))
+            or ((($token_count_result.renderedRequestSuccess // null) != null)
+                and (($workflow.input.llm_expected_model != "") and ($token_count_result.renderedRequestSuccess.resolvedModel != $workflow.input.llm_expected_model)))
+            or ((($token_count_result.renderedRequestSuccess // null) != null)
+                and ((($token_count_result.renderedRequestSuccess.renderedInputTokens | tonumber) + $summary_max_tokens + 512) > $effective_context_window_tokens))) }
+      raise:
+        error:
+          type: "https://memories.local/errors/weekly-work-summary/token-budget"
+          status: 422
+          title: "Weekly summary does not fit the model context"
+          detail: "The resolved model changed, the rendered request exceeds its context budget, or token counting failed for a reason other than an unavailable provider capability."
+
   # Step 11: Generate the weekly aggregate via LLM. The system prompt
   # adds week-over-week trend detection on top of daily-work-summary's
   # purpose grouping, which is the value-add of this layer.
-  - generateWeeklySummary:
-      run:
-        function:
-          runnerName: LLM
-          using: completion
-          settings:
-            ollama:
-              base_url: "${$workflow.input.ollama_base_url}"
-              model: "${$workflow.input.summary_model}"
-          options:
-            channel: llm
-            storeSuccess: false
-            storeFailure: true
-          arguments:
-            system_prompt: "${ $weekly_work_summary_system_prompt }"
-            prompt: >-
-              $${## Target week
-              {{ target_week_resolved }}
+  - generateWeeklySummaryWithRetry:
+      if: "${ ($target_memories | length) != 1 }"
+      try:
+        - generateWeeklySummary:
+            run:
+              function:
+                runnerName: LLM
+                using: completion
+                settings:
+                  ollama:
+                    base_url: "${$workflow.input.ollama_base_url}"
+                    model: "${$workflow.input.summary_model}"
+                options:
+                  channel: llm
+                  storeSuccess: false
+                  storeFailure: true
+                arguments:
+                  system_prompt: "${ $weekly_work_summary_system_prompt }"
+                  prompt: >-
+                    $${## Target week
+                    {{ target_week_resolved }}
 
-              ## Weekly daily summaries ({{ truncated_entries | size }} entries / {{ target_memories | size }} source entries)
+                    ## Weekly daily summaries ({{ truncated_entries | size }} entries / {{ target_memories | size }} source entries)
 
-              {% for e in truncated_entries %}
-              ---
-              memory_id: {{ e.memory.id.value }}
-              thread_id: {{ e.threadId.value }}
-              thread_description: {{ e.threadDescription }}
-              memory_updated_at: {{ e.memory.data.updatedAt }}
-              summary_json: {{ e.memory.data.content }}
-              {% endfor %}
+                    {% for e in truncated_entries %}
+                    ---
+                    memory_id: {{ e.memory.id.value }}
+                    thread_id: {{ e.threadId.value }}
+                    thread_description: {{ e.threadDescription }}
+                    memory_updated_at: {{ e.memory.data.updatedAt }}
+                    summary_json: {{ e.memory.data.content }}
+                    {% endfor %}
 
-              {{ weekly_work_summary_user_tail }}}
-            options:
-              max_tokens: 8000
-              temperature: 0.3
-            json_schema: |
-              {
-                "type": "object",
-                "required": ["overall_purpose", "purpose_groups", "by_topic", "trends", "carryover"],
-                "properties": {
-                  "overall_purpose": { "type": "string" },
-                  "purpose_groups": {
-                    "type": "array",
-                    "items": {
+                    ## Output size guidance
+                    Aim for at most {{ summary_target_tokens }} output tokens for the complete JSON, including text, source IDs, and structure. The generation allowance is {{ summary_max_tokens }} tokens; leave room to finish the JSON. This token target takes priority over the character guides below: shorten text and use fewer representative source IDs as needed.
+                    This is a writing target, not permission to truncate JSON. Keep each free-text item near {{ summary_output_guidance.weekly.item_chars }} characters and the whole summary near {{ summary_output_guidance.weekly.total_chars }} characters. Use at most {{ summary_output_guidance.max_purpose_groups.weekly }} purpose groups and at most {{ summary_output_guidance.max_source_memory_ids }} source memory IDs per item. Return one complete JSON object.
+
+                    {{ weekly_work_summary_user_tail }}}
+                  options:
+                    max_tokens: "${ $summary_max_tokens }"
+                    temperature: 0.3
+                    # Thinking inside schema-constrained output can collapse to blank JSON.
+                    extract_reasoning_content: false
+                  json_schema: |
+                    {
                       "type": "object",
-                      "required": ["purpose", "bullets", "source_memory_ids", "status"],
+                      "required": ["overall_purpose", "purpose_groups", "by_topic", "trends", "carryover"],
                       "properties": {
-                        "purpose": { "type": "string" },
-                        "bullets": { "type": "array", "items": { "type": "string" } },
-                        "source_memory_ids": { "type": "array", "items": { "type": "string" } },
-                        "status": { "type": "string", "enum": ["resolved", "ongoing", "in_review", "blocked", "deferred", "abandoned"] }
+                        "overall_purpose": { "type": "string" },
+                        "purpose_groups": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "required": ["purpose", "bullets", "source_memory_ids", "status"],
+                            "properties": {
+                              "purpose": { "type": "string" },
+                              "bullets": { "type": "array", "items": { "type": "string" } },
+                              "source_memory_ids": { "type": "array", "items": { "type": "string" } },
+                              "status": { "type": "string", "enum": ["resolved", "ongoing", "in_review", "blocked", "deferred", "abandoned"] }
+                            }
+                          }
+                        },
+                        "by_topic": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "required": ["topic", "bullets"],
+                            "properties": {
+                              "topic": { "type": "string" },
+                              "bullets": { "type": "array", "items": { "type": "string" } }
+                            }
+                          }
+                        },
+                        "trends": {
+                          "type": "array",
+                          "maxItems": 20,
+                          "items": {
+                            "type": "object",
+                            "required": ["kind", "topic", "summary"],
+                            "properties": {
+                              "kind": { "type": "string", "enum": ["continued", "new", "completed"] },
+                              "topic": { "type": "string" },
+                              "summary": { "type": "string" },
+                              "source_memory_ids": { "type": "array", "items": { "type": "string" } }
+                            }
+                          }
+                        },
+                        "carryover": { "type": "array", "items": { "type": "string" } }
                       }
                     }
-                  },
-                  "by_topic": {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "required": ["topic", "bullets"],
-                      "properties": {
-                        "topic": { "type": "string" },
-                        "bullets": { "type": "array", "items": { "type": "string" } }
-                      }
-                    }
-                  },
-                  "trends": {
-                    "type": "array",
-                    "maxItems": 20,
-                    "items": {
-                      "type": "object",
-                      "required": ["kind", "topic", "summary"],
-                      "properties": {
-                        "kind": { "type": "string", "enum": ["continued", "new", "completed"] },
-                        "topic": { "type": "string" },
-                        "summary": { "type": "string" },
-                        "source_memory_ids": { "type": "array", "items": { "type": "string" } }
-                      }
-                    }
-                  },
-                  "carryover": { "type": "array", "items": { "type": "string" } }
-                }
-              }
-      export:
-        as:
-          summary_json: ${ .content.text | fromjson }
+            export:
+              as:
+                summary_json: >-
+                  ${ try (.content.text | fromjson) catch null }
+        - validateWeeklySummaryShape:
+            if: >-
+              ${ (($summary_json | type) != "object")
+                 or (($summary_json.overall_purpose | type) != "string")
+                 or (($summary_json.purpose_groups | type) != "array")
+                 or (($summary_json.by_topic | type) != "array")
+                 or (($summary_json.trends | type) != "array")
+                 or (($summary_json.carryover | type) != "array")
+                 or (($summary_json.overall_purpose | gsub("\\s"; "")) == "")
+                 or (($summary_json.purpose_groups | length) == 0)
+                 or ($summary_json.purpose_groups | any(((.purpose? // "") | tostring | gsub("\\s"; "")) == "")) }
+            raise:
+              error:
+                type: "https://memories.local/errors/weekly-work-summary/invalid-output"
+                status: 422
+                title: "Weekly summary output does not match its contract"
+                detail: "The LLM returned malformed, incomplete, or blank JSON."
+      # Blank or malformed LLM output is usually transient; retry only that.
+      catch:
+        errors:
+          with:
+            type: "https://memories.local/errors/weekly-work-summary/invalid-output"
+        retry:
+          limit:
+            attempt:
+              count: 2
+        do:
+          # Retries are exhausted: fail instead of persisting the output.
+          - rejectWeeklySummaryOutput:
+              raise:
+                error:
+                  type: "https://memories.local/errors/weekly-work-summary/invalid-output"
+                  status: 422
+                  title: "Weekly summary output does not match its contract"
+                  detail: "The LLM returned malformed, incomplete, or blank JSON."
 
   # Step 11.5: Default for created_weekly_thread_id (Step 12 may skip).
   - initCreatedWeeklyThreadId:
@@ -520,13 +1023,13 @@ do:
             json_body: >-
               ${ {
                 user_id: { value: $effective_user_id },
-                memory_kind: "MEMORY_KIND_WEEKLY_SUMMARY",
                 description: ($target_week_resolved + " の作業要約 ("
                               + ($target_memories | length | tostring)
                               + " 日次)"),
                 labels: $weekly_thread_labels,
                 created_at: $week_start_ms,
-                updated_at: $max_source_updated_at
+                updated_at: $max_source_updated_at,
+                memory_kind: "MEMORY_KIND_WEEKLY_SUMMARY"
               } | tojson }
             as_json: true
       export:
@@ -537,7 +1040,8 @@ do:
       set:
         weekly_thread_id: "${ $existing_weekly_thread_id // $created_weekly_thread_id }"
         weekly_metadata_json: >-
-          ${ {
+          ${ (if $workflow.input.v2_rollup_scope == ""
+              then {
               iso_week: $target_week_resolved,
               scope: $scope_key,
               extra_labels: $sorted_extra_labels,
@@ -547,7 +1051,51 @@ do:
               source_fingerprint_algorithm: "sha256",
               source_fingerprint: $source_fingerprint,
               summary_version: "1.0"
-            } | tojson }
+              }
+              else {
+                schema_version: 2,
+                period_kind: "weekly",
+                period_key: $target_week_resolved,
+                rollup_scope: $workflow.input.v2_rollup_scope,
+                source_scope_digest: $workflow.input.v2_source_scope_digest,
+                source_scope_match_mode: ($workflow.input.extra_labels_match_mode // "LABEL_ALL"),
+                source_scope_labels: $sorted_extra_labels,
+                path_bucket_kind: (if $workflow.input.v2_rollup_scope == "path" then $workflow.input.v2_path_bucket_kind else null end),
+                path_label: (if $workflow.input.v2_rollup_scope == "path" and $workflow.input.v2_path_bucket_kind == "label" then $workflow.input.v2_path_label else null end),
+                aggregation_mode: (if ($target_memories | length) == 1 then "passthrough" else "llm" end),
+                completion_status: (if $workflow.input.v2_rollup_scope == "overall" and ((($target_memories | length) < $workflow.input.expected_path_bucket_count) or (($workflow.input.v2_failed_path_buckets | length) > 0)) then "incomplete" else "complete" end),
+                source_collection_state: (if $workflow.input.v2_rollup_scope == "overall" and ((($target_memories | length) < $workflow.input.expected_path_bucket_count) or (($workflow.input.v2_failed_path_buckets | length) > 0)) then "incomplete" else "complete" end),
+                planned_source_count: (if $workflow.input.v2_rollup_scope == "overall" and $workflow.input.expected_path_bucket_count > 0 then $workflow.input.expected_path_bucket_count else ($target_memories | length) end),
+                missing_path_bucket_count: (if $workflow.input.v2_rollup_scope == "overall" then [$workflow.input.expected_path_bucket_count - ($target_memories | length), 0] | max else 0 end),
+                passthrough_source_memory_id: (if ($target_memories | length) == 1 then ($target_memories[0].memory.id.value | tostring) else null end),
+                source_memory_count: ($target_memories | length),
+                source_snapshot_version: 2,
+                source_max_updated_at: $max_source_updated_at,
+                source_fingerprint_algorithm: "sha256",
+                source_fingerprint: $source_fingerprint,
+                source_plan_fingerprint: $source_plan_fingerprint,
+                model_contract_fingerprint: (if ($target_memories | length) == 1 then null else $model_contract_fingerprint end),
+                context_truncated: (($truncated_entries | length) < ($target_memories | length)),
+                included_source_count: ($truncated_entries | length),
+                omitted_source_count: (($target_memories | length) - ($truncated_entries | length)),
+                included_context_chars: ($truncated_entries | map(.memory.data.content // "" | length) | add // 0),
+                omitted_context_chars: (($target_memories | map(.memory.data.content // "" | length) | add // 0) - ($truncated_entries | map(.memory.data.content // "" | length) | add // 0)),
+                omitted_source_memory_ids: ($target_memories | map(select((.memory.id.value | tostring) as $id | ($truncated_entries | map(.memory.id.value | tostring) | index($id)) == null) | (.memory.id.value | tostring)) | .[0:1024]),
+                omitted_source_ids_truncated: ((($target_memories | length) - ($truncated_entries | length)) > 1024),
+                generation_id: $effective_generation_id,
+                generation_started_at: $effective_generation_started_at,
+                input_generation_ids: $input_generation_ids,
+                input_without_generation_id_count: $input_without_generation_id_count,
+                generation_consistency: (if (($truncated_entries | length) < ($target_memories | length)) or ($workflow.input.v2_rollup_scope == "overall" and (($workflow.input.v2_failed_path_buckets | length) > 0)) then "partial" else $input_generation_consistency end)
+                ,failed_path_bucket_digests: (if $workflow.input.v2_rollup_scope == "overall" then ($workflow.input.v2_failed_path_buckets | map(.path_bucket_digest) | map(select(type == "string" and length > 0)) | unique) else [] end)
+                ,fallback_path_bucket_digests: (if $workflow.input.v2_rollup_scope == "overall" then (($workflow.input.v2_failed_path_buckets | map(.path_bucket_digest) | map(select(type == "string" and length > 0))) as $failed | $target_memories | map(.memory.data.externalId // "") | map(select(. as $id | $failed | any(. as $digest | $id | endswith(":path:" + $digest)))) | map(sub("^.*:path:"; "")) | unique) else [] end)
+                ,missing_path_bucket_digests: (if $workflow.input.v2_rollup_scope == "overall" then (($workflow.input.v2_failed_path_buckets | map(.path_bucket_digest) | map(select(type == "string" and length > 0))) as $failed | ($target_memories | map(.memory.data.externalId // "") | map(sub("^.*:path:"; ""))) as $available | $failed | map(select(. as $digest | ($available | index($digest)) == null)) | unique) else [] end)
+                ,path_bucket_diagnostics: (if $workflow.input.v2_rollup_scope == "overall" then (($workflow.input.v2_failed_path_buckets | map(select((.path_bucket_digest // "") | (type == "string" and length > 0)))) as $failed | ($target_memories | map(.memory.data.externalId // "") | map(sub("^.*:path:"; ""))) as $available | $failed | sort_by(.path_bucket_digest) | group_by(.path_bucket_digest) | map(.[0] as $bucket | {path_bucket_digest: $bucket.path_bucket_digest, statuses: (["failed"] + (if ($available | index($bucket.path_bucket_digest)) != null then ["fallback"] else ["missing"] end)), path_bucket_kind: $bucket.path_bucket_kind, path_label: (if $bucket.path_bucket_kind == "label" then $bucket.path_label else null end)})) else [] end)
+                ,last_material_attempt_generation_id: $effective_generation_id
+                ,last_material_attempt_started_at: $effective_generation_started_at
+                ,last_material_attempt_status: "succeeded"
+              }
+              end) | tojson }
 
   # Step 13-a: Update existing weekly memory in place (preserves
   # external_id UNIQUE invariant on re-summarize).
@@ -594,14 +1142,14 @@ do:
                 thread_id: { value: $weekly_thread_id },
                 memory: {
                   user_id: { value: $effective_user_id },
-                  memory_kind: "MEMORY_KIND_WEEKLY_SUMMARY",
                   content: ($summary_json | tojson),
                   content_type: "TEXT",
                   role: "ROLE_ASSISTANT",
                   metadata: $weekly_metadata_json,
                   external_id: $weekly_external_id,
                   created_at: $week_start_ms,
-                  updated_at: $max_source_updated_at
+                  updated_at: $max_source_updated_at,
+                  memory_kind: "MEMORY_KIND_WEEKLY_SUMMARY"
                 }
               } | tojson }
             as_json: true
@@ -618,10 +1166,10 @@ do:
              then $existing_weekly_thread_data
              else {
                user_id: { value: $effective_user_id },
-               memory_kind: "MEMORY_KIND_WEEKLY_SUMMARY",
                labels: $weekly_thread_labels,
                created_at: $week_start_ms,
-               updated_at: $max_source_updated_at
+               updated_at: $max_source_updated_at,
+               memory_kind: "MEMORY_KIND_WEEKLY_SUMMARY"
              }
              end }
 
@@ -642,7 +1190,7 @@ do:
                 id: { value: $weekly_thread_id },
                 data: ($weekly_thread_data
                   | .description = ($target_week_resolved
-                                    + " — " + $summary_json.overall_purpose)
+                                    + " — " + ($summary_json.overall_purpose // $summary_json.title // "要約"))
                   | .updatedAt = $max_source_updated_at)
               } | tojson }
             as_json: true
@@ -660,3 +1208,4 @@ output:
       ${ if $summary_json != null then ($summary_json.trends | length) else 0 end }
     skipped: ${ $skipped // false }
     skip_reason: ${ if ($skipped // false) then $result else null end }
+    path_buckets: ${ $path_buckets }

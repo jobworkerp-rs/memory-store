@@ -151,7 +151,8 @@ memories-import --user-id 1 \
 ## Register Generation Workers
 
 `upsert-generation-workers` registers language-specific workflow workers for
-reflection, summary, work-summary, and personality generation. Prompts are
+reflection, thread summary, thread-group summary, work-summary, and personality
+generation. Prompts are
 embedded into worker settings at registration time; re-run registration after
 changing prompts.
 
@@ -176,6 +177,31 @@ The command resolves the `agent-chat-import` crate directory in this order:
 When distributing the binary outside the build tree, set `--repo-root` or
 `MEMORY_REPO_ROOT` to the `agent-chat-import` crate directory, not the workspace
 root.
+
+### Channels
+
+A parent workflow must never run on the channel its child needs: it holds a
+slot while waiting, and the child can deadlock when no slot is left. The
+batches dispatch their children as follows, so register each parent on a
+channel distinct from its child's:
+
+| Parent | Child channel |
+|---|---|
+| `*-single` language workers | `llm` (the inline LLM call) |
+| `*-batch` workflows | the single worker's registered channel (`--channel`) |
+| `agent-chat-summary` stages | `llm_batch` |
+| `thread-group-summary-batch` | `llm_batch` (nested thread-summary batch); run it on a separate channel such as `thread_group_summary` |
+
+### Validate Workflow YAML
+
+Every YAML under `workers/` and `workflows/` is validated against jobworkerp's
+workflow schema by an infra test. The schema copy it uses is checked against
+`runner/schema/workflow_minimal_fix.json` when the jobworkerp-rs checkout is
+present:
+
+```bash
+cargo test -p infra workflow_schema -- --test-threads=1
+```
 
 ## Import and Then Summarize
 
@@ -204,7 +230,10 @@ memories-import --user-id 1 \
 ```
 
 `--since` is converted to absolute epoch milliseconds and passed to the workflow
-as `updated_after_ms`. If import reports errors, summary dispatch is skipped to
+as `last_message_after_ms`. Templates that still contain the removed names
+`updated_after_ms`, `updated_before_ms`, or `updated_within_hours` are rejected
+before dispatch, because the batches would otherwise ignore them and summarize
+the whole history. If import reports errors, summary dispatch is skipped to
 avoid summarizing partial thread state.
 
 For frequent imports, `--since` also enables a session-file mtime filter.

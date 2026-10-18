@@ -14,6 +14,7 @@ use infra::infra::thread_group::test_support::{
     T0, insert_thread, key, new_group, new_member, setup_thread_group_pool,
 };
 use infra::infra::thread_label::rdb::{ThreadLabelRepository, ThreadLabelRepositoryImpl};
+use infra_utils::infra::test::TEST_RUNTIME;
 use protobuf::llm_memory::data::{MemoryKind, ThreadSearchFilter};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -85,11 +86,7 @@ async fn add_group_for_owner(group_key: u64, thread_ids: &[i64], user_id: i64) -
 #[test]
 fn all_predicates_default_to_one_member_and_cross_member_is_explicit() {
     let _database_lock = lock_test_database();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    runtime.block_on(async {
+    TEST_RUNTIME.block_on(async {
         let group_id = add_group(700_001, &[700_001, 700_002]).await;
         let mut provider = FakeSearchProvider::default();
         provider.scores.insert(("thread".into(), 700_001), 0.8);
@@ -119,11 +116,7 @@ fn all_predicates_default_to_one_member_and_cross_member_is_explicit() {
 #[test]
 fn group_search_uses_max_member_score_then_latest_and_canonical_ties() {
     let _database_lock = lock_test_database();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    runtime.block_on(async {
+    TEST_RUNTIME.block_on(async {
         let first = add_group(700_010, &[700_010]).await;
         let second = add_group(700_011, &[700_011]).await;
         let third = add_group(700_012, &[700_012]).await;
@@ -154,11 +147,7 @@ fn group_search_uses_max_member_score_then_latest_and_canonical_ties() {
 #[test]
 fn keyset_cursor_is_opaque_and_rejects_a_changed_snapshot() {
     let _database_lock = lock_test_database();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    runtime.block_on(async {
+    TEST_RUNTIME.block_on(async {
         add_group(700_020, &[700_020]).await;
         add_group(700_021, &[700_021]).await;
         let pool = setup_thread_group_pool().await;
@@ -200,11 +189,7 @@ fn keyset_cursor_is_opaque_and_rejects_a_changed_snapshot() {
 #[test]
 fn search_owner_filter_selects_groups_and_is_bound_into_the_cursor() {
     let _database_lock = lock_test_database();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    runtime.block_on(async {
+    TEST_RUNTIME.block_on(async {
         let first = add_group_for_owner(700_040, &[700_040], 1).await;
         let second = add_group_for_owner(700_041, &[700_041], 1).await;
         let other_owner = add_group_for_owner(700_042, &[700_042], 2).await;
@@ -261,11 +246,7 @@ fn search_owner_filter_selects_groups_and_is_bound_into_the_cursor() {
 #[test]
 fn browse_cursor_search_supports_label_only_filters() {
     let _database_lock = lock_test_database();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    runtime.block_on(async {
+    TEST_RUNTIME.block_on(async {
         let matching = add_group(700_030, &[700_030]).await;
         let other = add_group(700_031, &[700_031]).await;
         let pool = setup_thread_group_pool().await;
@@ -314,5 +295,101 @@ fn browse_cursor_search_supports_label_only_filters() {
             vec![other]
         );
         assert!(page.results[0].witnesses.is_empty());
+    });
+}
+
+#[derive(Default)]
+struct RecordingProvider {
+    calls: Mutex<Vec<(String, i64)>>,
+    failing_threads: Vec<i64>,
+}
+
+#[async_trait]
+impl ThreadGroupMemberSearchProvider for RecordingProvider {
+    async fn search_member(
+        &self,
+        query: &ThreadGroupMemberSearchQuery,
+        _group_id: i64,
+        thread_id: i64,
+    ) -> Result<Option<ThreadGroupMemberSearchHit>> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push((query.query_text.clone(), thread_id));
+        if self.failing_threads.contains(&thread_id) {
+            anyhow::bail!("search failed for {thread_id}");
+        }
+        Ok(Some(ThreadGroupMemberSearchHit {
+            thread_id,
+            score: 0.5,
+        }))
+    }
+}
+
+#[test]
+fn every_live_member_is_searched_once_per_predicate() {
+    let _database_lock = lock_test_database();
+    TEST_RUNTIME.block_on(async {
+        add_group_for_owner(700_050, &[700_050, 700_051], 77).await;
+        add_group_for_owner(700_052, &[700_052], 77).await;
+        let read = ThreadGroupReadService::new(setup_thread_group_pool().await);
+        let provider = RecordingProvider::default();
+        let page = read
+            .search_groups(
+                &provider,
+                &[query(GroupSearchTarget::Thread, "q")],
+                false,
+                10,
+                None,
+                None,
+                Some(77),
+            )
+            .await
+            .expect("search");
+        assert_eq!(page.results.len(), 2);
+        let mut calls = provider.calls.lock().expect("calls").clone();
+        calls.sort();
+        assert_eq!(
+            calls,
+            vec![
+                ("q".to_string(), 700_050),
+                ("q".to_string(), 700_051),
+                ("q".to_string(), 700_052)
+            ]
+        );
+    });
+}
+
+#[test]
+fn delegated_search_errors_surface_in_group_order() {
+    let _database_lock = lock_test_database();
+    TEST_RUNTIME.block_on(async {
+        let first = add_group_for_owner(700_060, &[700_060], 78).await;
+        let second = add_group_for_owner(700_061, &[700_061], 78).await;
+        // Groups are visited in id order, which need not follow creation order.
+        let expected_thread = if first < second { 700_060 } else { 700_061 };
+        let read = ThreadGroupReadService::new(setup_thread_group_pool().await);
+        let provider = RecordingProvider {
+            failing_threads: vec![700_061, 700_060],
+            ..Default::default()
+        };
+        let error = read
+            .search_groups(
+                &provider,
+                &[query(GroupSearchTarget::Thread, "q")],
+                false,
+                10,
+                None,
+                None,
+                Some(78),
+            )
+            .await
+            .expect_err("delegated failure must fail the search");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("search failed for {expected_thread}")),
+            "{error}"
+        );
     });
 }

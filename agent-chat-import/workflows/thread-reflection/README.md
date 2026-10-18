@@ -49,7 +49,7 @@ jobworkerp-client job enqueue-workflow \
     "reflector_base_url": "http://localhost:11434",
     "prompt_version": "20260511-baseline",
     "output_language": "en",
-    "updated_within_hours": 24
+    "last_message_within_hours": 24
   }' \
   -w /abs/path/to/memories/agent-chat-import/workflows/thread-reflection/thread-reflection-batch.yaml
 ```
@@ -57,6 +57,17 @@ jobworkerp-client job enqueue-workflow \
 `thread-reflection-batch.yaml` dispatches
 `memories-thread-reflection-single-ja/en` according to `output_language`. Prompt
 context is already embedded in worker settings.
+
+Thread selection inputs: `thread_ids`, `target_thread_ids` (authoritative set;
+an explicit empty array targets zero threads), `labels_filter` +
+`labels_filter_match_mode` (`LABEL_ALL` default / `LABEL_ANY`),
+`last_message_within_hours` / `last_message_after_ms` (conversation last-message
+time; the absolute bound wins), and `thread_created_after_ms` /
+`thread_created_before_ms`. Defaults for `context_limit_tokens` /
+`single_pass_threshold_tokens` / `merge_max_input_tokens` are
+222000 / 170000 / 100000. The output reports `completed` (no thread failed),
+`processed_threads`, `succeeded_count`, `failed_count`, and `last_error`; an
+item that ended without an outcome (timed out or aborted) counts as failed.
 
 ## Related
 

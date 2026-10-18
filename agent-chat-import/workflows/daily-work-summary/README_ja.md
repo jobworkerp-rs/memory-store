@@ -37,10 +37,10 @@ worker を登録しておく（後述）。
 | 集約スレッドのラベル | `daily_summary`, `date:YYYY-MM-DD`, `scope:<scope_key>`, `extra_labels_filter` の各値 (sort 済み) | `daily_summary` で一覧、`date:` で日付絞り込み、`scope:` で同日内の異 scope を分離 |
 | 集約メモリの `external_id` | `daily:<user_id>:YYYY-MM-DD:<scope_key>` | `memory.external_id` は DB 全体で UNIQUE。所有者と scope を含め、同日に異なるユーザーまたは `extra_labels_filter` で並列実行しても衝突しないようにする |
 | `scope_key` の算出 | `extra_labels_filter` を `sort | join(",")`。空なら `_all` | 呼び出し側のラベル順に依存しない (`["b","a"]` も `["a","b"]` も `scope_key="a,b"`)。external_id・スレッドラベル・filter request すべてが順序非依存 |
-| 入力の取得方法 | `MemoryService.FindListByCondition` で **要約メモリ自身**を絞り込む (`external_id_prefix="summary:"` + `roles=[ROLE_ASSISTANT]` + `updated_after/before` + `thread_filter.labels=[summary]+extra` の AND マッチ) | スレッドの `updated_at` はサーバが `AddMemory` 時に `now` で bump されるため、要約 *スレッド* 単位で絞ると元の会話日付ではなく要約実行日でヒットしてしまう。要約 *メモリ* の `updated_at` は `thread-summary-single` が元スレッドの updated_at をそのまま転記しているため、メモリ単位で絞ることで正しく「会話があった日」で絞れる |
+| 入力の取得方法 | `MemoryService.FindListByCondition` で **要約メモリ自身**を絞り込む (`memory_kinds=[MEMORY_KIND_THREAD_SUMMARY]` + `roles=[ROLE_ASSISTANT]` + `updated_after/before` + `thread_filter.labels=[summary]+extra` の AND マッチ) | スレッドの `updated_at` はサーバが `AddMemory` 時に `now` で bump されるため、要約 *スレッド* 単位で絞ると元の会話日付ではなく要約実行日でヒットしてしまう。要約 *メモリ* の `updated_at` には `thread-summary-single` が元スレッドの会話の最終メッセージ時刻 (`last_message_at`) を書き込むため、メモリ単位で絞ることで正しく「会話があった日」で絞れる |
 
 | LLM 入力 | `memory.data.content` (構造化要約 JSON: category / title / summary / key_decisions / status) + `thread_description` の組み合わせ | スレッドの一行サマリだけでなく key_decisions など詳細データを LLM に渡すことでグルーピング精度を上げる |
-| コンテキスト圧縮 | `max_context_chars` を超えたら updated_at desc 順の prefix を保持して末尾を切り捨て | 時系列の新しい順に詰めるので、日のうち古い議論が落ちる |
+| コンテキスト圧縮 | `token_count` で計測し、収まるまで古い入力から外す。正確に数えられないプロバイダは `summary_input_byte_budget` で updated_at desc 順に詰める | 下記「パス単位集約と生成時の保護」を参照 |
 
 ## 上位の目的別整理（このワークフローの価値）
 
@@ -189,7 +189,12 @@ jobworkerp-client job enqueue-workflow \
 | `daily_label` | - | `daily_summary` | 出力スレッドのマーカーラベル |
 | `extra_labels_filter` | - | `[]` | 入力に AND マッチする追加ラベル（全 project 横断が既定） |
 | `min_thread_count` | - | `1` | 入力スレッド数がこれ未満なら skip |
-| `max_context_chars` | - | `200000` | LLM 入力の上限文字数 |
+| `max_context_chars` | - | `200000` | 互換のため受け付けるのみ（未使用）。入力上限は `summary_input_byte_budget` と `token_count` で決まる |
+| `llm_context_window_tokens` | - | `131072` | モデルのコンテキスト長（ハードリミット） |
+| `summary_max_completion_tokens` | - | `32768` | 出力トークン上限 |
+| `summary_input_byte_budget` | - | `200000` | token_count 不可時の入力バイト上限 |
+| `llm_expected_model` | - | `""` | 指定時は token_count の解決済みモデル名と一致を要求 |
+| `extra_labels_match_mode` | - | `LABEL_ALL` | `extra_labels_filter` の照合方法 |
 | `summary_model` / `ollama_base_url` | - | thread-summary と同じ | LLM 設定 |
 | `timezone_offset_hours` | - | `9` | 1日の境界を切るタイムゾーン（JST 既定） |
 | `force_resummarize` | - | `false` | `true` で既存日次要約も再生成 |
@@ -210,12 +215,45 @@ batch 経由で `workerName` 指定の言語別 worker に渡る）:
 |-----------|------|-----------|------|
 | `start_date` / `end_date` | - | - | 両方指定で範囲モード（包含） |
 | `last_n_days` | - | - | 直近 N 日モード（昨日終わり） |
+| `target_dates` | - | `[]` | 対象期間の明示列挙。指定時は範囲・直近 N より優先 |
+| `stop_on_error` | - | `false` | `true` で最初の失敗で停止 |
+| `source_scope_digest` | - | 絞り込みなし範囲の digest | path 単位集約（v2）の入力範囲識別子 |
+| `generation_id` / `generation_started_at` | - | `""` | 生成世代の識別子（空なら実行時刻）。metadata に記録 |
 
 `(start_date, end_date)` と `last_n_days` の両方が省略されたときは「昨日のみ」のフォールバック。両方指定されたときは `(start_date, end_date)` が勝つ。
 batch は `output_language` に応じて `memories-daily-work-summary-single-ja` /
 `memories-daily-work-summary-single-en` を `workerName` で呼ぶ。事前に
 `memories-import upsert-generation-workers --feature daily-work-summary --language all`
 などで言語別 single worker を登録しておく。
+
+## パス単位集約と生成時の保護
+
+batch は各日について、まず single を `plan_only: true` で呼び、入力のスレッド要約メモリを
+path bucket（入力スレッドの `path:*` ラベル。0 個なら `unassigned`、複数なら `ambiguous`）に分類する。
+次に bucket ごとの path 要約
+（`daily:v2:<user_id>:YYYY-MM-DD:<source_scope_digest>:path:<digest>`、ラベル
+`summary_scope:path` / `source_scope:<digest>`）を書き、最後にそれらを入力とした全体要約
+（`...:overall`、ラベル `summary_scope:overall`）を書く。計画から消えた bucket の path 要約は
+メモリ行だけ削除する（スレッドは残す）。入力が 1 件だけのときは LLM を呼ばずにそのまま転記する。
+
+- `source_scope_digest` は入力ラベル範囲の識別子。既定値は絞り込みなし範囲の digest。
+  `extra_labels_match_mode`（`LABEL_ALL` / `LABEL_ANY`）で `extra_labels_filter` の照合方法を選ぶ。
+- `target_dates` は対象期間を明示列挙するモードで、範囲指定・直近 N 指定より優先される。
+- LLM リクエストはまず LLM runner の `token_count` メソッドで計測し、
+  `llm_context_window_tokens` と `summary_max_completion_tokens` に収まるまで古い入力から外す。
+  正確に数えられないプロバイダ（Ollama など）は `summary_input_byte_budget` によるバイト上限に
+  フォールバックする。`llm_expected_model` を指定した場合は解決済みモデル名と一致しなければ失敗する。
+  `max_context_chars` は互換のために受け付けるだけで使われない。
+- JSON として不正、または空欄の LLM 出力は `.../invalid-output` として拒否し、最大 2 回再生成する。
+  空の要約は保存しない。
+- 再生成は source fingerprint、path 計画の fingerprint、（LLM で生成した要約では）
+  モデル契約の fingerprint（prompt・モデル・予算）のいずれかが変わったときに行う。
+- `stop_on_error: true` で最初に失敗した path / 期間で停止する。既定はベストエフォート。
+  batch 出力の `outcome` は `succeeded`、`completed_with_errors`（path が失敗したが全体要約は書けた。
+  `failed_path_buckets` を参照）、`failed` のいずれか。
+- batch 全体と期間ループには 31 日の timeout がある。結果を返さずに終わった項目
+  （timeout / 中断）は失敗として数える。個々の run/call タスクは worker が
+  `WORKFLOW_TASK_DEFAULT_TIMEOUT_SEC` を設定していればそれに従う。
 
 ## 差分実行
 
@@ -224,8 +262,9 @@ batch は `output_language` に応じて `memories-daily-work-summary-single-ja`
 1. 同 (user_id, date, scope) の `external_id = "daily:<user_id>:YYYY-MM-DD:<scope_key>"` 集約メモリが存在
 2. その集約メモリの `updated_at` が、当日の入力スレッド群の最大 `updated_at` 以上
 3. 入力要約の ID と `updated_at` から作る source fingerprint が、保存済み metadata の fingerprint と一致する
+4. path 計画の fingerprint と、LLM で生成した要約ではモデル契約の fingerprint も一致する
 
-入力の追加・削除を最大 `updated_at` が変わらない場合にも検知するため、2 と 3 の両方を満たしたときだけスキップする。
+入力の追加・削除を最大 `updated_at` が変わらない場合にも検知するため、2〜4 をすべて満たしたときだけスキップする。
 
 ## 出力データの構造
 
@@ -240,6 +279,7 @@ batch は `output_language` に応じて `memories-daily-work-summary-single-ja`
 - `content`: 下記 JSON 構造を `tojson` した文字列
 - `external_id`: `daily:<user_id>:YYYY-MM-DD:<scope_key>`
 - `metadata`: `{daily_date, scope, extra_labels[], source_memory_count, source_snapshot_version, source_max_updated_at, source_fingerprint_algorithm, source_fingerprint, summary_version}`
+  - 上記は `v2_rollup_scope` 未指定（直接呼び出し）時の形式。batch が書く path / overall 要約は `schema_version=2` 形式で、`period_kind`・`period_key`・`rollup_scope`・`source_scope_digest`・`path_bucket_kind`・`aggregation_mode`（`llm` / `passthrough`）・`completion_status`・`source_plan_fingerprint`・`model_contract_fingerprint`・`generation_id` などを持つ
   - `source_fingerprint` は入力要約の ID と `updated_at` を SHA-256 で固定長化した値。`updated_at` だけでは検出できない入力の追加・削除も検知する
 
 ```json
@@ -271,7 +311,7 @@ batch は `output_language` に応じて `memories-daily-work-summary-single-ja`
 - **`thread-summary-batch` は `MEMORY_KIND_RAW` のみを取得する**ため、日次要約スレッドは次回のスレッド要約対象に含まれない。
 - **`extra_labels_filter` を変えると別スレッドができる**。同一日に「全 project 横断」と「`agent:claude_code` のみ」の両方を実行すると、`labels` が異なる 2 本の集約スレッドが作られる。狙ったとおりなら問題ないが、運用は揃えたほうが listing が綺麗。
 - **タイムゾーンの取り扱い**。日界は jq を評価する jobworkerp worker の `TZ` 環境変数（例 `TZ=Asia/Tokyo`）で決まり、夏時間 (DST) と負オフセットに対応する。`TZ` 未設定時のフォールバック `timezone_offset_hours` は時単位（0..23）なので、半端なオフセット（IST 等）や負オフセットには未対応。それらが必要なら worker の `TZ` を設定する。
-- **LLM のコンテキスト長**。`max_context_chars=200000` は Qwen3.6:27b（256k トークン）を想定。モデルを変える場合は調整すること。
+- **LLM のコンテキスト長**。`llm_context_window_tokens` を使用モデルのコンテキスト長に合わせること（Ollama では token_count が使えないため `summary_input_byte_budget` で入力量を調整する）。
 
 ## バッチ結果
 

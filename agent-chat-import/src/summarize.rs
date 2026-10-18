@@ -1,7 +1,7 @@
-use crate::common::workflow_input::reject_removed_fields;
+use crate::common::workflow_input::merge_thread_batch_template;
 use anyhow::{Context, Result, anyhow};
 use jobworkerp_client::client::wrapper::JobworkerpClientWrapper;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use std::sync::Arc;
 ///    state silently is worse than asking the operator to rerun.
 /// 2. Nothing was actually imported (every session was Skipped or all
 ///    `memories_imported == 0`). Without `--since`, `merge_template`
-///    does not inject `updated_after_ms` (see `merge_template` below),
+///    does not inject `last_message_after_ms` (see `merge_template` below),
 ///    so a "0-imported" run would dispatch a workflow whose effective
 ///    scope is the *entire user history*. That is both expensive and
 ///    semantically wrong — the import did nothing this run, so the
@@ -42,32 +42,20 @@ pub(crate) fn skip_reason(import_errors: usize, memories_imported: usize) -> Opt
     None
 }
 
-/// Apply import-derived overrides on top of the user-supplied template.
-/// The template MUST be a JSON object — this is enforced at startup so
-/// the workflow input shape is correct before any import work begins.
-///
-/// `updated_after_ms` is forwarded as an absolute lower bound for
-/// the latest message time so the summary window aligns exactly with the imported
-/// set. We deliberately do *not* convert it to `updated_within_hours`:
-/// that path re-anchors the window at workflow execution time, which
-/// drifts past the import boundary whenever there is dispatch / queue
-/// delay between the CLI and the workflow worker.
 fn merge_template(
-    mut template: Value,
+    template: Value,
     user_id: i64,
-    updated_after_ms: Option<i64>,
+    last_message_after_ms: Option<i64>,
     output_language: &str,
 ) -> Result<Value> {
-    let obj = template
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("--summarize-after-* must be a JSON object"))?;
-    reject_removed_fields(obj, &["summary_user_id"])?;
-    obj.insert("user_id".into(), json!(user_id));
-    obj.insert("output_language".into(), json!(output_language));
-    if let Some(ms) = updated_after_ms {
-        obj.insert("updated_after_ms".into(), json!(ms));
-    }
-    Ok(template)
+    merge_thread_batch_template(
+        template,
+        "--summarize-after-*",
+        &["summary_user_id"],
+        user_id,
+        last_message_after_ms,
+        output_language,
+    )
 }
 
 /// Validate input the user provided for the workflow before any import
@@ -143,7 +131,7 @@ pub(crate) async fn run_summarize_after(
         abs_path.to_string_lossy().into_owned()
     };
 
-    // Forward `--since` as an absolute `updated_after_ms` so the summary
+    // Forward `--since` as an absolute `last_message_after_ms` so the summary
     // window matches the imported set verbatim regardless of how long the
     // workflow waits in the jobworkerp queue. Prompt bodies are baked into
     // the language workers at registration, so no workflow_context is
@@ -170,63 +158,6 @@ mod tests {
     use serde_json::json;
 
     // ---- merge_template ----
-
-    #[test]
-    fn merge_overrides_user_id() {
-        let tmpl = json!({
-            "user_id": 999,
-            "memories_grpc_host": "localhost",
-        });
-        let out = merge_template(tmpl, 1, None, "ja").unwrap();
-        assert_eq!(out["user_id"], json!(1));
-        assert_eq!(out["output_language"], json!("ja"));
-        assert_eq!(out["memories_grpc_host"], json!("localhost"));
-    }
-
-    #[test]
-    fn merge_overrides_output_language() {
-        let tmpl = json!({
-            "output_language": "ja",
-        });
-        let out = merge_template(tmpl, 1, None, "en").unwrap();
-        assert_eq!(out["output_language"], json!("en"));
-    }
-
-    #[test]
-    fn merge_keeps_existing_updated_after_ms_when_none() {
-        let tmpl = json!({
-            "updated_after_ms": 1_700_000_000_000_i64,
-            "custom_field": "/x.yaml",
-        });
-        let out = merge_template(tmpl, 1, None, "ja").unwrap();
-        assert_eq!(out["updated_after_ms"], json!(1_700_000_000_000_i64));
-        assert_eq!(out["custom_field"], json!("/x.yaml"));
-    }
-
-    #[test]
-    fn merge_inserts_updated_after_ms_when_some() {
-        let tmpl = json!({});
-        let out = merge_template(tmpl, 1, Some(1_700_000_000_000), "ja").unwrap();
-        assert_eq!(out["updated_after_ms"], json!(1_700_000_000_000_i64));
-        assert_eq!(out["user_id"], json!(1));
-    }
-
-    #[test]
-    fn merge_overrides_updated_after_ms_when_some() {
-        let tmpl = json!({"updated_after_ms": 100});
-        let out = merge_template(tmpl, 1, Some(2_000_000_000_000), "ja").unwrap();
-        assert_eq!(out["updated_after_ms"], json!(2_000_000_000_000_i64));
-    }
-
-    #[test]
-    fn merge_does_not_emit_updated_within_hours() {
-        // The CLI no longer derives `updated_within_hours` from `--since`;
-        // it forwards the absolute boundary instead. Make sure we don't
-        // accidentally re-introduce the relative path.
-        let tmpl = json!({});
-        let out = merge_template(tmpl, 1, Some(1_700_000_000_000), "ja").unwrap();
-        assert!(out.get("updated_within_hours").is_none());
-    }
 
     #[test]
     fn merge_rejects_legacy_summary_owner() {
@@ -332,12 +263,14 @@ mod tests {
             ),
         ] {
             assert!(!worker.contains("source_user_id"));
-            assert!(worker.contains(&format!("MEMORY_KIND_{input_kind}")));
+            assert!(worker.contains(&format!(
+                "source_memory_kind: {{ type: string, default: \"MEMORY_KIND_{input_kind}\" }}"
+            )));
             assert!(worker.contains(&format!("memory_kind: \"MEMORY_KIND_{output_kind}\"")));
             assert!(
-                worker.contains(&format!(
-                    "thread_filter: {{\n                  user_id: $effective_user_id,\n                  memory_kinds: [\"MEMORY_KIND_{input_kind}\"]"
-                )),
+                worker.contains(
+                    "thread_filter: {\n                  user_id: $effective_user_id,\n                  memory_kinds: [$workflow.input.source_memory_kind]"
+                ),
                 "{input_kind} must be a ThreadSearchFilter condition"
             );
             assert!(
@@ -372,30 +305,6 @@ mod tests {
                 "{relative} must require user_id"
             );
         }
-    }
-
-    #[test]
-    fn merge_rejects_non_object_array() {
-        let err = merge_template(json!([1, 2, 3]), 1, None, "ja").unwrap_err();
-        assert!(err.to_string().contains("JSON object"));
-    }
-
-    #[test]
-    fn merge_rejects_non_object_string() {
-        let err = merge_template(json!("nope"), 1, None, "ja").unwrap_err();
-        assert!(err.to_string().contains("JSON object"));
-    }
-
-    #[test]
-    fn merge_rejects_non_object_number() {
-        let err = merge_template(json!(42), 1, None, "ja").unwrap_err();
-        assert!(err.to_string().contains("JSON object"));
-    }
-
-    #[test]
-    fn merge_rejects_non_object_null() {
-        let err = merge_template(Value::Null, 1, None, "ja").unwrap_err();
-        assert!(err.to_string().contains("JSON object"));
     }
 
     // ---- parse_template ----
@@ -588,7 +497,11 @@ mod tests {
         assert!(yaml.contains("memory_kinds: [\"MEMORY_KIND_THREAD_SUMMARY\"]"));
         assert!(yaml.contains("external_id_prefix: \"summary:\""));
         assert!(yaml.contains("$workflow.input.force_resummarize"));
-        assert!(yaml.contains("> $existing_summary.memory.data.updatedAt"));
+        // Summaries carry the conversation's last message time as
+        // updated_at, so freshness compares conversation times only.
+        assert!(yaml.contains("(($thread.data.lastMessageAt // \"0\") | tostring)"));
+        assert!(yaml.contains("and $last_message_at > $summary_updated_at"));
+        assert!(!yaml.contains("$thread.data.updatedAt"));
         assert!(yaml.contains("$required_labels"));
         assert!(yaml.contains("$existing_summary_thread.data.labels"));
         assert!(yaml.contains("pre_skipped_threads:"));
@@ -624,9 +537,23 @@ mod tests {
             include_str!("../workflows/thread-reflection/thread-reflection-batch.yaml"),
             include_str!("../workflows/personality/thread-personality-batch.yaml"),
         ] {
-            assert!(yaml.contains("last_message_after: $updated_after_ms"));
+            assert!(yaml.contains("last_message_after: $last_message_after_ms"));
+            // Batches ignore unknown keys, so a renamed input must fail
+            // instead of silently widening the window to the whole history.
+            assert!(yaml.contains("- rejectRenamedMessageWindowInputs:"));
+            for removed in [
+                "updated_after_ms",
+                "updated_before_ms",
+                "updated_within_hours",
+            ] {
+                assert_eq!(
+                    yaml.matches(removed).count(),
+                    1,
+                    "renamed window input {removed} may appear only in the rejection guard"
+                );
+            }
             assert!(
-                !yaml.contains("updated_after: $updated_after_ms"),
+                !yaml.contains("updated_after: $last_message_after_ms"),
                 "reserved proto field must not be emitted in a gRPC JSON request"
             );
             assert!(
@@ -636,8 +563,8 @@ mod tests {
         }
 
         let summary = include_str!("../workflows/thread-summary/thread-summary-batch.yaml");
-        assert!(summary.contains("last_message_before: $updated_before_ms"));
-        assert!(!summary.contains("updated_before: $updated_before_ms"));
+        assert!(summary.contains("last_message_before: $last_message_before_ms"));
+        assert!(!summary.contains("updated_before: $last_message_before_ms"));
         assert!(!summary.contains("del(.updated_before)"));
     }
 
@@ -702,7 +629,9 @@ mod tests {
             assert!(workflow.contains("stdin: \"${ $source_snapshot_json }\""));
             assert!(workflow.contains("shasum -a 256"));
             assert!(workflow.contains("source_fingerprint: $source_fingerprint"));
-            assert!(!workflow.contains("source_memory_ids: ($target_memories"));
+            // Only a bounded sample of omitted IDs may reach metadata.
+            assert!(!workflow.contains("\n                source_memory_ids: ($target_memories"));
+            assert!(workflow.contains("| .[0:1024]),"));
             assert!(!workflow.contains("source_thread_ids: ($target_memories"));
         }
 
@@ -836,6 +765,170 @@ mod tests {
                     .all(|status| prompt.contains(status)),
                 "summary prompt must explain every kanban-compatible status"
             );
+        }
+    }
+
+    #[test]
+    fn summary_prompts_do_not_ask_for_issue_candidates() {
+        for prompt in [
+            include_str!("../workers/thread-summary/prompts/system_prompt.en.txt"),
+            include_str!("../workers/thread-summary/prompts/system_prompt.ja.txt"),
+            include_str!("../workers/thread-summary/prompts/user_tail.en.txt"),
+            include_str!("../workers/thread-summary/prompts/user_tail.ja.txt"),
+        ] {
+            assert!(!prompt.contains("has_unfinished_issue_candidates"));
+        }
+    }
+
+    #[test]
+    fn thread_summary_single_dates_by_conversation_and_rejects_blank_output() {
+        let yaml = include_str!("../workers/thread-summary/thread-summary-single.yaml");
+        assert!(yaml.contains("created_at: $thread.data.firstMessageAt"));
+        assert!(yaml.contains("updated_at: $thread.data.lastMessageAt"));
+        assert!(yaml.contains(".updatedAt = $thread.data.lastMessageAt"));
+        assert!(yaml.contains("- startedAt: {{ conversation_started_at }}"));
+        assert!(yaml.contains(
+            "$thread.data.lastMessageAt\n                 > $existing_summary_memory.data.updatedAt"
+        ));
+        assert!(!yaml.contains("$thread.data.updatedAt"));
+        assert!(yaml.contains("extract_reasoning_content: false"));
+        assert!(yaml.contains("model: \"${$workflow.input.summary_model}\""));
+        // Only blank/malformed output is retried, then the item fails.
+        assert!(
+            yaml.contains("type: \"https://memories.local/errors/thread-summary/invalid-output\"")
+        );
+        assert!(yaml.contains("retry:"));
+    }
+
+    #[test]
+    fn thread_summary_batch_accounts_for_every_target_thread() {
+        let yaml = include_str!("../workflows/thread-summary/thread-summary-batch.yaml");
+        assert!(yaml.contains("collectUnaccountedThreads"));
+        assert!(yaml.contains("insufficient_message_threads: ${ $insufficient_message_threads }"));
+        assert!(yaml.contains("summary_model: $workflow.input.summary_model"));
+        assert!(yaml.contains("ollama_base_url: $workflow.input.ollama_base_url"));
+        assert!(yaml.contains("target_thread_ids:"));
+    }
+
+    #[test]
+    fn thread_group_summary_batch_refreshes_members_then_calls_language_single() {
+        let batch =
+            include_str!("../workflows/thread-group-summary/thread-group-summary-batch.yaml");
+        assert!(batch.contains("workflow_url: \"${ $workflow.input.per_thread_batch_yaml }\""));
+        assert!(batch.contains(
+            "required: [group_owner_user_id, memories_grpc_host, memories_grpc_port, per_thread_batch_yaml]"
+        ));
+        assert!(batch.contains("GetThreadGroupCapabilities"));
+        assert!(batch.contains("summary_model: $workflow.input.summary_model"));
+        // A hard-coded label would make the nested batch relabel summaries
+        // created under a custom prefix.
+        assert!(
+            batch.contains(
+                "memory_thread_label_prefix: $workflow.input.memory_thread_label_prefix,"
+            )
+        );
+        assert!(batch.contains(
+            "workerName: '${ \"memories-thread-group-summary-single-\" + $workflow.input.output_language }'"
+        ));
+        assert!(batch.contains("single_result: \"${ .output | fromjson }\""));
+        assert!(batch.contains(
+            "insufficient_message_thread_ids: ($insufficient_message_thread_ids | unique)"
+        ));
+        // Members are refreshed once per owner before any group is
+        // aggregated, so a thread shared by groups is refreshed once.
+        let refresh = batch.find("  - refreshMemberSummaries:").unwrap();
+        let aggregate = batch.find("  - summarizeEachGroup:").unwrap();
+        assert!(refresh < aggregate);
+        assert!(batch.contains("- rejectRefreshFailedMembers:"));
+        assert!(!batch.contains("stop_on_error"));
+        // Aggregation and persistence belong to the single workflow only.
+        assert!(!batch.contains("runnerName: LLM"));
+        assert!(!batch.contains("MEMORY_KIND_DERIVED_SUMMARY"));
+        assert!(batch.contains("collectUnaccountedGroups"));
+    }
+
+    #[test]
+    fn thread_group_summary_single_aggregates_one_group_with_baked_prompts() {
+        let single =
+            include_str!("../workers/thread-group-summary/thread-group-summary-single.yaml");
+        assert!(single.contains("group_id: { type: string"));
+        assert!(single.contains("output_language: { type: string, enum: [\"ja\", \"en\"]"));
+        assert!(single.contains("prompt_context_missing"));
+        assert!(single.contains("system_prompt: \"${ $thread_group_summary_system_prompt }\""));
+        assert!(single.contains("{{ thread_group_summary_user_tail }}"));
+        assert!(!single.contains("system_prompt: >-"));
+        assert!(single.contains("runnerName: LLM"));
+        assert!(single.contains("model: \"${$workflow.input.summary_model}\""));
+        assert!(single.contains("memory_kind: \"MEMORY_KIND_DERIVED_SUMMARY\""));
+        assert!(single.contains("\"thread-group-summary:\" + "));
+        assert!(single.contains("FindThreadGroupLineage"));
+        // Exact per-member lookups instead of scanning each owner's history.
+        assert!(single.contains("external_id: (\"summary:\" + $member_thread_id)"));
+        assert!(!single.contains("external_id_prefix"));
+        assert!(single.contains("index([$thread_id])"));
+        assert!(single.contains("snapshot-changed"));
+        assert!(
+            single.contains("https://memories.local/errors/thread-group-summary/invalid-output")
+        );
+        // Missing member summaries are a reportable outcome, not an opaque error.
+        assert!(single.contains("outcome: \"incomplete_input\""));
+        // Member refresh is the batch's job; the single must not nest batches.
+        assert!(!single.contains("per_thread_batch_yaml"));
+        assert!(!single.contains("runnerName: WORKFLOW"));
+    }
+
+    #[test]
+    fn agent_chat_summary_runs_optional_group_stage_between_thread_and_daily() {
+        let yaml = include_str!("../workflows/agent-chat-summary/agent-chat-summary.yaml");
+        let thread = yaml.find("                - threadSummaryBatch:").unwrap();
+        let group = yaml
+            .find("                - threadGroupSummaryBatch:")
+            .unwrap();
+        let daily = yaml.find("                - dailyWorkSummary:").unwrap();
+        assert!(thread < group && group < daily);
+        let group_stage = &yaml[group..daily];
+        assert!(group_stage.contains("if: \"${ $thread_group_summary_enabled }\""));
+        // The nested thread-summary batch runs on llm_batch; the group
+        // parent must not hold that slot while waiting for it.
+        assert!(
+            group_stage.contains("channel: \"${ $workflow.input.thread_group_summary_channel }\"")
+        );
+        assert!(!group_stage.contains("channel: llm_batch"));
+        assert!(yaml.contains("default: \"thread_group_summary\""));
+        // Both activity bounds are required, otherwise every group is scanned.
+        assert!(group_stage.contains("activity_after_ms: $last_message_after_ms_effective"));
+        assert!(group_stage.contains("activity_before_ms:"));
+        assert!(
+            group_stage
+                .contains("per_thread_batch_yaml: $workflow.input.thread_summary_batch_yaml")
+        );
+        assert!(group_stage.contains("group_owner_user_id: $workflow.input.user_id"));
+        assert!(
+            group_stage.contains(
+                "memory_thread_label_prefix: $workflow.input.memory_thread_label_prefix,"
+            )
+        );
+        assert!(yaml.contains("or $thread_group_summary_failed or $daily_summary_failed"));
+        assert!(yaml.contains("($thread_group_summary_enabled | not)"));
+    }
+
+    #[test]
+    fn summary_entry_scripts_forward_optional_group_stage() {
+        let pipeline = include_str!("../workflows/agent-chat-pipeline/agent-chat-pipeline.yaml");
+        assert!(pipeline.contains(
+            "thread_group_summary_batch_yaml: $workflow.input.thread_group_summary_batch_yaml,"
+        ));
+        assert!(pipeline.contains(
+            "thread_group_summary_channel: $workflow.input.thread_group_summary_channel,"
+        ));
+        for script in [
+            include_str!("../workflows/agent-chat-summary/run-summary.sh"),
+            include_str!("../workflows/agent-chat-pipeline/run-pipeline.sh"),
+        ] {
+            assert!(script.contains("--thread-group-summary-batch-yaml)"));
+            assert!(script.contains("--enable-thread-group-summary)"));
+            assert!(script.contains("payload[\"thread_group_summary_batch_yaml\"] = tgs_batch"));
+            assert!(script.contains("payload[\"thread_group_summary_channel\"] = tgs_channel"));
         }
     }
 

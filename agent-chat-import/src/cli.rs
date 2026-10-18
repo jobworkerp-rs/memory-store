@@ -235,7 +235,7 @@ pub struct GlobalArgs {
     pub output_language: Option<String>,
 
     /// JSON file holding input for thread-summary-batch.yaml. The
-    /// file's `user_id` and (when --since is given) `updated_after_ms`
+    /// file's `user_id` and (when --since is given) `last_message_after_ms`
     /// fields are overridden from import options. Mutually exclusive
     /// with --summarize-after-json. Requires --summarize-workflow.
     #[cfg(feature = "summarize-after")]
@@ -280,7 +280,7 @@ pub struct GlobalArgs {
     pub summarize_timeout_sec: u32,
 
     /// JSON file holding input for thread-personality-batch.yaml. The
-    /// file's `user_id` and (when --since is given) `updated_after_ms`
+    /// file's `user_id` and (when --since is given) `last_message_after_ms`
     /// fields are overridden from import options. Mutually exclusive
     /// with --extract-personality-after-json. Requires
     /// --personality-workflow.

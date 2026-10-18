@@ -76,8 +76,13 @@ personalityのthread作成者は入力`user_id`であり、出力thread／memory
 |---|---|---|
 | `thread_ids` | — | 指定時のみ対象スレッドを絞り込み |
 | `labels_filter` | — | 指定時のみ該当ラベルを持つスレッドを処理 |
-| `updated_within_hours` | — | 最新メッセージが直近 N 時間以内のスレッドのみ |
-| `updated_after_ms` | — | 最新メッセージ時刻の絶対 epoch ms 下限 (`updated_within_hours` より優先) |
+| `target_thread_ids` | — | 対象スレッド集合 (指定時は `thread_ids` より優先。空配列なら対象 0 件) |
+| `labels_filter_match_mode` | `LABEL_ALL` | `labels_filter` の照合方式 (`LABEL_ALL` / `LABEL_ANY`) |
+| `last_message_within_hours` | — | 最新メッセージが直近 N 時間以内のスレッドのみ |
+| `last_message_after_ms` | — | 最新メッセージ時刻の絶対 epoch ms 下限 (`last_message_within_hours` より優先) |
+| `thread_created_after_ms` / `thread_created_before_ms` | — | スレッド作成時刻の範囲 (下限は `>`、上限は `<=`) |
+| `max_context_chars` | `200000` | single / merge に伝搬する LLM コンテキスト上限 |
+| `target_signal_count` | `100` | merge に使う有効シグナル数の目標。新しいスレッドから処理し、到達後は処理済みスレッドの再抽出のみ省略する (新規スレッドは常に処理)。`force_reextract=true` では無視。merge の `max_signals` にも渡す |
 | `output_language` | `ja` | single / merge に伝搬する出力言語 (`ja` / `en`) |
 | `merge_enabled` | `false` | true なら1層後に言語別 `user-personality-merge` worker を呼ぶ |
 
@@ -93,7 +98,7 @@ personalityのthread作成者は入力`user_id`であり、出力thread／memory
 | `ollama_base_url` | `http://localhost:11434` | |
 | `output_language` | `ja` | 出力言語 (`ja` / `en`) |
 | `force_remerge` | `false` | true なら必ず再統合 |
-| `max_signals` | `200` | LLM 投入する1層シグナルの上限 |
+| `max_signals` | `100` | LLM 投入する1層シグナルの上限 |
 
 ## prompt context と worker 登録
 
@@ -183,7 +188,7 @@ memories-import claude-code -u 1 -f <session.jsonl> \
 }
 ```
 
-`user_id` と (`--since` 指定時) `updated_after_ms` は memories-import 側で
+`user_id` と (`--since` 指定時) `last_message_after_ms` は memories-import 側で
 上書き注入されるので、テンプレートに記述する必要はない。`output_language` も CLI 側で解決して上書きされる。
 
 ## プロファイル取得 (パーソナライズエージェント側)

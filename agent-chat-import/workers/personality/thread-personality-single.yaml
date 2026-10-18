@@ -7,7 +7,8 @@ document:
 # Per-thread user personality / preference signal extraction.
 #
 # Mirrors thread-summary-single but writes a separate "personality"
-# memory under the source user with PERSONALITY kind.
+# memory with `PERSONALITY` kind so that summary, daily-work and personality
+# systems remain logically disjoint while sharing the real user owner.
 
 input:
   schema:
@@ -20,7 +21,6 @@ input:
         memories_grpc_host: { type: string, default: "localhost" }
         memories_grpc_port: { type: integer, default: 9100 }
         memories_grpc_tls: { type: boolean, default: false }
-        llm_worker_name: { type: string, default: "memories-llm" }
         min_message_count: { type: integer, default: 4 }
         min_user_messages:
           type: integer
@@ -158,11 +158,16 @@ do:
                         and $meta.payload_type == "message"
                         and $meta.block_type == "input_text"
                         and (
-                          ($text | startswith("# AGENTS.md instructions for "))
-                          or ($text | startswith("# CLAUDE.md instructions for "))
-                          or ($text | startswith("<environment_context>"))
+                          ($text | startswith("<environment_context>"))
                           or ($text | startswith("<permissions instructions>"))
                           or ($text | startswith("<turn_aborted>"))
+                          or (
+                            (
+                              ($text | startswith("# AGENTS.md instructions"))
+                              or ($text | startswith("# CLAUDE.md instructions"))
+                            )
+                            and ($text | contains("<INSTRUCTIONS>"))
+                          )
                         )
                       )
                       or (
@@ -271,20 +276,18 @@ do:
   # Unlike thread-summary, we do NOT consult the source thread's
   # description here — we never write to it.
   #
-  # Written as `if/elif/else` instead of a multi-clause `or` because the
-  # original `${ force or (existing == null) or (thread.updatedAt > existing.data.updatedAt) }`
-  # silently produced a non-boolean `eligible` when `existing_signal == null`
-  # (jaq evaluates every `or` arm, and `null.data.updatedAt > null` left
-  # `eligible` as `null` — `null | not` is `true`, so skipIfNotEligible
-  # fired even with `force_reextract=true`). The explicit ladder short-
-  # circuits before the null dereference and keeps `eligible` a strict
-  # boolean.
+  # Signals carry the source conversation's times (first/last message), not
+  # the thread's server audit times, so a newer message is what re-extracts.
+  #
+  # An `if/elif/else` ladder rather than a multi-clause `or`: jaq evaluates
+  # every `or` arm, so dereferencing a null `existing_signal` would leave
+  # `eligible` null instead of a strict boolean.
   - checkEligibility:
       set:
         eligible: >-
           ${ if ($workflow.input.force_reextract // false) == true then true
              elif $existing_signal == null then true
-             elif (($thread.data.updatedAt // 0) | tonumber)
+             elif (($thread.data.lastMessageAt // 0) | tonumber)
                   > (($existing_signal.data.updatedAt // 0) | tonumber) then true
              else false
              end }
@@ -381,18 +384,33 @@ do:
                        )).acc )
              end }
 
-  - validatePromptContext:
+  # Fail closed if the language-specific prompt context was not baked into
+  # the worker (registration mistake). Running the LLM with an empty
+  # system_prompt / user_tail would silently produce off-language or
+  # malformed output, so reject instead. `$thread_personality_system_prompt`
+  # and `$thread_personality_user_tail` come from the worker's
+  # `workflow_context`.
+  - validateThreadPersonalityPromptContext:
       if: "${ (($thread_personality_system_prompt // \"\") | length) == 0 or (($thread_personality_user_tail // \"\") | length) == 0 }"
       raise:
         error:
-          type: "https://serverlessworkflow.io/spec/1.0.0/errors/configuration"
-          status: 500
-          title: "prompt_context_missing"
+          type: "https://memories.local/errors/personality/prompt_context_missing"
+          status: 422
+          title: "Thread personality prompt context is missing"
           detail: >-
             ${ if (($thread_personality_system_prompt // "") | length) == 0
                then "thread_personality_system_prompt is missing"
                else "thread_personality_user_tail is missing"
                end }
+
+  # The thread's createdAt is a server audit time (an import time for
+  # imported conversations); the LLM needs when the conversation started.
+  - resolveConversationStart:
+      set:
+        conversation_started_at: >-
+          ${ if (($thread.data.firstMessageAt // "") | tostring) == "" then "unknown"
+             else ($thread.data.firstMessageAt | tonumber / 1000 | floor
+                   | strftime("%Y-%m-%dT%H:%M:%SZ")) end }
 
   # `temperature` lower than thread-summary (0.2 vs 0.3) — stable
   # confidence/category outputs across re-runs.
@@ -414,7 +432,7 @@ do:
             prompt: >-
               $${## Thread info
               - labels: {{ thread.data.labels | join: ", " }}
-              - createdAt: {{ thread.data.createdAt }}
+              - startedAt: {{ conversation_started_at }}
 
               ## Conversation history
               {% for msg in truncated_messages %}
@@ -423,7 +441,7 @@ do:
 
               {{ thread_personality_user_tail }}}
             options:
-              max_tokens: 4000
+              max_tokens: 20000
               temperature: 0.2
             json_schema: |
               {
@@ -545,8 +563,8 @@ do:
                   "user:" + ($workflow.input.user_id | tostring),
                   "thread:" + ($workflow.input.thread_id | tostring)
                 ],
-                created_at: $thread.data.createdAt,
-                updated_at: $thread.data.updatedAt
+                created_at: $thread.data.firstMessageAt,
+                updated_at: $thread.data.lastMessageAt
               } | tojson }
             as_json: true
       export:
@@ -587,7 +605,7 @@ do:
                       truncation_level: $truncation_level
                     } | tojson)
                   | .externalId = ("personality:" + ($workflow.input.thread_id | tostring))
-                  | .updatedAt = $thread.data.updatedAt)
+                  | .updatedAt = $thread.data.lastMessageAt)
               } | tojson }
             as_json: true
 
@@ -621,8 +639,8 @@ do:
                     truncation_level: $truncation_level
                   } | tojson),
                   external_id: ("personality:" + ($workflow.input.thread_id | tostring)),
-                  created_at: $thread.data.createdAt,
-                  updated_at: $thread.data.updatedAt
+                  created_at: $thread.data.firstMessageAt,
+                  updated_at: $thread.data.lastMessageAt
                 }
               } | tojson }
             as_json: true

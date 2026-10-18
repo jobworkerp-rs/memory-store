@@ -35,7 +35,10 @@ cd "$repo_root"
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-1}
 # Local Memories may use a Lindera tokenizer for an enabled ThreadVector.
 # Include it so the migration bundle accepts the application's own config.
-cargo build --release -p grpc-admin --bin memories-db-migrate --features lindera
+# Build the whole workspace, as the standard release build does: a `-p`
+# selection unifies dependency features differently, which recompiles the
+# LanceDB stack into a second, multi-GB set of artifacts on every source change.
+cargo build --release --features lindera
 
 install -m 0755 target/release/memories-db-migrate "$staging_directory/memories-db-migrate"
 cp -R infra/atlas "$staging_directory/atlas"

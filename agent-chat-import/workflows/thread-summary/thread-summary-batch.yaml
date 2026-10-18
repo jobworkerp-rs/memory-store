@@ -14,55 +14,88 @@ input:
         memories_grpc_host: { type: string, default: "localhost" }
         memories_grpc_port: { type: integer, default: 9100 }
         memories_grpc_tls: { type: boolean, default: false }
-        llm_worker_name: { type: string, default: "memories-llm" }
         thread_ids:
           type: array
           items: { type: string }
           description: When specified, only these threads are summarized (all threads when omitted).
+        target_thread_ids:
+          type: array
+          items: { type: string, pattern: "^[1-9][0-9]*$" }
+          description: >-
+            Authoritative import target set. Presence takes precedence over
+            thread_ids; an explicitly empty array targets zero threads.
         labels_filter:
           type: array
           items: { type: string }
           description: When specified, only threads with these labels are targeted.
-        updated_within_hours:
+        labels_filter_match_mode:
+          type: string
+          enum: ["LABEL_ALL", "LABEL_ANY"]
+          default: "LABEL_ALL"
+          description: Match mode for labels_filter. Defaults to legacy LABEL_ALL.
+        last_message_within_hours:
           type: integer
           minimum: 1
           description: >-
-            When specified, only threads whose latest message is within the
+            When specified, only threads whose `last_message_at` is within the
             past N hours **measured from this workflow's execution time**
             are targeted (server-side `last_message_after` filter, strict `>`).
-            Omit to process all threads as before. `updated_after_ms`
+            Omit to process all threads as before. `last_message_after_ms`
             takes precedence when both are set, because relative windows
             drift with dispatch latency.
-        updated_after_ms:
+        last_message_after_ms:
           type: integer
           minimum: 0
           description: >-
             When specified, an absolute lower bound (epoch ms) for
-            the latest message time. Takes precedence over `updated_within_hours`.
-            Use this when the caller already knows the absolute boundary
-            (e.g. memories-import passes its `--since` here so the window
-            stays exactly aligned with the imported set even if jobworkerp
-            queueing delays workflow start).
-        updated_before_ms:
+            `last_message_at`. Takes precedence over `last_message_within_hours`.
+            Use this when the caller already knows the absolute conversation
+            boundary so dispatch latency cannot shift a relative window.
+        last_message_before_ms:
           type: integer
           minimum: 0
           description: >-
-            When specified, an absolute upper bound (epoch ms, inclusive
-            `<=`) for the latest message time. Omit for no upper bound. Pairs with
-            `updated_after_ms` to bound the targeted window on both ends.
+            When specified, an absolute upper bound (epoch ms,
+            inclusive `<=`) for `last_message_at`. Omit for no upper bound.
+            Pairs with `last_message_after_ms` so a bounded run only
+            touches threads inside the window.
+        thread_created_after_ms:
+          type: integer
+          minimum: 0
+          description: Import candidate lower bound (epoch ms, strict `>`).
+        thread_created_before_ms:
+          type: integer
+          minimum: 0
+          description: Import candidate upper bound (epoch ms, inclusive `<=`).
+        output_language:
+          type: string
+          enum: ["ja", "en"]
+          default: "ja"
+          description: >-
+            Output language for generated free-text. Selects the
+            language-specific single worker
+            (`memories-thread-summary-single-<lang>`) per fan-out.
         min_message_count: { type: integer, default: 4 }
         max_context_chars: { type: integer, default: 200000 }
         summary_model: { type: string, default: "qwen3.6:27b" }
         ollama_base_url: { type: string, default: "http://localhost:11434" }
-        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
         memory_thread_label_prefix: { type: string, default: "summary" }
         force_resummarize: { type: boolean, default: false }
 
-timeout:
-  after:
-    hours: 24
-
 do:
+  # Batches ignore unknown inputs, so a caller still sending a renamed
+  # message-window key would silently process the whole history.
+  - rejectRenamedMessageWindowInputs:
+      if: >-
+        ${ ["updated_after_ms", "updated_before_ms", "updated_within_hours"]
+           | any(. as $key | $workflow.input | has($key)) }
+      raise:
+        error:
+          type: "https://memories.local/errors/configuration/renamed-input"
+          status: 400
+          title: "Renamed message-window input"
+          detail: "Use last_message_after_ms, last_message_before_ms, or last_message_within_hours instead."
+
   - rejectLegacySummaryOwner:
       if: "${ $workflow.input.summary_user_id != null }"
       raise:
@@ -72,36 +105,43 @@ do:
           title: "summary_user_id is no longer supported"
           detail: "Use user_id and memory_kind instead."
 
-  # Step 0c: Resolve the effective latest-message lower bound (epoch ms).
-  # `updated_after_ms` (absolute) wins when supplied; otherwise fall back
-  # to deriving from `updated_within_hours` (relative to *workflow* start).
+  # Step 0c: Resolve the effective `last_message_after` lower bound (epoch ms).
+  # `last_message_after_ms` (absolute) wins when supplied; otherwise fall back
+  # to deriving from `last_message_within_hours` (relative to workflow start).
   # The relative path is kept for backward compatibility but it can drift
   # if dispatch is delayed — callers that know the exact boundary should
-  # pass `updated_after_ms` directly. `now` returns seconds; the gRPC
+  # pass `last_message_after_ms` directly. `now` returns seconds; the gRPC
   # filter expects milliseconds. Null result drops the field from the
   # request body so the server treats it as "no lower bound".
-  - resolveUpdatedAfter:
+  - resolveLastMessageAfter:
       set:
-        updated_after_ms: >-
-          ${ if $workflow.input.updated_after_ms != null
-             then $workflow.input.updated_after_ms
-             elif $workflow.input.updated_within_hours == null
+        last_message_after_ms: >-
+          ${ if $workflow.input.last_message_after_ms != null
+             then $workflow.input.last_message_after_ms
+             elif $workflow.input.last_message_within_hours == null
              then null
-             else ((now - ($workflow.input.updated_within_hours * 3600))
+             else ((now - ($workflow.input.last_message_within_hours * 3600))
                    * 1000 | floor)
              end }
 
-  # Step 0d: Resolve the optional `updated_before` upper bound. Absolute
-  # epoch ms only (the relative `updated_within_hours` path has no upper
+  # Step 0d: Resolve the optional `last_message_before` upper bound. Absolute
+  # epoch ms only (the relative `last_message_within_hours` path has no upper
   # counterpart). Null drops the field so the server treats it as "no
   # upper bound".
-  - resolveUpdatedBefore:
+  - resolveLastMessageBefore:
       set:
-        updated_before_ms: "${ $workflow.input.updated_before_ms }"
+        last_message_before_ms: "${ $workflow.input.last_message_before_ms }"
+
+  - initThreadCandidates:
+      set:
+        all_threads: "${ [] }"
 
   # Step 1a: Fetch threads by labels (when labels_filter is specified)
   - fetchByLabels:
-      if: "${ ($workflow.input.labels_filter // []) | length > 0 }"
+      if: >-
+        ${ (($workflow.input | has("target_thread_ids")) | not
+             or ($workflow.input.target_thread_ids | length) > 0)
+           and (($workflow.input.labels_filter // []) | length > 0) }
       run:
         function:
           runnerName: GRPC
@@ -116,14 +156,18 @@ do:
             json_body: >-
               ${ ({
                    labels: $workflow.input.labels_filter,
-                   match_mode: "LABEL_ALL",
+                   match_mode: ($workflow.input.labels_filter_match_mode // "LABEL_ALL"),
                    user_id: $workflow.input.user_id,
                    memory_kinds: ["MEMORY_KIND_RAW"],
-                   last_message_after: $updated_after_ms,
-                   last_message_before: $updated_before_ms
+                   last_message_after: $last_message_after_ms,
+                   last_message_before: $last_message_before_ms,
+                   thread_created_after: $workflow.input.thread_created_after_ms,
+                   thread_created_before: $workflow.input.thread_created_before_ms
                  }
-                 | if $updated_after_ms == null then del(.last_message_after) else . end
-                 | if $updated_before_ms == null then del(.last_message_before) else . end
+                 | if $last_message_after_ms == null then del(.last_message_after) else . end
+                 | if $last_message_before_ms == null then del(.last_message_before) else . end
+                 | if $workflow.input.thread_created_after_ms == null then del(.thread_created_after) else . end
+                 | if $workflow.input.thread_created_before_ms == null then del(.thread_created_before) else . end
                  | tojson) }
             as_json: true
       export:
@@ -132,7 +176,10 @@ do:
 
   # Step 1b: Fetch all threads by user (when no labels_filter)
   - fetchByUser:
-      if: "${ ($workflow.input.labels_filter // []) | length == 0 }"
+      if: >-
+        ${ (($workflow.input | has("target_thread_ids")) | not
+             or ($workflow.input.target_thread_ids | length) > 0)
+           and (($workflow.input.labels_filter // []) | length == 0) }
       run:
         function:
           runnerName: GRPC
@@ -148,11 +195,15 @@ do:
               ${ ({
                    user_id: { value: $workflow.input.user_id },
                    memory_kinds: ["MEMORY_KIND_RAW"],
-                   last_message_after: $updated_after_ms,
-                   last_message_before: $updated_before_ms
+                   last_message_after: $last_message_after_ms,
+                   last_message_before: $last_message_before_ms,
+                   thread_created_after: $workflow.input.thread_created_after_ms,
+                   thread_created_before: $workflow.input.thread_created_before_ms
                  }
-                 | if $updated_after_ms == null then del(.last_message_after) else . end
-                 | if $updated_before_ms == null then del(.last_message_before) else . end
+                 | if $last_message_after_ms == null then del(.last_message_after) else . end
+                 | if $last_message_before_ms == null then del(.last_message_before) else . end
+                 | if $workflow.input.thread_created_after_ms == null then del(.thread_created_after) else . end
+                 | if $workflow.input.thread_created_before_ms == null then del(.thread_created_before) else . end
                  | tojson) }
             as_json: true
       export:
@@ -163,15 +214,21 @@ do:
   - filterThreads:
       set:
         candidate_threads: >-
-          ${ if ($workflow.input.thread_ids // []) | length > 0
+          ${ if ($workflow.input | has("target_thread_ids"))
+             then $all_threads | map(select(
+               .id.value as $tid | $workflow.input.target_thread_ids | any(. == ($tid | tostring))
+             ))
+             elif ($workflow.input.thread_ids // []) | length > 0
              then $all_threads | map(select(
                .id.value as $tid | $workflow.input.thread_ids | any(. == $tid)
              ))
              else $all_threads
              end }
 
-  # Step 2a: Resolve already-current summaries in one gRPC call so a
-  # historical range does not dispatch one child workflow per skipped thread.
+  # Step 2a: Load existing per-thread summaries once. Without this bulk
+  # preflight, every up-to-date RAW thread still dispatches a child workflow
+  # only to discover that it should skip. Large backfills can spend hours on
+  # those serial checks and never reach the dependent daily stage.
   - initExistingSummaries:
       set:
         existing_summary_entries: "${ [] }"
@@ -268,8 +325,17 @@ do:
                        or (($required_labels
                             - ($existing_summary_thread.data.labels // []))
                            | length) > 0
-                       or $thread.data.updatedAt
-                          > $existing_summary.memory.data.updatedAt
+                       or (
+                         (($thread.data.lastMessageAt // "0") | tostring)
+                           as $last_message_at
+                         | (($existing_summary.memory.data.updatedAt // "0")
+                            | tostring) as $summary_updated_at
+                         | (($last_message_at | length)
+                            > ($summary_updated_at | length))
+                           or ((($last_message_at | length)
+                               == ($summary_updated_at | length))
+                              and $last_message_at > $summary_updated_at)
+                       )
                      )
                  )
              end }
@@ -280,36 +346,48 @@ do:
           ${ ($candidate_threads | map(.id.value | tostring))
              - ($target_threads | map(.id.value | tostring)) }
 
-  # Step 2.5: Initialize per-thread outcome accumulators so callers can
-  # distinguish "every thread failed" from "some succeeded" / "nothing to
-  # do" by reading succeeded_count / failed_count, mirroring the period
-  # batches' output contract.
+  # Step 2.5: Initialize per-thread outcome accumulators. Lets the
+  # caller distinguish "every thread failed" (fatal) from
+  # "some succeeded" / "nothing to do" by reading succeeded_count /
+  # failed_count, mirroring the period batches' output contract.
   - initOutcomeAccumulators:
       set:
         generated_threads: "${ [] }"
         skipped_threads: "${ $pre_skipped_threads // [] }"
         failed_threads: "${ [] }"
+        insufficient_message_threads: "${ [] }"
         last_error: "${ null }"
 
-  # Step 3: Invoke the language-specific single-thread summary worker.
-  # Prompt context is baked into the registered worker.
+  # Step 3: Invoke the language-specific single-thread summary worker for
+  # each thread. The `memories-thread-summary-single-<lang>` workers are
+  # pre-registered by `memories-import upsert-generation-workers` with the
+  # prompt context baked in, so the batch only forwards `output_language`.
   - summarizeEach:
-      timeout:
-        after:
-          hours: 24
       for:
         each: thread
+        # `at` exposes the 0-based loop index so each iteration can publish a
+        # (processed/total) progress signal.
+        at: thread_index
         in: "${ $target_threads }"
       onError: continue
       do:
+        # Emitting progress as the first sub-step makes the streamed
+        # WorkflowResult for this iteration carry `progress_processed` /
+        # `progress_total` in its output context so streaming callers can
+        # report `(N/M)`.
+        - reportProgress:
+            set:
+              progress_processed: "${ $thread_index + 1 }"
+              progress_total: "${ $target_threads | length }"
         - invokeSingleWithRetry:
             try:
               - invokeSingle:
-                  timeout:
-                    after:
-                      minutes: 120
                   run:
                     function:
+                      # Resolve the language-specific single worker by name.
+                      # Its registered channel must differ from the `llm`
+                      # channel the inner LLM job uses, or a single slot would
+                      # deadlock waiting for its own child.
                       workerName: '${ "memories-thread-summary-single-" + $workflow.input.output_language }'
                       arguments:
                         input: >-
@@ -319,17 +397,15 @@ do:
                             memories_grpc_host: $workflow.input.memories_grpc_host,
                             memories_grpc_port: $workflow.input.memories_grpc_port,
                             memories_grpc_tls: $workflow.input.memories_grpc_tls,
-                            llm_worker_name: $workflow.input.llm_worker_name,
-
-
+                            output_language: $workflow.input.output_language,
                             min_message_count: $workflow.input.min_message_count,
                             max_context_chars: $workflow.input.max_context_chars,
                             summary_model: $workflow.input.summary_model,
                             ollama_base_url: $workflow.input.ollama_base_url,
-                            output_language: $workflow.input.output_language,
                             memory_thread_label_prefix: $workflow.input.memory_thread_label_prefix,
                             force_resummarize: $workflow.input.force_resummarize
-                          } | tojson }
+                          }
+                          | tojson }
                   export:
                     as:
                       single_result: "${ .output | fromjson }"
@@ -354,6 +430,16 @@ do:
                   set:
                     skipped_threads: >-
                       ${ $skipped_threads + [($thread.id.value | tostring)] }
+              # Group summaries need to tell "too short to summarize" apart
+              # from a summary that should exist but is missing.
+              - recordInsufficientMessages:
+                  if: >-
+                    ${ ($single_result.skipped // false)
+                       and (($single_result.skip_reason // null)
+                            == "skipped: not enough messages") }
+                  set:
+                    insufficient_message_threads: >-
+                      ${ $insufficient_message_threads + [($thread.id.value | tostring)] }
             catch:
               as: error
               do:
@@ -363,11 +449,26 @@ do:
                         ${ $failed_threads + [($thread.id.value | tostring)] }
                       last_error: "${ $error }"
 
+  # An item whose own try timed out is skipped by `onError: continue` without
+  # reaching its catch. Count such items as failed so an incomplete run is
+  # never reported as completed.
+  - collectUnaccountedThreads:
+      set:
+        unaccounted_threads: >-
+          ${ ($target_threads | map(.id.value | tostring)) - $generated_threads - $skipped_threads - $failed_threads }
+  - recordUnaccountedThreads:
+      if: "${ ($unaccounted_threads | length) > 0 }"
+      set:
+        failed_threads: "${ $failed_threads + $unaccounted_threads }"
+        last_error: >-
+          ${ $last_error // ((($unaccounted_threads | length) | tostring)
+             + " item(s) ended without an outcome (timed out or aborted)") }
+
 output:
   as:
     # `completed` reflects "no thread failed". Callers read
-    # processed_threads / succeeded_count / failed_count to decide whether
-    # to treat the run as fully failed vs partial vs nothing-to-do.
+    # processed_threads / succeeded_count / failed_count to decide
+    # whether to treat the stage as fatal (all failed) vs partial vs skip.
     completed: ${ ($failed_threads | length) == 0 }
     processed_threads: >-
       ${ ($generated_threads | length)
@@ -381,4 +482,5 @@ output:
     generated_threads: ${ $generated_threads }
     skipped_threads: ${ $skipped_threads }
     failed_threads: ${ $failed_threads }
+    insufficient_message_threads: ${ $insufficient_message_threads }
     last_error: ${ $last_error }

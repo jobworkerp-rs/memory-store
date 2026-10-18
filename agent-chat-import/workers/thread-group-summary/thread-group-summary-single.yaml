@@ -1,0 +1,542 @@
+document:
+  dsl: "1.0.0-jobworkerp"
+  namespace: memories
+  name: thread-group-summary-single
+  version: "1.0.0"
+
+# Aggregates the persisted per-thread summaries of one ThreadGroup into a
+# single derived summary memory. Member summaries must already be current:
+# thread-group-summary-batch refreshes them before dispatching this worker.
+# Registered per language as memories-thread-group-summary-single-<lang>
+# with the prompt baked into workflow_context.
+
+input:
+  schema:
+    document:
+      type: object
+      required: [group_id, group_owner_user_id, memories_grpc_host, memories_grpc_port]
+      properties:
+        group_id: { type: string, pattern: "^[1-9][0-9]*$" }
+        group_owner_user_id: { type: integer, minimum: 1 }
+        memories_grpc_host: { type: string, default: "localhost" }
+        memories_grpc_port: { type: integer, default: 9100 }
+        memories_grpc_tls: { type: boolean, default: false }
+        expected_membership_snapshot_digest:
+          type: string
+          default: ""
+          description: Non-empty = reject the run if the group snapshot changed.
+        insufficient_message_thread_ids:
+          type: array
+          items: { type: string }
+          default: []
+          description: >-
+            Members that the per-thread batch skipped as too short. They are
+            excluded from aggregation unless a persisted summary exists.
+        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
+        summary_model: { type: string, default: "qwen3.6:27b" }
+        ollama_base_url: { type: string, default: "http://localhost:11434" }
+        force_resummarize: { type: boolean, default: false }
+
+do:
+  # Initialize variables read by `output.as` or by steps that follow a
+  # conditionally skipped producer; the skip gates exit before later steps.
+  - initOutputVars:
+      set:
+        outcome: "${ null }"
+        skip_reason: "${ null }"
+        detail: "${ null }"
+        summary_json: "${ null }"
+        thread_summaries: "${ [] }"
+        passthrough_summary_json: "${ null }"
+        created_summary_thread_id: "${ null }"
+        publication_state: "${ \"current\" }"
+
+  # Fail closed when the language-specific prompt was not baked into the
+  # worker: an empty prompt would silently produce off-language output.
+  - validateGroupSummaryPromptContext:
+      if: "${ (($thread_group_summary_system_prompt // \"\") | length) == 0 or (($thread_group_summary_user_tail // \"\") | length) == 0 }"
+      raise:
+        error:
+          type: "https://memories.local/errors/thread-group-summary/prompt_context_missing"
+          status: 422
+          title: "Thread group summary prompt context is missing"
+          detail: >-
+            ${ if (($thread_group_summary_system_prompt // "") | length) == 0
+               then "thread_group_summary_system_prompt is missing"
+               else "thread_group_summary_user_tail is missing"
+               end }
+
+  - fetchLineage:
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadGroupService/FindThreadGroupLineage"
+            json_body: "${ { value: $workflow.input.group_id, user_id: $workflow.input.group_owner_user_id } | tojson }"
+            as_json: true
+      export:
+        as:
+          lineage: "${ .jsonBody | fromjson }"
+          group: "${ .jsonBody | fromjson | .group // null }"
+
+  - rejectMissingGroup:
+      if: "${ $group == null }"
+      raise:
+        error:
+          type: "https://memories.local/errors/thread-group-summary/target-not-found"
+          status: 404
+          title: "target ThreadGroup was not found"
+
+  - validateTargetSnapshot:
+      if: >-
+        ${ (($workflow.input.expected_membership_snapshot_digest // "") != "")
+           and (($group.membershipSnapshotDigest // "")
+                != $workflow.input.expected_membership_snapshot_digest) }
+      raise:
+        error:
+          type: "https://memories.local/errors/thread-group-summary/snapshot-changed"
+          status: 409
+          title: "membership snapshot changed before generation"
+
+  - collectMemberThreadIds:
+      set:
+        member_thread_ids: >-
+          ${ ($lineage.members // [])
+              | map(select(.state == "THREAD_GROUP_MEMBER_STATE_ACTIVE" and .threadId != null)
+                    | .threadId | tostring)
+             | unique }
+        missing_member_owner_thread_ids: >-
+          ${ ($lineage.members // [])
+              | map(select(.state == "THREAD_GROUP_MEMBER_STATE_ACTIVE"
+                           and .threadId != null and .userId == null)
+                    | .threadId | tostring) }
+
+  # The batch cannot refresh an owner-less member, so aggregating it could
+  # publish a stale member summary.
+  - rejectMissingMemberOwner:
+      if: "${ ($missing_member_owner_thread_ids | length) > 0 }"
+      raise:
+        error:
+          type: "https://memories.local/errors/thread-group-summary/member-owner-missing"
+          status: 500
+          title: "active member Thread owner is missing"
+          detail: '${ $missing_member_owner_thread_ids | join(",") }'
+
+  # Per-thread summaries have a unique `summary:<thread_id>` external ID, so
+  # an exact lookup per member avoids streaming the owners' whole history.
+  - fetchMemberSummaries:
+      for:
+        each: member_thread_id
+        in: "${ $member_thread_ids }"
+      do:
+        - fetchMemberSummary:
+            run:
+              function:
+                runnerName: GRPC
+                using: streaming
+                settings:
+                  host: "${$workflow.input.memories_grpc_host}"
+                  port: ${$workflow.input.memories_grpc_port}
+                  tls: ${$workflow.input.memories_grpc_tls}
+                  useReflection: true
+                arguments:
+                  method: "/llm_memory.service.MemoryService/FindListByCondition"
+                  json_body: >-
+                    ${ {
+                      roles: ["ROLE_ASSISTANT"],
+                      content_types: ["TEXT"],
+                      memory_kinds: ["MEMORY_KIND_THREAD_SUMMARY"],
+                      external_id: ("summary:" + $member_thread_id)
+                    } | tojson }
+                  as_json: true
+            export:
+              as:
+                member_summary_hits: "${ (.jsonBody // \"[]\") | fromjson }"
+        - collectMemberSummary:
+            set:
+              thread_summaries: "${ $thread_summaries + $member_summary_hits }"
+
+  - indexMemberSummaries:
+      set:
+        summary_by_thread_id: >-
+          ${ reduce $thread_summaries[] as $entry
+               ({}; .[$entry.memory.data.externalId | ltrimstr("summary:")] = $entry) }
+
+  # thread-summary-single skips threads below min_message_count without
+  # persisting a summary. Such members cannot contribute and are dropped;
+  # any other missing summary is reported as incomplete input below.
+  - excludeInsufficientMessageMembers:
+      set:
+        source_member_thread_ids: >-
+          ${ $workflow.input.insufficient_message_thread_ids as $insufficient
+             | $member_thread_ids
+             | map(. as $thread_id
+                   | select(($summary_by_thread_id[$thread_id] != null)
+                            or (($insufficient | index([$thread_id])) == null))) }
+
+  - collectMemberSummaries:
+      set:
+        member_summary_entries: >-
+          ${ $source_member_thread_ids
+             | map($summary_by_thread_id[.]) | map(select(. != null)) }
+        missing_member_summary_thread_ids: >-
+          ${ $source_member_thread_ids | map(select($summary_by_thread_id[.] == null)) }
+
+  # A missing member summary is reported as an outcome so the batch can
+  # classify it as incomplete input and retry later.
+  - reportMissingMemberSummaries:
+      if: "${ ($missing_member_summary_thread_ids | length) > 0 }"
+      set:
+        outcome: "incomplete_input"
+        detail: "${ \"thread-summary-missing: \" + ($missing_member_summary_thread_ids | join(\",\")) }"
+      then: exit
+
+  - collectMemberSummaryBodies:
+      set:
+        member_summaries: "${ $member_summary_entries | map(.memory.data.content) }"
+
+  - skipWithoutSourceSummaries:
+      if: "${ ($member_summaries | length) == 0 }"
+      set:
+        outcome: "skipped"
+        skip_reason: "no member summaries"
+      then: exit
+
+  # A single member's summary is reused verbatim when it is a JSON object.
+  - preparePassthroughSummary:
+      if: "${ ($member_summary_entries | length) == 1 }"
+      set:
+        passthrough_summary_json: >-
+          ${ (try ($member_summary_entries[0].memory.data.content | fromjson) catch null)
+             | if type == "object" then . else null end }
+
+  - resolveAggregationMode:
+      set:
+        aggregation_mode: "${ if $passthrough_summary_json != null then \"passthrough\" else \"llm\" end }"
+        passthrough_source_memory_id: >-
+          ${ if $passthrough_summary_json != null
+             then ($member_summary_entries[0].memory.id.value | tostring)
+             else null
+             end }
+
+  - assignPassthroughSummary:
+      if: "${ $aggregation_mode == \"passthrough\" }"
+      set:
+        summary_json: >-
+          ${ $passthrough_summary_json
+             + { source_thread_ids: $source_member_thread_ids } }
+
+  - fetchExistingSummary:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryService/FindListByCondition"
+            json_body: >-
+              ${ {
+                user_id: { value: $workflow.input.group_owner_user_id },
+                roles: ["ROLE_ASSISTANT"],
+                content_types: ["TEXT"],
+                memory_kinds: ["MEMORY_KIND_DERIVED_SUMMARY"],
+                external_id: ("thread-group-summary:" + ($group.id.value | tostring))
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          existing_summary_entry: "${ ((.jsonBody // \"[]\") | fromjson | .[0]) // null }"
+
+  - linkExistingSummary:
+      if: "${ $existing_summary_entry != null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadGroupService/LinkThreadGroupMemory"
+            json_body: >-
+              ${ {
+                memory_id: $existing_summary_entry.memory.id,
+                relation: {
+                  group_id: { value: $group.id.value },
+                  purpose: "summary",
+                  on_group_delete: "GROUP_MEMORY_DELETE_POLICY_DELETE"
+                }
+              } | tojson }
+            as_json: true
+
+  - buildSummaryFingerprint:
+      set:
+         summary_fingerprint: >-
+           ${ {
+             group_id: ($group.id.value | tostring),
+             membership_snapshot_digest: ($group.membershipSnapshotDigest // ""),
+             member_summary_ids: ($member_summary_entries | map(.memory.id.value | tostring) | sort),
+             member_summary_contents: ($member_summaries | map(tostring)),
+             output_language: ($workflow.input.output_language // "ja"),
+             aggregation_mode: $aggregation_mode,
+             summary_version: "1.0"
+           } | tojson }
+
+  - evaluateFreshness:
+      set:
+         is_fresh: >-
+           ${ if $existing_summary_entry == null then false
+              else ((try ($existing_summary_entry.memory.data.metadata | fromjson) catch {}) as $metadata
+                    | (($metadata.summary_fingerprint // null) == $summary_fingerprint
+                       and ($metadata.publication_state // "current") != "stale"
+                       and (($workflow.input.force_resummarize // false) | not)))
+              end }
+
+  - skipFreshSummary:
+      if: "${ $is_fresh }"
+      set:
+        outcome: "skipped"
+        skip_reason: "already up to date"
+      then: exit
+
+  - generateSummaryWithRetry:
+      if: "${ $aggregation_mode == \"llm\" }"
+      try:
+        - generateSummary:
+            run:
+              function:
+                runnerName: LLM
+                using: completion
+                settings:
+                  ollama:
+                    base_url: "${$workflow.input.ollama_base_url}"
+                    model: "${$workflow.input.summary_model}"
+                options:
+                  channel: llm
+                  storeSuccess: false
+                  storeFailure: true
+                arguments:
+                  system_prompt: "${ $thread_group_summary_system_prompt }"
+                  prompt: >-
+                    $${## Thread group
+                    - canonical key: {{ group.groupCanonicalKey }}
+
+                    ## Member thread summaries
+                    {% for summary in member_summaries %}
+                    {{ summary }}
+                    {% endfor %}
+
+                    {{ thread_group_summary_user_tail }}}
+                  options:
+                    max_tokens: 20000
+                    temperature: 0.3
+                    # Thinking inside schema-constrained output can collapse to blank JSON.
+                    extract_reasoning_content: false
+                  json_schema: |
+                    {
+                      "type": "object",
+                      "required": ["category", "title", "summary", "key_decisions", "status"],
+                      "properties": {
+                        "category": {"type": "string", "enum": ["coding", "consultation", "research", "creative", "general"]},
+                        "title": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "key_decisions": {"type": "array", "items": {"type": "string"}},
+                        "status": {"type": "string", "enum": ["resolved", "ongoing", "in_review", "blocked", "deferred", "abandoned"]}
+                      }
+                    }
+            export:
+              as:
+                 summary_json: >-
+                   ${ try (.content.text | fromjson) catch null
+                      | if type == "object" then . + { source_thread_ids: $source_member_thread_ids } else . end }
+        - validateGroupSummaryOutput:
+            if: >-
+              ${ (($summary_json | type) != "object")
+                 or (($summary_json.title | type) != "string")
+                 or (($summary_json.summary | type) != "string")
+                 or (($summary_json.title | gsub("\\s"; "")) == "")
+                 or (($summary_json.summary | gsub("\\s"; "")) == "") }
+            raise:
+              error:
+                type: "https://memories.local/errors/thread-group-summary/invalid-output"
+                status: 422
+                title: "Thread group summary output does not match its contract"
+                detail: "The LLM returned malformed, incomplete, or blank JSON."
+      # Blank or malformed LLM output is usually transient; retry only that.
+      catch:
+        errors:
+          with:
+            type: "https://memories.local/errors/thread-group-summary/invalid-output"
+        retry:
+          limit:
+            attempt:
+              count: 2
+        do:
+          # Retries are exhausted: fail instead of persisting the output.
+          - rejectGroupSummaryOutput:
+              raise:
+                error:
+                  type: "https://memories.local/errors/thread-group-summary/invalid-output"
+                  status: 422
+                  title: "Thread group summary output does not match its contract"
+                  detail: "The LLM returned malformed, incomplete, or blank JSON."
+
+  - fetchLineageBeforeWrite:
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadGroupService/FindThreadGroupLineage"
+            json_body: "${ { value: $workflow.input.group_id, user_id: $workflow.input.group_owner_user_id } | tojson }"
+            as_json: true
+      export:
+        as:
+          fresh_lineage: "${ .jsonBody | fromjson }"
+
+  - verifySnapshotBeforeWrite:
+      if: >-
+        ${ ($fresh_lineage.group.membershipSnapshotDigest // "")
+           != ($group.membershipSnapshotDigest // "") }
+      set:
+         publication_state: "${ \"stale\" }"
+
+  - createSummaryThread:
+      if: "${ $existing_summary_entry == null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/Create"
+            json_body: >-
+              ${ {
+                user_id: { value: $workflow.input.group_owner_user_id },
+                description: $group.groupCanonicalKey,
+                labels: ["thread_group_summary", ("group_" + ($group.id.value | tostring))],
+                memory_kind: "MEMORY_KIND_DERIVED_SUMMARY"
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          created_summary_thread_id: "${ .jsonBody | fromjson | .id.value }"
+
+  - resolveSummaryThread:
+      set:
+        summary_thread_id: >-
+          ${ if $existing_summary_entry != null
+             then $existing_summary_entry.threadId.value
+             else $created_summary_thread_id
+             end }
+
+  - prepareSummaryMetadata:
+      set:
+        summary_metadata: >-
+          ${ {
+            group_id: ($group.id.value | tostring),
+            group_canonical_key: ($group.groupCanonicalKey // ""),
+            membership_snapshot_digest: ($group.membershipSnapshotDigest // ""),
+            active_member_count: ($group.activeMemberCount // 0),
+            deleted_member_count: ($group.deletedMemberCount // 0),
+            unresolved_count: ($group.unresolvedCount // 0),
+            member_summary_count: ($member_summaries | length),
+             aggregation_mode: $aggregation_mode,
+             passthrough_source_memory_id: $passthrough_source_memory_id,
+             summary_fingerprint: $summary_fingerprint,
+             publication_state: $publication_state,
+            summary_version: "1.0"
+          } | tojson }
+
+  - updateSummary:
+      if: "${ $existing_summary_entry != null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryService/Update"
+            json_body: >-
+              ${ {
+                id: $existing_summary_entry.memory.id,
+                data: ($existing_summary_entry.memory.data
+                  | .content = ($summary_json | tojson)
+                  | .metadata = $summary_metadata
+                  | .externalId = ("thread-group-summary:" + ($group.id.value | tostring))
+                  | .memoryKind = "MEMORY_KIND_DERIVED_SUMMARY")
+              } | tojson }
+            as_json: true
+
+  - addSummary:
+      if: "${ $existing_summary_entry == null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/AddMemory"
+            json_body: >-
+              ${ {
+                 thread_id: { value: $summary_thread_id },
+                 group_memory_relation: {
+                   group_id: { value: $group.id.value },
+                   purpose: "summary",
+                   on_group_delete: "GROUP_MEMORY_DELETE_POLICY_DELETE"
+                 },
+                 memory: {
+                    user_id: { value: $workflow.input.group_owner_user_id },
+                   content: ($summary_json | tojson),
+                   content_type: "TEXT",
+                   role: "ROLE_ASSISTANT",
+                   metadata: $summary_metadata,
+                  external_id: ("thread-group-summary:" + ($group.id.value | tostring)),
+                  memory_kind: "MEMORY_KIND_DERIVED_SUMMARY"
+                }
+              } | tojson }
+            as_json: true
+
+  - recordOutcome:
+      set:
+        outcome: "${ if $publication_state == \"current\" then \"generated\" else \"stale\" end }"
+
+output:
+  as:
+    group_id: "${ $workflow.input.group_id }"
+    outcome: "${ $outcome }"
+    completed: "${ $outcome == \"generated\" or $outcome == \"stale\" or $outcome == \"skipped\" }"
+    skipped: "${ $outcome == \"skipped\" }"
+    skip_reason: "${ $skip_reason }"
+    detail: "${ $detail }"
+    publication_state: "${ $publication_state }"
+    summary_title: "${ if $summary_json != null then $summary_json.title else null end }"

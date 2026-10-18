@@ -22,7 +22,10 @@ use super::rows::{
     ObservationIdentity, SourceIdentityKey,
 };
 use crate::infra::thread_group::rows::values;
-use infra_utils::infra::rdb::RdbPool;
+use infra_utils::infra::rdb::{Rdb, RdbPool};
+
+/// Lets downstream tests size fixtures across an `IN (...)` chunk boundary.
+pub use crate::sql::IN_LIST_CHUNK_SIZE;
 
 const BASE_SCHEMA: &str = include_str!("../../../sql/sqlite/001_schema.sql");
 const THREAD_GROUP_SCHEMA: &str =
@@ -96,15 +99,27 @@ pub async fn setup_thread_group_pool() -> &'static RdbPool {
 /// Insert a bare raw thread row (the ThreadGroup schema itself has no
 /// FKs; only the `latest_activity_at` join needs this table).
 pub async fn insert_thread(pool: &RdbPool, id: i64, last_message_at: Option<i64>) {
+    insert_thread_for_user(pool, id, 1, last_message_at).await;
+}
+
+/// `insert_thread` for an explicit owner; accepts a transaction so bulk
+/// fixtures avoid one SQLite commit per row.
+pub async fn insert_thread_for_user<'c, E: sqlx::Executor<'c, Database = Rdb>>(
+    executor: E,
+    id: i64,
+    user_id: i64,
+    last_message_at: Option<i64>,
+) {
     sqlx::query(
         "INSERT INTO thread (id, user_id, created_at, updated_at, memory_kind, last_message_at) \
-         VALUES (?, 1, ?, ?, 1, ?)",
+         VALUES (?, ?, ?, ?, 1, ?)",
     )
     .bind(id)
+    .bind(user_id)
     .bind(T0)
     .bind(T0)
     .bind(last_message_at)
-    .execute(pool)
+    .execute(executor)
     .await
     .expect("insert thread");
 }

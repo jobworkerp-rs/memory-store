@@ -1,6 +1,7 @@
 //! Read projections, search cursors, and delegated member search.
 
 use super::prelude::*;
+use futures::StreamExt;
 
 /// Search target for one raw member predicate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -637,25 +638,74 @@ fn decode_group_search_cursor(token: &str) -> anyhow::Result<ThreadGroupSearchCu
     })
 }
 
-fn compare_group_search_results(
-    left: &ThreadGroupSearchResult,
-    right: &ThreadGroupSearchResult,
-) -> std::cmp::Ordering {
+/// Sort boundary of one search result: relevance DESC, latest activity
+/// DESC (NULL last), canonical key ASC. Shared by sorting and the cursor.
+struct SearchSortKey<'a> {
+    relevance_score: f32,
+    latest_activity_at: Option<i64>,
+    group_canonical_key: &'a str,
+}
+
+fn compare_search_keys(left: &SearchSortKey<'_>, right: &SearchSortKey<'_>) -> std::cmp::Ordering {
     right
         .relevance_score
         .total_cmp(&left.relevance_score)
-        .then_with(|| {
-            compare_optional_desc(
-                left.group.latest_activity_at,
-                right.group.latest_activity_at,
-            )
-        })
-        .then_with(|| {
-            left.group
-                .group_canonical_key
-                .cmp(&right.group.group_canonical_key)
-        })
+        .then_with(|| compare_optional_desc(left.latest_activity_at, right.latest_activity_at))
+        .then_with(|| left.group_canonical_key.cmp(right.group_canonical_key))
 }
+
+/// A matched group before enrichment.
+struct SearchMatch {
+    row: ThreadGroupRow,
+    relevance_score: f32,
+    witnesses: Vec<ThreadGroupSearchWitness>,
+    latest_activity_at: Option<i64>,
+}
+
+impl SearchMatch {
+    fn new(
+        row: ThreadGroupRow,
+        relevance_score: f32,
+        witnesses: Vec<ThreadGroupSearchWitness>,
+    ) -> Self {
+        Self {
+            row,
+            relevance_score,
+            witnesses,
+            latest_activity_at: None,
+        }
+    }
+
+    fn sort_key(&self) -> SearchSortKey<'_> {
+        SearchSortKey {
+            relevance_score: self.relevance_score,
+            latest_activity_at: self.latest_activity_at,
+            group_canonical_key: &self.row.group_canonical_key,
+        }
+    }
+}
+
+/// Current members per group plus their live thread rows, loaded in a
+/// fixed number of queries for any number of groups.
+struct MemberContext {
+    members_by_group: std::collections::HashMap<i64, Vec<ThreadGroupMemberRow>>,
+    threads: std::collections::HashMap<i64, protobuf::llm_memory::data::Thread>,
+}
+
+impl MemberContext {
+    fn members_of(&self, group_id: i64) -> &[ThreadGroupMemberRow] {
+        self.members_by_group
+            .get(&group_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+}
+
+/// Upper bound of one FindThreadGroupSummaries request.
+const MAX_GROUP_SUMMARY_BATCH: usize = 100;
+
+/// Groups whose delegated member searches run concurrently.
+const GROUP_SEARCH_CONCURRENCY: usize = 8;
 
 fn compare_optional_desc(left: Option<i64>, right: Option<i64>) -> std::cmp::Ordering {
     match (left, right) {
@@ -703,35 +753,131 @@ fn resolve_relation_endpoints(
         .collect()
 }
 
-fn cursor_is_before(cursor: &ThreadGroupSearchCursor, result: &ThreadGroupSearchResult) -> bool {
-    let cursor_score = f32::from_bits(cursor.relevance_score_bits);
-    match compare_group_search_results(
-        result,
-        &ThreadGroupSearchResult {
-            group: ThreadGroupView {
-                id: 0,
-                user_id: 0,
-                group_canonical_key: cursor.group_canonical_key.clone(),
-                title: None,
-                status: String::new(),
-                grouping_authority: String::new(),
-                redirect_to_group_id: None,
-                latest_activity_at: cursor.latest_activity_at,
-                root_thread_id: None,
-                root_thread_canonical_key: None,
-                root_display: None,
-                active_member_count: 0,
-                deleted_member_count: 0,
-                unresolved_count: 0,
-                membership_snapshot_digest: String::new(),
-            },
-            relevance_score: cursor_score,
-            witnesses: Vec::new(),
-        },
-    ) {
-        std::cmp::Ordering::Greater => true,
-        std::cmp::Ordering::Equal => result.group.group_canonical_key > cursor.group_canonical_key,
-        std::cmp::Ordering::Less => false,
+fn cursor_is_before(cursor: &ThreadGroupSearchCursor, key: &SearchSortKey<'_>) -> bool {
+    let boundary = SearchSortKey {
+        relevance_score: f32::from_bits(cursor.relevance_score_bits),
+        latest_activity_at: cursor.latest_activity_at,
+        group_canonical_key: &cursor.group_canonical_key,
+    };
+    // The canonical key is the final tie-break, so `Equal` is the cursor row itself.
+    compare_search_keys(key, &boundary).is_gt()
+}
+
+/// Browse predicate for one thread of a group (a group matches when any
+/// of its live threads matches). `labels` are that thread's labels.
+fn thread_matches_filter(
+    thread: &protobuf::llm_memory::data::Thread,
+    labels: Option<&Vec<String>>,
+    filter: &ThreadSearchFilter,
+) -> bool {
+    let Some(data) = thread.data.as_ref() else {
+        return false;
+    };
+    if filter
+        .user_id
+        .is_some_and(|value| data.user_id.as_ref().map(|id| id.value) != Some(value))
+        || filter
+            .channel
+            .as_deref()
+            .is_some_and(|value| data.channel.as_deref() != Some(value))
+        || filter
+            .thread_id
+            .is_some_and(|value| thread.id.as_ref().map(|id| id.value) != Some(value))
+        || filter
+            .thread_created_after
+            .is_some_and(|value| data.created_at <= value)
+        || filter
+            .thread_created_before
+            .is_some_and(|value| data.created_at >= value)
+        || filter
+            .thread_updated_after
+            .is_some_and(|value| data.updated_at <= value)
+        || filter
+            .thread_updated_before
+            .is_some_and(|value| data.updated_at >= value)
+        || filter
+            .first_message_after
+            .is_some_and(|value| data.first_message_at.unwrap_or(i64::MIN) <= value)
+        || filter
+            .first_message_before
+            .is_some_and(|value| data.first_message_at.unwrap_or(i64::MAX) >= value)
+        || filter
+            .last_message_after
+            .is_some_and(|value| data.last_message_at.unwrap_or(i64::MIN) <= value)
+        || filter
+            .last_message_before
+            .is_some_and(|value| data.last_message_at.unwrap_or(i64::MAX) >= value)
+    {
+        return false;
+    }
+    if !filter.memory_kinds.is_empty()
+        && !filter.memory_kinds.contains(&data.memory_kind)
+        && !(filter.memory_kinds.contains(&(MemoryKind::Raw as i32)) && data.memory_kind == 0)
+    {
+        return false;
+    }
+    if filter.labels.is_empty() {
+        return true;
+    }
+    let has_label = |label: &String| labels.is_some_and(|values| values.contains(label));
+    match filter.label_match_mode() {
+        LabelMatchMode::LabelAll => filter.labels.iter().all(has_label),
+        _ => filter.labels.iter().any(has_label),
+    }
+}
+
+/// Unresolved candidate associations loaded once per request for the
+/// groups being rendered, so per-group lookups never rescan the rows. Rows keep their visiting order
+/// (state, then the repository's `updated_at, id` order), which is part of
+/// the observable lineage order.
+struct UnresolvedCandidateIndex {
+    rows: Vec<ThreadGroupCandidateAssociationRow>,
+    by_group: std::collections::HashMap<i64, Vec<usize>>,
+    by_subject_thread: std::collections::HashMap<i64, Vec<usize>>,
+}
+
+/// Visiting order of unresolved states; part of the observable lineage order.
+const UNRESOLVED_CANDIDATE_STATES: [&str; 3] = [
+    values::candidate_state::PENDING,
+    values::candidate_state::AMBIGUOUS,
+    values::candidate_state::CONFLICT,
+];
+
+impl UnresolvedCandidateIndex {
+    fn new(rows: Vec<ThreadGroupCandidateAssociationRow>) -> Self {
+        let mut by_group = std::collections::HashMap::<i64, Vec<usize>>::new();
+        let mut by_subject_thread = std::collections::HashMap::<i64, Vec<usize>>::new();
+        for (index, row) in rows.iter().enumerate() {
+            if let Some(group_id) = row.candidate_group_id {
+                by_group.entry(group_id).or_default().push(index);
+            }
+            if let Some(thread_id) = row.subject_thread_id {
+                by_subject_thread.entry(thread_id).or_default().push(index);
+            }
+        }
+        Self {
+            rows,
+            by_group,
+            by_subject_thread,
+        }
+    }
+
+    /// Rows matching the group directly or through a current member's live
+    /// thread, each once, in original visiting order.
+    fn for_group(
+        &self,
+        group_id: i64,
+        members: &[ThreadGroupMemberRow],
+    ) -> Vec<&ThreadGroupCandidateAssociationRow> {
+        let mut indices = self.by_group.get(&group_id).cloned().unwrap_or_default();
+        for thread_id in members.iter().filter_map(|member| member.thread_id) {
+            if let Some(matches) = self.by_subject_thread.get(&thread_id) {
+                indices.extend(matches);
+            }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        indices.into_iter().map(|index| &self.rows[index]).collect()
     }
 }
 
@@ -745,7 +891,6 @@ pub fn thread_group_summary_external_id(group_id: i64) -> String {
 /// is a consistent-enough snapshot for display (the mutation paths own
 /// the invariants).
 pub struct ThreadGroupReadService {
-    pool: &'static RdbPool,
     groups: ThreadGroupRepositoryImpl,
     members: ThreadGroupMemberRepositoryImpl,
     threads: ThreadRepositoryImpl,
@@ -761,7 +906,6 @@ impl ThreadGroupReadService {
     pub fn new(pool: &'static RdbPool) -> Self {
         let id_generator = IdGeneratorWrapper::new();
         Self {
-            pool,
             groups: ThreadGroupRepositoryImpl::new(id_generator.clone(), pool),
             members: ThreadGroupMemberRepositoryImpl::new(pool),
             threads: ThreadRepositoryImpl::new(id_generator.clone(), pool),
@@ -832,46 +976,90 @@ impl ThreadGroupReadService {
 
         let rows = self
             .groups
-            .list_by_status(values::group_status::ACTIVE, None, None)
+            .list_by_status_for_user(values::group_status::ACTIVE, owner_user_id)
             .await?;
-        let mut matches = Vec::new();
-        for row in rows {
-            if owner_user_id.is_some_and(|user_id| row.user_id != user_id) {
-                continue;
-            }
-            let members = self.members.list_current_by_group_id(row.id).await?;
-            let displays = self.member_displays(&members).await?;
-            let (relevance_score, witnesses) = if queries.is_empty() {
-                if !self
-                    .group_matches_filter(row.id, &members, browse_filter.unwrap())
-                    .await?
-                {
+        let group_ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let context = self.load_member_context(&group_ids).await?;
+        let threads = &context.threads;
+
+        // Matching runs over every active group, but only on cheap batched
+        // data; full views are built for the returned page alone.
+        let mut matches: Vec<SearchMatch> = Vec::new();
+        if let Some(filter) = browse_filter.filter(|_| queries.is_empty()) {
+            let thread_ids = threads.keys().copied().collect::<Vec<_>>();
+            let labels_by_thread = self
+                .thread_labels
+                .find_labels_by_thread_ids(&thread_ids)
+                .await?
+                .into_iter()
+                .fold(BTreeMap::<i64, Vec<String>>::new(), |mut map, row| {
+                    map.entry(row.thread_id).or_default().push(row.label);
+                    map
+                });
+            for row in rows {
+                if filter.thread_group_id.is_some_and(|value| value != row.id) {
                     continue;
                 }
-                (0.0, Vec::new())
-            } else {
-                let Some(result) = self
-                    .match_group(
+                let matched = context
+                    .members_of(row.id)
+                    .iter()
+                    .filter_map(|member| member.thread_id)
+                    .filter_map(|thread_id| threads.get(&thread_id))
+                    .any(|thread| {
+                        let labels = thread
+                            .id
+                            .as_ref()
+                            .and_then(|id| labels_by_thread.get(&id.value));
+                        thread_matches_filter(thread, labels, filter)
+                    });
+                if matched {
+                    matches.push(SearchMatch::new(row, 0.0, Vec::new()));
+                }
+            }
+        } else {
+            // Groups are independent, so their delegated searches overlap;
+            // `buffered` keeps group order, so the first error reported is
+            // still the one the sequential loop would have hit.
+            let displays = rows
+                .iter()
+                .map(|row| displays_from(context.members_of(row.id), threads))
+                .collect::<Vec<_>>();
+            // Collected eagerly: a stream holding the mapping closure makes the
+            // service future fail the higher-ranked `Send` check.
+            let searches = rows
+                .iter()
+                .zip(&displays)
+                .map(|(row, displays)| {
+                    self.match_group(
                         row.id,
-                        &members,
-                        &displays,
+                        context.members_of(row.id),
+                        displays,
                         provider,
                         queries,
                         allow_cross_member,
                     )
-                    .await?
-                else {
-                    continue;
-                };
-                result
-            };
-            matches.push(ThreadGroupSearchResult {
-                group: self.view_of(row).await?,
-                relevance_score,
-                witnesses,
-            });
+                })
+                .collect::<Vec<_>>();
+            let outcomes = futures::stream::iter(searches)
+                .buffered(GROUP_SEARCH_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+            for (row, outcome) in rows.iter().zip(outcomes) {
+                if let Some((relevance_score, witnesses)) = outcome? {
+                    matches.push(SearchMatch::new(row.clone(), relevance_score, witnesses));
+                }
+            }
         }
-        matches.sort_by(compare_group_search_results);
+        let activity = self
+            .members
+            .find_latest_activity_by_group_ids(
+                &matches.iter().map(|entry| entry.row.id).collect::<Vec<_>>(),
+            )
+            .await?;
+        for entry in &mut matches {
+            entry.latest_activity_at = activity.get(&entry.row.id).copied().flatten();
+        }
+        matches.sort_by(|left, right| compare_search_keys(&left.sort_key(), &right.sort_key()));
 
         // A mutation during the expensive delegated searches must not create
         // a cursor that claims to represent the earlier result set.
@@ -888,13 +1076,31 @@ impl ThreadGroupReadService {
             .map(|cursor| {
                 matches
                     .iter()
-                    .position(|result| cursor_is_before(cursor, result))
+                    .position(|entry| cursor_is_before(cursor, &entry.sort_key()))
                     .unwrap_or(matches.len())
             })
             .unwrap_or(0);
         let end = (start + page_size).min(matches.len());
-        let results = matches[start..end].to_vec();
-        let next_page_token = (end < matches.len()).then(|| {
+        let has_more = end < matches.len();
+        let page = matches.drain(start..end).collect::<Vec<_>>();
+        let page_rows = page
+            .iter()
+            .map(|entry| entry.row.clone())
+            .collect::<Vec<_>>();
+        let unresolved = self.unresolved_for_rows(&page_rows, &context).await?;
+        let views = self
+            .views_from_context(page_rows, &context, &activity, &unresolved)
+            .await?;
+        let results = page
+            .into_iter()
+            .zip(views)
+            .map(|(entry, group)| ThreadGroupSearchResult {
+                group,
+                relevance_score: entry.relevance_score,
+                witnesses: entry.witnesses,
+            })
+            .collect::<Vec<_>>();
+        let next_page_token = has_more.then(|| {
             encode_group_search_cursor(&ThreadGroupSearchCursor {
                 version: 1,
                 snapshot: snapshot.clone(),
@@ -917,96 +1123,6 @@ impl ThreadGroupReadService {
             results,
             next_page_token,
         })
-    }
-
-    async fn group_matches_filter(
-        &self,
-        group_id: i64,
-        members: &[ThreadGroupMemberRow],
-        filter: &ThreadSearchFilter,
-    ) -> anyhow::Result<bool> {
-        if filter
-            .thread_group_id
-            .is_some_and(|value| value != group_id)
-        {
-            return Ok(false);
-        }
-        let thread_ids = members
-            .iter()
-            .filter_map(|member| member.thread_id)
-            .collect::<Vec<_>>();
-        let threads = self.threads.find_by_ids(&thread_ids).await?;
-        let labels = self
-            .thread_labels
-            .find_labels_by_thread_ids(&thread_ids)
-            .await?;
-        let labels_by_thread =
-            labels
-                .into_iter()
-                .fold(BTreeMap::<i64, Vec<String>>::new(), |mut map, row| {
-                    map.entry(row.thread_id).or_default().push(row.label);
-                    map
-                });
-        Ok(threads.into_iter().any(|thread| {
-            let Some(data) = thread.data else {
-                return false;
-            };
-            if filter
-                .user_id
-                .is_some_and(|value| data.user_id.as_ref().map(|id| id.value) != Some(value))
-                || filter
-                    .channel
-                    .as_deref()
-                    .is_some_and(|value| data.channel.as_deref() != Some(value))
-                || filter
-                    .thread_id
-                    .is_some_and(|value| thread.id.as_ref().map(|id| id.value) != Some(value))
-                || filter
-                    .thread_created_after
-                    .is_some_and(|value| data.created_at <= value)
-                || filter
-                    .thread_created_before
-                    .is_some_and(|value| data.created_at >= value)
-                || filter
-                    .thread_updated_after
-                    .is_some_and(|value| data.updated_at <= value)
-                || filter
-                    .thread_updated_before
-                    .is_some_and(|value| data.updated_at >= value)
-                || filter
-                    .first_message_after
-                    .is_some_and(|value| data.first_message_at.unwrap_or(i64::MIN) <= value)
-                || filter
-                    .first_message_before
-                    .is_some_and(|value| data.first_message_at.unwrap_or(i64::MAX) >= value)
-                || filter
-                    .last_message_after
-                    .is_some_and(|value| data.last_message_at.unwrap_or(i64::MIN) <= value)
-                || filter
-                    .last_message_before
-                    .is_some_and(|value| data.last_message_at.unwrap_or(i64::MAX) >= value)
-            {
-                return false;
-            }
-            if !filter.memory_kinds.is_empty()
-                && !filter.memory_kinds.contains(&data.memory_kind)
-                && !(filter.memory_kinds.contains(&(MemoryKind::Raw as i32))
-                    && data.memory_kind == 0)
-            {
-                return false;
-            }
-            if filter.labels.is_empty() {
-                return true;
-            }
-            let thread_labels =
-                labels_by_thread.get(&thread.id.map(|id| id.value).unwrap_or_default());
-            let has_label =
-                |label: &String| thread_labels.is_some_and(|values| values.contains(label));
-            match filter.label_match_mode() {
-                LabelMatchMode::LabelAll => filter.labels.iter().all(has_label),
-                _ => filter.labels.iter().any(has_label),
-            }
-        }))
     }
 
     async fn match_group<P: ThreadGroupMemberSearchProvider>(
@@ -1159,26 +1275,35 @@ impl ThreadGroupReadService {
         } else {
             &[values::group_status::ACTIVE]
         };
-        let mut views = Vec::new();
+        let mut rows = Vec::new();
         for status in statuses {
-            for row in self.groups.list_by_status(status, None, None).await? {
-                if owner_user_id.is_some_and(|user_id| row.user_id != user_id) {
-                    continue;
-                }
-                views.push(self.view_of(row).await?);
-            }
+            rows.extend(
+                self.groups
+                    .list_by_status_for_user(status, owner_user_id)
+                    .await?,
+            );
         }
-        views.sort_by(|a, b| {
-            b.latest_activity_at
-                .cmp(&a.latest_activity_at)
+        // Sort on the cheap key first and enrich only the requested window.
+        let group_ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let activity = self
+            .members
+            .find_latest_activity_by_group_ids(&group_ids)
+            .await?;
+        let mut keyed = rows
+            .into_iter()
+            .map(|row| (activity.get(&row.id).copied().flatten(), row))
+            .collect::<Vec<_>>();
+        keyed.sort_by(|(a_latest, a), (b_latest, b)| {
+            compare_optional_desc(*a_latest, *b_latest)
                 .then_with(|| a.group_canonical_key.cmp(&b.group_canonical_key))
         });
         let offset = offset.unwrap_or_default().max(0) as usize;
-        let views = views.into_iter().skip(offset);
-        let views = match limit {
-            Some(limit) => views.take(limit.max(0) as usize).collect(),
-            None => views.collect(),
+        let page = keyed.into_iter().skip(offset).map(|(_, row)| row);
+        let page = match limit {
+            Some(limit) => page.take(limit.max(0) as usize).collect(),
+            None => page.collect(),
         };
+        let views = self.views_of(page, None).await?;
         Ok(views)
     }
 
@@ -1220,11 +1345,14 @@ impl ThreadGroupReadService {
         }
         relations.sort_by_key(|relation| relation.id);
 
-        let mut unresolved = Vec::new();
-        self.for_each_unresolved_candidate(group_id, &members, |candidate| {
-            unresolved.push(candidate);
-        })
-        .await?;
+        let unresolved_index = self
+            .load_unresolved_candidates(&[group_id], members.iter())
+            .await?;
+        let unresolved = unresolved_index
+            .for_group(group_id, &members)
+            .into_iter()
+            .cloned()
+            .collect();
 
         // Evidence for each member's owner-local identity. A member
         // without source identity (manual thread) contributes none.
@@ -1286,7 +1414,7 @@ impl ThreadGroupReadService {
         );
 
         Ok(Some(ThreadGroupLineageView {
-            group: self.view_of(group).await?,
+            group: self.view_of(group, &unresolved_index).await?,
             members,
             member_displays,
             relations,
@@ -1304,19 +1432,68 @@ impl ThreadGroupReadService {
         group_id: i64,
         owner_user_id: Option<i64>,
     ) -> anyhow::Result<Option<protobuf::llm_memory::data::Memory>> {
-        let Some(group) = self.groups.find_by_id(group_id).await? else {
-            return Ok(None);
-        };
-        if group.status != values::group_status::ACTIVE
-            || owner_user_id.is_some_and(|user_id| group.user_id != user_id)
-        {
-            return Ok(None);
+        // Delegates so the single and batch reads share one eligibility rule.
+        Ok(self
+            .find_group_summaries(&[group_id], owner_user_id)
+            .await?
+            .pop()
+            .flatten())
+    }
+
+    /// Summaries for up to `MAX_GROUP_SUMMARY_BATCH` groups: one entry per
+    /// requested id, in request order. A group yields `None` unless it exists,
+    /// is ACTIVE and (when `owner_user_id` is set) belongs to that owner.
+    pub async fn find_group_summaries(
+        &self,
+        group_ids: &[i64],
+        owner_user_id: Option<i64>,
+    ) -> anyhow::Result<Vec<Option<protobuf::llm_memory::data::Memory>>> {
+        if group_ids.is_empty() || group_ids.len() > MAX_GROUP_SUMMARY_BATCH {
+            return Err(anyhow::Error::new(
+                infra::error::LlmMemoryError::InvalidArgument(format!(
+                    "group_ids must contain 1..={MAX_GROUP_SUMMARY_BATCH} entries"
+                )),
+            ));
         }
-        self.memories
-            .find_by_external_id_and_kind(
-                &thread_group_summary_external_id(group_id),
-                MemoryKind::DerivedSummary,
-            )
+        let mut unique_ids = group_ids.to_vec();
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+        let eligible = self
+            .groups
+            .find_by_ids(&unique_ids)
+            .await?
+            .into_iter()
+            .filter(|group| {
+                group.status == values::group_status::ACTIVE
+                    && owner_user_id.is_none_or(|user_id| group.user_id == user_id)
+            })
+            .map(|group| thread_group_summary_external_id(group.id))
+            .collect::<Vec<_>>();
+        let by_external_id = self
+            .memories
+            .find_by_external_ids_and_kind(&eligible, MemoryKind::DerivedSummary)
+            .await?
+            .into_iter()
+            .filter_map(|memory| {
+                let external_id = memory.data.as_ref()?.external_id.clone()?;
+                Some((external_id, memory))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        // Duplicated ids each get the same summary.
+        Ok(group_ids
+            .iter()
+            .map(|group_id| {
+                by_external_id
+                    .get(&thread_group_summary_external_id(*group_id))
+                    .cloned()
+            })
+            .collect())
+    }
+
+    /// Number of groups `list_groups(false, .., owner)` returns, counted in SQL.
+    pub async fn count_groups(&self, owner_user_id: Option<i64>) -> anyhow::Result<i64> {
+        self.groups
+            .count_by_status(values::group_status::ACTIVE, owner_user_id)
             .await
     }
 
@@ -1325,50 +1502,35 @@ impl ThreadGroupReadService {
     pub async fn count_group_summaries(&self, owner_user_id: Option<i64>) -> anyhow::Result<i64> {
         let groups = self
             .groups
-            .list_by_status(values::group_status::ACTIVE, None, None)
+            .list_by_status_for_user(values::group_status::ACTIVE, owner_user_id)
             .await?;
-        let mut count = 0;
-        for group in groups {
-            if owner_user_id.is_some_and(|user_id| group.user_id != user_id) {
-                continue;
-            }
-            let members = self.members.list_current_by_group_id(group.id).await?;
-            if !members.iter().any(|member| {
+        let group_ids = groups.iter().map(|group| group.id).collect::<Vec<_>>();
+        let live_groups = self
+            .members
+            .list_current_by_group_ids(&group_ids)
+            .await?
+            .into_iter()
+            .filter(|member| {
                 member.state == values::member_state::ACTIVE && member.thread_id.is_some()
-            }) {
-                continue;
-            }
-            if self
-                .find_group_summary(group.id, owner_user_id)
-                .await?
-                .is_some()
-            {
-                count += 1;
-            }
-        }
-        Ok(count)
+            })
+            .map(|member| member.group_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let external_ids = live_groups
+            .into_iter()
+            .map(thread_group_summary_external_id)
+            .collect::<Vec<_>>();
+        // `external_id` is UNIQUE, so each live group contributes at most one row.
+        self.memories
+            .count_by_external_ids_and_kind(&external_ids, MemoryKind::DerivedSummary)
+            .await
     }
 
     /// Operational counts for monitoring / alerts (design 9.3). A
     /// snapshot, not a transactionally consistent set.
     pub async fn reconciliation_report(&self) -> anyhow::Result<ThreadGroupReconciliationReport> {
-        let count_groups = async |status: &str| -> anyhow::Result<i64> {
-            Ok(self.groups.list_by_status(status, None, None).await?.len() as i64)
-        };
-        let count_candidates = async |state: &str| -> anyhow::Result<i64> {
-            Ok(self
-                .candidates
-                .list_by_state(state, None, None)
-                .await?
-                .len() as i64)
-        };
-        let count_observations = async |state: &str| -> anyhow::Result<i64> {
-            Ok(self
-                .observations
-                .list_by_state(state, None, None)
-                .await?
-                .len() as i64)
-        };
+        let count_groups = async |status: &str| self.groups.count_by_status(status, None).await;
+        let count_candidates = async |state: &str| self.candidates.count_by_state(state).await;
+        let count_observations = async |state: &str| self.observations.count_by_state(state).await;
         Ok(ThreadGroupReconciliationReport {
             active_groups: count_groups(values::group_status::ACTIVE).await?,
             redirected_groups: count_groups(values::group_status::REDIRECTED).await?,
@@ -1381,140 +1543,172 @@ impl ThreadGroupReadService {
         })
     }
 
-    async fn view_of(&self, row: ThreadGroupRow) -> anyhow::Result<ThreadGroupView> {
-        let latest_activity_at = self
+    async fn view_of(
+        &self,
+        row: ThreadGroupRow,
+        unresolved: &UnresolvedCandidateIndex,
+    ) -> anyhow::Result<ThreadGroupView> {
+        Ok(self
+            .views_of(vec![row], Some(unresolved))
+            .await?
+            .pop()
+            .expect("views_of returns one view per row"))
+    }
+
+    /// Group views for many rows with a fixed number of queries (members,
+    /// activity, threads, parent relations) instead of several per group.
+    /// Views are returned in input order.
+    /// `unresolved` is loaded for `rows` when the caller has none yet.
+    async fn views_of(
+        &self,
+        rows: Vec<ThreadGroupRow>,
+        unresolved: Option<&UnresolvedCandidateIndex>,
+    ) -> anyhow::Result<Vec<ThreadGroupView>> {
+        let group_ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let context = self.load_member_context(&group_ids).await?;
+        let activity = self
             .members
-            .find_latest_activity_at_tx(self.pool, row.id)
+            .find_latest_activity_by_group_ids(&group_ids)
             .await?;
-        let members = self.members.list_current_by_group_id(row.id).await?;
-        let root = self.root_member(row.id).await?;
-        let displays = self.member_displays(&members).await?;
-        let root_display = root.as_ref().and_then(|root| {
-            displays
-                .iter()
-                .find(|display| display.thread_canonical_key == root.thread_canonical_key)
-                .cloned()
-        });
-        let snapshot_entries = self.snapshot_entries(&members).await?;
-        Ok(ThreadGroupView {
-            id: row.id,
-            user_id: row.user_id,
-            group_canonical_key: row.group_canonical_key,
-            title: row.title,
-            status: row.status,
-            grouping_authority: row.grouping_authority,
-            redirect_to_group_id: row.redirect_to_group_id,
-            latest_activity_at,
-            root_thread_id: root.as_ref().and_then(|member| member.thread_id),
-            root_thread_canonical_key: root.map(|member| member.thread_canonical_key),
-            root_display,
-            active_member_count: members
-                .iter()
-                .filter(|member| member.state == values::member_state::ACTIVE)
-                .count() as i64,
-            deleted_member_count: members
-                .iter()
-                .filter(|member| member.state == values::member_state::DELETED)
-                .count() as i64,
-            unresolved_count: self.unresolved_count(row.id, &members).await?,
-            membership_snapshot_digest: membership_snapshot_digest(&snapshot_entries),
-        })
-    }
-
-    async fn unresolved_count(
-        &self,
-        group_id: i64,
-        members: &[ThreadGroupMemberRow],
-    ) -> anyhow::Result<i64> {
-        let mut count = 0;
-        self.for_each_unresolved_candidate(group_id, members, |_| count += 1)
-            .await?;
-        Ok(count)
-    }
-
-    async fn for_each_unresolved_candidate(
-        &self,
-        group_id: i64,
-        members: &[ThreadGroupMemberRow],
-        mut visit: impl FnMut(ThreadGroupCandidateAssociationRow),
-    ) -> anyhow::Result<()> {
-        let member_thread_ids: HashSet<i64> = members
-            .iter()
-            .filter_map(|member| member.thread_id)
-            .collect();
-        for state in [
-            values::candidate_state::PENDING,
-            values::candidate_state::AMBIGUOUS,
-            values::candidate_state::CONFLICT,
-        ] {
-            for candidate in self.candidates.list_by_state(state, None, None).await? {
-                if candidate.candidate_group_id == Some(group_id)
-                    || candidate
-                        .subject_thread_id
-                        .is_some_and(|id| member_thread_ids.contains(&id))
-                {
-                    visit(candidate);
-                }
+        let loaded;
+        let unresolved = match unresolved {
+            Some(unresolved) => unresolved,
+            None => {
+                loaded = self.unresolved_for_rows(&rows, &context).await?;
+                &loaded
             }
-        }
-        Ok(())
+        };
+        self.views_from_context(rows, &context, &activity, unresolved)
+            .await
+    }
+
+    /// `views_of` over already-loaded member context, activity and unresolved
+    /// candidates; all three must cover every row.
+    async fn views_from_context(
+        &self,
+        rows: Vec<ThreadGroupRow>,
+        context: &MemberContext,
+        activity: &std::collections::HashMap<i64, Option<i64>>,
+        unresolved: &UnresolvedCandidateIndex,
+    ) -> anyhow::Result<Vec<ThreadGroupView>> {
+        let member_keys = rows
+            .iter()
+            .flat_map(|row| context.members_of(row.id))
+            .map(|member| member.thread_canonical_key.clone())
+            .collect::<Vec<_>>();
+        let relations = self
+            .relations
+            .list_by_parent_canonical_keys(&member_keys, Some(values::relation_state::ACTIVE))
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let members = context.members_of(row.id);
+                let root = compute_root(members, &relations);
+                let displays = displays_from(members, &context.threads);
+                let root_display = root.as_ref().and_then(|root| {
+                    displays
+                        .iter()
+                        .find(|display| display.thread_canonical_key == root.thread_canonical_key)
+                        .cloned()
+                });
+                let snapshot_entries = snapshot_entries_from(members, &context.threads);
+                ThreadGroupView {
+                    id: row.id,
+                    user_id: row.user_id,
+                    latest_activity_at: activity.get(&row.id).copied().flatten(),
+                    unresolved_count: unresolved.for_group(row.id, members).len() as i64,
+                    group_canonical_key: row.group_canonical_key,
+                    title: row.title,
+                    status: row.status,
+                    grouping_authority: row.grouping_authority,
+                    redirect_to_group_id: row.redirect_to_group_id,
+                    root_thread_id: root.as_ref().and_then(|member| member.thread_id),
+                    root_thread_canonical_key: root.map(|member| member.thread_canonical_key),
+                    root_display,
+                    active_member_count: members
+                        .iter()
+                        .filter(|member| member.state == values::member_state::ACTIVE)
+                        .count() as i64,
+                    deleted_member_count: members
+                        .iter()
+                        .filter(|member| member.state == values::member_state::DELETED)
+                        .count() as i64,
+                    membership_snapshot_digest: membership_snapshot_digest(&snapshot_entries),
+                }
+            })
+            .collect())
+    }
+
+    async fn unresolved_for_rows(
+        &self,
+        rows: &[ThreadGroupRow],
+        context: &MemberContext,
+    ) -> anyhow::Result<UnresolvedCandidateIndex> {
+        let group_ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        self.load_unresolved_candidates(
+            &group_ids,
+            rows.iter().flat_map(|row| context.members_of(row.id)),
+        )
+        .await
+    }
+
+    /// Unresolved candidates that `UnresolvedCandidateIndex::for_group` can
+    /// return for these groups: rows naming one of the groups or one of the
+    /// members' live threads. Loading only those keeps the read independent
+    /// of the size of the unresolved backlog.
+    async fn load_unresolved_candidates<'a>(
+        &self,
+        group_ids: &[i64],
+        members: impl Iterator<Item = &'a ThreadGroupMemberRow>,
+    ) -> anyhow::Result<UnresolvedCandidateIndex> {
+        let mut thread_ids = members
+            .filter_map(|member| member.thread_id)
+            .collect::<Vec<_>>();
+        thread_ids.sort_unstable();
+        thread_ids.dedup();
+        let rows = self
+            .candidates
+            .list_by_states_for_groups_or_subject_threads(
+                &UNRESOLVED_CANDIDATE_STATES,
+                group_ids,
+                &thread_ids,
+            )
+            .await?;
+        Ok(UnresolvedCandidateIndex::new(rows))
     }
 
     async fn member_displays(
         &self,
         members: &[ThreadGroupMemberRow],
     ) -> anyhow::Result<Vec<ThreadDisplayView>> {
-        let by_id = self.member_threads_by_id(members).await?;
-        Ok(members
-            .iter()
-            .map(|member| {
-                let data = member
-                    .thread_id
-                    .and_then(|thread_id| by_id.get(&thread_id))
-                    .and_then(|thread| thread.data.as_ref());
-                ThreadDisplayView {
-                    thread_id: member.thread_id,
-                    thread_canonical_key: member.thread_canonical_key.clone(),
-                    description: data.and_then(|data| data.description.clone()),
-                    source: member.source.clone(),
-                    created_at: data.map(|data| data.created_at),
-                    last_message_at: data.and_then(|data| data.last_message_at),
-                    deleted_at: member.deleted_at,
-                }
-            })
-            .collect())
+        let by_id = self.member_threads_by_id(members.iter()).await?;
+        Ok(displays_from(members, &by_id))
     }
 
-    async fn snapshot_entries(
-        &self,
-        members: &[ThreadGroupMemberRow],
-    ) -> anyhow::Result<Vec<MembershipSnapshotEntry>> {
-        let by_id = self.member_threads_by_id(members).await?;
-        Ok(members
-            .iter()
-            .map(|member| {
-                let data = member
-                    .thread_id
-                    .and_then(|thread_id| by_id.get(&thread_id))
-                    .and_then(|thread| thread.data.as_ref());
-                MembershipSnapshotEntry {
-                    thread_canonical_key: member.thread_canonical_key.clone(),
-                    state: member.state.clone(),
-                    role: member.role.clone(),
-                    deleted_at: member.deleted_at,
-                    updated_at: data.map(|data| data.updated_at),
-                    last_message_at: data.and_then(|data| data.last_message_at),
-                }
-            })
-            .collect())
+    async fn load_member_context(&self, group_ids: &[i64]) -> anyhow::Result<MemberContext> {
+        let mut members_by_group = std::collections::HashMap::<i64, Vec<_>>::new();
+        for member in self.members.list_current_by_group_ids(group_ids).await? {
+            members_by_group
+                .entry(member.group_id)
+                .or_default()
+                .push(member);
+        }
+        let threads = self
+            .member_threads_by_id(members_by_group.values().flatten())
+            .await?;
+        Ok(MemberContext {
+            members_by_group,
+            threads,
+        })
     }
 
     async fn member_threads_by_id(
         &self,
-        members: &[ThreadGroupMemberRow],
+        members: impl Iterator<Item = &ThreadGroupMemberRow>,
     ) -> anyhow::Result<std::collections::HashMap<i64, protobuf::llm_memory::data::Thread>> {
         let thread_ids = members
-            .iter()
             .filter_map(|member| member.thread_id)
             .collect::<Vec<_>>();
         let threads = self.threads.find_by_ids(&thread_ids).await?;
@@ -1531,27 +1725,427 @@ impl ThreadGroupReadService {
         if members.is_empty() {
             return Ok(None);
         }
-        let keys: HashSet<&str> = members
+        let keys = members
             .iter()
-            .map(|member| member.thread_canonical_key.as_str())
-            .collect();
-        let mut has_parent: HashSet<String> = HashSet::new();
-        for key in &keys {
-            for relation in self
-                .relations
-                .list_by_parent_canonical_key(key, Some(values::relation_state::ACTIVE))
-                .await?
-            {
-                if keys.contains(relation.child_thread_canonical_key.as_str()) {
-                    has_parent.insert(relation.child_thread_canonical_key);
-                }
+            .map(|member| member.thread_canonical_key.clone())
+            .collect::<Vec<_>>();
+        let relations = self
+            .relations
+            .list_by_parent_canonical_keys(&keys, Some(values::relation_state::ACTIVE))
+            .await?;
+        Ok(compute_root(&members, &relations))
+    }
+}
+
+/// Root selection over a group's current members. `relations` may contain
+/// edges of other groups; only edges whose both endpoints are members of
+/// this group can disqualify a root.
+fn compute_root(
+    members: &[ThreadGroupMemberRow],
+    relations: &[ThreadRelationRow],
+) -> Option<ThreadGroupMemberRow> {
+    let keys: HashSet<&str> = members
+        .iter()
+        .map(|member| member.thread_canonical_key.as_str())
+        .collect();
+    let has_parent: HashSet<&str> = relations
+        .iter()
+        .filter(|relation| {
+            keys.contains(relation.parent_thread_canonical_key.as_str())
+                && keys.contains(relation.child_thread_canonical_key.as_str())
+        })
+        .map(|relation| relation.child_thread_canonical_key.as_str())
+        .collect();
+    members
+        .iter()
+        .filter(|member| !has_parent.contains(member.thread_canonical_key.as_str()))
+        .min_by(|a, b| a.thread_canonical_key.cmp(&b.thread_canonical_key))
+        .cloned()
+}
+
+fn displays_from(
+    members: &[ThreadGroupMemberRow],
+    threads: &std::collections::HashMap<i64, protobuf::llm_memory::data::Thread>,
+) -> Vec<ThreadDisplayView> {
+    members
+        .iter()
+        .map(|member| {
+            let data = member
+                .thread_id
+                .and_then(|thread_id| threads.get(&thread_id))
+                .and_then(|thread| thread.data.as_ref());
+            ThreadDisplayView {
+                thread_id: member.thread_id,
+                thread_canonical_key: member.thread_canonical_key.clone(),
+                description: data.and_then(|data| data.description.clone()),
+                source: member.source.clone(),
+                created_at: data.map(|data| data.created_at),
+                last_message_at: data.and_then(|data| data.last_message_at),
+                deleted_at: member.deleted_at,
             }
+        })
+        .collect()
+}
+
+fn snapshot_entries_from(
+    members: &[ThreadGroupMemberRow],
+    threads: &std::collections::HashMap<i64, protobuf::llm_memory::data::Thread>,
+) -> Vec<MembershipSnapshotEntry> {
+    members
+        .iter()
+        .map(|member| {
+            let data = member
+                .thread_id
+                .and_then(|thread_id| threads.get(&thread_id))
+                .and_then(|thread| thread.data.as_ref());
+            MembershipSnapshotEntry {
+                thread_canonical_key: member.thread_canonical_key.clone(),
+                state: member.state.clone(),
+                role: member.role.clone(),
+                deleted_at: member.deleted_at,
+                updated_at: data.map(|data| data.updated_at),
+                last_message_at: data.and_then(|data| data.last_message_at),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod read_model_tests {
+    use super::*;
+    use protobuf::llm_memory::data::{Thread, ThreadData, ThreadId, UserId};
+
+    fn member(group_id: i64, thread_id: Option<i64>, key: &str) -> ThreadGroupMemberRow {
+        ThreadGroupMemberRow {
+            group_id,
+            thread_id,
+            thread_canonical_key: key.into(),
+            user_id: 1,
+            source: None,
+            identity_scope: None,
+            native_id: None,
+            role: values::member_role::MEMBER.into(),
+            state: values::member_state::ACTIVE.into(),
+            provenance: values::grouping_authority::RECONCILER.into(),
+            deleted_at: None,
+            created_at: 0,
+            updated_at: 0,
         }
-        let mut candidates: Vec<&ThreadGroupMemberRow> = members
+    }
+
+    /// Member of group 7 whose canonical key is derived from its thread id.
+    fn thread_member(thread_id: Option<i64>) -> ThreadGroupMemberRow {
+        member(
+            7,
+            thread_id,
+            &format!("{:0>64}", thread_id.unwrap_or_default()),
+        )
+    }
+
+    /// Group-1 member identified only by its canonical key.
+    fn keyed_member(key: &str) -> ThreadGroupMemberRow {
+        member(1, Some(1), key)
+    }
+
+    fn candidate(
+        id: i64,
+        group: Option<i64>,
+        subject: Option<i64>,
+    ) -> ThreadGroupCandidateAssociationRow {
+        ThreadGroupCandidateAssociationRow {
+            id,
+            subject_thread_id: subject,
+            subject_source: "codex".into(),
+            subject_identity_scope_known: true,
+            subject_identity_scope_value: String::new(),
+            subject_user_id: 1,
+            subject_native_id: format!("subject-{id}"),
+            candidate_group_id: group,
+            candidate_parent_thread_id: None,
+            state: values::candidate_state::PENDING.into(),
+            selected_observation_id: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn edge(parent: &str, child: &str) -> ThreadRelationRow {
+        ThreadRelationRow {
+            id: 0,
+            parent_thread_id: None,
+            child_thread_id: None,
+            parent_thread_canonical_key: parent.into(),
+            child_thread_canonical_key: child.into(),
+            parent_user_id: 1,
+            parent_source: None,
+            parent_identity_scope: None,
+            parent_native_id: None,
+            child_user_id: 1,
+            child_source: None,
+            child_identity_scope: None,
+            child_native_id: None,
+            relation_type: "continuation".into(),
+            state: values::relation_state::ACTIVE.into(),
+            selection_basis: "source_exact".into(),
+            source_confidence: None,
+            selected_observation_id: None,
+            selected_operator_decision_id: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn root_key(
+        members: &[ThreadGroupMemberRow],
+        relations: &[ThreadRelationRow],
+    ) -> Option<String> {
+        compute_root(members, relations).map(|member| member.thread_canonical_key)
+    }
+
+    #[test]
+    fn smallest_member_without_an_in_group_parent_is_root() {
+        let members = [keyed_member("b"), keyed_member("a"), keyed_member("c")];
+        assert_eq!(root_key(&members, &[]), Some("a".into()));
+        assert_eq!(root_key(&members, &[edge("b", "a")]), Some("b".into()));
+        // Edges from outside the group, or into other groups, do not count.
+        assert_eq!(
+            root_key(&members, &[edge("outside", "a"), edge("a", "outside")]),
+            Some("a".into())
+        );
+        assert_eq!(root_key(&[], &[edge("a", "b")]), None);
+    }
+    #[test]
+    fn for_group_keeps_visiting_order_and_visits_each_row_once() {
+        let index = UnresolvedCandidateIndex::new(vec![
+            candidate(1, None, Some(20)),
+            candidate(2, Some(7), None),
+            candidate(3, Some(7), Some(21)),
+            candidate(4, Some(8), Some(20)),
+            candidate(5, None, Some(99)),
+        ]);
+        let members = [
+            thread_member(Some(20)),
+            thread_member(Some(21)),
+            thread_member(None),
+        ];
+        let ids = index
+            .for_group(7, &members)
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn for_group_is_empty_without_direct_or_member_matches() {
+        let index = UnresolvedCandidateIndex::new(vec![candidate(1, Some(8), Some(30))]);
+        assert!(index.for_group(7, &[]).is_empty());
+        assert!(index.for_group(7, &[thread_member(None)]).is_empty());
+        assert!(
+            UnresolvedCandidateIndex::new(Vec::new())
+                .for_group(7, &[thread_member(Some(30))])
+                .is_empty()
+        );
+    }
+    fn thread(memory_kind: i32) -> Thread {
+        Thread {
+            id: Some(ThreadId { value: 5 }),
+            data: Some(ThreadData {
+                user_id: Some(UserId { value: 1 }),
+                channel: Some("slack".into()),
+                created_at: 100,
+                updated_at: 200,
+                first_message_at: Some(110),
+                last_message_at: Some(190),
+                memory_kind,
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn matches(filter: ThreadSearchFilter, labels: &[&str], memory_kind: i32) -> bool {
+        let labels = labels
             .iter()
-            .filter(|member| !has_parent.contains(&member.thread_canonical_key))
-            .collect();
-        candidates.sort_by(|a, b| a.thread_canonical_key.cmp(&b.thread_canonical_key));
-        Ok(candidates.first().map(|member| (*member).clone()))
+            .map(|label| label.to_string())
+            .collect::<Vec<_>>();
+        thread_matches_filter(&thread(memory_kind), Some(&labels), &filter)
+    }
+
+    #[test]
+    fn scalar_bounds_are_exclusive_and_missing_times_never_match_bounds() {
+        let raw = MemoryKind::Raw as i32;
+        let filter = ThreadSearchFilter::default;
+        let cases = [
+            (filter(), true),
+            (
+                ThreadSearchFilter {
+                    user_id: Some(2),
+                    ..filter()
+                },
+                false,
+            ),
+            (
+                ThreadSearchFilter {
+                    channel: Some("x".into()),
+                    ..filter()
+                },
+                false,
+            ),
+            (
+                ThreadSearchFilter {
+                    thread_id: Some(6),
+                    ..filter()
+                },
+                false,
+            ),
+            (
+                ThreadSearchFilter {
+                    thread_created_after: Some(100),
+                    ..filter()
+                },
+                false,
+            ),
+            (
+                ThreadSearchFilter {
+                    thread_created_after: Some(99),
+                    ..filter()
+                },
+                true,
+            ),
+            (
+                ThreadSearchFilter {
+                    thread_created_before: Some(100),
+                    ..filter()
+                },
+                false,
+            ),
+            (
+                ThreadSearchFilter {
+                    thread_updated_after: Some(200),
+                    ..filter()
+                },
+                false,
+            ),
+            (
+                ThreadSearchFilter {
+                    thread_updated_before: Some(200),
+                    ..filter()
+                },
+                false,
+            ),
+            (
+                ThreadSearchFilter {
+                    first_message_after: Some(110),
+                    ..filter()
+                },
+                false,
+            ),
+            (
+                ThreadSearchFilter {
+                    first_message_before: Some(110),
+                    ..filter()
+                },
+                false,
+            ),
+            (
+                ThreadSearchFilter {
+                    last_message_after: Some(190),
+                    ..filter()
+                },
+                false,
+            ),
+            (
+                ThreadSearchFilter {
+                    last_message_before: Some(191),
+                    ..filter()
+                },
+                true,
+            ),
+        ];
+        for (case, expected) in cases {
+            assert_eq!(matches(case.clone(), &[], raw), expected, "{case:?}");
+        }
+        let mut no_times = thread(raw);
+        no_times.data.as_mut().unwrap().last_message_at = None;
+        assert!(!thread_matches_filter(
+            &no_times,
+            None,
+            &ThreadSearchFilter {
+                last_message_after: Some(0),
+                ..filter()
+            }
+        ));
+        assert!(!thread_matches_filter(
+            &Thread {
+                id: None,
+                data: None
+            },
+            None,
+            &filter()
+        ));
+    }
+
+    #[test]
+    fn raw_kind_also_matches_legacy_unspecified_threads() {
+        let raw_only = ThreadSearchFilter {
+            memory_kinds: vec![MemoryKind::Raw as i32],
+            ..Default::default()
+        };
+        assert!(matches(raw_only.clone(), &[], 0));
+        assert!(!matches(raw_only, &[], MemoryKind::ThreadSummary as i32));
+        let summary_only = ThreadSearchFilter {
+            memory_kinds: vec![MemoryKind::ThreadSummary as i32],
+            ..Default::default()
+        };
+        assert!(!matches(summary_only, &[], 0));
+    }
+
+    #[test]
+    fn labels_use_any_by_default_and_all_when_requested() {
+        let raw = MemoryKind::Raw as i32;
+        let any = ThreadSearchFilter {
+            labels: vec!["a".into(), "b".into()],
+            ..Default::default()
+        };
+        assert!(matches(any.clone(), &["b"], raw));
+        assert!(!matches(any.clone(), &["c"], raw));
+        assert!(!thread_matches_filter(&thread(raw), None, &any));
+        let all = ThreadSearchFilter {
+            labels: vec!["a".into(), "b".into()],
+            label_match_mode: Some(LabelMatchMode::LabelAll as i32),
+            ..Default::default()
+        };
+        assert!(!matches(all.clone(), &["a"], raw));
+        assert!(matches(all, &["b", "a"], raw));
+    }
+
+    #[test]
+    fn sort_keys_order_by_relevance_then_activity_then_canonical_key() {
+        let key = |relevance_score, latest_activity_at, group_canonical_key| SearchSortKey {
+            relevance_score,
+            latest_activity_at,
+            group_canonical_key,
+        };
+        use std::cmp::Ordering::*;
+        assert_eq!(
+            compare_search_keys(&key(0.9, None, "z"), &key(0.5, Some(9), "a")),
+            Less
+        );
+        assert_eq!(
+            compare_search_keys(&key(0.5, Some(9), "z"), &key(0.5, Some(1), "a")),
+            Less
+        );
+        assert_eq!(
+            compare_search_keys(&key(0.5, Some(1), "z"), &key(0.5, None, "a")),
+            Less
+        );
+        assert_eq!(
+            compare_search_keys(&key(0.5, None, "a"), &key(0.5, None, "b")),
+            Less
+        );
+        assert_eq!(
+            compare_search_keys(&key(0.5, None, "a"), &key(0.5, None, "a")),
+            Equal
+        );
     }
 }

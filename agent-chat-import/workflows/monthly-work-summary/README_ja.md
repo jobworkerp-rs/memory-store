@@ -41,7 +41,7 @@ worker を登録しておく（後述）。
 | 集約スレッドのラベル | `monthly_summary`, `month:YYYY-MM`, `scope:<scope_key>`, `extra_labels_filter` の各値 (sort 済み) | `monthly_summary` で一覧、`month:` で月絞り込み、`scope:` で同月内の異 scope を分離 |
 | 集約メモリの `external_id` | `monthly:<user_id>:YYYY-MM:<scope_key>` | `memory.external_id` は DB 全体で UNIQUE。所有者と scope を含め、同月に異なるユーザーまたは `extra_labels_filter` で並列実行しても衝突しないようにする |
 | `scope_key` の算出 | `extra_labels_filter` を `sort \| join(",")`。空なら `_all` | 順序非依存 |
-| 入力の取得方法 | `MemoryService.FindListByCondition` で **週次要約メモリ自身**を絞り込む (`external_id_prefix="weekly:"` + `roles=[ROLE_ASSISTANT]` + `updated_after/before` + `thread_filter.labels=[weekly_summary]+extra` の AND マッチ) | 週次・日次と同じ「メモリ単位で時間絞り込み」パターン |
+| 入力の取得方法 | `MemoryService.FindListByCondition` で **週次要約メモリ自身**を絞り込む (`memory_kinds=[MEMORY_KIND_WEEKLY_SUMMARY]` + `roles=[ROLE_ASSISTANT]` + `updated_after/before` + `thread_filter.labels=[weekly_summary]+extra` の AND マッチ) | 週次・日次と同じ「メモリ単位で時間絞り込み」パターン |
 
 | LLM 入力 | `memory.data.content` (週次要約 JSON: overall_purpose / purpose_groups / by_topic / trends / carryover) + `thread_description` の組み合わせ | trends フィールドを使って月内の節目を判定 |
 | 月境界 | 暦月 (1 日 00:00 〜 翌月 1 日 00:00 in tz) | 文字列演算で年跨ぎを処理することで、broken-down arithmetic のうるう/DST 問題を回避 |
@@ -174,7 +174,12 @@ agent-chat-import/workflows/monthly-work-summary/run-monthly-summary.sh \
 | `monthly_label` | - | `monthly_summary` | 出力スレッドのマーカーラベル |
 | `extra_labels_filter` | - | `[]` | 入力に AND マッチする追加ラベル |
 | `min_thread_count` | - | `1` | 入力 memory 数がこれ未満なら skip （実態は memory 件数） |
-| `max_context_chars` | - | `200000` | LLM 入力の上限文字数 |
+| `max_context_chars` | - | `200000` | 互換のため受け付けるのみ（未使用）。入力上限は `summary_input_byte_budget` と `token_count` で決まる |
+| `llm_context_window_tokens` | - | `131072` | モデルのコンテキスト長（ハードリミット） |
+| `summary_max_completion_tokens` | - | `32768` | 出力トークン上限 |
+| `summary_input_byte_budget` | - | `200000` | token_count 不可時の入力バイト上限 |
+| `llm_expected_model` | - | `""` | 指定時は token_count の解決済みモデル名と一致を要求 |
+| `extra_labels_match_mode` | - | `LABEL_ALL` | `extra_labels_filter` の照合方法 |
 | `summary_model` / `ollama_base_url` | - | daily/weekly と同じ | LLM 設定 |
 | `timezone_offset_hours` | - | `9` | 月の境界を切るタイムゾーン（JST 既定） |
 | `force_resummarize` | - | `false` | `true` で既存月次要約も再生成 |
@@ -195,12 +200,45 @@ batch 経由で `workerName` 指定の言語別 worker に渡る）:
 |-----------|------|-----------|------|
 | `start_month` / `end_month` | - | - | 両方指定で範囲モード（包含） |
 | `last_n_months` | - | - | 直近 N ヶ月モード（先月終わり） |
+| `target_months` | - | `[]` | 対象期間の明示列挙。指定時は範囲・直近 N より優先 |
+| `stop_on_error` | - | `false` | `true` で最初の失敗で停止 |
+| `source_scope_digest` | - | 絞り込みなし範囲の digest | path 単位集約（v2）の入力範囲識別子 |
+| `generation_id` / `generation_started_at` | - | `""` | 生成世代の識別子（空なら実行時刻）。metadata に記録 |
 
 `(start_month, end_month)` と `last_n_months` の両方が省略されたときは「先月のみ」のフォールバック。両方指定されたときは `(start_month, end_month)` が勝つ。
 batch は `output_language` に応じて `memories-monthly-work-summary-single-ja` /
 `memories-monthly-work-summary-single-en` を `workerName` で呼ぶ。事前に
 `memories-import upsert-generation-workers --feature monthly-work-summary --language all`
 などで言語別 single worker を登録しておく。
+
+## パス単位集約と生成時の保護
+
+batch は各月について、まず single を `plan_only: true` で呼び、入力の週次要約メモリを
+path bucket（入力スレッドの `path:*` ラベル。0 個なら `unassigned`、複数なら `ambiguous`）に分類する。
+次に bucket ごとの path 要約
+（`monthly:v2:<user_id>:YYYY-MM:<source_scope_digest>:path:<digest>`、ラベル
+`summary_scope:path` / `source_scope:<digest>`）を書き、最後にそれらを入力とした全体要約
+（`...:overall`、ラベル `summary_scope:overall`）を書く。計画から消えた bucket の path 要約は
+メモリ行だけ削除する（スレッドは残す）。入力が 1 件だけのときは LLM を呼ばずにそのまま転記する。
+
+- `source_scope_digest` は入力ラベル範囲の識別子。既定値は絞り込みなし範囲の digest。
+  `extra_labels_match_mode`（`LABEL_ALL` / `LABEL_ANY`）で `extra_labels_filter` の照合方法を選ぶ。
+- `target_months` は対象期間を明示列挙するモードで、範囲指定・直近 N 指定より優先される。
+- LLM リクエストはまず LLM runner の `token_count` メソッドで計測し、
+  `llm_context_window_tokens` と `summary_max_completion_tokens` に収まるまで古い入力から外す。
+  正確に数えられないプロバイダ（Ollama など）は `summary_input_byte_budget` によるバイト上限に
+  フォールバックする。`llm_expected_model` を指定した場合は解決済みモデル名と一致しなければ失敗する。
+  `max_context_chars` は互換のために受け付けるだけで使われない。
+- JSON として不正、または空欄の LLM 出力は `.../invalid-output` として拒否し、最大 2 回再生成する。
+  空の要約は保存しない。
+- 再生成は source fingerprint、path 計画の fingerprint、（LLM で生成した要約では）
+  モデル契約の fingerprint（prompt・モデル・予算）のいずれかが変わったときに行う。
+- `stop_on_error: true` で最初に失敗した path / 期間で停止する。既定はベストエフォート。
+  batch 出力の `outcome` は `succeeded`、`completed_with_errors`（path が失敗したが全体要約は書けた。
+  `failed_path_buckets` を参照）、`failed` のいずれか。
+- batch 全体と期間ループには 31 日の timeout がある。結果を返さずに終わった項目
+  （timeout / 中断）は失敗として数える。個々の run/call タスクは worker が
+  `WORKFLOW_TASK_DEFAULT_TIMEOUT_SEC` を設定していればそれに従う。
 
 ## 差分実行
 
@@ -209,6 +247,7 @@ batch は `output_language` に応じて `memories-monthly-work-summary-single-j
 1. 同 (user_id, month, scope) の `external_id = "monthly:<user_id>:YYYY-MM:<scope_key>"` 集約メモリが存在
 2. その集約メモリの `updated_at` が、当月の入力週次要約群の最大 `updated_at` 以上
 3. 入力週次要約の ID・`updated_at`・各 metadata の `source_fingerprint` から作る source fingerprint が、保存済み metadata の fingerprint と一致する
+4. path 計画の fingerprint と、LLM で生成した要約ではモデル契約の fingerprint も一致する
 
 週次要約が元の時刻を保持したまま再生成された場合も、上流 fingerprint の変化により月次要約を再生成する。
 
@@ -225,6 +264,7 @@ batch は `output_language` に応じて `memories-monthly-work-summary-single-j
 - `content`: 下記 JSON 構造を `tojson` した文字列
 - `external_id`: `monthly:<user_id>:YYYY-MM:<scope_key>`
 - `metadata`: `{month, scope, extra_labels[], source_memory_count, source_snapshot_version, source_max_updated_at, source_fingerprint_algorithm, source_fingerprint, summary_version}`
+  - 上記は `v2_rollup_scope` 未指定（直接呼び出し）時の形式。batch が書く path / overall 要約は `schema_version=2` 形式で、`period_kind`・`period_key`・`rollup_scope`・`source_scope_digest`・`path_bucket_kind`・`aggregation_mode`（`llm` / `passthrough`）・`completion_status`・`source_plan_fingerprint`・`model_contract_fingerprint`・`generation_id` などを持つ
   - `source_snapshot_version=2` の fingerprint は **週次要約メモリ** の ID・`updated_at`・上流 fingerprint を含むため、時刻を変えない週次再生成も検知する
 
 ```json
@@ -266,7 +306,7 @@ batch は `output_language` に応じて `memories-monthly-work-summary-single-j
 - **下位層が空の場合**: `weekly_summary` メモリが対象月に 1 件もない場合は `skipped: true, skip_reason: "skipped: not enough source summary memories for the month"` で正常終了する。エラーではない
 - **`extra_labels_filter` を変えると別スレッドができる**。daily/weekly と同じ仕様
 - **タイムゾーンの取り扱い**。月境界は jq を評価する jobworkerp worker の `TZ` 環境変数（例 `TZ=Asia/Tokyo`）で決まり、夏時間 (DST) と負オフセットに対応する。`TZ` 未設定時のフォールバック `timezone_offset_hours` は時単位（0..23）
-- **LLM のコンテキスト長**。月 4-5 週分の週次 JSON が入る。`max_context_chars=200000` は十分
+- **LLM のコンテキスト長**。`llm_context_window_tokens` を使用モデルのコンテキスト長に合わせること（Ollama では token_count が使えないため `summary_input_byte_budget` で入力量を調整する）。
 - **cron 順序**: weekly が完了してから monthly を回すこと。例: weekly を月曜 03:30 JST、monthly を毎月 1 日 04:00 JST
 
 ## バッチ結果

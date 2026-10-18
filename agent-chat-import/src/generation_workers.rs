@@ -14,6 +14,7 @@ use std::sync::Arc;
 pub(crate) enum GenerationWorkerFeature {
     Reflection,
     ThreadSummary,
+    ThreadGroupSummary,
     ThreadPersonality,
     UserPersonalityMerge,
     DailyWorkSummary,
@@ -22,9 +23,10 @@ pub(crate) enum GenerationWorkerFeature {
 }
 
 impl GenerationWorkerFeature {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Reflection,
         Self::ThreadSummary,
+        Self::ThreadGroupSummary,
         Self::ThreadPersonality,
         Self::UserPersonalityMerge,
         Self::DailyWorkSummary,
@@ -36,13 +38,14 @@ impl GenerationWorkerFeature {
         match raw.trim() {
             "reflection" => Ok(Self::Reflection),
             "thread-summary" => Ok(Self::ThreadSummary),
+            "thread-group-summary" => Ok(Self::ThreadGroupSummary),
             "thread-personality" => Ok(Self::ThreadPersonality),
             "user-personality-merge" => Ok(Self::UserPersonalityMerge),
             "daily-work-summary" => Ok(Self::DailyWorkSummary),
             "weekly-work-summary" => Ok(Self::WeeklyWorkSummary),
             "monthly-work-summary" => Ok(Self::MonthlyWorkSummary),
             other => Err(anyhow!(
-                "unsupported generation worker feature `{other}`; supported: reflection, thread-summary, thread-personality, user-personality-merge, daily-work-summary, weekly-work-summary, monthly-work-summary"
+                "unsupported generation worker feature `{other}`; supported: reflection, thread-summary, thread-group-summary, thread-personality, user-personality-merge, daily-work-summary, weekly-work-summary, monthly-work-summary"
             )),
         }
     }
@@ -65,6 +68,15 @@ impl GenerationWorkerFeature {
                 prompts: &[
                     ("summary_system_prompt", "system_prompt"),
                     ("summary_user_tail", "user_tail"),
+                ],
+            },
+            Self::ThreadGroupSummary => FeatureSpec {
+                worker_base_name: "memories-thread-group-summary-single",
+                workflow_path: "workers/thread-group-summary/thread-group-summary-single.yaml",
+                prompt_dir: "workers/thread-group-summary/prompts",
+                prompts: &[
+                    ("thread_group_summary_system_prompt", "system_prompt"),
+                    ("thread_group_summary_user_tail", "user_tail"),
                 ],
             },
             Self::ThreadPersonality => FeatureSpec {
@@ -391,6 +403,45 @@ mod tests {
     }
 
     #[test]
+    fn builds_thread_group_summary_registration_with_prompt_context() {
+        assert_eq!(
+            parse_feature_selection("thread-group-summary").unwrap(),
+            vec![GenerationWorkerFeature::ThreadGroupSummary]
+        );
+        assert!(
+            parse_feature_selection("all")
+                .unwrap()
+                .contains(&GenerationWorkerFeature::ThreadGroupSummary)
+        );
+        let regs = build_generation_worker_registrations(
+            &resolve_repo_root(),
+            None,
+            &[GenerationWorkerFeature::ThreadGroupSummary],
+            &["ja".to_string(), "en".to_string()],
+        )
+        .unwrap();
+        let names: Vec<_> = regs.iter().map(|r| r.worker_name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "memories-thread-group-summary-single-ja",
+                "memories-thread-group-summary-single-en",
+            ]
+        );
+        for reg in regs {
+            let context = reg.settings["workflow_context"].as_str().unwrap();
+            assert!(context.contains("thread_group_summary_system_prompt"));
+            assert!(context.contains("thread_group_summary_user_tail"));
+            assert!(
+                reg.settings["workflow_data"]
+                    .as_str()
+                    .unwrap()
+                    .contains("name: thread-group-summary-single")
+            );
+        }
+    }
+
+    #[test]
     fn personality_feature_alias_expands_both_layers() {
         assert_eq!(
             parse_feature_selection("personality").unwrap(),
@@ -447,6 +498,52 @@ mod tests {
                 .unwrap()
                 .contains("user_personality_merge_user_tail")
         );
+    }
+
+    fn generation_yaml_files() -> Vec<PathBuf> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "yaml") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = resolve_repo_root();
+        let mut files = Vec::new();
+        walk(&root.join("workers"), &mut files);
+        walk(&root.join("workflows"), &mut files);
+        for feature in GenerationWorkerFeature::ALL {
+            let single = root.join(feature.spec().workflow_path);
+            assert!(files.contains(&single), "{} not scanned", single.display());
+        }
+        files
+    }
+
+    /// Generation workflows must run on a bare jobworkerp + memories setup:
+    /// they may only call the language workers registered here and must
+    /// configure every LLM call inline.
+    #[test]
+    fn generation_workflows_depend_only_on_registered_language_workers() {
+        for path in generation_yaml_files() {
+            let body = std::fs::read_to_string(&path).unwrap();
+            let name = path.display();
+            for line in body.lines().filter(|l| l.contains("workerName:")) {
+                assert!(
+                    line.contains("memories-") && line.contains("$workflow.input.output_language"),
+                    "{name} may only call the registered language workers: {line}"
+                );
+            }
+            if body.contains("using: completion") {
+                assert!(body.contains("runnerName: LLM"), "{name}");
+                assert!(
+                    body.contains("ollama:"),
+                    "{name} must configure the LLM inline"
+                );
+            }
+        }
     }
 
     #[test]

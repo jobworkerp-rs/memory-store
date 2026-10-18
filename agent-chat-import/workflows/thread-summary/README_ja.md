@@ -119,7 +119,7 @@ jobworkerp-client job enqueue-workflow \
 `agent-chat-import` クレートのバイナリ `memories-import` には、import 完了直後に本ワークフロー (batch) を jobworkerp 経由で実行する `--summarize-after-*` オプションがある。
 
 ```bash
-# 入力 JSON を用意 (user_id と updated_within_hours は memories-import 側で上書きされる)
+# 入力 JSON を用意 (user_id と last_message_after_ms は memories-import 側で上書きされる)
 cat > /tmp/summarize.json <<'EOF'
 {
   "memories_grpc_host": "localhost",
@@ -130,7 +130,7 @@ cat > /tmp/summarize.json <<'EOF'
 EOF
 
 # JOBWORKERP_ADDR (URI スキーム必須、http:// または https://) を指定する。
-# --since を指定すると updated_within_hours が自動算出される
+# --since を指定すると last_message_after_ms (epoch ms) が設定される
 JOBWORKERP_ADDR=http://localhost:9000 \
   memories-import -u 1 --all-projects \
     --since 2026-04-29T00:00:00Z \
@@ -141,13 +141,15 @@ JOBWORKERP_ADDR=http://localhost:9000 \
 上書きされるフィールド:
 
 - `user_id` — `memories-import --user-id` の値で常に上書き (テンプレ側の値は無視)
-- `updated_within_hours` — `--since` を指定したときのみ、`(now - since)` を 1 時間単位に切り上げて上書き。`--since` 未指定なら touch しない
+- `last_message_after_ms` — `--since` を指定したときのみ、その時刻 (epoch ms) で上書き。jobworkerp のキュー待ちで窓がずれないよう絶対値で渡す。`--since` 未指定なら touch しない
 
 その他のフィールド (`memories_grpc_host`/`_port`、`labels_filter` 等) は JSON の値がそのまま透過される。`user_id` はimportの`--user-id`から上書きされる。
 
 `--summarize-after-json '<JSON>'` で同等のインライン指定も可。
 
-ジョブ timeout は `--summarize-timeout-sec`(秒、デフォルト 86400 = 24h) で調整できる。jobworkerp の既定値 1200 秒は複数スレッドの LLM 要約には短いため、本オプションは workflow YAML 側の上限 24h に合わせて長めの default を採用している。
+ジョブ timeout は `--summarize-timeout-sec`(秒、デフォルト 86400 = 24h) で調整できる。jobworkerp の既定値 1200 秒は複数スレッドの LLM 要約には短いため長めの default を採用している。
+
+workflow YAML 自体には document / for / try の timeout を設定していない。ハングした LLM 呼び出しや single 呼び出しを打ち切るには、jobworkerp 側で `WORKFLOW_TASK_DEFAULT_TIMEOUT_SEC`（run/call タスクだけに適用される既定 timeout、例: `3600`）を設定する。
 
 ## 入力パラメータ
 
@@ -180,7 +182,17 @@ batch 経由で `workerName` 指定の言語別 worker に渡る）:
 | パラメータ | 必須 | デフォルト | 説明 |
 |-----------|------|-----------|------|
 | `thread_ids` | - | (全件) | 指定したスレッドIDのみ要約 |
+| `target_thread_ids` | - | (未指定) | 対象スレッドID集合（文字列）。指定時は `thread_ids` より優先され、空配列なら対象 0 件 |
 | `labels_filter` | - | (フィルタなし) | 指定ラベルを持つスレッドのみ対象 |
+| `labels_filter_match_mode` | - | `LABEL_ALL` | `labels_filter` の一致方式 (`LABEL_ALL` / `LABEL_ANY`) |
+| `last_message_within_hours` | - | (未指定) | 実行時刻から過去 N 時間以内に最終メッセージがあるスレッドのみ対象 |
+| `last_message_after_ms` | - | (未指定) | 最終メッセージ時刻の下限 (epoch ms, `>`)。`last_message_within_hours` より優先 |
+| `last_message_before_ms` | - | (未指定) | 最終メッセージ時刻の上限 (epoch ms, `<=`) |
+| `thread_created_after_ms` | - | (未指定) | スレッド作成時刻の下限 (epoch ms, `>`) |
+| `thread_created_before_ms` | - | (未指定) | スレッド作成時刻の上限 (epoch ms, `<=`) |
+
+旧入力 `updated_within_hours` / `updated_after_ms` / `updated_before_ms` は
+`last_message_within_hours` / `last_message_after_ms` / `last_message_before_ms` に改名された。
 
 batch は `output_language` に応じて `memories-thread-summary-single-ja` /
 `memories-thread-summary-single-en` を `workerName` で呼ぶ。事前に
@@ -193,7 +205,8 @@ batch は `output_language` に応じて `memories-thread-summary-single-ja` /
 
 1. `description` が設定済み
 2. 既存の要約メモリが存在する
-3. スレッドの `updated_at` が既存要約の `updated_at` 以下（更新なし）
+3. スレッドの `last_message_at` が既存要約の `updated_at` 以下（新しいメッセージなし）
+4. 要約メモリスレッドが元スレッドのラベル + `memory_thread_label_prefix` をすべて持つ
 
 上記すべてを満たす場合はスキップされるため、バッチを繰り返し実行しても処理済みスレッドは再処理されない。
 
@@ -209,7 +222,8 @@ batch は `output_language` に応じて `memories-thread-summary-single-ja` /
 
 要約は元会話と同じ`user_id`を持つ`THREAD_SUMMARY`メモリスレッドに保存される。同一ラベルのスレッドは同一メモリスレッドに集約される。
 
-- `content`: JSON構造化要約（category, title, summary, key_decisions, status）
+- `content`: JSON構造化要約（category, title, summary, key_decisions, status）。LLM 出力が JSON として解釈できない、または title / summary が空の場合は再生成し（最大 2 回）、それでも満たさなければその thread を失敗として扱い保存しない
+- `created_at` / `updated_at`: 元スレッドの `first_message_at` / `last_message_at`。スレッド自体の `created_at` / `updated_at` はサーバの監査時刻（import 時刻）なので使わない。日次要約はこの `updated_at` で対象日を決める
 - `metadata`: `{"source_thread_id": "<元スレッドID(文字列)>", "category": "...", "summary_version": "1.0"}` （`source_thread_id` はint64の精度欠落を避けるため文字列で格納）
 - `external_id`: `summary:<元スレッドID>`（逆引き・重複防止用）
 - `role`: `ROLE_ASSISTANT`
@@ -243,7 +257,7 @@ LLMが会話内容から自動判定:
 
 - 要約の分離は`THREAD_SUMMARY`種別で行う。別のthread作成者を指定するフィールドはない。
 - **ワークフローファイルのパスは絶対パスで指定すること**。jobworkerpサーバの作業ディレクトリとワークフローファイルの場所が異なるため
-- **バッチ実行は逐次処理**。ただし既存要約と `updated_at`・ラベルが一致するスレッドは一括事前判定で除外され、single worker へ投入されない。生成対象だけが逐次処理される
+- **バッチ実行は逐次処理**。ただし既存要約と `last_message_at`・ラベルが一致するスレッドは一括事前判定で除外され、single worker へ投入されない。生成対象だけが逐次処理される
 - **`max_context_chars`** はモデルのコンテキスト長に対してマージンを取った値を指定する。Qwen3.6:27b（256kトークン）ではデフォルト `200000` を推奨
 
 ## バッチ結果
@@ -252,3 +266,13 @@ LLMが会話内容から自動判定:
 `skipped` は既存要約が利用可能な正常結果であり、`succeeded_count` に含まれる。
 従って上位ワークフローは依存順序を維持したまま日次要約へ進む。
 single worker が `completed=false, skipped=false` を返した場合だけ論理失敗として扱う。
+結果を返さないまま終わった（timeout・中断）スレッドも `failed_threads` に数え、未完了の実行を
+`completed=true` として報告しない。
+
+`insufficient_message_threads` は `min_message_count` 未満のためスキップしたスレッド ID
+（`skipped_threads` の部分集合）。スレッドグループ要約
+（[`../thread-group-summary/`](../thread-group-summary/README_ja.md)）が「要約不要なほど短い」
+メンバーと「要約が欠けている」メンバーを区別するために使う。
+
+各反復は `progress_processed` / `progress_total`（処理中の番号 / 対象件数）を出力コンテキストに
+載せるため、ストリーミングで受け取る呼び出し側は `(m/N)` 形式の進捗を表示できる。

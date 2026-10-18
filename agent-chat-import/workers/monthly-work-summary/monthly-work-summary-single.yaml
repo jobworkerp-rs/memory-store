@@ -7,7 +7,7 @@ document:
 # Aggregates per-week summaries (produced by weekly-work-summary-single)
 # for one calendar month into a single "monthly work summary" memory.
 #
-# Input is the set of WEEKLY_SUMMARY memories owned by `user_id` carrying the
+# Input is the set of memories owned by `user_id` carrying the
 # `weekly_label` marker AND whose memory.updated_at falls within
 # [month_start, month_end) (1st 00:00 local — next-month-1st 00:00
 # local). Output is one memory under a monthly_summary thread keyed by
@@ -27,9 +27,7 @@ input:
       required:
         - user_id
       properties:
-        user_id:
-          type: integer
-          description: Creator of per-week summaries and monthly aggregates.
+        user_id: { type: integer }
         target_month:
           type: string
           default: ""
@@ -49,7 +47,13 @@ input:
         memories_grpc_host: { type: string, default: "localhost" }
         memories_grpc_port: { type: integer, default: 9100 }
         memories_grpc_tls: { type: boolean, default: false }
-        llm_worker_name: { type: string, default: "memories-llm" }
+        summary_model: { type: string, default: "qwen3.6:27b" }
+        ollama_base_url: { type: string, default: "http://localhost:11434" }
+        # Output language for free-text fields. The system_prompt / user_tail
+        # context are baked per-language into the registered lang-worker, so
+        # this is logging/validation metadata only — the worker name already
+        # pins the language. Kept in schema so batch-supplied input validates.
+        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
         weekly_label:
           type: string
           default: "weekly_summary"
@@ -69,6 +73,11 @@ input:
           description: >-
             Additional labels AND-matched against the per-week summary
             listing. Empty (default) = aggregate across all projects.
+        extra_labels_match_mode:
+          type: string
+          enum: ["LABEL_ALL", "LABEL_ANY"]
+          default: "LABEL_ALL"
+          description: Match mode for extra_labels_filter.
         min_thread_count:
           type: integer
           default: 1
@@ -82,10 +91,43 @@ input:
             Hard cap on combined per-week summary text. Weekly
             summaries are already ordered by updated_at desc; trailing
             entries are truncated when the cap is exceeded.
-        summary_model: { type: string, default: "qwen3.6:27b" }
-        ollama_base_url: { type: string, default: "http://localhost:11434" }
-        output_language: { type: string, enum: ["ja", "en"], default: "ja" }
         force_resummarize: { type: boolean, default: false }
+        summary_output_guidance: { type: object, default: {monthly: {item_chars: 800, total_chars: 80000}, max_purpose_groups: {monthly: 50}, max_source_memory_ids: 10} }
+        llm_context_window_tokens: { type: integer, minimum: 1024, default: 131072 }
+        llm_expected_model: { type: string, default: "" }
+        summary_max_completion_tokens: { type: integer, minimum: 1, default: 32768 }
+        summary_input_byte_budget: { type: integer, minimum: 0, default: 200000 }
+        # Common v2 batch contract; monthly path planning will materialize
+        # these identities from weekly path summaries.
+        v2_source_scope_digest: { type: string, default: "" }
+        v2_rollup_scope: { type: string, enum: ["", "overall", "path"], default: "" }
+        v2_path_bucket_digest: { type: string, default: "" }
+        v2_path_bucket_kind: { type: string, default: "" }
+        v2_path_label: { type: string, default: "" }
+        generation_id: { type: string, default: "" }
+        generation_started_at: { type: string, default: "" }
+        planned_source_memory_ids:
+          type: array
+          items: { type: string }
+          default: []
+        source_memory_kind: { type: string, default: "MEMORY_KIND_WEEKLY_SUMMARY" }
+        source_thread_labels_override:
+          type: array
+          items: { type: string }
+          default: []
+        source_thread_match_mode: { type: string, enum: ["LABEL_ALL", "LABEL_ANY"], default: "LABEL_ALL" }
+        plan_only: { type: boolean, default: false }
+        # See daily single: preserves an explicit missing-child signal when
+        # best-effort generation continues after a path fan-out failure.
+        expected_path_bucket_count: { type: integer, default: 0 }
+        planned_path_bucket_digests:
+          type: array
+          items: { type: string }
+          default: []
+        v2_failed_path_buckets:
+          type: array
+          items: { type: object }
+          default: []
 
 do:
   # Step 0: Initialize variables referenced by `output.as` so early
@@ -99,6 +141,11 @@ do:
         target_memories: "${ [] }"
         source_snapshot_json: "${ \"[]\" }"
         source_fingerprint: "${ \"\" }"
+        source_plan_fingerprint: "${ \"\" }"
+        model_contract_fingerprint: "${ \"\" }"
+        path_buckets: "${ [] }"
+        summary_max_tokens: "${ 0 }"
+        token_count_result: "${ null }"
 
   # Step 0.5: Expose the fallback fixed offset (seconds). The TZ-vs-offset
   # choice is read inline via `env.TZ` per expression (see
@@ -112,7 +159,7 @@ do:
   # minus 1 second, formatted with %Y-%m. Offset path shifts `now` by
   # tz_offset before the UTC-as-if strftime/mktime; TZ path renders the
   # local 1st via strflocaltime, converts to a DST-aware UTC epoch with
-  # the localtime offset correction, backs up one second, and reformats.
+  # candidate offset re-evaluation, backs up one second, and reformats.
   - resolveTargetMonth:
       set:
         target_month_resolved: >-
@@ -120,9 +167,16 @@ do:
              then $workflow.input.target_month
              elif (env.TZ // "") != ""
              then (((now | strflocaltime("%Y-%m-01T00:00:00"))
-                    | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $e
-                   | ($e | localtime | mktime) as $b
-                   | (($e - ($b - $e)) - 1 | strflocaltime("%Y-%m")))
+                   | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $wall_epoch
+                   | ($wall_epoch | localtime | mktime) as $first_local_epoch
+                   | ($wall_epoch - ($first_local_epoch - $wall_epoch)) as $candidate_epoch
+                   | ($wall_epoch | strftime("%Y-%m-%d")) as $target_day
+                   | if ($candidate_epoch | strflocaltime("%Y-%m-%d")) == $target_day
+                     then (($candidate_epoch - 1) | strflocaltime("%Y-%m"))
+                     else (($candidate_epoch | localtime | mktime) as $candidate_local_epoch
+                           | (($wall_epoch - ($candidate_local_epoch - $candidate_epoch)) - 1
+                              | strflocaltime("%Y-%m")))
+                     end)
              else ((((now + $tz_offset_seconds)
                      | strftime("%Y-%m-01T00:00:00Z"))
                     | strptime("%Y-%m-%dT%H:%M:%SZ")
@@ -131,16 +185,22 @@ do:
              end }
 
   # Step 2: Compute month_start_ms (1st 00:00 in local tz). Offset path
-  # subtracts tz_offset from UTC-as-if mktime; TZ path applies the
-  # localtime offset correction to the local "<month>-01 00:00".
+  # subtracts tz_offset from UTC-as-if mktime; TZ path re-evaluates the
+  # candidate offset for the local "<month>-01 00:00".
   - computeMonthStart:
       set:
         month_start_ms: >-
           ${ (if (env.TZ // "") != ""
               then (($target_month_resolved + "-01T00:00:00")
-                    | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $e
-                   | ($e | localtime | mktime) as $b
-                   | ($e - ($b - $e))
+                   | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $wall_epoch
+                   | ($wall_epoch | localtime | mktime) as $first_local_epoch
+                   | ($wall_epoch - ($first_local_epoch - $wall_epoch)) as $candidate_epoch
+                   | ($wall_epoch | strftime("%Y-%m-%d")) as $target_day
+                   | if ($candidate_epoch | strflocaltime("%Y-%m-%d")) == $target_day
+                     then $candidate_epoch
+                     else (($candidate_epoch | localtime | mktime) as $candidate_local_epoch
+                           | ($wall_epoch - ($candidate_local_epoch - $candidate_epoch)))
+                     end
               else ((($target_month_resolved + "-01T00:00:00Z")
                      | strptime("%Y-%m-%dT%H:%M:%SZ")
                      | mktime) - $tz_offset_seconds)
@@ -175,9 +235,15 @@ do:
         month_end_ms: >-
           ${ (if (env.TZ // "") != ""
               then (($next_month_token + "-01T00:00:00")
-                    | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $e
-                   | ($e | localtime | mktime) as $b
-                   | ($e - ($b - $e))
+                   | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $wall_epoch
+                   | ($wall_epoch | localtime | mktime) as $first_local_epoch
+                   | ($wall_epoch - ($first_local_epoch - $wall_epoch)) as $candidate_epoch
+                   | ($wall_epoch | strftime("%Y-%m-%d")) as $target_day
+                   | if ($candidate_epoch | strflocaltime("%Y-%m-%d")) == $target_day
+                     then $candidate_epoch
+                     else (($candidate_epoch | localtime | mktime) as $candidate_local_epoch
+                           | ($wall_epoch - ($candidate_local_epoch - $candidate_epoch)))
+                     end
               else ((($next_month_token + "-01T00:00:00Z")
                      | strptime("%Y-%m-%dT%H:%M:%SZ")
                      | mktime) - $tz_offset_seconds)
@@ -200,18 +266,76 @@ do:
              else ($workflow.input.extra_labels_filter | sort | join(","))
              end }
 
+  - resolveV2Generation:
+      set:
+        effective_generation_id: >-
+          ${ if $workflow.input.generation_id != "" then $workflow.input.generation_id else (now | strftime("%Y%m%d%H%M%S")) end }
+        effective_generation_started_at: >-
+          ${ if $workflow.input.generation_started_at != "" then $workflow.input.generation_started_at else (now | strftime("%Y-%m-%dT%H:%M:%SZ")) end }
+
+  - initV2PathBucketDigest:
+      set:
+        effective_v2_path_bucket_digest: "${ $workflow.input.v2_path_bucket_digest }"
+  - deriveV2PathBucketDigest:
+      if: "${ $workflow.input.v2_rollup_scope == \"path\" and $effective_v2_path_bucket_digest == \"\" }"
+      run:
+        function:
+          runnerName: COMMAND
+          settings: {}
+          arguments:
+            command: "/bin/sh"
+            args: ["-c", "if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi | awk '{print $1}'"]
+            stdin: >-
+              ${ if $workflow.input.v2_path_bucket_kind == "label" then ({kind:"label",label:$workflow.input.v2_path_label,version:1}|tojson)
+                 else ({kind:$workflow.input.v2_path_bucket_kind,version:1}|tojson) end }
+            treat_nonzero_as_error: true
+      export:
+        as:
+          effective_v2_path_bucket_digest: "${ .stdout | split(\" \")[0] }"
+
   # Step 3b: Compose external_id. Split from deriveScopeKey because
   # jaq evaluates `set` keys in parallel — same-block references would
   # see undefined.
   - composeMonthlyExternalId:
       set:
         monthly_external_id: >-
-          ${ "monthly:" + ($effective_user_id | tostring) + ":" + $target_month_resolved + ":" + $scope_key }
+          ${ if $workflow.input.v2_rollup_scope == "overall"
+             then "monthly:v2:" + ($effective_user_id | tostring) + ":" + $target_month_resolved + ":" + $workflow.input.v2_source_scope_digest + ":overall"
+             elif $workflow.input.v2_rollup_scope == "path"
+             then "monthly:v2:" + ($effective_user_id | tostring) + ":" + $target_month_resolved + ":" + $workflow.input.v2_source_scope_digest + ":path:" + $effective_v2_path_bucket_digest
+             else "monthly:" + ($effective_user_id | tostring) + ":" + $target_month_resolved + ":" + $scope_key
+             end }
         monthly_thread_labels: >-
-          ${ [$workflow.input.monthly_label,
-              "month:" + $target_month_resolved,
-              "scope:" + $scope_key]
-             + $sorted_extra_labels }
+          ${ if $workflow.input.v2_rollup_scope == "overall"
+             then [$workflow.input.monthly_label, "month:" + $target_month_resolved,
+                   "summary_scope:overall", "source_scope:" + $workflow.input.v2_source_scope_digest]
+             elif $workflow.input.v2_rollup_scope == "path"
+             then ([$workflow.input.monthly_label, "month:" + $target_month_resolved,
+                    "summary_scope:path", "source_scope:" + $workflow.input.v2_source_scope_digest]
+                   + (if $workflow.input.v2_path_bucket_kind == "label" then [$workflow.input.v2_path_label]
+                      else ["summary_path:" + $workflow.input.v2_path_bucket_kind] end))
+             else ([$workflow.input.monthly_label, "month:" + $target_month_resolved,
+                    "scope:" + $scope_key] + $sorted_extra_labels)
+             end }
+        monthly_identity_labels: >-
+          ${ if $workflow.input.v2_rollup_scope == "overall"
+             then [$workflow.input.monthly_label, "month:" + $target_month_resolved,
+                   "summary_scope:overall", "source_scope:" + $workflow.input.v2_source_scope_digest]
+             elif $workflow.input.v2_rollup_scope == "path"
+             then ([$workflow.input.monthly_label, "month:" + $target_month_resolved,
+                    "summary_scope:path", "source_scope:" + $workflow.input.v2_source_scope_digest]
+                   + (if $workflow.input.v2_path_bucket_kind == "label" then [$workflow.input.v2_path_label]
+                      else ["summary_path:" + $workflow.input.v2_path_bucket_kind] end))
+             else [$workflow.input.monthly_label, "month:" + $target_month_resolved, "scope:" + $scope_key]
+             end }
+
+  - resolveWeeklyThreadFilter:
+      set:
+        weekly_thread_filter_labels: >-
+          ${ if ($workflow.input.source_thread_labels_override | length) > 0 then $workflow.input.source_thread_labels_override
+             else [$workflow.input.weekly_label, "scope:" + $scope_key] end }
+        weekly_thread_filter_match_mode: >-
+          ${ if ($workflow.input.source_thread_labels_override | length) > 0 then $workflow.input.source_thread_match_mode else "LABEL_ALL" end }
 
   # Step 4: Fetch weekly summary memories in the month window.
   # Filter on memories (not threads) for the same reason as weekly:
@@ -234,7 +358,7 @@ do:
               ${ {
                 roles: ["ROLE_ASSISTANT"],
                 user_id: { value: $effective_user_id },
-                external_id_prefix: "weekly:",
+                memory_kinds: [$workflow.input.source_memory_kind],
                 # API: updated_after is strict (>), updated_before is
                 # inclusive (<=). To express the half-open interval
                 # [month_start_ms, month_end_ms): pass start-1 (>=)
@@ -244,10 +368,9 @@ do:
                 content_types: ["TEXT"],
                 thread_filter: {
                   user_id: $effective_user_id,
-                  memory_kinds: ["MEMORY_KIND_WEEKLY_SUMMARY"],
-                  labels: ([$workflow.input.weekly_label]
-                           + $sorted_extra_labels),
-                  label_match_mode: "LABEL_ALL"
+                  memory_kinds: [$workflow.input.source_memory_kind],
+                  labels: $weekly_thread_filter_labels,
+                  label_match_mode: $weekly_thread_filter_match_mode
                 }
               } | tojson }
             as_json: true
@@ -255,24 +378,84 @@ do:
         as:
           target_memories: ${ .jsonBody | fromjson }
 
-  # Step 5: Skip if too few source weekly summary memories.
-  - checkMemoryCount:
-      if: "${ ($target_memories | length) < $workflow.input.min_thread_count }"
+  - applyPlannedSourceMemories:
+      if: "${ ($workflow.input.planned_source_memory_ids | length) > 0 }"
       set:
-        skipped: true
+        target_memories: >-
+          ${ $target_memories | map(select((.memory.id.value | tostring) as $id | $workflow.input.planned_source_memory_ids | index($id))) }
+
+  - applyPlannedPathBucketDigests:
+      if: "${ $workflow.input.v2_rollup_scope == \"overall\" and ($workflow.input.planned_path_bucket_digests | length) > 0 }"
+      set:
+        target_memories: >-
+          ${ $target_memories
+             | map(select((.memory.data.externalId // "") as $external_id
+                          | $workflow.input.planned_path_bucket_digests
+                            | any(. as $digest | $external_id | endswith(":path:" + $digest)))) }
+
+  - initializePathBuckets:
+      set:
+        path_buckets: "${ [] }"
+
+  - fetchSourceThreadsForPathPlan:
+      if: "${ $workflow.input.plan_only }"
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
+            json_body: >-
+              ${ {labels:$weekly_thread_filter_labels,match_mode:$weekly_thread_filter_match_mode,user_id:$effective_user_id,memory_kinds:[$workflow.input.source_memory_kind]} | tojson }
+            as_json: true
       export:
         as:
-          result: "skipped: not enough source summary memories for the month"
+          path_plan_threads: ${ .jsonBody | fromjson }
+
+  - buildPathPlan:
+      if: "${ $workflow.input.plan_only }"
+      set:
+        path_buckets: >-
+          ${ (reduce $path_plan_threads[] as $thread ({}; .[($thread.id.value|tostring)]=($thread.data.labels//[]))) as $labels_by_thread
+             | (reduce $target_memories[] as $entry ({};
+                 ($entry.threadId.value // null) as $thread_id
+                 | if $thread_id == null or ($labels_by_thread[($thread_id|tostring)] // null) == null then .
+                   else ($labels_by_thread[($thread_id|tostring)] // []) as $labels
+                         | ($labels|map(select(startswith("path:")))|unique) as $paths
+                         | ($entry.memory.id.value|tostring) as $memory_id
+                         | (if ($labels | index("summary_path:ambiguous")) != null then "ambiguous:"
+                            elif ($labels | index("summary_path:unassigned")) != null then "unassigned:"
+                            elif ($paths|length)==0 then "unassigned:" elif ($paths|length)==1 then "label:"+$paths[0] else "ambiguous:" end) as $bucket_key
+                         | .[$bucket_key]=((.[$bucket_key]//{ids:[]})+{ids:((.[$bucket_key].ids//[])+[$memory_id])})
+                   end))
+             | to_entries | map(if (.key|startswith("label:")) then {path_bucket_kind:"label",path_label:(.key|sub("^label:";"")),source_memory_ids:.value.ids}
+                                elif (.key|startswith("ambiguous:")) then {path_bucket_kind:"ambiguous",path_label:"",source_memory_ids:.value.ids}
+                                else {path_bucket_kind:"unassigned",path_label:"",source_memory_ids:.value.ids} end) }
+  - exitAfterPathPlan:
+      if: "${ $workflow.input.plan_only }"
+      # A conditional exit needs an accompanying task for the workflow DSL.
+      set:
+        result: "${ \"path plan completed\" }"
       then: exit
 
+  # Version 2 includes each source's own fingerprint so a re-summarized
+  # lower layer changes this snapshot even when its updated_at is unchanged.
   - buildSourceSnapshot:
       set:
         source_snapshot_json: >-
-          ${ ($target_memories | map({
-                id: (.memory.id.value | tostring),
-                updated_at: .memory.data.updatedAt,
-                source_fingerprint: (((.memory.data.metadata // "{}") | fromjson | .source_fingerprint) // "")
-              }) | sort_by(.id) | tojson) }
+          ${ ($target_memories
+              | map({
+                  id: (.memory.id.value | tostring),
+                  updated_at: .memory.data.updatedAt,
+                  source_fingerprint: (((.memory.data.metadata // "{}") | fromjson | .source_fingerprint) // "")
+                })
+              | sort_by(.id)
+              | tojson) }
 
   - fingerprintSourceSnapshot:
       run:
@@ -281,12 +464,112 @@ do:
           settings: {}
           arguments:
             command: "/bin/sh"
-            args: ["-c", "if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi | awk '{print $1}'"]
+            args:
+              - "-c"
+              - "if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi | awk '{print $1}'"
             stdin: "${ $source_snapshot_json }"
             treat_nonzero_as_error: true
       export:
         as:
           source_fingerprint: "${ .stdout | split(\" \")[0] }"
+
+  - buildSourcePlanSnapshot:
+      set:
+        source_plan_snapshot_json: >-
+          ${ ({version: 1,
+               rollup_scope: $workflow.input.v2_rollup_scope,
+               entries: (if $workflow.input.v2_rollup_scope == "overall"
+                         then (($workflow.input.v2_failed_path_buckets
+                                | map(.path_bucket_digest // "")
+                                | map(select(type == "string" and length > 0)) | unique) as $failed
+                               | ($target_memories
+                                  | map((.memory.data.externalId // (.memory.id.value | tostring))
+                                        | sub("^.*:path:"; ""))) as $available
+                               | (($available
+                                   | map(. as $identity
+                                         | {identity: $identity, status: (if ($failed | index($identity)) != null then "fallback" else "available" end)}))
+                                  + ($failed | map(. as $identity
+                                                   | select(($available | index($identity)) == null)
+                                                   | {identity: $identity, status: "missing"})))
+                               | sort_by(.identity))
+                         else ($target_memories
+                               | map({identity: (.memory.id.value | tostring), status: "available"})
+                               | sort_by(.identity))
+                         end)} | tojson) }
+
+  - fingerprintSourcePlan:
+      run:
+        function:
+          runnerName: COMMAND
+          settings: {}
+          arguments:
+            command: "/bin/sh"
+            args: ["-c", "if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi | awk '{print $1}'"]
+            stdin: "${ $source_plan_snapshot_json }"
+            treat_nonzero_as_error: true
+      export:
+        as:
+          source_plan_fingerprint: "${ .stdout | split(\" \")[0] }"
+
+  - deriveSummaryTokenBudget:
+      set:
+        summary_max_tokens: "${ $workflow.input.summary_max_completion_tokens }"
+        summary_target_tokens: "${ ($workflow.input.summary_max_completion_tokens * 0.75 | floor) }"
+        summary_output_guidance: "${ $workflow.input.summary_output_guidance }"
+
+  - buildModelContractSnapshot:
+      set:
+        model_contract_snapshot_json: >-
+          ${ if ($target_memories | length) == 1 then ""
+             else ({version: 3, output_budget_policy: 1,
+                    summary_model: $workflow.input.summary_model,
+                    ollama_base_url: $workflow.input.ollama_base_url,
+                    llm_expected_model: $workflow.input.llm_expected_model,
+                    llm_context_window_tokens: $workflow.input.llm_context_window_tokens,
+                    system_prompt: ($monthly_work_summary_system_prompt // ""),
+                    user_tail: ($monthly_work_summary_user_tail // ""),
+                    temperature: 0.3,
+                    max_tokens: $summary_max_tokens,
+                    structured_output: "monthly-work-summary-v1",
+                    summary_input_byte_budget: $workflow.input.summary_input_byte_budget,
+                    context_selection_version: 1} | tojson)
+             end }
+
+  - fingerprintModelContract:
+      if: "${ $model_contract_snapshot_json != \"\" }"
+      run:
+        function:
+          runnerName: COMMAND
+          settings: {}
+          arguments:
+            command: "/bin/sh"
+            args: ["-c", "if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi | awk '{print $1}'"]
+            stdin: "${ $model_contract_snapshot_json }"
+            treat_nonzero_as_error: true
+      export:
+        as:
+          model_contract_fingerprint: "${ .stdout | split(\" \")[0] }"
+
+  - inspectInputGenerations:
+      set:
+        input_generation_ids: >-
+          ${ $target_memories
+             | map(try ((.memory.data.metadata // "{}") | fromjson | .generation_id) catch null)
+             | map(select(type == "string" and length > 0)) | unique }
+        input_without_generation_id_count: >-
+          ${ $target_memories
+             | map(try ((.memory.data.metadata // "{}") | fromjson | .generation_id) catch null)
+             | map(select((type != "string") or length == 0)) | length }
+        input_generation_consistency: >-
+          ${ ($target_memories
+              | map(try ((.memory.data.metadata // "{}") | fromjson | .generation_id) catch null)
+              | map(select(type == "string" and length > 0)) | unique) as $ids
+             | ($target_memories
+                | map(try ((.memory.data.metadata // "{}") | fromjson | .generation_id) catch null)
+                | map(select((type != "string") or length == 0)) | length) as $without
+             | if $without > 0 then "partial"
+               elif ($ids | length) == 1 and $ids[0] == $effective_generation_id then "aligned"
+               else "mixed" end }
 
   # Step 6: Build LLM input. Each MemoryListEntry carries:
   #   - memory.data.content   = weekly-summary's structured JSON string
@@ -297,16 +580,19 @@ do:
   #   - thread_id             = weekly aggregate thread id.
   - buildContext:
       set:
-        truncated_entries: >-
-          ${ ($target_memories | map(.memory.data.content // "" | length) | add // 0) as $total
-             | if $total > $workflow.input.max_context_chars
+        # Exact-capable workers must see every candidate first. The bounded
+        # list is retained solely for providers that explicitly cannot count.
+        truncated_entries: "${ $target_memories }"
+        fallback_byte_budget_entries: >-
+          ${ ($target_memories | map(. as $e | ("---\nmemory_id: " + ($e.memory.id.value // "") + "\nthread_id: " + ($e.threadId.value // "") + "\nthread_description: " + ($e.threadDescription // "") + "\nmemory_updated_at: " + (($e.memory.data.updatedAt // "") | tostring) + "\nsummary_json: " + ($e.memory.data.content // "") + "\n") | utf8bytelength) | add // 0) as $total
+             | if $total > $workflow.input.summary_input_byte_budget
                then
                  ($target_memories | reduce .[] as $e (
                     {acc: [], used: 0};
-                    if .used + ($e.memory.data.content // "" | length)
-                       <= $workflow.input.max_context_chars
+                    if .used + (("---\nmemory_id: " + ($e.memory.id.value // "") + "\nthread_id: " + ($e.threadId.value // "") + "\nthread_description: " + ($e.threadDescription // "") + "\nmemory_updated_at: " + (($e.memory.data.updatedAt // "") | tostring) + "\nsummary_json: " + ($e.memory.data.content // "") + "\n") | utf8bytelength)
+                       <= $workflow.input.summary_input_byte_budget
                     then {acc: (.acc + [$e]),
-                          used: (.used + ($e.memory.data.content // "" | length))}
+                          used: (.used + (("---\nmemory_id: " + ($e.memory.id.value // "") + "\nthread_id: " + ($e.threadId.value // "") + "\nthread_description: " + ($e.threadDescription // "") + "\nmemory_updated_at: " + (($e.memory.data.updatedAt // "") | tostring) + "\nsummary_json: " + ($e.memory.data.content // "") + "\n") | utf8bytelength))}
                     else .
                     end
                   )).acc
@@ -329,9 +615,7 @@ do:
             method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
             json_body: >-
               ${ {
-                labels: [$workflow.input.monthly_label,
-                         "month:" + $target_month_resolved,
-                         "scope:" + $scope_key],
+                labels: $monthly_identity_labels,
                 match_mode: "LABEL_ALL",
                 user_id: $effective_user_id,
                 memory_kinds: ["MEMORY_KIND_MONTHLY_SUMMARY"],
@@ -352,7 +636,8 @@ do:
       set:
         existing_monthly_memory: "${ null }"
 
-  # Step 9: Look up the existing monthly memory inside that thread.
+  # Step 9: Look up the existing monthly memory inside that thread,
+  # keyed by external_id = "monthly:<user_id>:<YYYY-MM>:<scope_key>".
   - findExistingMonthlyMemory:
       if: "${ $existing_monthly_thread_id != null }"
       run:
@@ -378,7 +663,32 @@ do:
           existing_monthly_memory: >-
             ${ ((.jsonBody // "[]") | fromjson)
                | map(select(.data.externalId == $monthly_external_id))
-               | if length > 0 then .[0] else null end }
+               | (if length > 0 then .[0] else null end) }
+
+  - deleteEmptyV2MonthlySummary:
+      if: "${ ($target_memories | length) < $workflow.input.min_thread_count and $workflow.input.v2_rollup_scope != \"\" and $existing_monthly_memory != null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: unary
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.MemoryService/Delete"
+            json_body: "${ $existing_monthly_memory.id | tojson }"
+            as_json: true
+
+  - checkMemoryCount:
+      if: "${ ($target_memories | length) < $workflow.input.min_thread_count }"
+      set:
+        skipped: true
+      export:
+        as:
+          result: "skipped: not enough source weekly summary memories for the month"
+      then: exit
 
   # Step 10: Eligibility — skip when an up-to-date monthly summary
   # already exists. Split into two setTasks because jaq's `set`
@@ -395,7 +705,13 @@ do:
           ${ $workflow.input.force_resummarize
              or ($existing_monthly_memory == null)
              or ($existing_monthly_memory.data.updatedAt < $max_source_updated_at)
-             or ((($existing_monthly_memory.data.metadata // "{}") | fromjson | .source_fingerprint // "") != $source_fingerprint) }
+             or ((($existing_monthly_memory.data.metadata // "{}") | fromjson
+                  | .source_fingerprint // "") != $source_fingerprint)
+             or ((($existing_monthly_memory.data.metadata // "{}") | fromjson
+                  | .source_plan_fingerprint // "") != $source_plan_fingerprint)
+             or ((($target_memories | length) != 1)
+                 and (((($existing_monthly_memory.data.metadata // "{}") | fromjson
+                        | .model_contract_fingerprint) // "") != $model_contract_fingerprint)) }
 
   - skipIfNotEligible:
       if: "${ $eligible | not }"
@@ -409,8 +725,15 @@ do:
   # Step 11: Generate the monthly aggregate via LLM. The system prompt
   # adds month-level highlights and milestones on top of weekly trend
   # detection, which is the value-add of this layer.
+  #
+  # Fail closed if the language-specific prompt context was not baked into
+  # the worker (registration mistake). Running the LLM with an empty
+  # system_prompt / user_tail would silently produce off-language or
+  # malformed output, so reject instead. `$monthly_work_summary_system_prompt`
+  # and `$monthly_work_summary_user_tail` come from the worker's
+  # `workflow_context`.
   - validateMonthlyWorkSummaryPromptContext:
-      if: "${ (($monthly_work_summary_system_prompt // \"\") | length) == 0 or (($monthly_work_summary_user_tail // \"\") | length) == 0 }"
+      if: "${ ($target_memories | length) != 1 and (((($monthly_work_summary_system_prompt // \"\") | length) == 0) or ((($monthly_work_summary_user_tail // \"\") | length) == 0)) }"
       raise:
         error:
           type: "https://memories.local/errors/monthly-work-summary/prompt_context_missing"
@@ -422,102 +745,258 @@ do:
                else "monthly_work_summary_user_tail is missing"
                end }
 
-  - generateMonthlySummary:
-      run:
-        function:
-          runnerName: LLM
-          using: completion
-          settings:
-            ollama:
-              base_url: "${$workflow.input.ollama_base_url}"
-              model: "${$workflow.input.summary_model}"
-          options:
-            channel: llm
-            storeSuccess: false
-            storeFailure: true
-          arguments:
-            system_prompt: "${ $monthly_work_summary_system_prompt }"
-            prompt: >-
-              $${## Target month
-              {{ target_month_resolved }}
+  - initializePassthroughSummary:
+      if: "${ ($target_memories | length) == 1 }"
+      set:
+        summary_json: "${ $target_memories[0].memory.data.content | fromjson }"
 
-              ## Monthly weekly summaries ({{ truncated_entries | size }} entries / {{ target_memories | size }} source entries)
+  # Count the complete candidate set first, then remove the oldest entries
+  # only until an exact rendered request fits.
+  - initializeMonthlyEffectiveContextWindow:
+      set:
+        effective_context_window_tokens: "${ $workflow.input.llm_context_window_tokens }"
 
-              {% for e in truncated_entries %}
-              ---
-              memory_id: {{ e.memory.id.value }}
-              thread_id: {{ e.threadId.value }}
-              thread_description: {{ e.threadDescription }}
-              memory_updated_at: {{ e.memory.data.updatedAt }}
-              summary_json: {{ e.memory.data.content }}
-              {% endfor %}
+  - fitMonthlyInputToExactBudget:
+      for:
+        each: exact_budget_attempt
+        in: "${ [range(0; ($truncated_entries | length))] }"
+      do:
+        - countMonthlySummaryInput:
+              if: >-
+                ${ ($target_memories | length) != 1 and
+                   (($token_count_result == null)
+                    or ((($token_count_result.renderedRequestSuccess // null) != null)
+                        and ((($token_count_result.renderedRequestSuccess.renderedInputTokens | tonumber) + $summary_max_tokens + 512) > $effective_context_window_tokens))) }
+              run:
+                function:
+                  runnerName: LLM
+                  using: token_count
+                  settings:
+                    ollama:
+                      base_url: "${$workflow.input.ollama_base_url}"
+                      model: "${$workflow.input.summary_model}"
+                  options:
+                    channel: llm
+                    storeSuccess: false
+                    storeFailure: true
+                  arguments:
+                    completion:
+                      system_prompt: "${ $monthly_work_summary_system_prompt }"
+                      prompt: >-
+                        $${## Target month
+                        {{ target_month_resolved }}
 
-              {{ monthly_work_summary_user_tail }}}
-            options:
-              max_tokens: 8000
-              temperature: 0.3
-            json_schema: |
-              {
-                "type": "object",
-                "required": ["overall_purpose", "purpose_groups", "by_topic", "highlights", "milestones", "carryover"],
-                "properties": {
-                  "overall_purpose": { "type": "string" },
-                  "purpose_groups": {
-                    "type": "array",
-                    "items": {
+                        ## Monthly weekly summaries ({{ truncated_entries | size }} entries / {{ target_memories | size }} source entries)
+
+                        {% for e in truncated_entries %}
+                        ---
+                        memory_id: {{ e.memory.id.value }}
+                        thread_id: {{ e.threadId.value }}
+                        thread_description: {{ e.threadDescription }}
+                        memory_updated_at: {{ e.memory.data.updatedAt }}
+                        summary_json: {{ e.memory.data.content }}
+                        {% endfor %}
+
+                        ## Output size guidance
+                        Aim for at most {{ summary_target_tokens }} output tokens for the complete JSON, including text, source IDs, and structure. The generation allowance is {{ summary_max_tokens }} tokens; leave room to finish the JSON. This token target takes priority over the character guides below: shorten text and use fewer representative source IDs as needed.
+                        This is a writing target, not permission to truncate JSON. Keep each free-text item near {{ summary_output_guidance.monthly.item_chars }} characters and the whole summary near {{ summary_output_guidance.monthly.total_chars }} characters. Use at most {{ summary_output_guidance.max_purpose_groups.monthly }} purpose groups and at most {{ summary_output_guidance.max_source_memory_ids }} source memory IDs per item. Return one complete JSON object.
+
+                        {{ monthly_work_summary_user_tail }}}
+                      options: { max_tokens: "${ $summary_max_tokens }", temperature: 0.3 }
+                      json_schema: |
+                        {"type":"object","required":["overall_purpose","purpose_groups","by_topic","highlights","milestones","carryover"],"properties":{"overall_purpose":{"type":"string"},"purpose_groups":{"type":"array","items":{"type":"object","required":["purpose","bullets","source_memory_ids","status"],"properties":{"purpose":{"type":"string"},"bullets":{"type":"array","items":{"type":"string"}},"source_memory_ids":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["resolved","ongoing","in_review","blocked","deferred","abandoned"]}}}},"by_topic":{"type":"array","items":{"type":"object","required":["topic","bullets"],"properties":{"topic":{"type":"string"},"bullets":{"type":"array","items":{"type":"string"}}}}},"highlights":{"type":"array","maxItems":5,"items":{"type":"object","required":["title","summary"],"properties":{"title":{"type":"string"},"summary":{"type":"string"},"source_memory_ids":{"type":"array","items":{"type":"string"}}}}},"milestones":{"type":"array","items":{"type":"object","required":["title","outcome"],"properties":{"title":{"type":"string"},"outcome":{"type":"string"},"completed_in_week":{"type":"string"},"source_memory_ids":{"type":"array","items":{"type":"string"}}}}},"carryover":{"type":"array","items":{"type":"string"}}}}
+              export:
+                as:
+                  token_count_result: "${ . }"
+        - captureMonthlyEffectiveContextWindow:
+              if: "${ ($token_count_result.renderedRequestSuccess // null) != null }"
+              set:
+                effective_context_window_tokens: >-
+                  ${ [$workflow.input.llm_context_window_tokens,
+                      (($token_count_result.renderedRequestSuccess.contextWindowTokens // $workflow.input.llm_context_window_tokens) | tonumber)] | min }
+        - discardOldestMonthlyEntryAfterExactOverflow:
+              if: >-
+                ${ (($token_count_result.renderedRequestSuccess // null) != null)
+                   and ((($token_count_result.renderedRequestSuccess.renderedInputTokens | tonumber) + $summary_max_tokens + 512) > $effective_context_window_tokens)
+                   and (($truncated_entries | length) > 1) }
+              set:
+                truncated_entries: "${ $truncated_entries[0:-1] }"
+
+  - fallbackToMonthlyByteBudget:
+      if: >-
+        ${ (($token_count_result.error.code // "") == "TOKEN_COUNT_EXACT_UNAVAILABLE")
+           or (($token_count_result.error.code // "") == "PROVIDER_CAPABILITY_UNAVAILABLE") }
+      set:
+        truncated_entries: "${ $fallback_byte_budget_entries }"
+
+  - rejectEmptyMonthlyFallbackContext:
+      if: "${ ($target_memories | length) != 1 and ($target_memories | length) >= $workflow.input.min_thread_count and ($truncated_entries | length) == 0 }"
+      raise:
+        error:
+          type: "https://memories.local/errors/monthly-work-summary/input-budget"
+          status: 422
+          title: "Monthly summary source input does not fit the model context"
+          detail: "No complete source summary fits the conservative fallback input budget."
+
+  - validateMonthlyExactBudget:
+      if: >-
+        ${ ($target_memories | length) != 1 and
+           (((($token_count_result.renderedRequestSuccess // null) == null)
+             and ((($token_count_result.error.code // "") != "TOKEN_COUNT_EXACT_UNAVAILABLE")
+                  and (($token_count_result.error.code // "") != "PROVIDER_CAPABILITY_UNAVAILABLE")))
+            or ((($token_count_result.renderedRequestSuccess // null) != null)
+                and (($workflow.input.llm_expected_model != "") and ($token_count_result.renderedRequestSuccess.resolvedModel != $workflow.input.llm_expected_model)))
+            or ((($token_count_result.renderedRequestSuccess // null) != null)
+                and ((($token_count_result.renderedRequestSuccess.renderedInputTokens | tonumber) + $summary_max_tokens + 512) > $effective_context_window_tokens))) }
+      raise:
+        error:
+          type: "https://memories.local/errors/monthly-work-summary/token-budget"
+          status: 422
+          title: "Monthly summary does not fit the model context"
+          detail: "The resolved model changed, the rendered request exceeds its context budget, or token counting failed for a reason other than an unavailable provider capability."
+
+  - generateMonthlySummaryWithRetry:
+      if: "${ ($target_memories | length) != 1 }"
+      try:
+        - generateMonthlySummary:
+            run:
+              function:
+                runnerName: LLM
+                using: completion
+                settings:
+                  ollama:
+                    base_url: "${$workflow.input.ollama_base_url}"
+                    model: "${$workflow.input.summary_model}"
+                options:
+                  channel: llm
+                  storeSuccess: false
+                  storeFailure: true
+                arguments:
+                  system_prompt: "${ $monthly_work_summary_system_prompt }"
+                  prompt: >-
+                    $${## Target month
+                    {{ target_month_resolved }}
+
+                    ## Monthly weekly summaries ({{ truncated_entries | size }} entries / {{ target_memories | size }} source entries)
+
+                    {% for e in truncated_entries %}
+                    ---
+                    memory_id: {{ e.memory.id.value }}
+                    thread_id: {{ e.threadId.value }}
+                    thread_description: {{ e.threadDescription }}
+                    memory_updated_at: {{ e.memory.data.updatedAt }}
+                    summary_json: {{ e.memory.data.content }}
+                    {% endfor %}
+
+                    ## Output size guidance
+                    Aim for at most {{ summary_target_tokens }} output tokens for the complete JSON, including text, source IDs, and structure. The generation allowance is {{ summary_max_tokens }} tokens; leave room to finish the JSON. This token target takes priority over the character guides below: shorten text and use fewer representative source IDs as needed.
+                    This is a writing target, not permission to truncate JSON. Keep each free-text item near {{ summary_output_guidance.monthly.item_chars }} characters and the whole summary near {{ summary_output_guidance.monthly.total_chars }} characters. Use at most {{ summary_output_guidance.max_purpose_groups.monthly }} purpose groups and at most {{ summary_output_guidance.max_source_memory_ids }} source memory IDs per item. Return one complete JSON object.
+
+                    {{ monthly_work_summary_user_tail }}}
+                  options:
+                    max_tokens: "${ $summary_max_tokens }"
+                    temperature: 0.3
+                    # Thinking inside schema-constrained output can collapse to blank JSON.
+                    extract_reasoning_content: false
+                  json_schema: |
+                    {
                       "type": "object",
-                      "required": ["purpose", "bullets", "source_memory_ids", "status"],
+                      "required": ["overall_purpose", "purpose_groups", "by_topic", "highlights", "milestones", "carryover"],
                       "properties": {
-                        "purpose": { "type": "string" },
-                        "bullets": { "type": "array", "items": { "type": "string" } },
-                        "source_memory_ids": { "type": "array", "items": { "type": "string" } },
-                        "status": { "type": "string", "enum": ["resolved", "ongoing", "in_review", "blocked", "deferred", "abandoned"] }
+                        "overall_purpose": { "type": "string" },
+                        "purpose_groups": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "required": ["purpose", "bullets", "source_memory_ids", "status"],
+                            "properties": {
+                              "purpose": { "type": "string" },
+                              "bullets": { "type": "array", "items": { "type": "string" } },
+                              "source_memory_ids": { "type": "array", "items": { "type": "string" } },
+                              "status": { "type": "string", "enum": ["resolved", "ongoing", "in_review", "blocked", "deferred", "abandoned"] }
+                            }
+                          }
+                        },
+                        "by_topic": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "required": ["topic", "bullets"],
+                            "properties": {
+                              "topic": { "type": "string" },
+                              "bullets": { "type": "array", "items": { "type": "string" } }
+                            }
+                          }
+                        },
+                        "highlights": {
+                          "type": "array",
+                          "maxItems": 5,
+                          "items": {
+                            "type": "object",
+                            "required": ["title", "summary"],
+                            "properties": {
+                              "title": { "type": "string" },
+                              "summary": { "type": "string" },
+                              "source_memory_ids": { "type": "array", "items": { "type": "string" } }
+                            }
+                          }
+                        },
+                        "milestones": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "required": ["title", "outcome"],
+                            "properties": {
+                              "title": { "type": "string" },
+                              "outcome": { "type": "string" },
+                              "completed_in_week": { "type": "string" },
+                              "source_memory_ids": { "type": "array", "items": { "type": "string" } }
+                            }
+                          }
+                        },
+                        "carryover": { "type": "array", "items": { "type": "string" } }
                       }
                     }
-                  },
-                  "by_topic": {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "required": ["topic", "bullets"],
-                      "properties": {
-                        "topic": { "type": "string" },
-                        "bullets": { "type": "array", "items": { "type": "string" } }
-                      }
-                    }
-                  },
-                  "highlights": {
-                    "type": "array",
-                    "maxItems": 5,
-                    "items": {
-                      "type": "object",
-                      "required": ["title", "summary"],
-                      "properties": {
-                        "title": { "type": "string" },
-                        "summary": { "type": "string" },
-                        "source_memory_ids": { "type": "array", "items": { "type": "string" } }
-                      }
-                    }
-                  },
-                  "milestones": {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "required": ["title", "outcome"],
-                      "properties": {
-                        "title": { "type": "string" },
-                        "outcome": { "type": "string" },
-                        "completed_in_week": { "type": "string" },
-                        "source_memory_ids": { "type": "array", "items": { "type": "string" } }
-                      }
-                    }
-                  },
-                  "carryover": { "type": "array", "items": { "type": "string" } }
-                }
-              }
-      export:
-        as:
-          summary_json: ${ .content.text | fromjson }
+            export:
+              as:
+                summary_json: >-
+                  ${ try (.content.text | fromjson) catch null }
+        - validateMonthlySummaryShape:
+            if: >-
+              ${ (($summary_json | type) != "object")
+                 or (($summary_json.overall_purpose | type) != "string")
+                 or (($summary_json.purpose_groups | type) != "array")
+                 or (($summary_json.by_topic | type) != "array")
+                 or (($summary_json.highlights | type) != "array")
+                 or (($summary_json.milestones | type) != "array")
+                 or (($summary_json.carryover | type) != "array")
+                 or (($summary_json.overall_purpose | gsub("\\s"; "")) == "")
+                 or (($summary_json.purpose_groups | length) == 0)
+                 or ($summary_json.purpose_groups | any(((.purpose? // "") | tostring | gsub("\\s"; "")) == "")) }
+            raise:
+              error:
+                type: "https://memories.local/errors/monthly-work-summary/invalid-output"
+                status: 422
+                title: "Monthly summary output does not match its contract"
+                detail: "The LLM returned malformed, incomplete, or blank JSON."
+      # Blank or malformed LLM output is usually transient; retry only that.
+      catch:
+        errors:
+          with:
+            type: "https://memories.local/errors/monthly-work-summary/invalid-output"
+        retry:
+          limit:
+            attempt:
+              count: 2
+        do:
+          # Retries are exhausted: fail instead of persisting the output.
+          - rejectMonthlySummaryOutput:
+              raise:
+                error:
+                  type: "https://memories.local/errors/monthly-work-summary/invalid-output"
+                  status: 422
+                  title: "Monthly summary output does not match its contract"
+                  detail: "The LLM returned malformed, incomplete, or blank JSON."
 
   # Step 11.5: Default for created_monthly_thread_id.
   - initCreatedMonthlyThreadId:
@@ -541,13 +1020,13 @@ do:
             json_body: >-
               ${ {
                 user_id: { value: $effective_user_id },
-                memory_kind: "MEMORY_KIND_MONTHLY_SUMMARY",
                 description: ($target_month_resolved + " の作業要約 ("
                               + ($target_memories | length | tostring)
                               + " 週次)"),
                 labels: $monthly_thread_labels,
                 created_at: $month_start_ms,
-                updated_at: $max_source_updated_at
+                updated_at: $max_source_updated_at,
+                memory_kind: "MEMORY_KIND_MONTHLY_SUMMARY"
               } | tojson }
             as_json: true
       export:
@@ -558,7 +1037,8 @@ do:
       set:
         monthly_thread_id: "${ $existing_monthly_thread_id // $created_monthly_thread_id }"
         monthly_metadata_json: >-
-          ${ {
+          ${ (if $workflow.input.v2_rollup_scope == ""
+              then {
               month: $target_month_resolved,
               scope: $scope_key,
               extra_labels: $sorted_extra_labels,
@@ -568,7 +1048,51 @@ do:
               source_fingerprint_algorithm: "sha256",
               source_fingerprint: $source_fingerprint,
               summary_version: "1.0"
-            } | tojson }
+              }
+              else {
+                schema_version: 2,
+                period_kind: "monthly",
+                period_key: $target_month_resolved,
+                rollup_scope: $workflow.input.v2_rollup_scope,
+                source_scope_digest: $workflow.input.v2_source_scope_digest,
+                source_scope_match_mode: ($workflow.input.extra_labels_match_mode // "LABEL_ALL"),
+                source_scope_labels: $sorted_extra_labels,
+                path_bucket_kind: (if $workflow.input.v2_rollup_scope == "path" then $workflow.input.v2_path_bucket_kind else null end),
+                path_label: (if $workflow.input.v2_rollup_scope == "path" and $workflow.input.v2_path_bucket_kind == "label" then $workflow.input.v2_path_label else null end),
+                aggregation_mode: (if ($target_memories | length) == 1 then "passthrough" else "llm" end),
+                completion_status: (if $workflow.input.v2_rollup_scope == "overall" and ((($target_memories | length) < $workflow.input.expected_path_bucket_count) or (($workflow.input.v2_failed_path_buckets | length) > 0)) then "incomplete" else "complete" end),
+                source_collection_state: (if $workflow.input.v2_rollup_scope == "overall" and ((($target_memories | length) < $workflow.input.expected_path_bucket_count) or (($workflow.input.v2_failed_path_buckets | length) > 0)) then "incomplete" else "complete" end),
+                planned_source_count: (if $workflow.input.v2_rollup_scope == "overall" and $workflow.input.expected_path_bucket_count > 0 then $workflow.input.expected_path_bucket_count else ($target_memories | length) end),
+                missing_path_bucket_count: (if $workflow.input.v2_rollup_scope == "overall" then [$workflow.input.expected_path_bucket_count - ($target_memories | length), 0] | max else 0 end),
+                passthrough_source_memory_id: (if ($target_memories | length) == 1 then ($target_memories[0].memory.id.value | tostring) else null end),
+                source_memory_count: ($target_memories | length),
+                source_snapshot_version: 2,
+                source_max_updated_at: $max_source_updated_at,
+                source_fingerprint_algorithm: "sha256",
+                source_fingerprint: $source_fingerprint,
+                source_plan_fingerprint: $source_plan_fingerprint,
+                model_contract_fingerprint: (if ($target_memories | length) == 1 then null else $model_contract_fingerprint end),
+                context_truncated: (($truncated_entries | length) < ($target_memories | length)),
+                included_source_count: ($truncated_entries | length),
+                omitted_source_count: (($target_memories | length) - ($truncated_entries | length)),
+                included_context_chars: ($truncated_entries | map(.memory.data.content // "" | length) | add // 0),
+                omitted_context_chars: (($target_memories | map(.memory.data.content // "" | length) | add // 0) - ($truncated_entries | map(.memory.data.content // "" | length) | add // 0)),
+                omitted_source_memory_ids: ($target_memories | map(select((.memory.id.value | tostring) as $id | ($truncated_entries | map(.memory.id.value | tostring) | index($id)) == null) | (.memory.id.value | tostring)) | .[0:1024]),
+                omitted_source_ids_truncated: ((($target_memories | length) - ($truncated_entries | length)) > 1024),
+                generation_id: $effective_generation_id,
+                generation_started_at: $effective_generation_started_at,
+                input_generation_ids: $input_generation_ids,
+                input_without_generation_id_count: $input_without_generation_id_count,
+                generation_consistency: (if (($truncated_entries | length) < ($target_memories | length)) or ($workflow.input.v2_rollup_scope == "overall" and (($workflow.input.v2_failed_path_buckets | length) > 0)) then "partial" else $input_generation_consistency end)
+                ,failed_path_bucket_digests: (if $workflow.input.v2_rollup_scope == "overall" then ($workflow.input.v2_failed_path_buckets | map(.path_bucket_digest) | map(select(type == "string" and length > 0)) | unique) else [] end)
+                ,fallback_path_bucket_digests: (if $workflow.input.v2_rollup_scope == "overall" then (($workflow.input.v2_failed_path_buckets | map(.path_bucket_digest) | map(select(type == "string" and length > 0))) as $failed | $target_memories | map(.memory.data.externalId // "") | map(select(. as $id | $failed | any(. as $digest | $id | endswith(":path:" + $digest)))) | map(sub("^.*:path:"; "")) | unique) else [] end)
+                ,missing_path_bucket_digests: (if $workflow.input.v2_rollup_scope == "overall" then (($workflow.input.v2_failed_path_buckets | map(.path_bucket_digest) | map(select(type == "string" and length > 0))) as $failed | ($target_memories | map(.memory.data.externalId // "") | map(sub("^.*:path:"; ""))) as $available | $failed | map(select(. as $digest | ($available | index($digest)) == null)) | unique) else [] end)
+                ,path_bucket_diagnostics: (if $workflow.input.v2_rollup_scope == "overall" then (($workflow.input.v2_failed_path_buckets | map(select((.path_bucket_digest // "") | (type == "string" and length > 0)))) as $failed | ($target_memories | map(.memory.data.externalId // "") | map(sub("^.*:path:"; ""))) as $available | $failed | sort_by(.path_bucket_digest) | group_by(.path_bucket_digest) | map(.[0] as $bucket | {path_bucket_digest: $bucket.path_bucket_digest, statuses: (["failed"] + (if ($available | index($bucket.path_bucket_digest)) != null then ["fallback"] else ["missing"] end)), path_bucket_kind: $bucket.path_bucket_kind, path_label: (if $bucket.path_bucket_kind == "label" then $bucket.path_label else null end)})) else [] end)
+                ,last_material_attempt_generation_id: $effective_generation_id
+                ,last_material_attempt_started_at: $effective_generation_started_at
+                ,last_material_attempt_status: "succeeded"
+              }
+              end) | tojson }
 
   # Step 13-a: Update existing monthly memory in place (preserves
   # external_id UNIQUE invariant on re-summarize).
@@ -615,14 +1139,14 @@ do:
                 thread_id: { value: $monthly_thread_id },
                 memory: {
                   user_id: { value: $effective_user_id },
-                  memory_kind: "MEMORY_KIND_MONTHLY_SUMMARY",
                   content: ($summary_json | tojson),
                   content_type: "TEXT",
                   role: "ROLE_ASSISTANT",
                   metadata: $monthly_metadata_json,
                   external_id: $monthly_external_id,
                   created_at: $month_start_ms,
-                  updated_at: $max_source_updated_at
+                  updated_at: $max_source_updated_at,
+                  memory_kind: "MEMORY_KIND_MONTHLY_SUMMARY"
                 }
               } | tojson }
             as_json: true
@@ -639,10 +1163,10 @@ do:
              then $existing_monthly_thread_data
              else {
                user_id: { value: $effective_user_id },
-               memory_kind: "MEMORY_KIND_MONTHLY_SUMMARY",
                labels: $monthly_thread_labels,
                created_at: $month_start_ms,
-               updated_at: $max_source_updated_at
+               updated_at: $max_source_updated_at,
+               memory_kind: "MEMORY_KIND_MONTHLY_SUMMARY"
              }
              end }
 
@@ -663,7 +1187,7 @@ do:
                 id: { value: $monthly_thread_id },
                 data: ($monthly_thread_data
                   | .description = ($target_month_resolved
-                                    + " — " + $summary_json.overall_purpose)
+                                    + " — " + ($summary_json.overall_purpose // $summary_json.title // "要約"))
                   | .updatedAt = $max_source_updated_at)
               } | tojson }
             as_json: true
@@ -683,3 +1207,4 @@ output:
       ${ if $summary_json != null then ($summary_json.milestones | length) else 0 end }
     skipped: ${ $skipped // false }
     skip_reason: ${ if ($skipped // false) then $result else null end }
+    path_buckets: ${ $path_buckets }

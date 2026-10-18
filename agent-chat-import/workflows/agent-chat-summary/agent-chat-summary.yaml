@@ -6,10 +6,11 @@ document:
 
 # Summary stage extracted from the monolithic agent-chat-pipeline.
 #
-# Runs thread-summary, then OPTIONALLY daily-work-summary, then
+# Runs thread-summary, then OPTIONALLY thread-group-summary, then
+# OPTIONALLY daily-work-summary, then
 # OPTIONALLY reflection (= summaryBranch) while optionally fanning
 # out personality extraction (= personalityBranch) on the same
-# updated_after_ms window.
+# last_message_after_ms window.
 #
 # Breaking change vs. 1.x: daily-work-summary is now opt-in
 # (same idiom as personality/reflection). Pass `daily_work_summary_batch_yaml`
@@ -23,11 +24,12 @@ document:
 # scripts can pass the same values they passed to memories-import.
 #
 # Failure semantics:
-#   summaryBranch (致命):  runner-level threadSummaryBatch or
-#                          dailyWorkSummary failure, an all-failed daily
+#   summaryBranch (致命):  runner-level threadSummaryBatch,
+#                          threadGroupSummaryBatch or dailyWorkSummary
+#                          failure, an all-failed daily
 #                          batch, or reflectionStage failure → branch
 #                          fails → fork fails → workflow fails. Item-level
-#                          thread/daily batch failures are reported as
+#                          thread/group/daily batch failures are reported as
 #                          `outcome: partial` after dependent stages run.
 #   personalityBranch:     branch-level try/catch keeps the failure
 #                          non-fatal (personality is supplementary).
@@ -77,12 +79,6 @@ input:
             Pass "true" / "false" to override when the URL scheme does
             not match the transport (e.g. plaintext gRPC behind an
             HTTPS-terminating proxy).
-        llm_worker_name:
-          type: string
-          default: "memories-llm"
-          description: >-
-            Named LLM worker forwarded to all downstream child
-            workflows.
         # ---- date window (supplied by caller; agent-chat-import emits
         #      these on completion) -------------------------------------
         since_date:
@@ -95,13 +91,13 @@ input:
           type: integer
           description: >-
             since_date 00:00 in tz, expressed in epoch ms. Used as the
-            lower bound of `updated_after_ms` for thread-summary-batch
+            lower bound of `last_message_after_ms` for thread-summary-batch
             and thread-reflection-batch.
         since_ms_utc:
           type: integer
           description: >-
             UTC `--since` cutoff in epoch ms. 0 = day_start fallback.
-            `updated_after_ms` becomes max(since_ms_utc, range_start_ms) - 1.
+            `last_message_after_ms` becomes max(since_ms_utc, range_start_ms) - 1.
         timezone_offset_hours:
           type: integer
           minimum: 0
@@ -116,6 +112,19 @@ input:
         thread_summary_batch_yaml:
           type: string
           description: Absolute path / URL of thread-summary-batch.yaml.
+        thread_group_summary_batch_yaml:
+          type: string
+          default: ""
+          description: >-
+            Absolute path / URL of thread-group-summary-batch.yaml.
+            Empty (default) skips the ThreadGroup summary stage.
+        thread_group_summary_channel:
+          type: string
+          default: "thread_group_summary"
+          description: >-
+            Channel for the ThreadGroup batch. It must differ from
+            `llm_batch`, where the batch's nested thread-summary batch runs,
+            so the parent never holds the slot its child needs.
         daily_work_summary_batch_yaml:
           type: string
           default: ""
@@ -192,7 +201,7 @@ input:
         # ---- reflection stage (opt-in) ------------------------------------
         # Set `thread_reflection_batch_yaml` to enable the reflection
         # stage at the end of summaryBranch. Reflection runs over the
-        # same updated_after_ms window as thread-summary; if you need
+        # same last_message_after_ms window as thread-summary; if you need
         # label/thread-id scoping, invoke thread-reflection-batch.yaml
         # directly instead.
         thread_reflection_batch_yaml:
@@ -270,6 +279,9 @@ do:
       set:
         thread_summary_succeeded: "${ false }"
         thread_summary_failed: "${ false }"
+        thread_group_summary_succeeded: "${ false }"
+        thread_group_summary_failed: "${ false }"
+        thread_group_summary_result: "${ null }"
         daily_summary_succeeded: "${ false }"
         daily_summary_failed: "${ false }"
         thread_summary_result: "${ null }"
@@ -338,15 +350,17 @@ do:
           ${ ($workflow.input.thread_reflection_batch_yaml // "") != "" }
         daily_summary_enabled: >-
           ${ ($workflow.input.daily_work_summary_batch_yaml // "") != "" }
-        # `updated_after_ms` strict-`>` boundary, so `-1` keeps threads
-        # updated AT the boundary included (parity with the legacy
+        thread_group_summary_enabled: >-
+          ${ ($workflow.input.thread_group_summary_batch_yaml // "") != "" }
+        # `last_message_after_ms` is a strict-`>` boundary, so `-1` keeps
+        # threads whose last message is AT the boundary included (parity with the legacy
         # day_start path). The max of (since_ms_utc, range_start_ms)
         # lets short-span runs with `since_mode="now_minus"` actually
         # narrow the fetch.
-        updated_after_ms_effective: >-
-          ${ (if $workflow.input.since_ms_utc > $workflow.input.range_start_ms
-              then $workflow.input.since_ms_utc
-              else $workflow.input.range_start_ms end) - 1 }
+        last_message_after_ms_effective: >-
+          ${ [((if $workflow.input.since_ms_utc > $workflow.input.range_start_ms
+               then $workflow.input.since_ms_utc
+               else $workflow.input.range_start_ms end) - 1), 0] | max }
 
   # Layered onto $personality_enabled so the precondition is defined
   # once. `set` evaluates keys in parallel so the reference has to
@@ -405,8 +419,7 @@ do:
                               memories_grpc_host: $memories_host,
                               memories_grpc_port: $memories_port,
                               memories_grpc_tls: $memories_tls,
-                              llm_worker_name: $workflow.input.llm_worker_name,
-                              updated_after_ms: $updated_after_ms_effective,
+                              last_message_after_ms: $last_message_after_ms_effective,
                               summary_model: $workflow.input.summary_model,
                               ollama_base_url: $workflow.input.ollama_base_url,
                               output_language: $workflow.input.output_language,
@@ -430,6 +443,51 @@ do:
                     set:
                       thread_summary_failed: "${ true }"
 
+                # Groups with a member active in the summary window are
+                # re-aggregated. The batch needs both activity bounds to
+                # avoid scanning every group; "now" closes the window.
+                - threadGroupSummaryBatch:
+                    if: "${ $thread_group_summary_enabled }"
+                    timeout:
+                      after:
+                        hours: 24
+                    run:
+                      function:
+                        runnerName: WORKFLOW
+                        settings:
+                          workflow_url: "${ $workflow.input.thread_group_summary_batch_yaml }"
+                        options:
+                          channel: "${ $workflow.input.thread_group_summary_channel }"
+                        arguments:
+                          input: >-
+                            ${ {
+                              group_owner_user_id: $workflow.input.user_id,
+                              memories_grpc_host: $memories_host,
+                              memories_grpc_port: $memories_port,
+                              memories_grpc_tls: $memories_tls,
+                              per_thread_batch_yaml: $workflow.input.thread_summary_batch_yaml,
+                              memory_thread_label_prefix: $workflow.input.memory_thread_label_prefix,
+                              activity_after_ms: $last_message_after_ms_effective,
+                              activity_before_ms: ((now * 1000 | floor) + 1),
+                              summary_model: $workflow.input.summary_model,
+                              ollama_base_url: $workflow.input.ollama_base_url,
+                              output_language: $workflow.input.output_language,
+                              force_resummarize: $workflow.input.force_resummarize,
+                              min_message_count: 4,
+                              max_context_chars: $workflow.input.max_context_chars
+                            } | tojson }
+                    export:
+                      as:
+                        thread_group_summary_result: "${ .output | fromjson }"
+
+                - recordThreadGroupSummaryOutcome:
+                    if: "${ $thread_group_summary_enabled }"
+                    set:
+                      thread_group_summary_succeeded: true
+                      thread_group_summary_failed: >-
+                        ${ (($thread_group_summary_result.failed_count // 0) > 0)
+                           or (($thread_group_summary_result.completed // false) | not) }
+
                 - dailyWorkSummary:
                     if: "${ $daily_summary_enabled }"
                     timeout:
@@ -452,7 +510,6 @@ do:
                               memories_grpc_host: $memories_host,
                               memories_grpc_port: $memories_port,
                               memories_grpc_tls: $memories_tls,
-                              llm_worker_name: $workflow.input.llm_worker_name,
                               summary_label: $workflow.input.memory_thread_label_prefix,
                               daily_label: $workflow.input.daily_summary_label,
                               extra_labels_filter: $workflow.input.extra_labels_filter,
@@ -522,8 +579,7 @@ do:
                                 memories_grpc_host: $memories_host,
                                 memories_grpc_port: $memories_port,
                                 memories_grpc_tls: $memories_tls,
-                                llm_worker_name: $workflow.input.llm_worker_name,
-                                updated_after_ms: $updated_after_ms_effective,
+                                last_message_after_ms: $last_message_after_ms_effective,
                                 reflector_model: $effective_reflector_model,
                                 reflector_base_url: $effective_reflector_base_url,
                                 prompt_version: $workflow.input.prompt_version,
@@ -564,9 +620,8 @@ do:
                               memories_grpc_host: $memories_host,
                               memories_grpc_port: $memories_port,
                               memories_grpc_tls: $memories_tls,
-                              llm_worker_name: $workflow.input.llm_worker_name,
                               merge_enabled: $personality_merge_enabled,
-                              updated_after_ms: $updated_after_ms_effective,
+                              last_message_after_ms: $last_message_after_ms_effective,
                               personality_model: $effective_personality_model,
                               ollama_base_url: $workflow.input.ollama_base_url,
                               output_language: $workflow.input.output_language,
@@ -605,16 +660,21 @@ output:
     completed: >-
       ${ $thread_summary_succeeded
          and ($thread_summary_failed | not)
+         and (($thread_group_summary_enabled | not)
+              or ($thread_group_summary_succeeded and ($thread_group_summary_failed | not)))
          and (($daily_summary_enabled | not) or $daily_summary_succeeded)
          and (($daily_summary_failed | not) or ($daily_summary_enabled | not))
          and (($reflection_enabled | not) or $reflection_succeeded) }
     outcome: >-
-      ${ if $thread_summary_failed or $daily_summary_failed
+      ${ if $thread_summary_failed or $thread_group_summary_failed or $daily_summary_failed
          then "partial"
          else "succeeded"
          end }
     thread_summary_succeeded: ${ $thread_summary_succeeded }
     thread_summary_failed: ${ $thread_summary_failed }
+    thread_group_summary_enabled: ${ $thread_group_summary_enabled // false }
+    thread_group_summary_succeeded: ${ $thread_group_summary_succeeded }
+    thread_group_summary_failed: ${ $thread_group_summary_failed }
     daily_summary_enabled: ${ $daily_summary_enabled // false }
     daily_summary_succeeded: ${ $daily_summary_succeeded }
     daily_summary_failed: ${ $daily_summary_failed }

@@ -41,6 +41,15 @@ message OptionalThreadResponse {
     optional llm_memory.data.Thread data = 1;
 }
 
+// Request to count threads owned by a given user, without streaming them.
+message CountThreadsByUserIdRequest {
+    // Target user id (required).
+    llm_memory.data.UserId user_id = 1;
+    // MemoryKind values to include (empty = all kinds, OR logic). RAW also
+    // matches legacy rows whose kind is unset, as in FindThreadListByUserId.
+    repeated llm_memory.data.MemoryKind memory_kinds = 2;
+}
+
 // Request to fetch threads owned by a given user.
 // The stream is ordered by `sort` (default: latest message descending).
 message FindThreadListByUserIdRequest {
@@ -429,8 +438,14 @@ service ThreadService {
     // Stream the Memories attached to a thread, in created_at
     // ascending (chronological) order.
     rpc FindMemoriesByThreadId(FindMemoriesByThreadIdRequest) returns (stream llm_memory.data.Memory);
-    // Return the total number of threads matching the condition.
-    rpc Count(FindCondition) returns (CountResponse);
+    // DEPRECATED: unscoped total over every user's threads; use CountByUserId.
+    // Retained for clients that predate it.
+    rpc Count(FindCondition) returns (CountResponse) {
+        option deprecated = true;
+    }
+    // Number of threads FindThreadListByUserId returns for the same user_id
+    // and memory_kinds, computed without streaming the rows.
+    rpc CountByUserId(CountThreadsByUserIdRequest) returns (CountResponse);
     // Walk parent_ids recursively to build the ancestor closure, and
     // return the ROLE_SYSTEM Memory with the largest position inside
     // that closure as the "active system prompt". Used by LLM-execution

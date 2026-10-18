@@ -364,6 +364,18 @@ pub trait ThreadObservationRepository: UseRdbPool + UseIdGenerator + Send + Sync
         }
     }
 
+    /// Row count for one state, without loading rows.
+    async fn count_by_state(&self, state: &str) -> Result<i64> {
+        Ok(sqlx::query_scalar::<Rdb, i64>(concat!(
+            "SELECT COUNT(*) FROM thread_observation WHERE state = ",
+            p!(1)
+        ))
+        .bind(state)
+        .fetch_one(self.db_pool())
+        .await
+        .map_err(LlmMemoryError::DBError)?)
+    }
+
     /// Reconciliation work-queue scan, oldest evidence first.
     async fn list_by_state(
         &self,
@@ -652,6 +664,31 @@ mod tests {
         TEST_RUNTIME.block_on(async {
             let pool = setup_thread_group_pool().await;
             _test_observation_idempotency(pool).await
+        })
+    }
+
+    #[test]
+    fn count_by_state_matches_list_length_sqlite() -> Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_thread_group_pool().await;
+            let repo = ThreadObservationRepositoryImpl::new(
+                crate::test_helper::shared_id_generator(),
+                pool,
+            );
+            let mut unsupported = new_observation(9_400_001);
+            unsupported.state = values::observation_state::UNSUPPORTED.to_string();
+            repo.insert_tx(pool, &unsupported).await?;
+            for state in [
+                values::observation_state::PENDING,
+                values::observation_state::UNSUPPORTED,
+            ] {
+                assert_eq!(
+                    repo.count_by_state(state).await?,
+                    repo.list_by_state(state, None, None).await?.len() as i64,
+                    "state {state}"
+                );
+            }
+            Ok(())
         })
     }
 }

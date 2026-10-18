@@ -138,6 +138,16 @@ input:
           default: 0
         thread_summary_batch_yaml:
           type: string
+        thread_group_summary_batch_yaml:
+          type: string
+          default: ""
+          description: >-
+            Absolute path / URL of thread-group-summary-batch.yaml.
+            Empty (default) skips the ThreadGroup summary stage.
+        thread_group_summary_channel:
+          type: string
+          default: "thread_group_summary"
+          description: Forwarded to agent-chat-summary (must not be llm_batch).
         daily_work_summary_batch_yaml:
           type: string
           default: ""
@@ -309,6 +319,8 @@ do:
                 since_ms_utc: $import_result.since_ms_utc,
                 timezone_offset_hours: $workflow.input.timezone_offset_hours,
                 thread_summary_batch_yaml: $workflow.input.thread_summary_batch_yaml,
+                thread_group_summary_batch_yaml: $workflow.input.thread_group_summary_batch_yaml,
+                thread_group_summary_channel: $workflow.input.thread_group_summary_channel,
                 daily_work_summary_batch_yaml: $workflow.input.daily_work_summary_batch_yaml,
                 summary_model: $workflow.input.summary_model,
                 ollama_base_url: $workflow.input.ollama_base_url,
@@ -358,6 +370,8 @@ output:
     since_ms_utc: ${ $import_result.since_ms_utc }
     import_succeeded: ${ $import_result.import_succeeded // false }
     thread_summary_succeeded: ${ $summary_result.thread_summary_succeeded // false }
+    thread_group_summary_enabled: ${ $summary_result.thread_group_summary_enabled // false }
+    thread_group_summary_succeeded: ${ $summary_result.thread_group_summary_succeeded // false }
     daily_summary_enabled: ${ $summary_result.daily_summary_enabled // false }
     daily_summary_succeeded: ${ $summary_result.daily_summary_succeeded // false }
     personality_enabled: ${ $summary_result.personality_enabled // false }

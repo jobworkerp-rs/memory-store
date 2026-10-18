@@ -302,6 +302,44 @@ pub trait ThreadRelationRepository: UseRdbPool + UseIdGenerator + Send + Sync {
         .await
     }
 
+    /// Batch form of `list_by_parent_canonical_key` over many parents,
+    /// ordered by id like the single-key query.
+    async fn list_by_parent_canonical_keys(
+        &self,
+        parent_thread_canonical_keys: &[String],
+        state: Option<&str>,
+    ) -> Result<Vec<ThreadRelationRow>> {
+        let mut rows = Vec::new();
+        for chunk in parent_thread_canonical_keys.chunks(IN_LIST_CHUNK_SIZE) {
+            let cols = THREAD_RELATION_COLUMNS!();
+            let mut sql = format!(
+                "SELECT {cols} FROM thread_relation WHERE parent_thread_canonical_key IN ({})",
+                build_in_placeholders(chunk.len(), 1)
+            );
+            if state.is_some() {
+                sql.push_str(&format!(
+                    " AND state = {}",
+                    dyn_placeholder(chunk.len() + 1)
+                ));
+            }
+            let mut query = sqlx::query_as::<Rdb, ThreadRelationRow>(sqlx::AssertSqlSafe(sql));
+            for key in chunk {
+                query = query.bind(key);
+            }
+            if let Some(state) = state {
+                query = query.bind(state);
+            }
+            rows.extend(
+                query
+                    .fetch_all(self.db_pool())
+                    .await
+                    .map_err(LlmMemoryError::DBError)?,
+            );
+        }
+        rows.sort_by_key(|relation| relation.id);
+        Ok(rows)
+    }
+
     /// Active edges touching any of the given live thread ids on either
     /// endpoint — the connected-component edge load the reconciliation
     /// app layer walks. Chunked for the SQLite bind cap.
@@ -608,6 +646,44 @@ mod tests {
         TEST_RUNTIME.block_on(async {
             let pool = setup_thread_group_pool().await;
             _test_relation_lifecycle(pool).await
+        })
+    }
+
+    #[test]
+    fn batch_parent_lookup_matches_per_key_lookup_sqlite() -> Result<()> {
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_thread_group_pool().await;
+            let repo =
+                ThreadRelationRepositoryImpl::new(crate::test_helper::shared_id_generator(), pool);
+            repo.insert_tx(pool, &new_relation(9_500_001, 9_500_002))
+                .await?;
+            repo.insert_tx(pool, &new_relation(9_500_001, 9_500_003))
+                .await?;
+            let mut retracted = new_relation(9_500_004, 9_500_005);
+            retracted.state = values::relation_state::RETRACTED.to_string();
+            repo.insert_tx(pool, &retracted).await?;
+
+            let mut keys: Vec<String> = (0..IN_LIST_CHUNK_SIZE as u64 + 3)
+                .map(|n| key(9_510_000 + n))
+                .collect();
+            keys.extend([key(9_500_004), key(9_500_001), key(9_500_002)]);
+            for state in [None, Some(values::relation_state::ACTIVE)] {
+                let mut expected = Vec::new();
+                for key in &keys {
+                    expected.extend(repo.list_by_parent_canonical_key(key, state).await?);
+                }
+                expected.sort_by_key(|relation| relation.id);
+                assert_eq!(
+                    repo.list_by_parent_canonical_keys(&keys, state).await?,
+                    expected
+                );
+            }
+            assert!(
+                repo.list_by_parent_canonical_keys(&[], None)
+                    .await?
+                    .is_empty()
+            );
+            Ok(())
         })
     }
 }

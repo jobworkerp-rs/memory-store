@@ -44,7 +44,7 @@ jobworkerp-client job enqueue-workflow \
     "reflector_base_url": "http://192.168.1.2:11434",
     "prompt_version": "20260511-baseline",
     "output_language": "ja",
-    "updated_within_hours": 24
+    "last_message_within_hours": 24
   }' \
   -w /abs/path/to/memories/agent-chat-import/workflows/thread-reflection/thread-reflection-batch.yaml \
   --format json \
@@ -52,6 +52,8 @@ jobworkerp-client job enqueue-workflow \
 ```
 
 `thread-reflection-batch.yaml` は `memories-thread-reflection-single-ja` / `memories-thread-reflection-single-en` を呼び分けます。prompt context を `--context` で渡す必要はありません。
+
+対象スレッドは `thread_ids`、`target_thread_ids`（指定時は優先。空配列なら対象 0 件）、`labels_filter` + `labels_filter_match_mode`（既定 `LABEL_ALL` / `LABEL_ANY`）、`last_message_within_hours` / `last_message_after_ms`（会話の最終メッセージ時刻。絶対値が優先）、`thread_created_after_ms` / `thread_created_before_ms` で絞り込みます。`context_limit_tokens` / `single_pass_threshold_tokens` / `merge_max_input_tokens` の既定値は 222000 / 170000 / 100000 です。出力は `completed`（失敗スレッドなし）、`processed_threads`、`succeeded_count`、`failed_count`、`last_error` を返し、結果なしで終わった項目（timeout・中断）は失敗として数えます。
 
 ## 関連ドキュメント
 
