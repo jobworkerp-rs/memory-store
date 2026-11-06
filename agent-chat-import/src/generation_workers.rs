@@ -34,20 +34,32 @@ impl GenerationWorkerFeature {
         Self::MonthlyWorkSummary,
     ];
 
-    fn parse(raw: &str) -> Result<Self> {
-        match raw.trim() {
-            "reflection" => Ok(Self::Reflection),
-            "thread-summary" => Ok(Self::ThreadSummary),
-            "thread-group-summary" => Ok(Self::ThreadGroupSummary),
-            "thread-personality" => Ok(Self::ThreadPersonality),
-            "user-personality-merge" => Ok(Self::UserPersonalityMerge),
-            "daily-work-summary" => Ok(Self::DailyWorkSummary),
-            "weekly-work-summary" => Ok(Self::WeeklyWorkSummary),
-            "monthly-work-summary" => Ok(Self::MonthlyWorkSummary),
-            other => Err(anyhow!(
-                "unsupported generation worker feature `{other}`; supported: reflection, thread-summary, thread-group-summary, thread-personality, user-personality-merge, daily-work-summary, weekly-work-summary, monthly-work-summary"
-            )),
+    /// Canonical `--feature` token. Failure reports print it so callers can
+    /// tell which feature was skipped.
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            Self::Reflection => "reflection",
+            Self::ThreadSummary => "thread-summary",
+            Self::ThreadGroupSummary => "thread-group-summary",
+            Self::ThreadPersonality => "thread-personality",
+            Self::UserPersonalityMerge => "user-personality-merge",
+            Self::DailyWorkSummary => "daily-work-summary",
+            Self::WeeklyWorkSummary => "weekly-work-summary",
+            Self::MonthlyWorkSummary => "monthly-work-summary",
         }
+    }
+
+    fn parse(raw: &str) -> Result<Self> {
+        let token = raw.trim();
+        Self::ALL
+            .into_iter()
+            .find(|feature| feature.token() == token)
+            .ok_or_else(|| {
+                anyhow!(
+                    "unsupported generation worker feature `{token}`; supported: {}",
+                    Self::ALL.map(Self::token).join(", ")
+                )
+            })
     }
 
     fn spec(self) -> FeatureSpec {
@@ -140,9 +152,96 @@ struct FeatureSpec {
 
 #[derive(Debug, Clone)]
 struct GenerationWorkerRegistration {
+    feature: GenerationWorkerFeature,
     worker_name: String,
     worker_data: WorkerData,
     settings: Value,
+}
+
+/// A feature that could not be registered. Other features are still
+/// registered so one missing or broken asset does not leave every
+/// generation worker unregistered.
+#[derive(Debug)]
+pub(crate) struct FeatureFailure {
+    pub feature: GenerationWorkerFeature,
+    pub error: anyhow::Error,
+}
+
+impl std::fmt::Display for FeatureFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `{:#}` keeps the whole context chain (which names the path) and the
+        // newline replacement keeps each failure a single parseable line.
+        let error = format!("{:#}", self.error).replace('\n', " ");
+        write!(f, "{}: {error}", self.feature.token())
+    }
+}
+
+#[derive(Debug)]
+struct RegistrationPlan {
+    registrations: Vec<GenerationWorkerRegistration>,
+    failures: Vec<FeatureFailure>,
+}
+
+#[derive(Debug)]
+pub(crate) struct UpsertReport {
+    /// Workers upserted, or planned when running as a dry run.
+    pub registered: Vec<String>,
+    pub failures: Vec<FeatureFailure>,
+}
+
+// Stable output contract for external callers: tools that run this command
+// parse these line prefixes to report which features were registered or
+// skipped. Changing them is a breaking change.
+/// Prefix of each stdout line naming an upserted worker.
+pub const UPSERTED_PREFIX: &str = "upserted generation worker: ";
+/// Prefix of each stdout line naming a worker a dry run would upsert.
+pub const DRY_RUN_PREFIX: &str = "[dry-run] would upsert generation worker: ";
+/// Prefix of each stderr line naming a skipped feature (`<token>: <error>`).
+pub const SKIPPED_FEATURE_PREFIX: &str = "warning: skipped generation feature ";
+/// Marker in the final error line: `<n> generation feature(s) failed: <tokens>; <m> worker(s) registered`.
+pub const FAILURE_SUMMARY_MARKER: &str = " generation feature(s) failed: ";
+
+/// Console form of an [`UpsertReport`], built from the stable prefixes above.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RenderedUpsertReport {
+    pub stdout: Vec<String>,
+    pub stderr: Vec<String>,
+    /// Set when any feature failed; the command must exit non-zero with it.
+    pub failure: Option<String>,
+}
+
+impl UpsertReport {
+    pub(crate) fn render(&self, dry_run: bool) -> RenderedUpsertReport {
+        let prefix = if dry_run {
+            DRY_RUN_PREFIX
+        } else {
+            UPSERTED_PREFIX
+        };
+        let stdout = self
+            .registered
+            .iter()
+            .map(|name| format!("{prefix}{name}"))
+            .collect();
+        let stderr = self
+            .failures
+            .iter()
+            .map(|failure| format!("{SKIPPED_FEATURE_PREFIX}{failure}"))
+            .collect();
+        let failure = (!self.failures.is_empty()).then(|| {
+            let tokens: Vec<_> = self.failures.iter().map(|f| f.feature.token()).collect();
+            format!(
+                "{}{FAILURE_SUMMARY_MARKER}{}; {} worker(s) registered",
+                self.failures.len(),
+                tokens.join(", "),
+                self.registered.len()
+            )
+        });
+        RenderedUpsertReport {
+            stdout,
+            stderr,
+            failure,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -216,14 +315,24 @@ fn build_generation_worker_registrations(
     channel: Option<&str>,
     features: &[GenerationWorkerFeature],
     languages: &[String],
-) -> Result<Vec<GenerationWorkerRegistration>> {
-    let mut registrations = Vec::new();
-    for feature in features {
-        for lang in languages {
-            registrations.push(build_registration(repo_root, channel, *feature, lang)?);
+) -> RegistrationPlan {
+    let mut plan = RegistrationPlan {
+        registrations: Vec::new(),
+        failures: Vec::new(),
+    };
+    for &feature in features {
+        // All languages or none: a half-registered feature would make the
+        // batch's `-<lang>` dispatch fail only for some output languages.
+        let built: Result<Vec<_>> = languages
+            .iter()
+            .map(|lang| build_registration(repo_root, channel, feature, lang))
+            .collect();
+        match built {
+            Ok(registrations) => plan.registrations.extend(registrations),
+            Err(error) => plan.failures.push(FeatureFailure { feature, error }),
         }
     }
-    Ok(registrations)
+    plan
 }
 
 fn build_registration(
@@ -275,6 +384,7 @@ fn build_registration(
         broadcast_results: false,
     };
     Ok(GenerationWorkerRegistration {
+        feature,
         worker_name,
         worker_data,
         settings,
@@ -290,20 +400,42 @@ fn read_non_empty(path: PathBuf, label: &str) -> Result<String> {
     Ok(body)
 }
 
+/// Upsert every buildable worker. Features whose assets fail to load, or
+/// whose upsert fails, are reported in [`UpsertReport::failures`] instead
+/// of aborting the rest. `dry_run` builds the plan without connecting to
+/// jobworkerp.
 pub(crate) async fn upsert_generation_workers(
     args: UpsertGenerationWorkersArgs,
-) -> Result<Vec<String>> {
-    let registrations = build_generation_worker_registrations(
+    dry_run: bool,
+) -> Result<UpsertReport> {
+    let RegistrationPlan {
+        registrations,
+        mut failures,
+    } = build_generation_worker_registrations(
         &args.repo_root,
         args.channel.as_deref(),
         &args.features,
         &args.languages,
-    )?;
+    );
+    // Nothing to upsert (dry run, or every feature failed to build): skip the
+    // connection; the rendered report still exits non-zero on failures.
+    if dry_run || registrations.is_empty() {
+        return Ok(UpsertReport {
+            registered: registrations.into_iter().map(|r| r.worker_name).collect(),
+            failures,
+        });
+    }
+
     let client = JobworkerpClientWrapper::new_by_env(Some(args.timeout_sec)).await?;
     let metadata = Arc::new(HashMap::new());
     let mut registered = Vec::with_capacity(registrations.len());
     for registration in registrations {
-        client
+        // After one language of a feature fails, skip its remaining
+        // languages so the feature is reported once.
+        if failures.iter().any(|f| f.feature == registration.feature) {
+            continue;
+        }
+        let result = client
             .register_worker(
                 None,
                 metadata.clone(),
@@ -312,15 +444,29 @@ pub(crate) async fn upsert_generation_workers(
                 Some(&registration.settings),
             )
             .await
-            .with_context(|| format!("upsert worker {}", registration.worker_name))?;
-        registered.push(registration.worker_name);
+            .with_context(|| format!("upsert worker {}", registration.worker_name));
+        match result {
+            Ok(_) => registered.push(registration.worker_name),
+            Err(error) => failures.push(FeatureFailure {
+                feature: registration.feature,
+                error,
+            }),
+        }
     }
-    Ok(registered)
+    Ok(UpsertReport {
+        registered,
+        failures,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn built(plan: RegistrationPlan) -> Vec<GenerationWorkerRegistration> {
+        assert!(plan.failures.is_empty(), "{:?}", plan.failures);
+        plan.registrations
+    }
 
     #[test]
     fn worker_name_for_feature_uses_language_suffix() {
@@ -351,13 +497,12 @@ mod tests {
 
     #[test]
     fn builds_reflection_registration_with_prompt_context() {
-        let regs = build_generation_worker_registrations(
+        let regs = built(build_generation_worker_registrations(
             &resolve_repo_root(),
             None,
             &[GenerationWorkerFeature::Reflection],
             &["ja".to_string()],
-        )
-        .unwrap();
+        ));
         assert_eq!(regs.len(), 1);
         let reg = &regs[0];
         assert_eq!(reg.worker_name, "memories-thread-reflection-single-ja");
@@ -371,7 +516,7 @@ mod tests {
 
     #[test]
     fn builds_all_summary_registrations() {
-        let regs = build_generation_worker_registrations(
+        let regs = built(build_generation_worker_registrations(
             &resolve_repo_root(),
             Some("workflow_lang"),
             &[
@@ -381,8 +526,7 @@ mod tests {
                 GenerationWorkerFeature::MonthlyWorkSummary,
             ],
             &["en".to_string()],
-        )
-        .unwrap();
+        ));
         let names: Vec<_> = regs.iter().map(|r| r.worker_name.as_str()).collect();
         assert_eq!(
             names,
@@ -413,13 +557,12 @@ mod tests {
                 .unwrap()
                 .contains(&GenerationWorkerFeature::ThreadGroupSummary)
         );
-        let regs = build_generation_worker_registrations(
+        let regs = built(build_generation_worker_registrations(
             &resolve_repo_root(),
             None,
             &[GenerationWorkerFeature::ThreadGroupSummary],
             &["ja".to_string(), "en".to_string()],
-        )
-        .unwrap();
+        ));
         let names: Vec<_> = regs.iter().map(|r| r.worker_name.as_str()).collect();
         assert_eq!(
             names,
@@ -454,7 +597,7 @@ mod tests {
 
     #[test]
     fn builds_personality_registrations_with_prompt_context() {
-        let regs = build_generation_worker_registrations(
+        let regs = built(build_generation_worker_registrations(
             &resolve_repo_root(),
             Some("workflow_lang"),
             &[
@@ -462,8 +605,7 @@ mod tests {
                 GenerationWorkerFeature::UserPersonalityMerge,
             ],
             &["ja".to_string(), "en".to_string()],
-        )
-        .unwrap();
+        ));
         let names: Vec<_> = regs.iter().map(|r| r.worker_name.as_str()).collect();
         assert_eq!(
             names,
@@ -544,6 +686,210 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.path().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    /// A copy of the shipped `workers/` tree that a test can break
+    /// without touching the checkout.
+    fn workers_copy() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        copy_tree(
+            &resolve_repo_root().join("workers"),
+            &dir.path().join("workers"),
+        );
+        dir
+    }
+
+    fn all_languages() -> Vec<String> {
+        vec!["ja".to_string(), "en".to_string()]
+    }
+
+    fn upsert_args(repo_root: &Path) -> UpsertGenerationWorkersArgs {
+        UpsertGenerationWorkersArgs {
+            repo_root: repo_root.to_path_buf(),
+            channel: Some("llm_workflow".to_string()),
+            timeout_sec: 1,
+            features: GenerationWorkerFeature::ALL.to_vec(),
+            languages: all_languages(),
+        }
+    }
+
+    #[test]
+    fn token_round_trips_parse() {
+        for feature in GenerationWorkerFeature::ALL {
+            assert_eq!(
+                GenerationWorkerFeature::parse(feature.token()).unwrap(),
+                feature
+            );
+        }
+    }
+
+    #[test]
+    fn skips_feature_with_missing_prompt_dir_and_keeps_others() {
+        let root = workers_copy();
+        std::fs::remove_dir_all(root.path().join("workers/thread-group-summary/prompts")).unwrap();
+
+        let plan = build_generation_worker_registrations(
+            root.path(),
+            None,
+            &GenerationWorkerFeature::ALL,
+            &all_languages(),
+        );
+
+        assert_eq!(plan.failures.len(), 1);
+        assert_eq!(
+            plan.failures[0].feature,
+            GenerationWorkerFeature::ThreadGroupSummary
+        );
+        let message = format!("{:#}", plan.failures[0].error);
+        assert!(
+            message.contains("thread-group-summary/prompts/system_prompt.ja.txt"),
+            "{message}"
+        );
+        assert_eq!(plan.registrations.len(), 14);
+        assert!(plan.registrations.iter().all(|r| {
+            !r.worker_name
+                .starts_with("memories-thread-group-summary-single")
+        }));
+    }
+
+    #[test]
+    fn feature_with_one_missing_language_is_skipped_entirely() {
+        let root = workers_copy();
+        std::fs::remove_file(
+            root.path()
+                .join("workers/thread-summary/prompts/system_prompt.en.txt"),
+        )
+        .unwrap();
+
+        let plan = build_generation_worker_registrations(
+            root.path(),
+            None,
+            &[
+                GenerationWorkerFeature::ThreadSummary,
+                GenerationWorkerFeature::Reflection,
+            ],
+            &all_languages(),
+        );
+
+        assert_eq!(plan.failures.len(), 1);
+        assert_eq!(
+            plan.failures[0].feature,
+            GenerationWorkerFeature::ThreadSummary
+        );
+        let names: Vec<_> = plan
+            .registrations
+            .iter()
+            .map(|r| r.worker_name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "memories-thread-reflection-single-ja",
+                "memories-thread-reflection-single-en",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_plans_every_worker_without_connecting() {
+        let report = upsert_generation_workers(upsert_args(&resolve_repo_root()), true)
+            .await
+            .unwrap();
+        assert!(report.failures.is_empty());
+        assert_eq!(
+            report.registered.len(),
+            GenerationWorkerFeature::ALL.len() * 2
+        );
+        assert!(
+            report
+                .registered
+                .contains(&"memories-thread-group-summary-single-en".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_skipped_features_alongside_planned_workers() {
+        let root = workers_copy();
+        std::fs::remove_dir_all(root.path().join("workers/thread-group-summary")).unwrap();
+
+        let report = upsert_generation_workers(upsert_args(root.path()), true)
+            .await
+            .unwrap();
+
+        assert_eq!(report.registered.len(), 14);
+        assert_eq!(report.failures.len(), 1);
+        let output = report.render(true);
+        assert_eq!(output.stdout.len(), 14);
+        assert!(
+            output
+                .stdout
+                .iter()
+                .all(|line| line.starts_with("[dry-run] would upsert generation worker: "))
+        );
+        assert_eq!(output.stderr.len(), 1);
+        assert!(
+            output.stderr[0]
+                .starts_with("warning: skipped generation feature thread-group-summary: "),
+            "{}",
+            output.stderr[0]
+        );
+        assert!(!output.stderr[0].contains('\n'));
+        assert_eq!(
+            output.failure.as_deref(),
+            Some("1 generation feature(s) failed: thread-group-summary; 14 worker(s) registered")
+        );
+    }
+
+    #[test]
+    fn successful_report_renders_without_failure() {
+        let report = UpsertReport {
+            registered: vec!["memories-thread-summary-single-ja".to_string()],
+            failures: Vec::new(),
+        };
+        let output = report.render(false);
+        assert_eq!(
+            output.stdout,
+            ["upserted generation worker: memories-thread-summary-single-ja"]
+        );
+        assert!(output.stderr.is_empty());
+        assert!(output.failure.is_none());
+    }
+
+    #[tokio::test]
+    async fn all_features_failing_is_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        // Not a dry run: with nothing buildable it must fail without trying
+        // to connect to jobworkerp.
+        let report = upsert_generation_workers(upsert_args(root.path()), false)
+            .await
+            .expect("an all-failed plan is reported, not raised");
+        assert!(report.registered.is_empty());
+        let failure = report
+            .render(false)
+            .failure
+            .expect("every feature failed, so the command must exit non-zero");
+        assert!(
+            failure.starts_with(&format!(
+                "{}{FAILURE_SUMMARY_MARKER}",
+                GenerationWorkerFeature::ALL.len()
+            )),
+            "{failure}"
+        );
+        assert!(failure.contains("thread-summary"), "{failure}");
+        assert!(failure.ends_with("; 0 worker(s) registered"), "{failure}");
     }
 
     #[test]

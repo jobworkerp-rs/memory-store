@@ -38,6 +38,15 @@ input:
           enum: ["LABEL_ALL", "LABEL_ANY"]
           default: "LABEL_ALL"
           description: Match mode for labels_filter. Defaults to legacy LABEL_ALL.
+        exclude_thread_labels:
+          type: array
+          items: { type: string }
+          default: ["subagent"]
+          description: >-
+            Threads carrying any of these labels are left out of the
+            period / label selection; subagent Threads are summarized only
+            through the thread-group summary. Explicit target_thread_ids /
+            thread_ids are never filtered. Empty disables the exclusion.
         last_message_within_hours:
           type: integer
           minimum: 1
@@ -244,6 +253,7 @@ do:
                  .id.value as $tid | $workflow.input.thread_ids | any(. == $tid)
                ))
                else $clean
+                 | map(select((.data.labels // []) as $labels | ($workflow.input.exclude_thread_labels // ["subagent"]) | any(. as $label | $labels | index([$label]) != null) | not))
                end }
 
   # Process newest threads first so the per-thread loop's signal-count

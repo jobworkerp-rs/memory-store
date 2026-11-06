@@ -195,6 +195,7 @@ jobworkerp-client job enqueue-workflow \
 | `summary_input_byte_budget` | - | `200000` | token_count 不可時の入力バイト上限 |
 | `llm_expected_model` | - | `""` | 指定時は token_count の解決済みモデル名と一致を要求 |
 | `extra_labels_match_mode` | - | `LABEL_ALL` | `extra_labels_filter` の照合方法 |
+| `exclude_thread_labels` | - | `["subagent"]` | これらの label を持つ元スレッドの要約（`summary:<thread_id>`）を集約から除く。subagent の内容は親スレッドの要約と thread-group summary に含まれる。空配列で除外なし |
 | `summary_model` / `ollama_base_url` | - | thread-summary と同じ | LLM 設定 |
 | `timezone_offset_hours` | - | `9` | 1日の境界を切るタイムゾーン（JST 既定） |
 | `force_resummarize` | - | `false` | `true` で既存日次要約も再生成 |

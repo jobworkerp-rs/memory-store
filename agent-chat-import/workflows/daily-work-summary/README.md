@@ -84,6 +84,7 @@ exactly one memory is copied through without an LLM call.
 - `source_scope_digest` identifies the source label scope; its default is the
   digest of the unfiltered scope. `extra_labels_match_mode` (`LABEL_ALL` /
   `LABEL_ANY`) selects how `extra_labels_filter` is matched.
+- `exclude_thread_labels` (default `["subagent"]`) drops summaries (`summary:<thread_id>`) whose source thread carries any of these labels; subagent work is already covered by the parent summary and the thread-group summary.
 - `target_dates` selects an exact sorted set of periods and takes precedence over
   range and last-N modes.
 - The LLM request is first measured with the LLM runner's `token_count`

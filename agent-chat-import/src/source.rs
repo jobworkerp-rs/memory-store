@@ -123,6 +123,11 @@ pub struct CanonicalSession {
     /// Source-independent ThreadGroup adapter output. The current importer
     /// preserves it until the atomic import boundary consumes it.
     pub thread_group_observations: Vec<ThreadGroupObservation>,
+    /// Identities of the sessions this one structurally belongs to,
+    /// nearest first (e.g. a subagent transcript's invoking transcripts
+    /// up to the main session). Sent with every batch so a deletion
+    /// marker on an ancestor also suppresses this session.
+    pub structural_ancestor_identities: Vec<ThreadGroupSourceIdentity>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -492,6 +497,11 @@ pub trait ChatSource {
     fn entry_since(&self, requested_since: Option<i64>) -> Option<i64> {
         requested_since
     }
+
+    /// The server cannot suppress sessions whose structural ancestor was
+    /// deleted with `forbid_reimport`. Sources that import such child
+    /// sessions (Claude Code subagent transcripts) must stop doing so.
+    fn on_missing_ancestor_suppression(&mut self) {}
 
     /// Parse one session input into canonical form.
     ///

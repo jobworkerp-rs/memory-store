@@ -319,6 +319,10 @@ pub struct AddMemoriesBatchInput {
     /// Explicit operator override that may consume a
     /// `forbid_reimport=true` marker.
     pub explicit_override: bool,
+    /// Identities of the sessions this one structurally belongs to. A
+    /// `forbid_reimport=true` marker on any of them suppresses the
+    /// import; `explicit_override` never consumes these markers.
+    pub structural_ancestor_identities: Vec<SourceIdentityInput>,
 }
 
 /// `Some((media_object.kind, storage_backend))` of the row-locked,
@@ -346,6 +350,57 @@ pub struct AddMemoriesBatchOutput {
     /// True when a `forbid_reimport=true` deletion marker suppressed the
     /// import. No content was written; `outcomes` is empty.
     pub suppressed: bool,
+}
+
+/// Ancestors are the same owner's short parent chain. Checked before any
+/// lock or marker read: each entry costs an identity lock, and a foreign
+/// identity must neither be locked nor probed for deletion markers
+/// through `suppressed`.
+fn validate_structural_ancestors(
+    memories: &[BatchMemoryInput],
+    ancestors: &[SourceIdentityInput],
+) -> Result<()> {
+    if ancestors.len() > MAX_STRUCTURAL_ANCESTORS {
+        return Err(LlmMemoryError::InvalidArgument(format!(
+            "structural_ancestor_identities has {} entries (max {MAX_STRUCTURAL_ANCESTORS})",
+            ancestors.len()
+        ))
+        .into());
+    }
+    let owners: HashSet<i64> = memories
+        .iter()
+        .filter_map(|item| item.memory.user_id.map(|u| u.value))
+        .collect();
+    if let Some((idx, ancestor)) = ancestors
+        .iter()
+        .enumerate()
+        .find(|(_, ancestor)| owners.len() != 1 || !owners.contains(&ancestor.user_id))
+    {
+        return Err(LlmMemoryError::InvalidArgument(format!(
+            "structural_ancestor_identities[{idx}].user_id {} does not match the memories' \
+             user_id {owners:?}",
+            ancestor.user_id
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// Upper bound on `AddMemoriesBatchInput::structural_ancestor_identities`.
+/// Claude Code nests subagents at most five layers deep; the margin only
+/// guards the per-entry identity lock against abuse.
+pub const MAX_STRUCTURAL_ANCESTORS: usize = 16;
+
+impl AddMemoriesBatchOutput {
+    fn suppressed() -> Self {
+        Self {
+            thread_id: ThreadId { value: 0 },
+            thread_created: false,
+            outcomes: Vec::new(),
+            new_memories_for_embedding: Vec::new(),
+            suppressed: true,
+        }
+    }
 }
 
 /// DB writes performed by `delete_thread_in_tx`, plus the post-commit
@@ -2382,6 +2437,7 @@ impl ThreadApp for ThreadAppImpl {
             labels,
             source_identity,
             explicit_override,
+            structural_ancestor_identities,
         } = input;
 
         if memories.is_empty() {
@@ -2422,10 +2478,11 @@ impl ThreadApp for ThreadAppImpl {
             }
         }
 
+        validate_structural_ancestors(&memories, &structural_ancestor_identities)?;
+
         // ----- Phase 1: transaction begin + thread resolution -----
         let pool = self.thread_repository().static_pool();
         let mut tx = pool.begin().await.map_err(LlmMemoryError::DBError)?;
-        super::thread_group::memory_relation::lock_group_mutations_tx(&mut tx, pool).await?;
 
         // ----- Phase 1 (cont.): design 8.2 suppression gate. Runs in the
         // same transaction as the content write, before any row is
@@ -2434,12 +2491,46 @@ impl ThreadApp for ThreadAppImpl {
         // in the same section. An unreadable identity scope skips the
         // gate (no marker can exist for it).
         let marker_key = source_identity.as_ref().and_then(|identity| identity.key());
+        // The importing identity's own marker is governed by the override
+        // below, even if a caller also lists it as an ancestor.
+        let ancestor_keys: Vec<_> = structural_ancestor_identities
+            .iter()
+            .filter_map(SourceIdentityInput::key)
+            .filter(|key| Some(*key) != marker_key)
+            .collect();
+        // Lock identities (sorted) before group membership, the order
+        // deletion, reconcile and observation recording use, so none of
+        // them can deadlock with an import.
+        let mut identity_locks: Vec<_> = marker_key.iter().chain(&ancestor_keys).copied().collect();
+        identity_locks.sort();
+        identity_locks.dedup();
+        let lock_repo = ThreadGroupLockRepositoryImpl::new(pool);
+        for key in &identity_locks {
+            lock_repo.lock_source_identity_tx(&mut *tx, key).await?;
+        }
+        // Markers are read only once membership is held too: group purge
+        // consumes markers under the membership lock alone, so an earlier
+        // read could act on a marker purge is about to remove.
+        super::thread_group::memory_relation::lock_group_mutations_tx(&mut tx, pool).await?;
+
+        // An ancestor deleted with `forbid_reimport=true` may predate this
+        // child's import, so the child has no marker of its own; its
+        // content must not resurface. The override applies only to the
+        // importing identity's own marker.
+        let marker_repo = ThreadDeletionMarkerRepositoryImpl::new(pool);
+        for key in &ancestor_keys {
+            if marker_repo
+                .find_tx(&mut *tx, key)
+                .await?
+                .is_some_and(|row| row.forbid_reimport)
+            {
+                tx.rollback().await.map_err(LlmMemoryError::DBError)?;
+                return Ok(AddMemoriesBatchOutput::suppressed());
+            }
+        }
         let mut marker_canonical_key: Option<String> = None;
         let mut consume_deletion_marker = false;
         if let Some(key) = &marker_key {
-            let lock_repo = ThreadGroupLockRepositoryImpl::new(pool);
-            lock_repo.lock_source_identity_tx(&mut *tx, key).await?;
-            let marker_repo = ThreadDeletionMarkerRepositoryImpl::new(pool);
             let marker = marker_repo.find_tx(&mut *tx, key).await?;
             marker_canonical_key = marker
                 .as_ref()
@@ -2460,24 +2551,13 @@ impl ThreadApp for ThreadAppImpl {
             );
             if decision == SuppressionDecision::Suppress {
                 tx.rollback().await.map_err(LlmMemoryError::DBError)?;
-                return Ok(AddMemoriesBatchOutput {
-                    thread_id: ThreadId { value: 0 },
-                    thread_created: false,
-                    outcomes: Vec::new(),
-                    new_memories_for_embedding: Vec::new(),
-                    suppressed: true,
-                });
+                return Ok(AddMemoriesBatchOutput::suppressed());
             }
             // A permitted re-import consumes the marker whether it was a
             // revivable (forbid=false) marker or an explicit override.
             if marker.is_some() && decision != SuppressionDecision::Suppress {
                 consume_deletion_marker = true;
             }
-        }
-        if marker_key.is_some() && crate::app::thread_group::thread_group_writes_enabled() {
-            ThreadGroupLockRepositoryImpl::new(pool)
-                .lock_group_membership_tx(&mut *tx)
-                .await?;
         }
 
         for item in &memories {
@@ -5943,6 +6023,7 @@ mod test {
             labels: vec![],
             source_identity: None,
             explicit_override: false,
+            structural_ancestor_identities: Vec::new(),
         }
     }
 
@@ -6431,6 +6512,7 @@ mod test {
             labels: vec![],
             source_identity: None,
             explicit_override: false,
+            structural_ancestor_identities: Vec::new(),
         })
         .await?;
         let after = app
@@ -6667,6 +6749,7 @@ mod test {
             labels: vec![],
             source_identity: None,
             explicit_override: false,
+            structural_ancestor_identities: Vec::new(),
         };
 
         let out = app.add_memories_batch(input).await?;
@@ -7508,6 +7591,7 @@ mod test {
                 labels: vec![],
                 source_identity: Some(identity.clone()),
                 explicit_override,
+                structural_ancestor_identities: Vec::new(),
             };
 
             let first = app.add_memories_batch(input(false)).await?;
@@ -7554,6 +7638,188 @@ mod test {
 
     #[cfg(not(feature = "postgres"))]
     #[test]
+    fn run_test_batch_import_structural_ancestor_suppression() -> Result<()> {
+        use common::thread_group_key::IdentityScope;
+        use infra::infra::thread_group::rows::NewThreadDeletionMarker;
+        use infra::infra::thread_group::test_support::new_deletion_marker;
+        use infra_utils::infra::test::TEST_RUNTIME;
+        TEST_RUNTIME.block_on(async {
+            let pool = infra::infra::thread_group::test_support::setup_thread_group_pool().await;
+            let app = build_app(pool);
+            let identity = |native_id: &str| SourceIdentityInput {
+                user_id: 1,
+                source: "claude_code".to_string(),
+                identity_scope: IdentityScope::known("proj".to_string()),
+                native_id: native_id.to_string(),
+            };
+            let input = |child: &str, ancestors: Vec<SourceIdentityInput>, explicit_override| {
+                AddMemoriesBatchInput {
+                    thread_target: BatchThreadTarget::UpsertByChannel(Box::new(ThreadData {
+                        user_id: Some(UserId { value: 1 }),
+                        channel: Some(format!("import:test:{child}")),
+                        memory_kind: MemoryKind::Raw as i32,
+                        ..Default::default()
+                    })),
+                    memories: vec![batch_memory_input(
+                        &format!("eid-{child}"),
+                        1,
+                        "hello",
+                        1_000,
+                        vec![],
+                    )],
+                    upsert_by_external_id: true,
+                    labels: vec![],
+                    source_identity: Some(identity(child)),
+                    explicit_override,
+                    structural_ancestor_identities: ancestors,
+                }
+            };
+            let marker_repo = ThreadDeletionMarkerRepositoryImpl::new(pool);
+            let put_marker = |native_id: &str, forbid_reimport: bool| {
+                let owned = identity(native_id);
+                let marker_repo = &marker_repo;
+                async move {
+                    marker_repo
+                        .put_tx(
+                            pool,
+                            &NewThreadDeletionMarker {
+                                identity: owned.key().unwrap(),
+                                forbid_reimport,
+                                ..new_deletion_marker(0)
+                            },
+                        )
+                        .await
+                }
+            };
+            let marker_exists = |native_id: &str| {
+                let owned = identity(native_id);
+                let marker_repo = &marker_repo;
+                async move {
+                    marker_repo
+                        .find(&owned.key().unwrap())
+                        .await
+                        .map(|m| m.is_some())
+                }
+            };
+
+            // A forbidden grandparent suppresses a child that has no
+            // marker of its own, even with an explicit override.
+            put_marker("forbidden-root", true).await?;
+            for explicit_override in [false, true] {
+                let out = app
+                    .add_memories_batch(input(
+                        "forbidden-root/subagents/agent-a1",
+                        vec![
+                            identity("forbidden-root"),
+                            identity("forbidden-root/subagents/agent-a0"),
+                        ],
+                        explicit_override,
+                    ))
+                    .await?;
+                assert!(out.suppressed, "override={explicit_override}");
+                assert!(out.outcomes.is_empty());
+            }
+            assert!(
+                marker_exists("forbidden-root").await?,
+                "a child import must never consume an ancestor marker"
+            );
+            assert!(
+                app.find_by_channel_and_user_id(
+                    "import:test:forbidden-root/subagents/agent-a1",
+                    &UserId { value: 1 },
+                )
+                .await?
+                .is_empty(),
+                "a suppressed import must not leave a thread behind"
+            );
+
+            // The emergency write gate cannot weaken the ancestor check:
+            // the import is still suppressed rather than failing or writing.
+            crate::app::thread_group::set_thread_group_writes_enabled_override(Some(false));
+            let gated = app
+                .add_memories_batch(input(
+                    "forbidden-root/subagents/agent-a2",
+                    vec![identity("forbidden-root")],
+                    false,
+                ))
+                .await;
+            crate::app::thread_group::set_thread_group_writes_enabled_override(None);
+            assert!(gated?.suppressed);
+
+            // Listing the importing identity among its own ancestors must
+            // not defeat the explicit override of its own marker.
+            put_marker("self-listed", true).await?;
+            let out = app
+                .add_memories_batch(input("self-listed", vec![identity("self-listed")], true))
+                .await?;
+            assert!(!out.suppressed, "own marker stays overridable");
+
+            // Ancestors are a short parent chain; an unbounded list would
+            // take one advisory lock per entry.
+            let err = app
+                .add_memories_batch(input(
+                    "too-deep",
+                    (0..=MAX_STRUCTURAL_ANCESTORS)
+                        .map(|i| identity(&format!("a{i}")))
+                        .collect(),
+                    false,
+                ))
+                .await
+                .expect_err("too many ancestors must be rejected");
+            assert!(matches!(
+                err.downcast_ref::<LlmMemoryError>(),
+                Some(LlmMemoryError::InvalidArgument(_))
+            ));
+
+            // An ancestor belongs to the importing owner by definition; a
+            // foreign owner's identity would turn the response into an
+            // oracle for that owner's deletion markers.
+            let mut foreign = identity("forbidden-root");
+            foreign.user_id = 2;
+            let err = app
+                .add_memories_batch(input("foreign/subagents/agent-f1", vec![foreign], false))
+                .await
+                .expect_err("a foreign ancestor must be rejected");
+            assert!(
+                matches!(
+                    err.downcast_ref::<LlmMemoryError>(),
+                    Some(LlmMemoryError::InvalidArgument(_))
+                ),
+                "{err:?}"
+            );
+
+            // A revivable ancestor marker does not block the child and is
+            // left for the ancestor's own re-import to consume.
+            put_marker("revivable-root", false).await?;
+            let out = app
+                .add_memories_batch(input(
+                    "revivable-root/subagents/agent-b1",
+                    vec![identity("revivable-root")],
+                    false,
+                ))
+                .await?;
+            assert!(!out.suppressed);
+            assert_eq!(out.outcomes.len(), 1);
+            assert!(marker_exists("revivable-root").await?);
+
+            // Ancestors without markers, or with an unknown scope (never
+            // marked), behave like the field being absent.
+            let mut unknown = identity("forbidden-root");
+            unknown.identity_scope = IdentityScope::unknown();
+            let out = app
+                .add_memories_batch(input(
+                    "clean-root/subagents/agent-c1",
+                    vec![identity("clean-root"), unknown],
+                    false,
+                ))
+                .await?;
+            assert!(!out.suppressed);
+            Ok(())
+        })
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
     fn run_test_batch_rejects_source_identity_with_a_different_thread_owner() -> Result<()> {
         use common::thread_group_key::IdentityScope;
         use infra_utils::infra::test::TEST_RUNTIME;
@@ -7584,6 +7850,7 @@ mod test {
                         native_id: "owner-mismatch".to_string(),
                     }),
                     explicit_override: false,
+                    structural_ancestor_identities: Vec::new(),
                 })
                 .await
                 .expect_err("a source identity cannot assign ownership to another user's thread");
@@ -7642,6 +7909,7 @@ mod test {
                         native_id: "owner-mismatch-existing".to_string(),
                     }),
                     explicit_override: false,
+                    structural_ancestor_identities: Vec::new(),
                 })
                 .await
                 .expect_err("the persisted Thread owner is authoritative");
@@ -7876,6 +8144,7 @@ mod test {
                 labels: vec![],
                 source_identity: Some(identity.clone()),
                 explicit_override,
+                structural_ancestor_identities: Vec::new(),
             };
             let alias_batch = |explicit_override: bool| AddMemoriesBatchInput {
                 thread_target: BatchThreadTarget::UpsertByChannel(Box::new(ThreadData {
@@ -7889,6 +8158,7 @@ mod test {
                 labels: vec![],
                 source_identity: Some(alias.clone()),
                 explicit_override,
+                structural_ancestor_identities: Vec::new(),
             };
 
             let first = app.add_memories_batch(batch(false)).await?;
@@ -8018,6 +8288,7 @@ mod test {
                         labels: vec![],
                         source_identity: Some(identity.clone()),
                         explicit_override: false,
+                        structural_ancestor_identities: Vec::new(),
                     })
                     .await?;
                 Ok(out.thread_id.value)
@@ -8145,6 +8416,7 @@ mod test {
                         labels: vec![],
                         source_identity: Some(identity.clone()),
                         explicit_override: false,
+                        structural_ancestor_identities: Vec::new(),
                     })
                     .await?;
                 Ok(out.thread_id.value)
@@ -8265,6 +8537,7 @@ mod test {
                         labels: vec![],
                         source_identity: Some(identity.clone()),
                         explicit_override: false,
+                        structural_ancestor_identities: Vec::new(),
                     })
                     .await?;
                 Ok(out.thread_id.value)
@@ -8603,6 +8876,7 @@ mod test {
                     labels: vec![],
                     source_identity: Some(identity.clone()),
                     explicit_override,
+                    structural_ancestor_identities: Vec::new(),
                 };
 
                 let first = app

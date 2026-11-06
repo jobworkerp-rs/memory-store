@@ -3,6 +3,9 @@
 //! Used by claude-code (`cwd`), codex (`session_meta.payload.cwd`),
 //! and plain (`--root`) to relativize the value put behind a `path:`
 //! label. Spec §5.3.6 / §3.3-§3.5.
+//! Also hosts the lexical path normalization used for identity keys.
+
+use std::path::{Component, Path, PathBuf};
 
 /// Strip the longest matching base prefix from `value` on a
 /// path-component boundary. Returns the original `value` when no
@@ -33,9 +36,45 @@ pub fn apply_path_prefix<'a>(value: &'a str, prefixes: &[String]) -> &'a str {
     }
 }
 
+/// Absolute spelling of `path` with `.` / `..` removed, without resolving
+/// symlinks. Sources that derive identities from directory names need it:
+/// a relative or `..`-bearing path hides those names, and `canonicalize`
+/// would replace a symlinked directory by its target's name.
+pub fn normalize_lexically(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_lexically_resolves_dots_without_following_symlinks() {
+        assert_eq!(
+            normalize_lexically(Path::new("/a/./b/../c/d/..")),
+            PathBuf::from("/a/c")
+        );
+        let relative = normalize_lexically(Path::new("x/../y"));
+        assert!(relative.is_absolute());
+        assert!(relative.ends_with("y"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("target")).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(tmp.path().join("target"), &link).unwrap();
+        assert_eq!(normalize_lexically(&link.join(".")), link);
+    }
 
     #[test]
     fn matches_simple() {

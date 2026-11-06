@@ -74,6 +74,8 @@ Batch-only inputs:
 | `target_thread_ids` | unset | Authoritative target set (string IDs). Takes precedence over `thread_ids`; an empty array targets zero threads. |
 | `labels_filter` | none | Only threads with these labels. |
 | `labels_filter_match_mode` | `LABEL_ALL` | `LABEL_ALL` or `LABEL_ANY` for `labels_filter`. |
+| `exclude_thread_labels` | `["subagent"]` | Leave threads with any of these labels out of period / label selection (explicit `target_thread_ids` / `thread_ids` are not filtered). Subagent threads are summarized only through the thread-group summary (without it they get no per-thread summary). To target them with `labels_filter: ["subagent"]`, also pass `exclude_thread_labels: []`. Empty disables it. |
+| `summary_thread_ignored_labels` | `["subagent"]` | Source labels left out of the summary container's label set, so a subagent thread's summary shares its parent's container. Forwarded to the single worker. |
 | `last_message_within_hours` | unset | Only threads whose last message is within the past N hours of workflow start. |
 | `last_message_after_ms` | unset | Absolute lower bound (epoch ms, `>`) on `last_message_at`; wins over `last_message_within_hours`. |
 | `last_message_before_ms` | unset | Absolute upper bound (epoch ms, `<=`) on `last_message_at`. |
@@ -111,9 +113,10 @@ The batch returns `generated_count`, `skipped_count`, and `failed_count` plus
 the corresponding thread ID arrays. An up-to-date summary is a successful
 skip and remains part of `succeeded_count`, allowing a serial parent workflow
 to continue to daily aggregation. Only `completed=false, skipped=false` is a
-logical failure. Up-to-date summaries are detected in one preflight query;
-only missing, stale, relabeled, forced, or description-less threads dispatch
-the single worker. Items that end without an outcome (timeout or abort) are
+logical failure. Every target dispatches the single worker, which decides
+freshness before reading messages: an up-to-date thread (summary present,
+labels unchanged, no newer message, description set, not forced) ends with
+`skipped: already up to date` without loading its history or calling the LLM. Items that end without an outcome (timeout or abort) are
 counted in `failed_threads`. `insufficient_message_threads` lists skipped
 threads below `min_message_count`, which the
 [thread-group summary](../thread-group-summary/README.md) uses to tell "too

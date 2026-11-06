@@ -185,6 +185,8 @@ batch 経由で `workerName` 指定の言語別 worker に渡る）:
 | `target_thread_ids` | - | (未指定) | 対象スレッドID集合（文字列）。指定時は `thread_ids` より優先され、空配列なら対象 0 件 |
 | `labels_filter` | - | (フィルタなし) | 指定ラベルを持つスレッドのみ対象 |
 | `labels_filter_match_mode` | - | `LABEL_ALL` | `labels_filter` の一致方式 (`LABEL_ALL` / `LABEL_ANY`) |
+| `exclude_thread_labels` | - | `["subagent"]` | これらの label を持つスレッドを期間・label 指定の選択から除外する（`target_thread_ids` / `thread_ids` の明示指定には適用しない）。subagent スレッドは thread-group summary 経由でだけ要約される（group summary を使わない運用では subagent スレッドの要約は作られない）。`labels_filter: ["subagent"]` で subagent スレッドを対象にする場合は `exclude_thread_labels: []` も指定する。空配列で除外なし |
+| `summary_thread_ignored_labels` | - | `["subagent"]` | 要約メモリスレッドの label 集合から除く元スレッドの label。subagent スレッドの要約は親と同じ要約メモリスレッドに入る。single worker にも引き渡す |
 | `last_message_within_hours` | - | (未指定) | 実行時刻から過去 N 時間以内に最終メッセージがあるスレッドのみ対象 |
 | `last_message_after_ms` | - | (未指定) | 最終メッセージ時刻の下限 (epoch ms, `>`)。`last_message_within_hours` より優先 |
 | `last_message_before_ms` | - | (未指定) | 最終メッセージ時刻の上限 (epoch ms, `<=`) |
@@ -201,12 +203,13 @@ batch は `output_language` に応じて `memories-thread-summary-single-ja` /
 
 ## 差分実行の仕組み
 
-`force_resummarize: false`（デフォルト）の場合、以下の条件で各スレッドをスキップする:
+`force_resummarize: false`（デフォルト）の場合、single worker がメッセージを読む前に以下の条件を判定し、
+すべて満たすスレッドをスキップする（batch は対象の全スレッドで single を呼び、判定は single だけが行う）:
 
 1. `description` が設定済み
 2. 既存の要約メモリが存在する
 3. スレッドの `last_message_at` が既存要約の `updated_at` 以下（新しいメッセージなし）
-4. 要約メモリスレッドが元スレッドのラベル + `memory_thread_label_prefix` をすべて持つ
+4. 要約メモリスレッドが元スレッドのラベル + `memory_thread_label_prefix` をすべて持つ（ラベルは `summary_thread_ignored_labels` を除いたもの）
 
 上記すべてを満たす場合はスキップされるため、バッチを繰り返し実行しても処理済みスレッドは再処理されない。
 
@@ -257,7 +260,7 @@ LLMが会話内容から自動判定:
 
 - 要約の分離は`THREAD_SUMMARY`種別で行う。別のthread作成者を指定するフィールドはない。
 - **ワークフローファイルのパスは絶対パスで指定すること**。jobworkerpサーバの作業ディレクトリとワークフローファイルの場所が異なるため
-- **バッチ実行は逐次処理**。ただし既存要約と `last_message_at`・ラベルが一致するスレッドは一括事前判定で除外され、single worker へ投入されない。生成対象だけが逐次処理される
+- **バッチ実行は逐次処理**。最新のスレッドは single がメッセージを読む前にスキップするため、短時間で終わる。時間がかかるのは生成対象だけ
 - **`max_context_chars`** はモデルのコンテキスト長に対してマージンを取った値を指定する。Qwen3.6:27b（256kトークン）ではデフォルト `200000` を推奨
 
 ## バッチ結果

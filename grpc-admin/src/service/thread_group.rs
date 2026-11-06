@@ -784,6 +784,7 @@ impl ThreadGroupService for ThreadGroupGrpcImpl {
     ) -> Result<Response<ThreadGroupCapabilitiesResponse>, tonic::Status> {
         Ok(Response::new(ThreadGroupCapabilitiesResponse {
             supports_independent_group_owner_scope: true,
+            supports_structural_ancestor_suppression: true,
         }))
     }
 
@@ -1910,6 +1911,22 @@ mod batch_read_rpc_tests {
     use infra::infra::thread_group::group::{ThreadGroupRepository, ThreadGroupRepositoryImpl};
     use infra::infra::thread_group::test_support::{new_group, setup_thread_group_pool};
     use infra_utils::infra::test::TEST_RUNTIME;
+
+    #[test]
+    fn capabilities_advertise_structural_ancestor_suppression() {
+        TEST_RUNTIME.block_on(async {
+            let pool = setup_thread_group_pool().await;
+            let response = ThreadGroupGrpcImpl::new(pool)
+                .get_thread_group_capabilities(tonic::Request::new(
+                    ThreadGroupCapabilitiesRequest {},
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(response.supports_independent_group_owner_scope);
+            assert!(response.supports_structural_ancestor_suppression);
+        })
+    }
 
     #[test]
     fn summary_batch_answers_in_request_order_and_bounds_its_size() {

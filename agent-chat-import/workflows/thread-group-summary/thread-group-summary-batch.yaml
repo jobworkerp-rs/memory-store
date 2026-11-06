@@ -8,7 +8,7 @@ input:
   schema:
     document:
       type: object
-      required: [group_owner_user_id, memories_grpc_host, memories_grpc_port, per_thread_batch_yaml]
+      required: [group_owner_user_id, memories_grpc_host, memories_grpc_port]
       properties:
         group_owner_user_id:
           type: integer
@@ -17,11 +17,6 @@ input:
         memories_grpc_host: { type: string, default: "localhost" }
         memories_grpc_port: { type: integer, default: 9100 }
         memories_grpc_tls: { type: boolean, default: false }
-        per_thread_batch_yaml:
-          type: string
-          description: >-
-            Workflow URL or path of thread-summary-batch.yaml, invoked per
-            member owner to refresh member summaries before aggregation.
         target_group_ids:
           type: array
           items: { type: string, pattern: "^[1-9][0-9]*$" }
@@ -314,37 +309,43 @@ do:
                           }] }
                       last_error: "${ $error }"
 
-  # Phase 2: refresh member summaries once per owner, so a thread shared by
-  # several groups is not re-summarized per group. A failed refresh marks
-  # only that owner's threads; groups without them still aggregate.
-  - buildMemberOwnerBatches:
+  # Phase 2: refresh member summaries one thread at a time through the
+  # thread summary single, which skips an up-to-date thread before reading
+  # its messages. A thread shared by several groups is refreshed once. One
+  # call per member lets this batch report (N/M) while summaries are
+  # generated (a child batch's progress is not streamed to this one). A
+  # failed refresh marks only that thread; groups without it still
+  # aggregate.
+  - buildMemberRefreshTargets:
       set:
-        member_owner_batches: >-
+        member_refresh_targets: >-
           ${ $owner_member_entries
-             | group_by(.user_id)
-             | map({ user_id: .[0].user_id, thread_ids: (map(.thread_id) | unique) }) }
+             | unique_by(.thread_id)
+             | sort_by(.user_id, .thread_id) }
 
   - refreshMemberSummaries:
       for:
-        each: member_owner
-        at: member_owner_index
-        in: "${ $member_owner_batches }"
+        each: member_target
+        at: member_target_index
+        in: "${ $member_refresh_targets }"
       do:
-        - refreshOwner:
+        - reportProgress:
+            set:
+              progress_processed: "${ $member_target_index + 1 }"
+              progress_total: "${ $member_refresh_targets | length }"
+        - refreshMember:
             try:
-              - refreshOwnerThreadSummaries:
+              # The single runs on its registered channel, which must differ
+              # from the one this batch holds while waiting.
+              - invokeMemberSingle:
                   run:
                     function:
-                      runnerName: WORKFLOW
-                      settings:
-                        workflow_url: "${ $workflow.input.per_thread_batch_yaml }"
-                      options:
-                        channel: llm_batch
+                      workerName: '${ "memories-thread-summary-single-" + $workflow.input.output_language }'
                       arguments:
                         input: >-
                           ${ {
-                            user_id: $member_owner.user_id,
-                            target_thread_ids: $member_owner.thread_ids,
+                            user_id: $member_target.user_id,
+                            thread_id: $member_target.thread_id,
                             memories_grpc_host: $workflow.input.memories_grpc_host,
                             memories_grpc_port: $workflow.input.memories_grpc_port,
                             memories_grpc_tls: $workflow.input.memories_grpc_tls,
@@ -358,31 +359,38 @@ do:
                           } | tojson }
                   export:
                     as:
-                      owner_refresh_result: "${ .output | fromjson }"
+                      member_single_result: "${ .output | fromjson }"
+              # Any skip (up to date, thread gone, too short) still leaves the
+              # member's stored summary current.
+              - classifyMemberRefresh:
+                  set:
+                    member_refreshed: >-
+                      ${ ($member_single_result.completed // false)
+                         or ($member_single_result.skipped // false) }
               # thread-summary-single skips threads below min_message_count
-              # without persisting a summary; the single drops those members.
-              - collectOwnerRefreshResult:
+              # without persisting a summary; the group single drops those
+              # members.
+              - collectMemberRefreshResult:
                   set:
                     insufficient_message_thread_ids: >-
                       ${ $insufficient_message_thread_ids
-                         + (($owner_refresh_result.insufficient_message_threads // []) | map(tostring)) }
+                         + (if ($member_single_result.skipped // false)
+                               and ($member_single_result.skip_reason == "skipped: not enough messages")
+                            then [$member_target.thread_id]
+                            else [] end) }
                     refresh_failed_thread_ids: >-
                       ${ $refresh_failed_thread_ids
-                         + (if ($owner_refresh_result.completed // false) == true
-                               and ($owner_refresh_result.failed_count // 0) == 0
-                            then []
-                            elif (($owner_refresh_result.failed_threads // []) | length) > 0
-                            then ($owner_refresh_result.failed_threads | map(tostring))
-                            else $member_owner.thread_ids
-                            end) }
+                         + (if $member_refreshed then [] else [$member_target.thread_id] end) }
                     refresh_error: >-
-                      ${ $refresh_error // $owner_refresh_result.last_error }
+                      ${ $refresh_error
+                         // (if $member_refreshed then null
+                            else "member thread summary returned neither completed nor skipped" end) }
             catch:
               as: error
               do:
-                - recordOwnerRefreshFailure:
+                - recordMemberRefreshFailure:
                     set:
-                      refresh_failed_thread_ids: "${ $refresh_failed_thread_ids + $member_owner.thread_ids }"
+                      refresh_failed_thread_ids: "${ $refresh_failed_thread_ids + [$member_target.thread_id] }"
                       refresh_error: "${ $refresh_error // ($error | tostring) }"
 
   # Phase 3: aggregate each readable group with the language-specific single.

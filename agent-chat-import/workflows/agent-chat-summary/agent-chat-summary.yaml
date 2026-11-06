@@ -122,9 +122,10 @@ input:
           type: string
           default: "thread_group_summary"
           description: >-
-            Channel for the ThreadGroup batch. It must differ from
-            `llm_batch`, where the batch's nested thread-summary batch runs,
-            so the parent never holds the slot its child needs.
+            Channel for the ThreadGroup batch. It must differ from the
+            channels its thread-summary and group single workers are
+            registered on, and from `llm_batch` shared by the summary stages,
+            so the parent never holds the slot its children need.
         daily_work_summary_batch_yaml:
           type: string
           default: ""
@@ -465,7 +466,6 @@ do:
                               memories_grpc_host: $memories_host,
                               memories_grpc_port: $memories_port,
                               memories_grpc_tls: $memories_tls,
-                              per_thread_batch_yaml: $workflow.input.thread_summary_batch_yaml,
                               memory_thread_label_prefix: $workflow.input.memory_thread_label_prefix,
                               activity_after_ms: $last_message_after_ms_effective,
                               activity_before_ms: ((now * 1000 | floor) + 1),

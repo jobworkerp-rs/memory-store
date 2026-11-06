@@ -26,14 +26,28 @@ use crate::source::{
     CLAUDE_CODE_ADAPTER_VERSION, CanonicalAddons, CanonicalEntry, CanonicalSession, ChatSource,
     ReadSessionOutcome, StreamItem, ThreadGroupConfidence, ThreadGroupEvidenceKind,
     ThreadGroupIdentityScope, ThreadGroupObservation, ThreadGroupPolarity,
-    ThreadGroupSourceIdentity, mtime_skip_outcome,
+    ThreadGroupSourceIdentity,
 };
 use anyhow::{Context, Result};
 use protobuf::llm_memory::data::{ContentType, MessageRole};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+mod subagent;
+
 const SOURCE_ID: &str = "claude_code";
+/// Label reserved for subagent Threads. Generation workflows exclude it
+/// from their period-based selection and ignore it when choosing the
+/// summary container, so it must stay the only subagent-specific label.
+/// The workflow YAML defaults (`exclude_thread_labels`,
+/// `summary_thread_ignored_labels`) name it too; `summarize` tests pin
+/// them to this constant.
+pub(crate) const SUBAGENT_LABEL: &str = "subagent";
+/// Skip reasons reported as `<code>: <detail>`; summaries count them by code.
+pub(crate) const SKIP_REASON_CODES: &[&str] =
+    &[subagent::UNRESOLVED_REASON, subagent::UNPARSEABLE_REASON];
+/// ThreadGroup `native_kind` of a main transcript (`native_id = <sessionId>`).
+const MAIN_NATIVE_KIND: &str = "session";
 
 /// Cap on the canonical `MemoryData.content` for attachment events.
 /// Subtypes such as `task_reminder` can carry multi-MB transcripts;
@@ -87,7 +101,15 @@ const CLAUDE_CODE_META_EXCLUDED: &[&str] = &[
     "planContent",
     "hookInfos",
     "hookErrors",
+    // Subagent hand-back provenance; its `body` duplicates the message,
+    // so only the scalars in `ORIGIN_SCALARS` are kept.
+    "origin",
 ];
+
+/// `origin.*` scalars transcribed as `claude_code.origin_*`. They link a
+/// subagent hand-back message in the parent Thread to the subagent's own
+/// Thread (`origin.from` is its agentId).
+const ORIGIN_SCALARS: &[&str] = &["kind", "from", "name"];
 
 /// Subtypes of `type=attachment` JSONL events that the default policy
 /// admits. Restricted to the bodies that carry conversation-relevant
@@ -162,6 +184,7 @@ impl AttachmentSubtypePolicy {
 pub struct ClaudeCodeSource {
     args: ClaudeCodeArgs,
     attachment_policy: AttachmentSubtypePolicy,
+    invoker_tool_use_ids: subagent::InvokerToolUseIds,
 }
 
 impl ClaudeCodeSource {
@@ -176,6 +199,7 @@ impl ClaudeCodeSource {
         Self {
             args,
             attachment_policy: policy,
+            invoker_tool_use_ids: subagent::InvokerToolUseIds::default(),
         }
     }
 }
@@ -195,8 +219,9 @@ impl ChatSource for ClaudeCodeSource {
         if let Some(ref file) = self.args.session_file {
             return Ok(vec![file.clone()]);
         }
+        let include_subagents = !self.args.no_subagents;
         if let Some(ref dir) = self.args.project_dir {
-            return collect_jsonl_files(dir);
+            return subagent::collect_project(dir, include_subagents);
         }
         let projects_dir = self.args.resolved_claude_dir().join("projects");
         let mut all = Vec::new();
@@ -207,9 +232,22 @@ impl ChatSource for ClaudeCodeSource {
             .collect();
         subdirs.sort();
         for sub in &subdirs {
-            all.extend(collect_jsonl_files(sub)?);
+            all.extend(subagent::collect_project(sub, include_subagents)?);
         }
         Ok(all)
+    }
+
+    fn on_missing_ancestor_suppression(&mut self) {
+        // A subagent of a session deleted with forbid_reimport has no
+        // marker of its own; only a server that also checks ancestor
+        // markers keeps that content from resurfacing.
+        if !self.args.no_subagents {
+            eprintln!(
+                "WARNING: the Memories server does not check deletion markers of parent \
+                 sessions; subagent transcripts are skipped. Upgrade the server to import them."
+            );
+            self.args.no_subagents = true;
+        }
     }
 
     fn read_session(
@@ -217,11 +255,24 @@ impl ChatSource for ClaudeCodeSource {
         input: &Self::SessionInput,
         since_millis_with_margin: Option<i64>,
     ) -> Result<ReadSessionOutcome> {
-        if let Some(skip) = mtime_skip_outcome(input.as_path(), since_millis_with_margin) {
-            return Ok(skip);
-        }
+        let subagent::Prepared {
+            normalized,
+            subagent: resolved,
+        } = match subagent::prepare(
+            input,
+            !self.args.no_subagents,
+            since_millis_with_margin,
+            &self.invoker_tool_use_ids,
+        ) {
+            Ok(prepared) => prepared,
+            Err(outcome) => return Ok(*outcome),
+        };
         let entries =
             parse_jsonl_file(input).with_context(|| format!("parse {}", input.display()))?;
+        if !self.args.no_subagents {
+            self.invoker_tool_use_ids
+                .insert_from_entries(&normalized, &entries);
+        }
         if entries.is_empty() {
             return Ok(ReadSessionOutcome::Skipped {
                 session_id_hint: input
@@ -233,7 +284,9 @@ impl ChatSource for ClaudeCodeSource {
             });
         }
 
-        let info = match raw_parser::extract_session_info(&entries, input) {
+        // The normalized path keeps the project key identical to the one its
+        // subagent transcripts derive, whatever spelling the input used.
+        let mut info = match raw_parser::extract_session_info(&entries, &normalized) {
             Ok(i) => i,
             Err(e) => {
                 return Ok(ReadSessionOutcome::Skipped {
@@ -247,8 +300,14 @@ impl ChatSource for ClaudeCodeSource {
             }
         };
 
+        if let Some(resolved) = &resolved {
+            resolved.override_info(&mut info, &entries);
+        }
         let mut session = build_canonical_session(&info, &self.args);
         session.thread_group_observations = main_session_observations(&info, &entries);
+        if let Some(resolved) = &resolved {
+            resolved.apply(&mut session, &entries);
+        }
         let include_types = self.args.include_types_set();
         let strip_prefixes = self.args.path_prefixes();
 
@@ -812,6 +871,13 @@ fn collect_claude_code_metadata(entry: &RawEntry) -> serde_json::Map<String, ser
             continue;
         }
         out.insert(snake_case_key(key), value.clone());
+    }
+    if let Some(origin) = entry.extra("origin").and_then(|v| v.as_object()) {
+        for key in ORIGIN_SCALARS {
+            if let Some(value) = origin.get(*key).and_then(|v| v.as_str()) {
+                out.insert(format!("origin_{key}"), value.into());
+            }
+        }
     }
     out
 }
@@ -1590,9 +1656,10 @@ fn build_canonical_session(info: &SessionInfo, args: &ClaudeCodeArgs) -> Canonic
         thread_metadata: None,
         source_identity: Some(claude_identity(
             info.project_hash.as_deref(),
-            "session",
+            MAIN_NATIVE_KIND,
             info.session_id.clone(),
         )),
+        structural_ancestor_identities: Vec::new(),
         thread_group_observations: Vec::new(),
     }
 }
@@ -1642,10 +1709,11 @@ fn main_session_observations(
 
     let subject = claude_identity(
         info.project_hash.as_deref(),
-        "session",
+        MAIN_NATIVE_KIND,
         info.session_id.clone(),
     );
-    let candidate_parent = claude_identity(info.project_hash.as_deref(), "session", fork_parent);
+    let candidate_parent =
+        claude_identity(info.project_hash.as_deref(), MAIN_NATIVE_KIND, fork_parent);
     let corroborated = entries
         .iter()
         .any(|entry| entry.extra("forkBoundaryAt").is_some())
@@ -1659,57 +1727,39 @@ fn main_session_observations(
     } else {
         ThreadGroupConfidence::Unsupported
     };
-    vec![ThreadGroupObservation {
+    vec![source_field_observation(
+        subject,
+        candidate_parent,
+        "fork",
+        confidence,
+        "claude_code:session.fork_metadata",
+    )]
+}
+
+/// Observation asserted by an explicit field of the Claude Code export.
+fn source_field_observation(
+    subject: ThreadGroupSourceIdentity,
+    candidate_parent: ThreadGroupSourceIdentity,
+    relation_kind: &str,
+    confidence: ThreadGroupConfidence,
+    source_record_ref: &str,
+) -> ThreadGroupObservation {
+    ThreadGroupObservation {
         subject,
         candidate_parent: Some(candidate_parent),
-        relation_kind: Some("fork".into()),
+        relation_kind: Some(relation_kind.into()),
         evidence_kind: ThreadGroupEvidenceKind::SourceField,
         polarity: ThreadGroupPolarity::Supports,
         confidence,
-        source_record_ref: "claude_code:session.fork_metadata".into(),
+        source_record_ref: source_record_ref.into(),
         adapter_version: CLAUDE_CODE_ADAPTER_VERSION,
-    }]
-}
-
-/// Observation for a dedicated `subagents/agent-<agentId>.jsonl`
-/// transcript. `exact` delegated requires the `.meta.json.toolUseId` to
-/// match an `Agent` tool_use id in the parent transcript; otherwise the
-/// observation stays `unsupported` with the structural parent session as
-/// a candidate only (design 10.1.3). The composite `native_id` is
-/// `<parentSessionId>/subagents/agent-<agentId>`.
-pub(crate) fn subagent_observations(
-    project_key: Option<&str>,
-    parent_session_id: &str,
-    agent_id: &str,
-    tool_use_id: Option<&str>,
-    parent_agent_tool_use_ids: &HashSet<String>,
-) -> Vec<ThreadGroupObservation> {
-    let native_id = format!("{parent_session_id}/subagents/agent-{agent_id}");
-    let matched = tool_use_id.is_some_and(|id| parent_agent_tool_use_ids.contains(id));
-    vec![ThreadGroupObservation {
-        subject: claude_identity(project_key, "subagent_transcript", native_id),
-        candidate_parent: Some(claude_identity(
-            project_key,
-            "session",
-            parent_session_id.to_string(),
-        )),
-        relation_kind: Some("delegated".into()),
-        evidence_kind: ThreadGroupEvidenceKind::SourceField,
-        polarity: ThreadGroupPolarity::Supports,
-        confidence: if matched {
-            ThreadGroupConfidence::Exact
-        } else {
-            ThreadGroupConfidence::Unsupported
-        },
-        source_record_ref: "claude_code:subagents/agent.meta.json".into(),
-        adapter_version: CLAUDE_CODE_ADAPTER_VERSION,
-    }]
+    }
 }
 
 /// Collect the `tool_use` ids of `Agent` invocations from a parent
 /// transcript. Only the explicit `name: "Agent"` tool is considered;
 /// proximity, `agentId`, and sidechain flags are not substitutes.
-pub(crate) fn agent_tool_use_ids(entries: &[RawEntry]) -> HashSet<String> {
+fn agent_tool_use_ids(entries: &[RawEntry]) -> HashSet<String> {
     let mut ids = HashSet::new();
     for entry in entries {
         let Some(content) = entry
@@ -1760,7 +1810,7 @@ mod tests {
     use crate::source::test_support::{entries_from_outcome, unpack_outcome};
     use std::io::Write;
 
-    fn args_with_file(p: PathBuf) -> ClaudeCodeArgs {
+    pub(super) fn args_with_file(p: PathBuf) -> ClaudeCodeArgs {
         ClaudeCodeArgs {
             session_file: Some(p),
             project_dir: None,
@@ -1770,6 +1820,7 @@ mod tests {
                 .to_string(),
             strip_path_prefix: None,
             attachment_subtypes: "default".to_string(),
+            no_subagents: false,
         }
     }
 
@@ -1938,52 +1989,6 @@ mod tests {
         let ids = agent_tool_use_ids(&entries);
         assert_eq!(ids.len(), 1);
         assert!(ids.contains("toolu_agent"));
-    }
-
-    #[test]
-    fn claude_subagent_with_matching_tool_use_id_is_exact_delegated() {
-        let parent_ids = HashSet::from(["toolu_agent".to_string()]);
-        let obs = subagent_observations(
-            Some("proj-key"),
-            "sess-1",
-            "abc123",
-            Some("toolu_agent"),
-            &parent_ids,
-        );
-        assert_eq!(obs.len(), 1);
-        assert_eq!(obs[0].confidence, ThreadGroupConfidence::Exact);
-        assert_eq!(obs[0].relation_kind.as_deref(), Some("delegated"));
-        assert_eq!(obs[0].subject.native_id, "sess-1/subagents/agent-abc123");
-        assert_eq!(obs[0].subject.native_kind, "subagent_transcript");
-        assert_eq!(
-            obs[0]
-                .candidate_parent
-                .as_ref()
-                .map(|p| p.native_id.as_str()),
-            Some("sess-1")
-        );
-        assert_eq!(
-            obs[0].subject.identity_scope,
-            ThreadGroupIdentityScope::Known("proj-key".into())
-        );
-    }
-
-    #[test]
-    fn claude_subagent_without_tool_use_match_is_unsupported() {
-        let parent_ids = HashSet::from(["toolu_agent".to_string()]);
-        let unmatched = subagent_observations(
-            Some("proj-key"),
-            "sess-1",
-            "abc123",
-            Some("toolu_other"),
-            &parent_ids,
-        );
-        assert_eq!(unmatched[0].confidence, ThreadGroupConfidence::Unsupported);
-
-        let missing =
-            subagent_observations(Some("proj-key"), "sess-1", "abc123", None, &parent_ids);
-        assert_eq!(missing[0].confidence, ThreadGroupConfidence::Unsupported);
-        assert!(missing[0].candidate_parent.is_some());
     }
 
     #[test]
@@ -2860,6 +2865,32 @@ mod tests {
             cc.get("user_type").and_then(|v| v.as_str()),
             Some("external")
         );
+    }
+
+    #[test]
+    fn subagent_hand_back_keeps_only_origin_scalars() {
+        // The hand-back body duplicates the message content; only the
+        // scalars that link it to the subagent Thread are kept, whatever
+        // the body length.
+        for body in ["short", &"x".repeat(4096)] {
+            let line = serde_json::json!({
+                "type": "user", "uuid": "u1", "timestamp": "2026-04-17T10:00:00.000Z",
+                "sessionId": "s1", "isMeta": true,
+                "origin": {"kind": "peer", "from": "a17f", "name": "Explore", "body": body,
+                           "handback": true},
+                "message": {"role": "user", "content": "report"}
+            })
+            .to_string();
+            let entries = read_entries(&[line.as_str()]);
+            let cc = claude_code_meta(&entries[0]);
+            assert_eq!(cc.get("origin_kind").and_then(|v| v.as_str()), Some("peer"));
+            assert_eq!(cc.get("origin_from").and_then(|v| v.as_str()), Some("a17f"));
+            assert_eq!(
+                cc.get("origin_name").and_then(|v| v.as_str()),
+                Some("Explore")
+            );
+            assert!(cc.get("origin").is_none());
+        }
     }
 
     #[test]

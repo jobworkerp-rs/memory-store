@@ -33,6 +33,15 @@ input:
           enum: ["LABEL_ALL", "LABEL_ANY"]
           default: "LABEL_ALL"
           description: Match mode for labels_filter. Defaults to legacy LABEL_ALL.
+        exclude_thread_labels:
+          type: array
+          items: { type: string }
+          default: ["subagent"]
+          description: >-
+            Threads carrying any of these labels are left out of the
+            period / label selection; subagent Threads are summarized only
+            through the thread-group summary. Explicit target_thread_ids /
+            thread_ids are never filtered. Empty disables the exclusion.
         last_message_within_hours:
           type: integer
           minimum: 1
@@ -80,6 +89,15 @@ input:
         summary_model: { type: string, default: "qwen3.6:27b" }
         ollama_base_url: { type: string, default: "http://localhost:11434" }
         memory_thread_label_prefix: { type: string, default: "summary" }
+        summary_thread_ignored_labels:
+          type: array
+          items: { type: string }
+          default: ["subagent"]
+          description: >-
+            Source-thread labels left out of the summary container's label
+            set. Containers are shared per label set, so a subagent Thread's
+            summary lands in its parent's container instead of a separate
+            subagent-labelled one.
         force_resummarize: { type: boolean, default: false }
 
 do:
@@ -210,10 +228,12 @@ do:
         as:
           all_threads: ${ .jsonBody | fromjson }
 
-  # Step 2: Filter by thread_ids if specified.
+  # Step 2: Filter by thread_ids if specified. Every target is dispatched:
+  # the single decides freshness before reading messages and skips an
+  # up-to-date thread cheaply.
   - filterThreads:
       set:
-        candidate_threads: >-
+        target_threads: >-
           ${ if ($workflow.input | has("target_thread_ids"))
              then $all_threads | map(select(
                .id.value as $tid | $workflow.input.target_thread_ids | any(. == ($tid | tostring))
@@ -223,128 +243,8 @@ do:
                .id.value as $tid | $workflow.input.thread_ids | any(. == $tid)
              ))
              else $all_threads
+               | map(select((.data.labels // []) as $labels | ($workflow.input.exclude_thread_labels // ["subagent"]) | any(. as $label | $labels | index([$label]) != null) | not))
              end }
-
-  # Step 2a: Load existing per-thread summaries once. Without this bulk
-  # preflight, every up-to-date RAW thread still dispatches a child workflow
-  # only to discover that it should skip. Large backfills can spend hours on
-  # those serial checks and never reach the dependent daily stage.
-  - initExistingSummaries:
-      set:
-        existing_summary_entries: "${ [] }"
-        existing_summary_threads: "${ [] }"
-
-  - fetchExistingSummaries:
-      if: "${ $workflow.input.force_resummarize | not }"
-      run:
-        function:
-          runnerName: GRPC
-          using: streaming
-          settings:
-            host: "${$workflow.input.memories_grpc_host}"
-            port: ${$workflow.input.memories_grpc_port}
-            tls: ${$workflow.input.memories_grpc_tls}
-            useReflection: true
-          arguments:
-            method: "/llm_memory.service.MemoryService/FindListByCondition"
-            json_body: >-
-              ${ {
-                user_id: { value: $workflow.input.user_id },
-                roles: ["ROLE_ASSISTANT"],
-                content_types: ["TEXT"],
-                memory_kinds: ["MEMORY_KIND_THREAD_SUMMARY"],
-                external_id_prefix: "summary:"
-              } | tojson }
-            as_json: true
-      export:
-        as:
-          existing_summary_entries: ${ .jsonBody | fromjson }
-
-  - fetchExistingSummaryThreads:
-      if: "${ $workflow.input.force_resummarize | not }"
-      run:
-        function:
-          runnerName: GRPC
-          using: streaming
-          settings:
-            host: "${$workflow.input.memories_grpc_host}"
-            port: ${$workflow.input.memories_grpc_port}
-            tls: ${$workflow.input.memories_grpc_tls}
-            useReflection: true
-          arguments:
-            method: "/llm_memory.service.ThreadService/FindThreadListByUserId"
-            json_body: >-
-              ${ {
-                user_id: { value: $workflow.input.user_id },
-                memory_kinds: ["MEMORY_KIND_THREAD_SUMMARY"]
-              } | tojson }
-            as_json: true
-      export:
-        as:
-          existing_summary_threads: ${ .jsonBody | fromjson }
-
-  - indexExistingSummaries:
-      set:
-        existing_summary_by_external_id: >-
-          ${ reduce $existing_summary_entries[] as $entry
-             ({};
-              .[$entry.memory.data.externalId] = {
-                memory: $entry.memory,
-                thread_id: ($entry.threadId.value | tostring)
-              }) }
-        existing_summary_thread_by_id: >-
-          ${ reduce $existing_summary_threads[] as $thread
-             ({}; .[$thread.id.value | tostring] = $thread) }
-
-  - selectThreadsNeedingSummary:
-      set:
-        target_threads: >-
-          ${ if $workflow.input.force_resummarize
-             then $candidate_threads
-             else
-               $candidate_threads
-               | map(
-                   . as $thread
-                   | ($existing_summary_by_external_id[
-                        "summary:" + ($thread.id.value | tostring)
-                     ] // null) as $existing_summary
-                   | (($thread.data.labels
-                       // ["thread_" + ($thread.id.value | tostring)])
-                      + [$workflow.input.memory_thread_label_prefix]
-                      | unique) as $required_labels
-                   | (if $existing_summary == null
-                      then null
-                      else ($existing_summary_thread_by_id[
-                              $existing_summary.thread_id
-                            ] // null)
-                      end) as $existing_summary_thread
-                   | select(
-                       ($thread.data.description // "") == ""
-                       or $existing_summary == null
-                       or $existing_summary_thread == null
-                       or (($required_labels
-                            - ($existing_summary_thread.data.labels // []))
-                           | length) > 0
-                       or (
-                         (($thread.data.lastMessageAt // "0") | tostring)
-                           as $last_message_at
-                         | (($existing_summary.memory.data.updatedAt // "0")
-                            | tostring) as $summary_updated_at
-                         | (($last_message_at | length)
-                            > ($summary_updated_at | length))
-                           or ((($last_message_at | length)
-                               == ($summary_updated_at | length))
-                              and $last_message_at > $summary_updated_at)
-                       )
-                     )
-                 )
-             end }
-
-  - collectPreSkippedThreads:
-      set:
-        pre_skipped_threads: >-
-          ${ ($candidate_threads | map(.id.value | tostring))
-             - ($target_threads | map(.id.value | tostring)) }
 
   # Step 2.5: Initialize per-thread outcome accumulators. Lets the
   # caller distinguish "every thread failed" (fatal) from
@@ -353,7 +253,7 @@ do:
   - initOutcomeAccumulators:
       set:
         generated_threads: "${ [] }"
-        skipped_threads: "${ $pre_skipped_threads // [] }"
+        skipped_threads: "${ [] }"
         failed_threads: "${ [] }"
         insufficient_message_threads: "${ [] }"
         last_error: "${ null }"
@@ -403,6 +303,7 @@ do:
                             summary_model: $workflow.input.summary_model,
                             ollama_base_url: $workflow.input.ollama_base_url,
                             memory_thread_label_prefix: $workflow.input.memory_thread_label_prefix,
+                            summary_thread_ignored_labels: $workflow.input.summary_thread_ignored_labels,
                             force_resummarize: $workflow.input.force_resummarize
                           }
                           | tojson }

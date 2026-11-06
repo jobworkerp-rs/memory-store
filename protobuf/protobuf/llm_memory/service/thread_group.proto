@@ -105,6 +105,9 @@ message ThreadGroupCapabilitiesResponse {
     // Group ownership is independent from each member Thread owner, and all
     // owner-aware ThreadGroup request fields and filters are honored.
     bool supports_independent_group_owner_scope = 1;
+    // AddMemoriesBatch honors `structural_ancestor_identities`: a
+    // `forbid_reimport=true` marker on any ancestor suppresses the import.
+    bool supports_structural_ancestor_suppression = 2;
 }
 
 message ThreadGroupPurgePreview {

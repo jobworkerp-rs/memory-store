@@ -415,6 +415,13 @@ pub struct ClaudeCodeArgs {
         help = "default | all | none | comma-separated subtype whitelist"
     )]
     pub attachment_subtypes: String,
+
+    /// Skip dedicated subagent transcripts
+    /// (`<sessionId>/subagents/agent-*.jsonl`). By default each one is
+    /// imported as its own Thread, a delegated child of the transcript
+    /// that spawned it.
+    #[arg(long)]
+    pub no_subagents: bool,
 }
 
 impl ClaudeCodeArgs {
@@ -1055,6 +1062,15 @@ mod tests {
                 assert_eq!(args.channel.as_deref(), Some("workflow_lang"));
             }
             other => panic!("expected UpsertGenerationWorkers, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upsert_generation_workers_accepts_dry_run_after_subcommand() {
+        for flag in ["-n", "--dry-run"] {
+            let cli = parse(&["upsert-generation-workers", flag]).unwrap();
+            assert!(cli.global.dry_run, "{flag}");
+            assert!(matches!(cli.command, Subcmd::UpsertGenerationWorkers(_)));
         }
     }
 

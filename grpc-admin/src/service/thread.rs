@@ -682,23 +682,13 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
         let source_identity = req
             .source_identity
             .as_ref()
-            .map(|endpoint| {
-                Ok::<SourceIdentityInput, tonic::Status>(SourceIdentityInput {
-                    user_id: super::thread_group::owner_user_id_from_proto(
-                        endpoint.user_id,
-                        &endpoint.owner_scope,
-                        "user_id",
-                    )?,
-                    source: endpoint.source.clone(),
-                    identity_scope: if endpoint.identity_scope_known {
-                        IdentityScope::known(endpoint.identity_scope.clone())
-                    } else {
-                        IdentityScope::unknown()
-                    },
-                    native_id: endpoint.native_id.clone(),
-                })
-            })
+            .map(source_identity_input_from_proto)
             .transpose()?;
+        let structural_ancestor_identities = req
+            .structural_ancestor_identities
+            .iter()
+            .map(source_identity_input_from_proto)
+            .collect::<Result<Vec<_>, _>>()?;
 
         let input = AddMemoriesBatchInput {
             thread_target,
@@ -707,6 +697,7 @@ impl<T: ThreadGrpc + Tracing + Send + Debug + Sync + 'static> ThreadService for 
             labels: req.labels,
             source_identity,
             explicit_override: req.explicit_override,
+            structural_ancestor_identities,
         };
 
         match self.app().add_memories_batch(input).await {
@@ -833,6 +824,26 @@ fn to_proto_memory_with_position(m: MemoryWithPosition) -> MemoryWithPositionPro
         memory: Some(m.memory),
         position: m.position,
     }
+}
+
+/// Owner-local source identity carried on an import batch.
+fn source_identity_input_from_proto(
+    endpoint: &crate::protobuf::llm_memory::data::ThreadGroupEndpoint,
+) -> Result<SourceIdentityInput, tonic::Status> {
+    Ok(SourceIdentityInput {
+        user_id: super::thread_group::owner_user_id_from_proto(
+            endpoint.user_id,
+            &endpoint.owner_scope,
+            "user_id",
+        )?,
+        source: endpoint.source.clone(),
+        identity_scope: if endpoint.identity_scope_known {
+            IdentityScope::known(endpoint.identity_scope.clone())
+        } else {
+            IdentityScope::unknown()
+        },
+        native_id: endpoint.native_id.clone(),
+    })
 }
 
 /// `IMPORT_BATCH_MAX_ITEMS` parsed once at first use, defaulting to 1000.

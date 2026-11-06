@@ -13,7 +13,9 @@ mod summarize;
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use cli::{Cli, CodexArgs, DEFAULT_PLAIN_SOURCE_NAME, GlobalArgs, OpenCodeArgs, PlainArgs, Subcmd};
-use client::{ImportClient, LiveGrpcImportClient, LiveGrpcImportClientConfig, RetryPolicy};
+use client::{
+    ImportCapabilities, ImportClient, LiveGrpcImportClient, LiveGrpcImportClientConfig, RetryPolicy,
+};
 use common::importer::{
     CanonicalSessionResult, ChunkLimits, run_all_with_entry_collector_and_event_sink,
     run_all_with_event_sink,
@@ -47,7 +49,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Subcmd::UpsertGenerationWorkers(args) => {
-            run_upsert_generation_workers(args).await?;
+            run_upsert_generation_workers(args, cli.global.dry_run).await?;
         }
         Subcmd::ClaudeCode(args) => {
             run_claude_code(&cli.global, args, user_id).await?;
@@ -82,13 +84,16 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_upsert_generation_workers(args: cli::UpsertGenerationWorkersArgs) -> Result<()> {
+async fn run_upsert_generation_workers(
+    args: cli::UpsertGenerationWorkersArgs,
+    dry_run: bool,
+) -> Result<()> {
     let features = generation_workers::parse_feature_selection(&args.feature)?;
     let languages = generation_workers::parse_language_selection(&args.language)?;
     let repo_root = args
         .repo_root
         .unwrap_or_else(generation_workers::resolve_repo_root);
-    let registered = generation_workers::upsert_generation_workers(
+    let report = generation_workers::upsert_generation_workers(
         generation_workers::UpsertGenerationWorkersArgs {
             repo_root,
             channel: args.channel,
@@ -96,12 +101,20 @@ async fn run_upsert_generation_workers(args: cli::UpsertGenerationWorkersArgs) -
             features,
             languages,
         },
+        dry_run,
     )
     .await?;
-    for name in registered {
-        println!("upserted generation worker: {name}");
+    let rendered = report.render(dry_run);
+    for line in &rendered.stdout {
+        println!("{line}");
     }
-    Ok(())
+    for line in &rendered.stderr {
+        eprintln!("{line}");
+    }
+    match rendered.failure {
+        Some(failure) => Err(anyhow::anyhow!(failure)),
+        None => Ok(()),
+    }
 }
 
 async fn init_tracing(verbose: bool) -> Result<()> {
@@ -116,22 +129,24 @@ async fn init_tracing(verbose: bool) -> Result<()> {
     Ok(())
 }
 
-/// Build the live gRPC client. `--dry-run` returns `None` so the
-/// importer skips every RPC and reports the "no thread / no memory
-/// written" reality in its summary.
-async fn build_import_client(global: &GlobalArgs) -> Result<Option<Arc<dyn ImportClient>>> {
+/// Build the live gRPC client and read the server's capabilities once.
+/// `--dry-run` returns `None` so the importer skips every RPC and
+/// reports the "no thread / no memory written" reality in its summary.
+async fn build_import_client(
+    global: &GlobalArgs,
+) -> Result<Option<(Arc<dyn ImportClient>, ImportCapabilities)>> {
     if global.dry_run {
         return Ok(None);
     }
     let cfg = live_client_config(global)?;
     let live = Arc::new(LiveGrpcImportClient::connect(cfg).await?);
-    if !global.no_thread_group_writes {
-        live.ensure_thread_group_owner_capability().await?;
-    }
+    let capabilities = live
+        .import_capabilities(!global.no_thread_group_writes)
+        .await?;
     if global.dry_run_connect {
         client::set_preview_client(live.clone());
     }
-    Ok(Some(live))
+    Ok(Some((live, capabilities)))
 }
 
 fn live_client_config(global: &GlobalArgs) -> Result<LiveGrpcImportClientConfig> {
@@ -162,7 +177,7 @@ fn live_client_config(global: &GlobalArgs) -> Result<LiveGrpcImportClientConfig>
 /// ThreadGroup reconciliation snapshot. No import RPC is issued.
 async fn report_connected_dry_run(global: &GlobalArgs) -> Result<()> {
     let live = LiveGrpcImportClient::connect(live_client_config(global)?).await?;
-    live.ensure_thread_group_owner_capability().await?;
+    live.import_capabilities(true).await?;
     let report = live.find_thread_group_reconciliation_report().await?;
     println!(
         "[dry-run-connect] active_groups={} redirected_groups={} split_groups={} \
@@ -316,7 +331,7 @@ async fn run_plain(global: &GlobalArgs, args: PlainArgs, user_id: i64) -> Result
         Some(raw) => Some(personality::parse_template(&raw)?),
         None => None,
     };
-    let client = build_import_client(global).await?;
+    let client = build_import_client(global).await?.map(|(client, _)| client);
     let display_label = if global.dry_run {
         "[dry-run] plain".to_string()
     } else {
@@ -497,7 +512,7 @@ async fn run_canonical_source<S>(
     global: &GlobalArgs,
     user_id: i64,
     label: &'static str,
-    source: S,
+    mut source: S,
 ) -> Result<()>
 where
     S: source::ChatSource,
@@ -517,7 +532,10 @@ where
         None => None,
     };
 
-    let client = build_import_client(global).await?;
+    let (client, capabilities) = build_import_client(global).await?.unzip();
+    if capabilities.is_some_and(|caps| !caps.structural_ancestor_suppression) {
+        source.on_missing_ancestor_suppression();
+    }
     let display_label = if global.dry_run {
         format!("[dry-run] {label}")
     } else {
@@ -715,7 +733,9 @@ fn print_canonical_summary(label: &str, results: &[CanonicalSessionResult]) {
             std::collections::BTreeMap::new();
         for r in &skipped_results {
             *by_reason
-                .entry(r.skip_reason.as_deref().unwrap_or("unknown"))
+                .entry(skip_reason_category(
+                    r.skip_reason.as_deref().unwrap_or("unknown"),
+                ))
                 .or_default() += 1;
         }
         println!("  Sessions skipped: {}", skipped_results.len());
@@ -791,6 +811,21 @@ where
     prune().await
 }
 
+/// Count `code: detail` skip reasons (e.g. `subagent_parent_unresolved:
+/// meta.json missing`) under their code; the per-session lines still show
+/// the detail. Other reasons are kept whole.
+fn skip_reason_category(reason: &str) -> &str {
+    source::claude_code::SKIP_REASON_CODES
+        .iter()
+        .find(|code| {
+            reason
+                .strip_prefix(**code)
+                .is_some_and(|rest| rest.starts_with(": "))
+        })
+        .copied()
+        .unwrap_or(reason)
+}
+
 fn print_reason_summary<'a, I>(label: &str, maps: I)
 where
     I: Iterator<Item = &'a std::collections::BTreeMap<String, usize>>,
@@ -813,6 +848,31 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skip_reason_category_groups_coded_reasons_only() {
+        assert_eq!(
+            skip_reason_category("subagent_parent_unresolved: meta.json missing"),
+            "subagent_parent_unresolved"
+        );
+        assert_eq!(
+            skip_reason_category("unchanged since 42"),
+            "unchanged since 42"
+        );
+        assert_eq!(
+            skip_reason_category("metadata-only session (types observed: a=1)"),
+            "metadata-only session (types observed: a=1)"
+        );
+        assert_eq!(
+            skip_reason_category("subagent_path_unparseable: /x/subagents/agent-a.b.jsonl"),
+            "subagent_path_unparseable"
+        );
+        // Free text that merely looks coded is not regrouped.
+        assert_eq!(
+            skip_reason_category("other_code: detail"),
+            "other_code: detail"
+        );
+    }
 
     #[test]
     fn import_completed_report_aggregates_results_and_keeps_parse_errors() {

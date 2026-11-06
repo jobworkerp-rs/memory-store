@@ -89,6 +89,35 @@ memories-import --user-id 1 --server-url http://localhost:9010 claude-code \
   --session-file ~/.claude/projects/-home-me-app/abc123.jsonl
 ```
 
+Subagent transcripts (`<projectKey>/<sessionId>/subagents/agent-<agentId>.jsonl`)
+are listed by `--project-dir` / `--all-projects` and imported as their own
+Threads:
+
+- The channel and ThreadGroup identity are
+  `<sessionId>/subagents/agent-<agentId>`. Labels are the parent's defaults
+  plus `subagent`; the agent type and other `.meta.json` fields go to
+  `metadata.session.subagent`.
+- A transcript is imported only when its `.meta.json` `toolUseId` matches an
+  `Agent` tool_use in the invoking transcript (the `parentAgentId` subagent
+  for nested spawns, otherwise the main transcript). It then becomes a
+  `delegated` child of that transcript. Others (for example the pre-v2.1.8x
+  layout) are skipped as `subagent_parent_unresolved`.
+- Subagents of a session deleted with `forbid_reimport` are not imported. This
+  needs a server that reports `supports_structural_ancestor_suppression`; with
+  an older server the importer warns and skips subagents.
+- `--no-subagents` restores main-transcript-only imports. Passing a subagent
+  transcript to `--session-file` imports it as a subagent.
+- The parent Thread keeps the subagent's hand-back message; its
+  `metadata.claude_code.origin_from` is the subagent's agentId.
+- Run the first import after upgrading without `--since`, so existing
+  subagent transcripts are imported and parents imported before source
+  identities existed get one.
+- Claude Code deletes subagent transcripts after `cleanupPeriodDays`
+  (30 days by default); import more often than that.
+- Generation workflows leave subagent Threads out of period-based selection
+  and summarize them only through the thread-group summary
+  (`exclude_thread_labels`).
+
 Import a project directory:
 
 ```bash
@@ -168,6 +197,29 @@ If `--channel` is omitted, the workers use jobworkerp's default channel. Pass
 
 This subcommand does not import data and does not require `--user-id`.
 
+With `-n` / `--dry-run` it does not connect to jobworkerp and only prints the
+planned workers as `[dry-run] would upsert generation worker: <name>`.
+
+When a feature's workflow YAML or prompts cannot be read (for example a missing
+file), that feature is skipped for every language and the remaining features are
+still registered. Each skipped feature is reported on stderr as
+`warning: skipped generation feature <feature>: <cause>`, followed by
+`N generation feature(s) failed: <feature,...>; M worker(s) registered` and a
+non-zero exit. If nothing can be built, the command fails without connecting to
+jobworkerp.
+
+These output lines are a stable contract for tools that run this command and
+parse its output:
+
+| Stream | Line |
+|--------|------|
+| stdout | `upserted generation worker: <name>` |
+| stdout | `[dry-run] would upsert generation worker: <name>` |
+| stderr | `warning: skipped generation feature <feature>: <cause>` |
+| stderr | `Error: <n> generation feature(s) failed: <feature, ...>; <m> worker(s) registered` |
+
+Changing these prefixes is a breaking change.
+
 The command resolves the `agent-chat-import` crate directory in this order:
 
 1. `--repo-root <PATH>`
@@ -190,7 +242,7 @@ channel distinct from its child's:
 | `*-single` language workers | `llm` (the inline LLM call) |
 | `*-batch` workflows | the single worker's registered channel (`--channel`) |
 | `agent-chat-summary` stages | `llm_batch` |
-| `thread-group-summary-batch` | `llm_batch` (nested thread-summary batch); run it on a separate channel such as `thread_group_summary` |
+| `thread-group-summary-batch` | the thread-summary and group single workers' registered channels; run it on a separate channel such as `thread_group_summary` |
 
 ### Validate Workflow YAML
 

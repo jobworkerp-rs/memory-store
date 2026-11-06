@@ -297,18 +297,29 @@ impl LiveGrpcImportClient {
         })
     }
 
-    /// Fail before owner-aware import work if the connected server cannot
-    /// preserve the independent ThreadGroup owner contract.
-    pub async fn ensure_thread_group_owner_capability(&self) -> Result<()> {
-        let response = retry_status(&self.retry, "get_thread_group_capabilities", || {
+    async fn fetch_thread_group_capabilities(
+        &self,
+    ) -> Result<ThreadGroupCapabilitiesResponse, Status> {
+        retry_status(&self.retry, "get_thread_group_capabilities", || {
             let mut client = self.build_thread_group_client();
             let request = self.attach_auth(tonic::Request::new(ThreadGroupCapabilitiesRequest {}));
             async move { client.get_thread_group_capabilities(request).await }
         })
         .await
-        .map(|response| response.into_inner());
+        .map(|response| response.into_inner())
+    }
 
-        validate_thread_group_owner_capability(response)
+    /// Fetch the server's ThreadGroup capabilities once. With
+    /// `require_owner_scope`, fail before owner-aware import work if the
+    /// server cannot preserve the independent ThreadGroup owner contract.
+    pub async fn import_capabilities(
+        &self,
+        require_owner_scope: bool,
+    ) -> Result<ImportCapabilities> {
+        import_capabilities_from(
+            self.fetch_thread_group_capabilities().await,
+            require_owner_scope,
+        )
     }
 
     /// Snapshot of the accumulated connected dry-run report.
@@ -796,18 +807,40 @@ fn map_status(status: Status) -> anyhow::Error {
     )
 }
 
-fn validate_thread_group_owner_capability(
+/// What the connected server can do for an import run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportCapabilities {
+    /// The server suppresses an import whose structural ancestor carries
+    /// a `forbid_reimport=true` deletion marker; importing subagent
+    /// transcripts is unsafe without it.
+    pub structural_ancestor_suppression: bool,
+}
+
+const OWNER_SCOPE_UNSUPPORTED: &str =
+    "connected Memories server does not support independent ThreadGroup group ownership";
+
+fn import_capabilities_from(
     response: Result<ThreadGroupCapabilitiesResponse, Status>,
-) -> Result<()> {
+    require_owner_scope: bool,
+) -> Result<ImportCapabilities> {
     match response {
-        Ok(response) if response.supports_independent_group_owner_scope => Ok(()),
-        Ok(_) => Err(anyhow!(
-            "connected Memories server does not support independent ThreadGroup group ownership; upgrade the server before importing"
-        )),
-        Err(status) if status.code() == tonic::Code::Unimplemented => Err(anyhow!(
-            "connected Memories server does not support independent ThreadGroup group ownership (UNIMPLEMENTED: {}); upgrade the server before importing",
-            status.message()
-        )),
+        Ok(response) if require_owner_scope && !response.supports_independent_group_owner_scope => {
+            Err(anyhow!(
+                "{OWNER_SCOPE_UNSUPPORTED}; upgrade the server before importing"
+            ))
+        }
+        Ok(response) => Ok(ImportCapabilities {
+            structural_ancestor_suppression: response.supports_structural_ancestor_suppression,
+        }),
+        Err(status) if status.code() == tonic::Code::Unimplemented && require_owner_scope => {
+            Err(anyhow!(
+                "{OWNER_SCOPE_UNSUPPORTED} (UNIMPLEMENTED: {}); upgrade the server before importing",
+                status.message()
+            ))
+        }
+        Err(status) if status.code() == tonic::Code::Unimplemented => Ok(ImportCapabilities {
+            structural_ancestor_suppression: false,
+        }),
         Err(status) => Err(map_status(status)),
     }
 }
@@ -919,21 +952,24 @@ mod tests {
     use std::sync::Mutex;
     use tonic::{Code, Status};
 
+    fn capabilities(owner_scope: bool, ancestor: bool) -> ThreadGroupCapabilitiesResponse {
+        ThreadGroupCapabilitiesResponse {
+            supports_independent_group_owner_scope: owner_scope,
+            supports_structural_ancestor_suppression: ancestor,
+        }
+    }
+
     #[test]
     fn owner_scope_capability_gate_accepts_supported_server() {
-        let response = protobuf::llm_memory::service::ThreadGroupCapabilitiesResponse {
-            supports_independent_group_owner_scope: true,
-        };
-
-        assert!(validate_thread_group_owner_capability(Ok(response)).is_ok());
+        let caps = import_capabilities_from(Ok(capabilities(true, true)), true).unwrap();
+        assert!(caps.structural_ancestor_suppression);
     }
 
     #[test]
     fn owner_scope_capability_gate_rejects_legacy_unimplemented_server_explicitly() {
-        let error =
-            validate_thread_group_owner_capability(Err(Status::unimplemented("unknown RPC")))
-                .unwrap_err()
-                .to_string();
+        let error = import_capabilities_from(Err(Status::unimplemented("unknown RPC")), true)
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("does not support independent ThreadGroup group ownership"));
         assert!(error.contains("UNIMPLEMENTED"));
@@ -941,14 +977,24 @@ mod tests {
 
     #[test]
     fn owner_scope_capability_gate_rejects_missing_server_capability() {
-        let response = protobuf::llm_memory::service::ThreadGroupCapabilitiesResponse {
-            supports_independent_group_owner_scope: false,
-        };
-
-        let error = validate_thread_group_owner_capability(Ok(response))
+        let error = import_capabilities_from(Ok(capabilities(false, false)), true)
             .unwrap_err()
             .to_string();
         assert!(error.contains("does not support independent ThreadGroup group ownership"));
+    }
+
+    #[test]
+    fn ancestor_suppression_capability_maps_absence_to_false_and_keeps_real_errors() {
+        let ancestor = |response, require_owner_scope| {
+            import_capabilities_from(response, require_owner_scope)
+                .map(|caps| caps.structural_ancestor_suppression)
+        };
+        assert!(!ancestor(Ok(capabilities(true, false)), true).unwrap());
+        // Without the owner requirement (`--no-thread-group-writes`), a
+        // server lacking the RPC merely lacks ancestor suppression.
+        assert!(!ancestor(Ok(capabilities(false, false)), false).unwrap());
+        assert!(!ancestor(Err(Status::unimplemented("old")), false).unwrap());
+        assert!(ancestor(Err(Status::unavailable("down")), false).is_err());
     }
 
     #[test]

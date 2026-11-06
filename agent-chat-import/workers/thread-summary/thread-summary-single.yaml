@@ -25,6 +25,15 @@ input:
         # pins the language. Kept in schema so batch-supplied input validates.
         output_language: { type: string, enum: ["ja", "en"], default: "ja" }
         memory_thread_label_prefix: { type: string, default: "summary" }
+        summary_thread_ignored_labels:
+          type: array
+          items: { type: string }
+          default: ["subagent"]
+          description: >-
+            Source-thread labels left out of the summary container's label
+            set. Containers are shared per label set, so a subagent Thread's
+            summary lands in its parent's container instead of a separate
+            subagent-labelled one.
         force_resummarize: { type: boolean, default: false }
 
 do:
@@ -86,6 +95,107 @@ do:
           result: "skipped: thread not found"
       then: exit
 
+  # Summary containers are shared per label set. Ignored labels (e.g.
+  # `subagent`) are dropped so a subagent thread's summary joins its
+  # parent's container instead of opening a separate one.
+  - resolveContainerLabels:
+      set:
+        container_source_labels: >-
+          ${ ($thread.data.labels
+              // ["thread_" + ($workflow.input.thread_id | tostring)])
+             - ($workflow.input.summary_thread_ignored_labels // ["subagent"]) }
+
+  # Step 1.6: Search for existing memory thread by labels
+  - findMemoryThread:
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
+            json_body: >-
+              ${ {
+                labels: ($container_source_labels + [$workflow.input.memory_thread_label_prefix]),
+                match_mode: "LABEL_ALL",
+                user_id: $workflow.input.user_id,
+                memory_kinds: ["MEMORY_KIND_THREAD_SUMMARY"],
+                limit: 1
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          existing_memory_thread_id: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | (if length > 0 then .[0].id.value else null end) }
+
+  # Step 1.7: Initialize default for existing_summary_memory
+  # (findExistingSummary may be skipped when no memory thread exists)
+  - initExistingSummary:
+      set:
+        existing_summary_memory: "${ null }"
+
+  # Step 1.8: Search for existing summary memory (for dedup + re-summarize check)
+  - findExistingSummary:
+      if: "${ $existing_memory_thread_id != null }"
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindMemoriesByThreadId"
+            json_body: >-
+              ${ {
+                thread_id: { value: $existing_memory_thread_id },
+                roles: ["ROLE_ASSISTANT"],
+                content_types: ["TEXT"]
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          existing_summary_memory: >-
+            ${ ((.jsonBody // "[]") | fromjson)
+               | map(select(
+                   (((.data.metadata // "{}") | fromjson).source_thread_id | tostring)
+                   == ($workflow.input.thread_id | tostring)
+                 ))
+               | (if length > 0 then .[0] else null end) }
+
+  # Step 1.9: Decide freshness before reading messages, so an up-to-date
+  # thread skips without loading its history. This is the only freshness
+  # check; batches dispatch every candidate here. ProtoJSON may carry the
+  # int64 timestamps as strings, so compare them by digit count first.
+  - checkEligibility:
+      set:
+        eligible: >-
+          ${ (($thread.data.lastMessageAt // "0") | tostring) as $last_message_at
+             | (($existing_summary_memory.data.updatedAt // "0") | tostring) as $summary_updated_at
+             | $workflow.input.force_resummarize
+               or ($thread.data.description // "") == ""
+               or ($existing_summary_memory == null)
+               or (($last_message_at | length) > ($summary_updated_at | length))
+               or ((($last_message_at | length) == ($summary_updated_at | length))
+                   and $last_message_at > $summary_updated_at) }
+
+  # Same setTask shape as the other skip gates above.
+  - skipIfNotEligible:
+      if: "${ $eligible | not }"
+      set:
+        skipped: true
+      export:
+        as:
+          result: "skipped: already up to date"
+      then: exit
+
   # Step 2: Fetch chat history (USER + ASSISTANT, TEXT only)
   - fetchMessages:
       run:
@@ -132,93 +242,6 @@ do:
       export:
         as:
           result: "skipped: not enough messages"
-      then: exit
-
-  # Step 4: Search for existing memory thread by labels
-  - findMemoryThread:
-      run:
-        function:
-          runnerName: GRPC
-          using: streaming
-          settings:
-            host: "${$workflow.input.memories_grpc_host}"
-            port: ${$workflow.input.memories_grpc_port}
-            tls: ${$workflow.input.memories_grpc_tls}
-            useReflection: true
-          arguments:
-            method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
-            json_body: >-
-              ${ {
-                labels: ( ($thread.data.labels
-                           // ["thread_" + ($workflow.input.thread_id | tostring)])
-                          + [$workflow.input.memory_thread_label_prefix] ),
-                match_mode: "LABEL_ALL",
-                user_id: $workflow.input.user_id,
-                memory_kinds: ["MEMORY_KIND_THREAD_SUMMARY"],
-                limit: 1
-              } | tojson }
-            as_json: true
-      export:
-        as:
-          existing_memory_thread_id: >-
-            ${ ((.jsonBody // "[]") | fromjson)
-               | (if length > 0 then .[0].id.value else null end) }
-
-  # Step 4.5: Initialize default for existing_summary_memory
-  # (findExistingSummary may be skipped when no memory thread exists)
-  - initExistingSummary:
-      set:
-        existing_summary_memory: "${ null }"
-
-  # Step 5: Search for existing summary memory (for dedup + re-summarize check)
-  - findExistingSummary:
-      if: "${ $existing_memory_thread_id != null }"
-      run:
-        function:
-          runnerName: GRPC
-          using: streaming
-          settings:
-            host: "${$workflow.input.memories_grpc_host}"
-            port: ${$workflow.input.memories_grpc_port}
-            tls: ${$workflow.input.memories_grpc_tls}
-            useReflection: true
-          arguments:
-            method: "/llm_memory.service.ThreadService/FindMemoriesByThreadId"
-            json_body: >-
-              ${ {
-                thread_id: { value: $existing_memory_thread_id },
-                roles: ["ROLE_ASSISTANT"],
-                content_types: ["TEXT"]
-              } | tojson }
-            as_json: true
-      export:
-        as:
-          existing_summary_memory: >-
-            ${ ((.jsonBody // "[]") | fromjson)
-               | map(select(
-                   (((.data.metadata // "{}") | fromjson).source_thread_id | tostring)
-                   == ($workflow.input.thread_id | tostring)
-                 ))
-               | (if length > 0 then .[0] else null end) }
-
-  # Step 6: Determine eligibility for (re-)summarization
-  - checkEligibility:
-      set:
-        eligible: >-
-          ${ $workflow.input.force_resummarize
-             or ($thread.data.description // "") == ""
-             or ($existing_summary_memory == null)
-             or ($thread.data.lastMessageAt
-                 > $existing_summary_memory.data.updatedAt) }
-
-  # Same setTask shape as the other skip gates above.
-  - skipIfNotEligible:
-      if: "${ $eligible | not }"
-      set:
-        skipped: true
-      export:
-        as:
-          result: "skipped: already up to date"
       then: exit
 
   # Step 7: Truncate messages if total content exceeds max_context_chars
@@ -396,12 +419,8 @@ do:
             json_body: >-
               ${ {
                 user_id: { value: $workflow.input.user_id },
-                description: (($thread.data.labels
-                               // ["thread_" + ($workflow.input.thread_id | tostring)])
-                              | join(", ")) + " の要約集",
-                labels: ( ($thread.data.labels
-                           // ["thread_" + ($workflow.input.thread_id | tostring)])
-                          + [$workflow.input.memory_thread_label_prefix] ),
+                description: ($container_source_labels | join(", ")) + " の要約集",
+                labels: ($container_source_labels + [$workflow.input.memory_thread_label_prefix]),
                 created_at: $thread.data.firstMessageAt,
                 updated_at: $thread.data.lastMessageAt,
                 memory_kind: "MEMORY_KIND_THREAD_SUMMARY"

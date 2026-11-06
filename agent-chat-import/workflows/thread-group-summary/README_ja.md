@@ -15,11 +15,12 @@ English: [README.md](README.md)
 batch は次を行う。
 
 1. 全対象グループの lineage を取得し、有効なメンバースレッドを所有者ごとにまとめる。
-2. 所有者ごとに 1 回だけ `thread-summary-batch.yaml`（`per_thread_batch_yaml`）を
-   `target_thread_ids` 付きで実行する。複数グループに属するスレッドも 1 回だけ更新され、
+2. メンバースレッドごとに `memories-thread-summary-single-<lang>` を 1 件ずつ呼び、各件の前に
+   `progress_processed` / `progress_total` を出す。複数グループに属するスレッドも 1 回だけ更新される。
+   single はメッセージを読む前に最新判定してスキップするので、最新のメンバーは短時間で終わり、
    古いメンバー要約のまま集約することはない。更新に失敗したメンバーを含むグループは集約せず、
    `thread-refresh-failed`（`reason_code: incomplete_input`）として報告する。
-3. グループごとに、スレッド単位 batch がメッセージ不足でスキップしたメンバーを渡して single worker を呼ぶ。
+3. グループごとに、スレッド要約 single がメッセージ不足でスキップしたメンバーを渡して single worker を呼ぶ。
 
 single worker は 1 グループだけを処理する。
 
@@ -46,7 +47,7 @@ single worker は 1 グループだけを処理する。
   worker が登録済みであること（`memories-import upsert-generation-workers --feature thread-summary` と
   `--feature thread-group-summary`、または `--feature all`）。prompt は
   `workers/thread-group-summary/prompts/` にあり、登録時に worker へ焼き込まれる。
-- 本 batch は、内部の thread-summary batch が使う `llm_batch` 以外の channel で実行する
+- 本 batch は、呼び出すスレッド要約・グループ要約の single worker の登録 channel とは別の channel で実行する
   （[channel 構成](../../README_ja.md#channel-構成) 参照）。
 
 ## 実行例
@@ -57,7 +58,6 @@ jobworkerp-client job enqueue-workflow \
     "group_owner_user_id": 1,
     "memories_grpc_host": "localhost",
     "memories_grpc_port": 9010,
-    "per_thread_batch_yaml": "/abs/path/to/agent-chat-import/workflows/thread-summary/thread-summary-batch.yaml",
     "ollama_base_url": "http://localhost:11434",
     "summary_model": "qwen3.6:27b",
     "output_language": "ja",
@@ -73,7 +73,6 @@ jobworkerp-client job enqueue-workflow \
 |---|---|---|---|
 | `group_owner_user_id` | ○ | - | グループの選択とグループ要約の所有に使うユーザ ID |
 | `memories_grpc_host` / `memories_grpc_port` / `memories_grpc_tls` | ○ | `localhost` / `9100` / `false` | memories の gRPC 接続先 |
-| `per_thread_batch_yaml` | ○ | - | `thread-summary-batch.yaml` のパスまたは URL |
 | `target_group_ids` | - | 有効な全グループ | 指定したグループのみ要約 |
 | `target_group_id` | - | - | このグループだけを要約。存在しないか無効なら失敗 |
 | `expected_membership_snapshot_digest` | - | - | 現在の snapshot digest と異なればそのグループを中止 |

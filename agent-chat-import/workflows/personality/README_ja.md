@@ -78,6 +78,7 @@ personalityのthread作成者は入力`user_id`であり、出力thread／memory
 | `labels_filter` | — | 指定時のみ該当ラベルを持つスレッドを処理 |
 | `target_thread_ids` | — | 対象スレッド集合 (指定時は `thread_ids` より優先。空配列なら対象 0 件) |
 | `labels_filter_match_mode` | `LABEL_ALL` | `labels_filter` の照合方式 (`LABEL_ALL` / `LABEL_ANY`) |
+| `exclude_thread_labels` | `["subagent"]` | これらの label を持つスレッドを期間・label 指定の選択から除外する（明示 ID 指定には適用しない）。空配列で除外なし |
 | `last_message_within_hours` | — | 最新メッセージが直近 N 時間以内のスレッドのみ |
 | `last_message_after_ms` | — | 最新メッセージ時刻の絶対 epoch ms 下限 (`last_message_within_hours` より優先) |
 | `thread_created_after_ms` / `thread_created_before_ms` | — | スレッド作成時刻の範囲 (下限は `>`、上限は `<=`) |

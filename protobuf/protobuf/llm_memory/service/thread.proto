@@ -341,6 +341,16 @@ message AddMemoriesBatchRequest {
     // Explicit operator override allowing a `forbid_reimport=true`
     // marker to be consumed. Default false.
     bool explicit_override = 8;
+    // Source identities of the sessions this one structurally belongs to
+    // (e.g. the parent session of a dedicated subagent transcript). A
+    // `forbid_reimport=true` marker on any of them returns `suppressed`
+    // with nothing written, so content of a deleted session cannot come
+    // back through a child that had no marker of its own. This holds even
+    // while ThreadGroup writes are disabled. `explicit_override` never
+    // consumes these markers; revive the ancestor itself first. Every
+    // entry's user_id must equal the memories' user_id (InvalidArgument
+    // otherwise); at most 16 entries; unknown-scope entries are ignored.
+    repeated llm_memory.data.ThreadGroupEndpoint structural_ancestor_identities = 9;
 }
 
 // Per-input outcome inside AddMemoriesBatch. Order matches request.

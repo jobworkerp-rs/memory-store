@@ -341,11 +341,9 @@ pub fn extract_session_info(entries: &[RawEntry], file_path: &Path) -> Result<Se
     })
 }
 
-/// Parse a single JSON line into a `RawEntry`. Test-only because the
-/// production JSONL reader (`stream_jsonl_file`) wraps the same logic
-/// while also handling per-line error recovery; callers outside tests
-/// should reach for that instead.
-#[cfg(test)]
+/// Parse a single JSON line into a `RawEntry`. Whole-file readers should
+/// use `stream_jsonl_file`, which adds per-line error recovery; this is
+/// for callers that pre-filter raw lines before paying for the parse.
 pub fn parse_raw_entry_str(json: &str) -> Result<RawEntry> {
     RawEntry::from_str(json).context("interpret JSON as RawEntry")
 }

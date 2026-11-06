@@ -594,6 +594,7 @@ fn build_per_file_session(
         }),
         thread_metadata: None,
         source_identity: None,
+        structural_ancestor_identities: Vec::new(),
         thread_group_observations: Vec::new(),
     }
 }
@@ -633,6 +634,7 @@ fn build_per_dir_session(
         }),
         thread_metadata: None,
         source_identity: None,
+        structural_ancestor_identities: Vec::new(),
         thread_group_observations: Vec::new(),
     }
 }
@@ -670,6 +672,7 @@ fn build_single_session(
         }),
         thread_metadata: None,
         source_identity: None,
+        structural_ancestor_identities: Vec::new(),
         thread_group_observations: Vec::new(),
     }
 }

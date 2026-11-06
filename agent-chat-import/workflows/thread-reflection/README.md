@@ -63,7 +63,9 @@ an explicit empty array targets zero threads), `labels_filter` +
 `labels_filter_match_mode` (`LABEL_ALL` default / `LABEL_ANY`),
 `last_message_within_hours` / `last_message_after_ms` (conversation last-message
 time; the absolute bound wins), and `thread_created_after_ms` /
-`thread_created_before_ms`. Defaults for `context_limit_tokens` /
+`thread_created_before_ms`. Period / label selection skips threads carrying
+any `exclude_thread_labels` label (default `["subagent"]`); explicit IDs are
+not filtered. Defaults for `context_limit_tokens` /
 `single_pass_threshold_tokens` / `merge_max_input_tokens` are
 222000 / 170000 / 100000. The output reports `completed` (no thread failed),
 `processed_threads`, `succeeded_count`, `failed_count`, and `last_error`; an

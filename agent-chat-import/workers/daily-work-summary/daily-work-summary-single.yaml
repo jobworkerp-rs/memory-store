@@ -73,6 +73,15 @@ input:
             Additional labels AND-matched against the per-thread
             summary listing. Empty (default) = aggregate across all
             projects.
+        exclude_thread_labels:
+          type: array
+          items: { type: string }
+          default: ["subagent"]
+          description: >-
+            Summaries whose source thread carries any of these labels are
+            not aggregated. Subagent Threads are already covered by their
+            parent's summary (hand-back) and by the thread-group summary.
+            Empty disables the exclusion.
         extra_labels_match_mode:
           type: string
           enum: ["LABEL_ALL", "LABEL_ANY"]
@@ -406,6 +415,47 @@ do:
       export:
         as:
           target_memories: ${ .jsonBody | fromjson }
+
+  # Summary containers are shared per label set (a subagent summary sits
+  # in its parent's container), so the source thread is identified by the
+  # summary memory's `summary:<thread_id>` external id, not by the
+  # container's labels.
+  - initExcludedSourceThreads:
+      set:
+        excluded_source_threads: "${ [] }"
+
+  - fetchExcludedSourceThreads:
+      if: "${ ($target_memories | length) > 0 and (($workflow.input.exclude_thread_labels // [\"subagent\"]) | length > 0) }"
+      run:
+        function:
+          runnerName: GRPC
+          using: streaming
+          settings:
+            host: "${$workflow.input.memories_grpc_host}"
+            port: ${$workflow.input.memories_grpc_port}
+            tls: ${$workflow.input.memories_grpc_tls}
+            useReflection: true
+          arguments:
+            method: "/llm_memory.service.ThreadService/FindThreadListByLabels"
+            json_body: >-
+              ${ {
+                labels: ($workflow.input.exclude_thread_labels // ["subagent"]),
+                match_mode: "LABEL_ANY",
+                user_id: $effective_user_id,
+                memory_kinds: ["MEMORY_KIND_RAW"]
+              } | tojson }
+            as_json: true
+      export:
+        as:
+          excluded_source_threads: ${ .jsonBody | fromjson }
+
+  - excludeSummariesOfExcludedThreads:
+      set:
+        target_memories: >-
+          ${ (reduce $excluded_source_threads[] as $thread
+                ({}; .["summary:" + ($thread.id.value | tostring)] = true)) as $excluded
+             | $target_memories
+             | map(select(($excluded[.memory.data.externalId // ""] // false) | not)) }
 
   # A path plan is the authority for bucket membership. Do not try to turn a
   # source LABEL_ANY plus a path condition into one thread filter: that would

@@ -144,7 +144,7 @@ pub mod values {
 /// Owner-local source identity tuple: the PRIMARY KEY of
 /// `source_thread_identity` and `thread_deletion_marker`. Borrowed form
 /// for lookup / delete / lock calls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourceIdentityKey<'a> {
     pub user_id: i64,
     pub source: &'a str,

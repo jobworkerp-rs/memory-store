@@ -1065,6 +1065,7 @@ fn build_session(
             json!({"source": SOURCE_ID, "import_schema": IMPORT_SCHEMA, "session": metadata}),
         ),
         source_identity: Some(opencode_identity(&session.id)),
+        structural_ancestor_identities: Vec::new(),
         thread_group_observations: observations_from_session(
             &session.id,
             session.parent_id.as_deref(),

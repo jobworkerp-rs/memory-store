@@ -68,7 +68,7 @@ Thread selection inputs match the reflection batch: `thread_ids`,
 `target_thread_ids` (authoritative; an explicit empty array targets zero
 threads), `labels_filter` + `labels_filter_match_mode`,
 `last_message_within_hours` / `last_message_after_ms` (conversation last-message
-time), and `thread_created_after_ms` / `thread_created_before_ms`. Threads are
+time), and `thread_created_after_ms` / `thread_created_before_ms`. `exclude_thread_labels` (default `["subagent"]`) leaves threads with those labels out of period / label selection; explicit IDs are not filtered. Threads are
 processed newest first; once `target_signal_count` (default 100) valid signals
 exist, only re-extraction of already processed threads is skipped (new threads
 always run; `force_reextract=true` ignores the cap).

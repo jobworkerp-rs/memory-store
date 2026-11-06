@@ -51,7 +51,8 @@ Optional inputs enable ThreadGroup summaries, reflection, and personality:
 
 - `thread_group_summary_batch_yaml` (runs after thread summaries and before
   daily summaries, on `thread_group_summary_channel`, default
-  `thread_group_summary`, which must not be `llm_batch`; see
+  `thread_group_summary`, which must not be `llm_batch` or the single
+  workers' registered channels; see
   [Channels](../../README.md#channels))
 - `thread_reflection_batch_yaml`
 - `thread_personality_batch_yaml`

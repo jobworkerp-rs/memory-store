@@ -637,6 +637,7 @@ async fn run_import_with_event_sink(
     // Owner-local source identity for the suppression gate / revival.
     // Empty for plain / non-source sessions (no adapter observation).
     let source_identity = source_identity_to_proto(session, user_id);
+    let structural_ancestors = structural_ancestors_to_proto(session, user_id);
 
     for (chunk_idx0, range) in chunks.iter().enumerate() {
         let chunk_idx = chunk_idx0 + 1;
@@ -658,6 +659,7 @@ async fn run_import_with_event_sink(
             labels: if is_last { labels.clone() } else { Vec::new() },
             source_identity: source_identity.clone(),
             explicit_override: false,
+            structural_ancestor_identities: structural_ancestors.clone(),
         };
 
         let response = match client.add_memories_batch(request).await {
@@ -829,6 +831,17 @@ fn source_identity_to_proto(
     user_id: i64,
 ) -> Option<ThreadGroupEndpoint> {
     canonical_source_identity(session).map(|identity| endpoint_to_proto(identity, user_id))
+}
+
+fn structural_ancestors_to_proto(
+    session: &CanonicalSession,
+    user_id: i64,
+) -> Vec<ThreadGroupEndpoint> {
+    session
+        .structural_ancestor_identities
+        .iter()
+        .map(|identity| endpoint_to_proto(identity, user_id))
+        .collect()
 }
 
 fn evidence_kind_to_proto(kind: ThreadGroupEvidenceKind) -> i32 {
@@ -2252,6 +2265,7 @@ async fn flush_chunk(
         },
         source_identity,
         explicit_override: false,
+        structural_ancestor_identities: structural_ancestors_to_proto(session, user_id),
     };
 
     let response = client
@@ -2348,6 +2362,7 @@ mod tests {
             source_metadata: serde_json::json!({"scope": "test"}),
             thread_metadata: None,
             source_identity: None,
+            structural_ancestor_identities: Vec::new(),
             thread_group_observations: Vec::new(),
         }
     }
@@ -3197,6 +3212,7 @@ mod tests {
             source_metadata: serde_json::json!({}),
             thread_metadata: None,
             source_identity: None,
+            structural_ancestor_identities: Vec::new(),
             thread_group_observations: Vec::new(),
         }
     }
@@ -3637,6 +3653,80 @@ mod tests {
         assert!(fake.batches()[0].source_identity.is_some());
         assert!(fake.observations().is_empty());
         drop(restore);
+    }
+
+    #[tokio::test]
+    async fn structural_ancestors_ride_on_every_batch_of_both_import_paths() {
+        let mut session = fake_session();
+        session.source_identity = Some(test_source_identity("codex", "child"));
+        session.structural_ancestor_identities = vec![
+            test_source_identity("codex", "parent"),
+            test_source_identity("codex", "root"),
+        ];
+        let expected: Vec<String> = vec!["parent".into(), "root".into()];
+        let native_ids = |batch: &AddMemoriesBatchRequest| {
+            batch
+                .structural_ancestor_identities
+                .iter()
+                .map(|endpoint| {
+                    assert_eq!(endpoint.user_id, Some(1));
+                    assert_eq!(endpoint.owner_scope, "user:1");
+                    endpoint.native_id.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let streaming = FakeImportClient::default();
+        let result = run_import_streaming(
+            &streaming,
+            &session,
+            stream_of(vec![
+                entry_with("a", 100, vec![]),
+                entry_with("b", 200, vec![]),
+            ]),
+            0,
+            None,
+            1,
+            &[],
+            ChunkLimits {
+                max_entries: 1,
+                ..ChunkLimits::default()
+            },
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(streaming.batches().len(), 2, "one batch per chunk");
+        for batch in streaming.batches() {
+            assert_eq!(native_ids(&batch), expected);
+        }
+
+        let vec_path = FakeImportClient::default();
+        let result = run_import(
+            &vec_path,
+            &session,
+            vec![entry_with("c", 100, vec![])],
+            0,
+            None,
+            1,
+            &[],
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(native_ids(&vec_path.batches()[0]), expected);
+
+        // Sessions without structural ancestors keep the field empty.
+        let plain = FakeImportClient::default();
+        run_import(
+            &plain,
+            &fake_session(),
+            vec![entry_with("d", 100, vec![])],
+            0,
+            None,
+            1,
+            &[],
+        )
+        .await;
+        assert!(plain.batches()[0].structural_ancestor_identities.is_empty());
     }
 
     #[tokio::test]

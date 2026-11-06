@@ -79,7 +79,7 @@ reflection を致命にしている理由: コーディング作業ログ処理�
 | パラメータ | 既定値 | 説明 |
 |---|---|---|
 | `thread_group_summary_batch_yaml` | `""` | `thread-group-summary-batch.yaml` の絶対パス / URL。空で段全体を skip |
-| `thread_group_summary_channel` | `thread_group_summary` | group batch を流す channel。`llm_batch` 以外を jobworkerp の `WORKER_CHANNELS` に登録しておく ([channel 構成](../../README_ja.md#channel-構成) 参照) |
+| `thread_group_summary_channel` | `thread_group_summary` | group batch を流す channel。`llm_batch` と single worker の登録 channel 以外を jobworkerp の `WORKER_CHANNELS` に登録しておく ([channel 構成](../../README_ja.md#channel-構成) 参照) |
 
 対象は、summary と同じ `last_message_after_ms` 窓から実行時刻までに活動したメンバーを持つ group。`group_owner_user_id` には `user_id` を渡す。group batch の失敗は thread/daily と同じく `outcome: partial` として報告する。
 

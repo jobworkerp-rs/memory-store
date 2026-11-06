@@ -21,6 +21,7 @@
   - **サイズガード**: 単一値が serialize 後 2048 bytes を超える場合は当該値のみスキップ (entry 全体ではなく値単位)。`null` 値もスキップ。本文・大 payload は `MemoryData.content` / `canonical.*` 側が保持するため metadata は軽量な属性バッグに保たれる。
   - **安定キー** (snake_case 固定 contract 名): `user_type` / `is_meta` / `entrypoint` / `claude_version` (raw `version`) / `slug` / `prompt_id` / `tool_use_id` / `source_tool_assistant_uuid` / `parent_tool_use_id`。その他の field は camelCase → snake_case の汎用変換。
   - **promoted top-level キー** (`uuid` / `parent_uuid` / `entry_type` / `is_sidechain` / `request_id` / `block_type` / `subtype`) は metadata 直下に置かれ、`claude_code.*` には重複させない。
+  - **`origin`**: subagent の hand-back 行の `origin` は本文と重複する `body` を含むため転記しない。代わりに `origin_kind` / `origin_from` (agentId) / `origin_name` (agentType) だけを入れる。
   - codex source は session_meta 付帯 field を metadata 直下 (`session_source` / `git` / `cli_version` 等) に持つ。`claude_code` は claude 固有名のため衝突しない。
 
 既定の env サイズ閾値:
@@ -79,6 +80,19 @@ memories-import --user-id 1 --server-url http://localhost:9010 claude-code \
 ```
 
 Claude Code の main session は、`/fork` の親子 observation がなくても project key と元の session ID から source identity を登録する。project key を特定できない場合は identity scope を `Unknown` のままにし、推測した root membership は作らない。fork の observation は従来どおり明示根拠があるときだけ確定する。
+
+### subagent transcript
+
+Claude Code の subagent（`Agent` tool で起動されたもの）の実行内容は、main transcript とは別の `<projectKey>/<sessionId>/subagents/agent-<agentId>.jsonl` に保存される。`--project-dir` / `--all-projects` はこれを自動で列挙し、1 ファイルを 1 Thread として取り込む。
+
+- 子 Thread の channel / ThreadGroup identity は `<sessionId>/subagents/agent-<agentId>`。label は親と同じ既定 label に `subagent` が付く。agentType などは `metadata.session.subagent` に入る。
+- 同名の `.meta.json` の `toolUseId` が、起動元 transcript（入れ子なら `parentAgentId` の subagent、それ以外は main）の `Agent` tool_use と一致した場合だけ取り込み、起動元の `delegated` child として ThreadGroup にまとめる。一致しない transcript（Claude Code v2.1.8x 以前の旧形式など）は `subagent_parent_unresolved` として skip する。
+- 親 Thread を `forbid_reimport` 付きで削除していれば、その session の subagent も取り込まない（サーバーが `supports_structural_ancestor_suppression` を返す必要がある。未対応サーバーでは警告を出して subagent を skip する）。
+- `--no-subagents` で従来どおり main transcript だけを取り込む。`--session-file` に subagent transcript を渡すとその 1 件を subagent として取り込む。
+- 親 Thread には subagent の最終報告（hand-back）も残る。その Memory の `metadata.claude_code.origin_from` が subagent の agentId を指す。
+- 導入後の最初の import は `--since` なしで行う。既存の subagent transcript が取り込まれ、source identity 登録前に import 済みの親 Thread にも identity が登録される。
+- Claude Code は subagent transcript を `cleanupPeriodDays`（既定 30 日）後に削除するため、それより短い間隔で import する。
+- 生成ワークフローは subagent Thread を期間指定の対象から除外し、thread-group summary の経由でだけ要約する（各ワークフローの `exclude_thread_labels`）。
 
 ### 1 プロジェクト分まとめて取り込む
 
@@ -165,6 +179,26 @@ memories-import upsert-generation-workers \
 `memories-user-personality-merge-ja/en`。
 このサブコマンドは import ではないため `--user-id` は不要。
 
+`-n` / `--dry-run` を付けると jobworkerp に接続せず、登録予定の worker 名だけを
+`[dry-run] would upsert generation worker: <name>` として出力する。
+
+ある feature の workflow YAML や prompt を読めない場合（ファイルの欠落など）、その feature は
+全言語ともスキップし、残りの feature は登録を続ける。スキップした feature ごとに標準エラーへ
+`warning: skipped generation feature <feature>: <原因>` を出力し、最後に
+`N generation feature(s) failed: <feature,...>; M worker(s) registered` を出して非 0 で終了する。
+1 件も組み立てられない場合は jobworkerp に接続せずエラー終了する。
+
+これらの出力行は、このコマンドを実行して出力を解析するツール向けの安定した契約である。
+
+| 出力先 | 行 |
+|--------|----|
+| 標準出力 | `upserted generation worker: <name>` |
+| 標準出力 | `[dry-run] would upsert generation worker: <name>` |
+| 標準エラー | `warning: skipped generation feature <feature>: <原因>` |
+| 標準エラー | `Error: <n> generation feature(s) failed: <feature, ...>; <m> worker(s) registered` |
+
+これらの接頭辞を変更することは互換性のない変更となる。
+
 ### `workers/` ディレクトリの場所指定
 
 登録時に各 `workers/<feature>/*-single.yaml` と `workers/<feature>/prompts/*.txt` を読むため、
@@ -197,7 +231,7 @@ MEMORY_REPO_ROOT=/opt/memories/agent-chat-import \
 | 言語別 `*-single` worker | `llm`（インラインの LLM 呼び出し） |
 | `*-batch` workflow | single worker の登録 channel（`--channel`） |
 | `agent-chat-summary` の各段 | `llm_batch` |
-| `thread-group-summary-batch` | `llm_batch`（内部の thread-summary batch）。本 batch は `thread_group_summary` など別 channel で実行する |
+| `thread-group-summary-batch` | スレッド要約・グループ要約 single worker の登録 channel。本 batch は `thread_group_summary` など別 channel で実行する |
 
 ### workflow YAML のスキーマ検証
 
@@ -674,6 +708,7 @@ MALLOC_ARENA_MAX=2 memories-import claude-code --all-projects ...
 | `-t, --include-types` | — | `user,assistant,tool_call,tool_output,system,reasoning,attachment` | canonical kind ベース。`tool_use` / `tool_result` / `image` block は対応する canonical kind を渡さないと取り込まれない |
 | `-P, --strip-path-prefix` | — | (なし) | `path:` ラベルから剥がすベースパス (カンマ区切り、最長マッチ優先)。`cwd` がベースパス配下なら相対パスが入る。マッチしなければ絶対パス |
 | `--attachment-subtypes` | — | `default` | `default` (HIGH-VALUE のみ: `task_reminder` / `diagnostics` / `edited_text_file` / `nested_memory`) / `all` / `none` / カンマ区切り whitelist。`type=attachment` JSONL イベント (画面共有・diagnostics 等) の取り込み制御 |
+| `--no-subagents` | — | (off) | `<sessionId>/subagents/agent-*.jsonl` を取り込まない |
 
 `memories-import --help` で全オプションを確認できる (subcommand 別 help は `memories-import claude-code --help`)。
 

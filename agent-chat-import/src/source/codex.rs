@@ -475,6 +475,7 @@ fn build_canonical_session(
         source_metadata: serde_json::Value::Object(session_meta),
         thread_metadata: None,
         source_identity: Some(codex_identity(session_id)),
+        structural_ancestor_identities: Vec::new(),
         thread_group_observations: observations_from_session_meta(session_id, payload),
     }
 }
