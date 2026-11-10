@@ -84,17 +84,19 @@ fn lock_held_elsewhere(path: &Path, offset: i64, length: i64) -> std::io::Result
     if result == -1 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(i32::from(lock.l_type) != libc::F_UNLCK)
+    Ok(lock.l_type != libc::F_UNLCK as libc::c_short)
 }
 
-#[cfg(all(test, target_os = "linux", not(feature = "postgres")))]
+#[cfg(all(test, not(feature = "postgres")))]
 mod tests {
     use super::*;
-    use crate::db_migrate::local::output::{ErrorCode, LocalFailure};
+    #[cfg(target_os = "linux")]
+    use crate::db_migrate::local::output::LocalFailure;
     use crate::db_migrate::local::target::SqliteTarget;
     use sqlx::{ConnectOptions, Connection, sqlite::SqliteConnectOptions};
     use std::str::FromStr;
 
+    #[cfg(target_os = "linux")]
     fn error_code(result: anyhow::Result<()>) -> Option<ErrorCode> {
         result
             .err()
@@ -134,6 +136,8 @@ mod tests {
         });
     }
 
+    // Only OFD queries see locks held by this process.
+    #[cfg(target_os = "linux")]
     #[test]
     fn idle_wal_connection_is_detected_until_it_closes() {
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
@@ -153,6 +157,8 @@ mod tests {
         });
     }
 
+    // Only OFD queries see locks held by this process.
+    #[cfg(target_os = "linux")]
     #[test]
     fn rollback_journal_transaction_is_detected() {
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
