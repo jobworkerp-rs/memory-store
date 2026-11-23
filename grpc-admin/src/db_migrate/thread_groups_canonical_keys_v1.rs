@@ -1543,12 +1543,12 @@ mod tests {
     }
 
     #[test]
-    fn replacement_verifies_an_empty_full_atlas_schema_fixture() {
+    fn replacement_verifies_an_empty_fully_migrated_schema_fixture() {
         TEST_RUNTIME.block_on(async {
             let pool = infra::infra::thread_group::test_support::setup_thread_group_pool().await;
             prepare_task_state(pool).await;
             replacement_task(pool.clone())
-                .apply("replacement-empty-atlas", "test")
+                .apply("replacement-empty-schema", "test")
                 .await
                 .unwrap();
             replacement_task(pool.clone()).verify().await.unwrap();

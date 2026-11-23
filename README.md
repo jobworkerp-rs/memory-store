@@ -96,44 +96,51 @@ CARGO_BUILD_JOBS=1 scripts/build-memories-db-migrate-sqlite.sh /path/to/memories
 ```
 
 The build supports Linux/x86_64 and macOS/Apple Silicon. It packages the native
-`memories-db-migrate` binary and the matching, SHA-256-pinned Atlas binary, plus
-a `bundle-manifest.json` recording the content digest (checked by
-`memories-db-migrate bundle verify`).
+`memories-db-migrate` binary, which carries the whole migration catalog (on
+macOS the build checks that it starts on macOS 14.0 or later), a `db-migrate/`
+copy of the SQLite catalog for the application's provenance records, and a
+`bundle-manifest.json` recording the content digest. `memories-db-migrate bundle
+verify` and every `local apply` check that the copy is exactly the compiled
+catalog and that the digest matches. No third-party migration engine is
+shipped.
 
 Before opening the database, stop all database writers and run the bundle's
 `memories-db-migrate local apply --maintenance-window-ack` with either
-`--backup-dir <dir> [--backup-keep <n>]` or `--no-backup-unsafe`. The command
-decides whether migration is needed, takes the backup, verifies the result, and
-decides whether a failed run may be retried; `local restore
+`--backup-dir <dir> [--backup-keep <n>]` or `--no-backup-unsafe`. The target
+SQLite database is named by `MEMORIES_DB_MIGRATE_DATABASE_URL` (the former
+`MEMORIES_ATLAS_DATABASE_URL` is still accepted for now, with a warning). The
+command decides whether migration is needed, takes the backup, verifies the
+result, and decides whether a failed run may be retried; `local restore
 --maintenance-window-ack --backup <backup>` restores a backup. Applications
 judge the result only by the exit code and the final structured stdout line
-(including `error_code`) and must not apply SQL or run Atlas directly. See
+(including `error_code`) and must not apply SQL directly. See
 [docs/database-migration-tool-spec_ja.md](docs/database-migration-tool-spec_ja.md)
 for the contract.
 
 ### Migration tool E2E tests
 
-The end-to-end tests of `memories-db-migrate` (`local`, `release`, and
-`embedding` commands) are `#[ignore]`d and run the release binary as a child
-process inside temporary fixtures. Build the binary of the backend under test
-and point the tests at it and at the Atlas artifact of the bundle:
+The end-to-end tests of `memories-db-migrate` (`local`, `release`,
+`embedding`, and `bundle` commands) are `#[ignore]`d and run the release binary
+as a child process inside temporary fixtures. Build the binary of the backend
+under test and point the tests at it:
 
 ```bash
 # SQLite
-scripts/build-memories-db-migrate-sqlite.sh /tmp/mdm-bundle
-MEMORIES_DB_MIGRATE_E2E_ATLAS_DIR=/tmp/mdm-bundle/atlas \
-MEMORIES_DB_MIGRATE_E2E_BINARY=/tmp/mdm-bundle/memories-db-migrate \
-  cargo test -p grpc-admin --bin memories-db-migrate -- --ignored --test-threads=1
+cargo build --release -p grpc-admin --bin memories-db-migrate
+MEMORIES_DB_MIGRATE_E2E_BINARY=target/release/memories-db-migrate \
+  cargo test --release -p grpc-admin --bin memories-db-migrate -- --ignored --test-threads=1
 
 # PostgreSQL: each test creates and drops its own schema in this database
 cargo build --release -p grpc-admin --bin memories-db-migrate --no-default-features --features postgres
-cp target/release/memories-db-migrate /tmp/mdm-pg/
 TEST_POSTGRES_URL='postgres://postgres:postgres@127.0.0.1:5432/memories_e2e?sslmode=disable' \
-MEMORIES_DB_MIGRATE_E2E_ATLAS_DIR=/tmp/mdm-bundle/atlas \
-MEMORIES_DB_MIGRATE_E2E_BINARY=/tmp/mdm-pg/memories-db-migrate \
-  cargo test -p grpc-admin --bin memories-db-migrate --no-default-features --features postgres \
+MEMORIES_DB_MIGRATE_E2E_BINARY=target/release/memories-db-migrate \
+  cargo test --release -p grpc-admin --bin memories-db-migrate --no-default-features --features postgres \
   -- --ignored --test-threads=1
 ```
+
+The handover of the history recorded by the previous migration engine (Atlas)
+is tested against the fixtures in
+`grpc-admin/tests/fixtures/db-migrate/legacy-history/`.
 
 Use `sslmode=disable` only for a local server without TLS. The tests run the
 binary with a cleared environment inside the fixture, so a developer's `.env`

@@ -1885,13 +1885,13 @@ pub(in crate::db_migrate) mod tests {
             .unwrap();
         for migration in [
             include_str!(
-                "../../../infra/atlas/sqlite/migrations/20260920000001_thread_group_schema.sql"
+                "../../../infra/db-migrate/sqlite/migrations/20260920000001_thread_group_schema.sql"
             ),
             include_str!(
-                "../../../infra/atlas/sqlite/migrations/20260926000001_thread_group_memory_relation.sql"
+                "../../../infra/db-migrate/sqlite/migrations/20260926000001_thread_group_memory_relation.sql"
             ),
             include_str!(
-                "../../../infra/atlas/sqlite/migrations/20260930000001_thread_group_user_ids.sql"
+                "../../../infra/db-migrate/sqlite/migrations/20260930000001_thread_group_user_ids.sql"
             ),
         ] {
             let ddl = migration
@@ -4169,22 +4169,22 @@ mod postgres_tests {
                 .expect("connect to isolated PostgreSQL test schema");
             for migration in [
                 include_str!(
-                    "../../../infra/atlas/postgres/migrations/20260803000001_adoption_baseline.sql"
+                    "../../../infra/db-migrate/postgres/migrations/20260803000001_adoption_baseline.sql"
                 ),
                 include_str!(
-                    "../../../infra/atlas/postgres/migrations/20260803000002_thread_message_times_schema.sql"
+                    "../../../infra/db-migrate/postgres/migrations/20260803000002_thread_message_times_schema.sql"
                 ),
                 include_str!(
-                    "../../../infra/atlas/postgres/migrations/20260803000003_schema_contract.sql"
+                    "../../../infra/db-migrate/postgres/migrations/20260803000003_schema_contract.sql"
                 ),
                 include_str!(
-                    "../../../infra/atlas/postgres/migrations/20260920000001_thread_group_schema.sql"
+                    "../../../infra/db-migrate/postgres/migrations/20260920000001_thread_group_schema.sql"
                 ),
                 include_str!(
-                    "../../../infra/atlas/postgres/migrations/20260926000001_thread_group_memory_relation.sql"
+                    "../../../infra/db-migrate/postgres/migrations/20260926000001_thread_group_memory_relation.sql"
                 ),
                 include_str!(
-                    "../../../infra/atlas/postgres/migrations/20260930000001_thread_group_user_ids.sql"
+                    "../../../infra/db-migrate/postgres/migrations/20260930000001_thread_group_user_ids.sql"
                 ),
             ] {
                 sqlx::raw_sql(migration)

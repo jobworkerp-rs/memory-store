@@ -11,6 +11,7 @@ use infra_utils::infra::rdb::RdbPool;
 pub mod catalog;
 pub mod embedding;
 pub mod local;
+pub mod schema;
 pub mod state;
 pub mod thread_groups_canonical_keys_v1;
 pub mod thread_groups_user_ids_v1;

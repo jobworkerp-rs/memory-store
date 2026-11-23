@@ -1,4 +1,4 @@
--- Mirrors infra/atlas/sqlite/migrations/20261009000001_embedding_storage_identity.sql
+-- Mirrors infra/db-migrate/sqlite/migrations/20261009000001_embedding_storage_identity.sql
 -- for the SQLx test schema.
 CREATE TABLE memories_storage_identity (
     identity_key TEXT PRIMARY KEY CHECK (identity_key = 'rdb'),

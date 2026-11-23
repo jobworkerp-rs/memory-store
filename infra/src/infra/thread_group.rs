@@ -60,7 +60,7 @@ pub mod source_identity;
 
 // SQLite-only fixture: the ThreadGroup tables are not part of the
 // shared `infra/sql/sqlite` test migrations yet, so repo tests build a
-// throwaway temp-file database straight from the committed Atlas
+// throwaway temp-file database straight from the committed schema
 // migration instead. PostgreSQL runs need the `infra/sql/postgres`
 // mirror before these tests can compile there. Exposed to downstream
 // test crates through the `test-helper` feature so app-layer services

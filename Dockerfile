@@ -40,10 +40,6 @@ COPY scripts scripts/
 # Workflows are read at runtime by the binary but the build does not need them;
 # they are copied into the runtime image instead.
 
-# Atlas is a fixed release dependency of memories-db-migrate. The lock pins a
-# stable release URL, version, and SHA-256; every mismatch fails closed.
-RUN scripts/fetch-atlas-linux-amd64.sh /build/atlas-bin/atlas
-
 RUN cargo build --release \
         --no-default-features \
         --features summarize-after \
@@ -53,9 +49,7 @@ RUN cargo build --release \
 # build. This deliberately uses a disposable database; user SQLite files are
 # never part of the image build.
 RUN cargo build --release -p grpc-admin --bin memories-db-migrate \
-    && mkdir -p infra/atlas/bin \
-    && cp /build/atlas-bin/atlas infra/atlas/bin/atlas \
-    && export MEMORIES_ATLAS_DATABASE_URL="sqlite:///tmp/memories-db-migrate-e2e.sqlite3?mode=rwc" \
+    && export MEMORIES_DB_MIGRATE_DATABASE_URL="sqlite:///tmp/memories-db-migrate-e2e.sqlite3?mode=rwc" \
     && ./target/release/memories-db-migrate schema validate \
     && ./target/release/memories-db-migrate schema status \
     && ./target/release/memories-db-migrate schema apply --dry-run \
@@ -123,8 +117,6 @@ COPY --from=builder --chown=memories:memories /build/target/release/memories-db-
 COPY --from=builder --chown=memories:memories /build/target/release/memories-maintenance ./memories-maintenance
 COPY --chown=memories:memories workflows ./workflows
 COPY --chown=memories:memories infra/sql/postgres ./sql/postgres
-COPY --chown=memories:memories infra/atlas ./atlas
-COPY --from=builder --chown=memories:memories /build/atlas-bin/atlas ./atlas/bin/atlas
 COPY --chown=memories:memories docker/start.sh ./start.sh
 RUN chmod +x ./start.sh
 

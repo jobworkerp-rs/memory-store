@@ -95,41 +95,45 @@ CARGO_BUILD_JOBS=1 scripts/build-memories-db-migrate-sqlite.sh /path/to/memories
 ```
 
 このビルドは Linux/x86_64 および macOS/Apple Silicon をサポートします。ネイティブの
-`memories-db-migrate` バイナリと、対応する SHA-256 固定済み Atlas バイナリを
-パッケージ化し、内容 digest を記録した `bundle-manifest.json` を含めます
-（`memories-db-migrate bundle verify` で検証できます）。
+`memories-db-migrate` バイナリ（migration 一式を組み込み済み、macOS では 14.0 以上で起動できることを
+ビルド時に検査）と、利用側の provenance 用の SQLite カタログの写し `db-migrate/` をパッケージ化し、
+内容 digest を記録した `bundle-manifest.json` を含めます。`memories-db-migrate bundle verify` と
+毎回の `local apply` は、写しが組み込み済みのカタログと過不足なく一致することと、digest の一致を検証します。
+第三者の migration engine は同梱しません。
 
 データベースを開く前に、すべてのデータベース書き込み処理を停止し、バンドル内の
 `memories-db-migrate local apply --maintenance-window-ack` を実行してください。
+対象の SQLite は `MEMORIES_DB_MIGRATE_DATABASE_URL` で指定します（旧名の
+`MEMORIES_ATLAS_DATABASE_URL` も当面は受け付けますが、警告が出ます）。
 `--backup-dir <ディレクトリ> [--backup-keep <世代数>]` か `--no-backup-unsafe` のどちらかの指定が必須です。
 移行要否の判断、バックアップ、検証、失敗時の再実行可否の判断はこのコマンドが行い、
 復元は `local restore --maintenance-window-ack --backup <バックアップ>` で行います。
 アプリケーションは終了コードと stdout 最終行の構造化行（`error_code` など）だけで判定し、
-SQL を適用したり Atlas を直接実行したりしてはいけません。
+SQL を直接適用してはいけません。
 契約の詳細は [docs/database-migration-tool-spec_ja.md](docs/database-migration-tool-spec_ja.md) を参照してください。
 
 ### マイグレーションツールの E2E 試験
 
-`memories-db-migrate` の E2E 試験（`local`・`release`・`embedding` コマンド）は
+`memories-db-migrate` の E2E 試験（`local`・`release`・`embedding`・`bundle` コマンド）は
 `#[ignore]` 付きで、リリースバイナリを一時 fixture の中で子プロセスとして実行します。
-対象のバックエンドのバイナリをビルドし、それとバンドルの Atlas を指定して実行します。
+対象のバックエンドのバイナリをビルドし、それを指定して実行します。
 
 ```bash
 # SQLite
-scripts/build-memories-db-migrate-sqlite.sh /tmp/mdm-bundle
-MEMORIES_DB_MIGRATE_E2E_ATLAS_DIR=/tmp/mdm-bundle/atlas \
-MEMORIES_DB_MIGRATE_E2E_BINARY=/tmp/mdm-bundle/memories-db-migrate \
-  cargo test -p grpc-admin --bin memories-db-migrate -- --ignored --test-threads=1
+cargo build --release -p grpc-admin --bin memories-db-migrate
+MEMORIES_DB_MIGRATE_E2E_BINARY=target/release/memories-db-migrate \
+  cargo test --release -p grpc-admin --bin memories-db-migrate -- --ignored --test-threads=1
 
 # PostgreSQL（各試験がこのデータベースに専用の schema を作り、終了時に削除する）
 cargo build --release -p grpc-admin --bin memories-db-migrate --no-default-features --features postgres
-cp target/release/memories-db-migrate /tmp/mdm-pg/
 TEST_POSTGRES_URL='postgres://postgres:postgres@127.0.0.1:5432/memories_e2e?sslmode=disable' \
-MEMORIES_DB_MIGRATE_E2E_ATLAS_DIR=/tmp/mdm-bundle/atlas \
-MEMORIES_DB_MIGRATE_E2E_BINARY=/tmp/mdm-pg/memories-db-migrate \
-  cargo test -p grpc-admin --bin memories-db-migrate --no-default-features --features postgres \
+MEMORIES_DB_MIGRATE_E2E_BINARY=target/release/memories-db-migrate \
+  cargo test --release -p grpc-admin --bin memories-db-migrate --no-default-features --features postgres \
   -- --ignored --test-threads=1
 ```
+
+以前の migration engine（Atlas）が記録した移行履歴の引き継ぎは、
+`grpc-admin/tests/fixtures/db-migrate/legacy-history/` の fixture を使って試験します。
 
 `sslmode=disable` は TLS のないローカルのサーバーにだけ使ってください。試験は環境変数を
 消去したうえで fixture の中でバイナリを実行するので、開発者の `.env`（実際の保存先を指すことがある）

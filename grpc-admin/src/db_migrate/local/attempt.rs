@@ -28,8 +28,9 @@ pub struct AttemptRecord {
     pub bundle_digest: Option<String>,
     /// `None` when the attempt ran without a backup.
     pub backup: Option<PathBuf>,
-    /// The last stage the attempt started.
-    pub stage: Stage,
+    /// The last stage the attempt started; `None` for a stage this release
+    /// no longer has (an attempt of an earlier release).
+    pub stage: Option<Stage>,
     pub status: AttemptStatus,
 }
 
@@ -79,7 +80,7 @@ impl AttemptRecord {
             started_at: self.started_at,
             bundle_digest: self.bundle_digest.clone(),
             backup: self.backup.clone(),
-            stage: self.stage.as_str().to_string(),
+            stage: self.stage.map_or("", Stage::as_str).to_string(),
             status: status.to_string(),
             resolution,
         };
@@ -102,7 +103,8 @@ impl AttemptRecord {
             started_at: stored.started_at,
             bundle_digest: stored.bundle_digest,
             backup: stored.backup,
-            stage: Stage::parse(&stored.stage)?,
+            // The status and backup still decide what the next run may do.
+            stage: Stage::parse(&stored.stage),
             status,
         })
     }
@@ -120,7 +122,7 @@ mod tests {
             started_at: 10,
             bundle_digest: Some("digest".to_string()),
             backup: Some("/backups/memories-backup-1".into()),
-            stage: Stage::PostMigrate,
+            stage: Some(Stage::PostMigrate),
             status,
         }
     }
@@ -154,6 +156,28 @@ mod tests {
             AttemptRecord::load(&target).unwrap().unwrap().status,
             AttemptStatus::Succeeded
         );
+    }
+
+    #[test]
+    fn a_failure_in_a_retired_stage_still_requires_a_restore() {
+        // Earlier releases had a `baseline` stage; their failure there must
+        // not be forgotten by an upgraded tool.
+        let directory = tempfile::tempdir().unwrap();
+        let target = SqliteTarget::at(directory.path().join("db"));
+        std::fs::write(
+            AttemptRecord::path(&target),
+            br#"{"format":"memories-local-attempt-v1","attempt_id":"a","started_at":1,
+                "bundle_digest":null,"backup":"/backups/b","stage":"baseline",
+                "status":"failed","resolution":"restore_required"}"#,
+        )
+        .unwrap();
+        let record = AttemptRecord::load(&target).unwrap().unwrap();
+        assert_eq!(record.stage, None);
+        assert_eq!(
+            record.status,
+            AttemptStatus::Failed(Resolution::RestoreRequired)
+        );
+        assert_eq!(record.backup, Some("/backups/b".into()));
     }
 
     #[test]

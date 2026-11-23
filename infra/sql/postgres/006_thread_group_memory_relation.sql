@@ -1,4 +1,4 @@
--- Mirrors the Atlas migration without its schema-contract version update.
+-- Mirrors the db-migrate catalog migration without its schema-contract version update.
 CREATE TABLE thread_group_memory_relation (
     group_id BIGINT NOT NULL,
     memory_id BIGINT NOT NULL,

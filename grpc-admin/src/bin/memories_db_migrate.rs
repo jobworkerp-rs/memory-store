@@ -1,19 +1,22 @@
-//! Release schema-migration adapter and post-schema task coordinator.
+//! Release schema-migration engine and post-schema task coordinator.
 
 use anyhow::{Context, Result, bail};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Args, Parser, Subcommand};
 use grpc_admin::db_migrate::{
     catalog::{self},
-    local::output::{ErrorCode, LocalFailure, Resolution},
+    schema::{
+        drift, engine,
+        history::{
+            Inspection, LegacyHistoryLocation, NEWER_THAN_TOOL_MESSAGE, SCHEMA_CORRUPT_MESSAGE,
+            SchemaState,
+        },
+        migrations, seeds,
+    },
     state::{self, TaskStateKind},
     task_from_catalog,
 };
 use infra_utils::infra::rdb::{Rdb, RdbPool};
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use std::fs;
-use std::process::Stdio;
+#[cfg(feature = "postgres")]
 use url::Url;
 
 // Crate-root modules resolve next to the root file, where Cargo would treat
@@ -32,45 +35,6 @@ mod embedding_migrate;
 
 #[path = "memories_db_migrate/embedding_finish.rs"]
 mod embedding_finish;
-
-const ATLAS_TOOL_LOCK_FILE: &str = "atlas-tool.lock.json";
-#[cfg(feature = "postgres")]
-const ATLAS_SUM: &str = include_str!("../../../infra/atlas/postgres/migrations/atlas.sum");
-#[cfg(not(feature = "postgres"))]
-const ATLAS_SUM: &str = include_str!("../../../infra/atlas/sqlite/migrations/atlas.sum");
-
-#[derive(Debug, Deserialize)]
-struct AtlasToolLock {
-    version: String,
-    platforms: std::collections::BTreeMap<String, AtlasToolPlatform>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AtlasToolPlatform {
-    url: String,
-    sha256: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct SeedExpectations {
-    version: String,
-    tables: Vec<SeedExpectation>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SeedExpectation {
-    table: String,
-    key_column: String,
-    keys: Vec<String>,
-}
-
-impl AtlasToolLock {
-    fn platform(&self, name: &str) -> Result<&AtlasToolPlatform> {
-        self.platforms
-            .get(name)
-            .with_context(|| format!("Atlas tool lock has no {name} platform"))
-    }
-}
 
 #[derive(Debug, Parser)]
 #[command(name = "memories-db-migrate")]
@@ -119,7 +83,6 @@ enum SchemaCommand {
     Status,
     Apply(ApplyArgs),
     Verify(VerifyArgs),
-    Baseline,
 }
 
 #[derive(Debug, Args)]
@@ -144,7 +107,6 @@ enum PostMigrateCommand {
 #[derive(Debug, Subcommand)]
 enum ReleaseCommand {
     Plan,
-    Baseline,
     Apply(ReleaseApplyArgs),
 }
 
@@ -152,36 +114,6 @@ enum ReleaseCommand {
 struct ReleaseApplyArgs {
     #[arg(long)]
     maintenance_window_ack: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SchemaState {
-    Uninitialized,
-    BaselineRequired,
-    Pending {
-        applied_count: usize,
-    },
-    Managed,
-    /// A newer release migrated the database past this tool's catalog.
-    NewerThanTool,
-    SchemaCorrupt,
-}
-
-const SCHEMA_CORRUPT_MESSAGE: &str =
-    "schema_corrupt: Atlas history, schema contract, and task state must be introduced together";
-const NEWER_THAN_TOOL_MESSAGE: &str = "newer_than_tool: the database was migrated by a newer release; use that release or a newer one";
-
-impl SchemaState {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Uninitialized => "uninitialized",
-            Self::BaselineRequired => "baseline_required",
-            Self::Pending { .. } => "pending",
-            Self::Managed => "managed",
-            Self::NewerThanTool => "newer_than_tool",
-            Self::SchemaCorrupt => "schema_corrupt",
-        }
-    }
 }
 
 #[derive(Debug, Args)]
@@ -215,10 +147,6 @@ async fn main() -> Result<()> {
                 run_apply(args.dry_run).await
             }
             SchemaCommand::Verify(verify_args) => run_verify(verify_args.to_version).await,
-            SchemaCommand::Baseline => {
-                let _embedding_guard = embedding_guard_for_rdb_work(RdbWork::Schema).await?;
-                run_baseline().await
-            }
         },
         Command::PostMigrate { command } => {
             let _embedding_guard = match &command {
@@ -235,14 +163,18 @@ async fn main() -> Result<()> {
         Command::Embedding { command } => {
             std::process::exit(embedding_command::run_embedding(command).await)
         }
-        Command::Bundle { command } => {
-            std::process::exit(bundle_command::run_bundle(command).await)
-        }
+        Command::Bundle { command } => std::process::exit(bundle_command::run_bundle(command)),
     }
 }
 
 async fn run_schema_validate() -> Result<()> {
-    run_atlas(&["migrate", "validate"]).await?;
+    // The migrations are compiled in; validating them means checking the
+    // compiled catalog and the post-migration task catalog agree.
+    let versions = migrations::versions();
+    if versions.is_empty() || versions.windows(2).any(|pair| pair[0] >= pair[1]) {
+        bail!("the compiled migration catalog must list unique ascending versions");
+    }
+    catalog::load_catalog()?;
     println!("schema_validate status=valid");
     Ok(())
 }
@@ -255,15 +187,6 @@ async fn run_release(command: ReleaseCommand) -> Result<()> {
             run_apply(true).await?;
             run_post_migrate(PostMigrateCommand::Status).await?;
             println!("release_plan status=completed");
-        }
-        ReleaseCommand::Baseline => {
-            run_schema_validate().await?;
-            run_status().await?;
-            let _embedding_guard = embedding_guard_for_rdb_work(RdbWork::Both).await?;
-            run_baseline().await?;
-            run_status().await?;
-            run_verify(None).await?;
-            println!("release_baseline status=completed");
         }
         ReleaseCommand::Apply(args) => {
             if !args.maintenance_window_ack {
@@ -306,76 +229,49 @@ async fn run_status() -> Result<()> {
     if state == SchemaState::SchemaCorrupt {
         bail!(SCHEMA_CORRUPT_MESSAGE);
     }
-    let pending_count = pending_count_for_schema_state(state, atlas_migration_versions().len())
+    let pending_count = state
+        .pending_count()
         .map_or_else(|| "unknown".to_string(), |count| count.to_string());
     println!(
         "schema_status status={} pending_count={pending_count}",
         state.as_str()
     );
-    if matches!(state, SchemaState::Pending { .. } | SchemaState::Managed) {
-        run_atlas(&["migrate", "status"]).await?;
-    }
     Ok(())
 }
 
-/// The fixed migration catalog is the source of an automatable pending count.
-/// A baseline candidate has no trustworthy revision history, so its count must
-/// remain unknown until the explicit baseline procedure completes.
-fn pending_count_for_schema_state(state: SchemaState, migration_count: usize) -> Option<usize> {
-    match state {
-        SchemaState::Uninitialized => Some(migration_count),
-        SchemaState::Pending { applied_count } => migration_count.checked_sub(applied_count),
-        SchemaState::Managed => Some(0),
-        SchemaState::BaselineRequired | SchemaState::NewerThanTool | SchemaState::SchemaCorrupt => {
-            None
-        }
-    }
-}
-
 async fn run_apply(dry_run: bool) -> Result<()> {
-    let pool = open_target_pool().await?;
-    let state = schema_state(&pool).await?;
-    match (state, dry_run) {
-        (SchemaState::SchemaCorrupt, _) => bail!(SCHEMA_CORRUPT_MESSAGE),
-        (SchemaState::NewerThanTool, _) => bail!(NEWER_THAN_TOOL_MESSAGE),
-        (SchemaState::BaselineRequired, true) => {
+    let pool = open_migration_pool().await?;
+    let location = legacy_history_location()?;
+    if dry_run {
+        let plan = engine::plan(&pool, location).await?;
+        if plan.inspection.handover_required() {
+            println!("apply_dry_run_history_handover status=required");
+        }
+        for migration in plan.pending {
             println!(
-                "apply_dry_run status=baseline_required required_action=baseline adoption_baseline_versions={}",
-                adoption_baseline_versions().join(",")
+                "apply_dry_run_migration version={} description={}",
+                migrations::version_string(migration.version),
+                grpc_admin::db_migrate::vocabulary::encode_value(&migration.description)
             );
-            Ok(())
+            println!("{}", migration.sql.as_str().trim_end());
         }
-        (SchemaState::BaselineRequired, false) => {
-            bail!("baseline_required: run memories-db-migrate baseline before apply")
-        }
-        (SchemaState::Uninitialized, true) => {
-            run_uninitialized_dry_run().await?;
-            print_schema_dry_run_tasks().await
-        }
-        (SchemaState::Pending { .. } | SchemaState::Managed, true) => {
-            run_atlas(&["migrate", "apply", "--dry-run"]).await?;
-            print_schema_dry_run_tasks().await
-        }
-        (
-            SchemaState::Uninitialized | SchemaState::Pending { .. } | SchemaState::Managed,
-            false,
-        ) => {
-            run_atlas(&["migrate", "apply"]).await?;
-            let artifact_root = atlas_artifact_root()?;
-            let backend = target_backend()?;
-            ensure_schema_prerequisites(&pool, &latest_migration_version(&artifact_root, backend)?)
-                .await?;
-            println!("apply status=completed");
-            Ok(())
-        }
+        return print_schema_dry_run_tasks();
     }
+    let report = engine::apply(&pool, location).await?;
+    if report.handed_over {
+        println!("apply_history_handover status=completed");
+    }
+    for version in &report.applied {
+        println!("apply_migration version={version} status=applied");
+    }
+    ensure_schema_prerequisites(&pool, &migrations::latest_version()).await?;
+    println!("apply status=completed");
+    Ok(())
 }
 
-async fn print_schema_dry_run_tasks() -> Result<()> {
-    let artifact_root = atlas_artifact_root()?;
+fn print_schema_dry_run_tasks() -> Result<()> {
     let backend = target_backend()?;
-    let target_version = latest_migration_version(&artifact_root, backend)?;
-    for task in selected_tasks_for_schema_version(&target_version, backend)? {
+    for task in selected_tasks_for_schema_version(&migrations::latest_version(), backend)? {
         println!(
             "apply_dry_run_selected_task task_identity={} canonical_definition_digest={} maintenance_window_required={}",
             task.identity(),
@@ -450,14 +346,12 @@ async fn required_tasks_not_completed(
 /// Schema migrations a database in `state` has yet to apply (all of them
 /// when the state does not tell).
 fn pending_schema_versions(state: SchemaState) -> Vec<String> {
-    let versions = atlas_migration_versions();
-    match state {
-        SchemaState::Managed => Vec::new(),
-        SchemaState::Pending { applied_count } => {
-            versions.into_iter().skip(applied_count).collect()
-        }
-        _ => versions,
-    }
+    state
+        .pending_migrations()
+        .unwrap_or(migrations::migrations())
+        .iter()
+        .map(|migration| migrations::version_string(migration.version))
+        .collect()
 }
 
 /// Whether pending schema migrations and tasks are all embedding neutral.
@@ -472,33 +366,33 @@ fn pending_work_is_embedding_neutral(
     )
 }
 
+/// Which pending work a guarded command performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RdbWork {
+    /// `schema apply`.
+    Schema,
+    /// `post-migrate run`.
+    Tasks,
+    /// `release apply`.
+    Both,
+}
+
 /// Commands that change the RDB outside `local` (`release`, `schema`,
 /// `post-migrate`) take the embedding exclusion and are refused by an
 /// unfinished embedding migration like `local apply` (embedding space
 /// management spec §3.8). Taken once per command, at its entry. `None`
 /// when there is no work.
-/// Which pending work a guarded command performs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RdbWork {
-    /// `schema apply` / `schema baseline`.
-    Schema,
-    /// `post-migrate run`.
-    Tasks,
-    /// `release apply` / `release baseline`.
-    Both,
-}
-
 async fn embedding_guard_for_rdb_work(
     kind: RdbWork,
 ) -> Result<Option<grpc_admin::db_migrate::embedding::guard::Guard>> {
     use grpc_admin::db_migrate::embedding::guard::{self, Work};
     let pool = open_target_pool().await?;
-    let state = schema_state(&pool).await?;
-    let latest = atlas_migration_versions()
-        .last()
-        .cloned()
-        .context("the migration catalog is empty")?;
-    let schema_work = kind != RdbWork::Tasks && !pending_schema_versions(state).is_empty();
+    let inspection = inspect_target(&pool).await?;
+    let state = inspection.state;
+    let latest = migrations::latest_version();
+    // A pending handover is schema work too, though embedding neutral.
+    let schema_work = kind != RdbWork::Tasks
+        && (!pending_schema_versions(state).is_empty() || inspection.legacy_history.is_some());
     let task_work = kind != RdbWork::Schema
         && !pending_required_tasks(&pool, state, &latest, target_backend()?)
             .await?
@@ -544,116 +438,6 @@ async fn embedding_guard_for_rdb_work(
             bail!("refused error_code={code} resolution={resolution}{extra}: {e}")
         }
     }
-}
-
-async fn run_uninitialized_dry_run() -> Result<()> {
-    let pool = open_target_pool().await?;
-    let had_history_schema = atlas_history_schema_exists(&pool).await?;
-    drop(pool);
-    let atlas_result = run_atlas(&["migrate", "apply", "--dry-run"]).await;
-    let cleanup_result = cleanup_uninitialized_dry_run_history(had_history_schema).await;
-    match (atlas_result, cleanup_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Ok(()), Err(error)) => Err(error),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(cleanup_error)) => Err(error.context(format!(
-            "Atlas dry-run also left an unsafe migration-control state: {cleanup_error}"
-        ))),
-    }
-}
-
-async fn cleanup_uninitialized_dry_run_history(had_history_schema: bool) -> Result<()> {
-    let pool = open_target_pool().await?;
-    let has_application_table = table_exists(&pool, "thread").await?;
-    let has_history = atlas_history_exists(&pool).await?;
-    let has_contract = table_exists(&pool, "memories_schema_contract").await?;
-    let has_task_state = table_exists(&pool, "memories_data_migration_task_state").await?;
-    if !has_history {
-        if has_application_table || has_contract || has_task_state {
-            bail!(
-                "Atlas dry-run changed an uninitialized target beyond its empty revision history"
-            );
-        }
-        cleanup_new_atlas_history_schema(&pool, had_history_schema).await?;
-        return Ok(());
-    }
-    if has_application_table || has_contract || has_task_state {
-        bail!("Atlas dry-run changed an uninitialized target beyond its empty revision history");
-    }
-
-    let (count_sql, _, drop_sql) = atlas_history_sql()?;
-    let revision_count: i64 = sqlx::query_scalar(count_sql)
-        .fetch_one(&pool)
-        .await
-        .context("checking Atlas dry-run revision history")?;
-    if revision_count != 0 {
-        bail!("Atlas dry-run left a non-empty revision history on an uninitialized target");
-    }
-    // Atlas creates its revision table before rendering a dry-run plan. An
-    // empty table is not migration state, so remove it to preserve dry-run.
-    sqlx::query(drop_sql)
-        .execute(&pool)
-        .await
-        .context("restoring uninitialized target after Atlas dry-run")?;
-    cleanup_new_atlas_history_schema(&pool, had_history_schema).await?;
-    if schema_state(&pool).await? != SchemaState::Uninitialized {
-        bail!("Atlas dry-run cleanup did not restore the uninitialized target state");
-    }
-    Ok(())
-}
-
-async fn atlas_history_schema_exists(pool: &RdbPool) -> Result<bool> {
-    #[cfg(feature = "postgres")]
-    if !postgres_history_is_scoped()? {
-        return sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'atlas_schema_revisions')",
-        )
-        .fetch_one(pool)
-        .await
-        .context("checking dedicated Atlas revision schema");
-    }
-    let _ = pool;
-    Ok(false)
-}
-
-async fn cleanup_new_atlas_history_schema(pool: &RdbPool, had_history_schema: bool) -> Result<()> {
-    #[cfg(feature = "postgres")]
-    if !had_history_schema
-        && !postgres_history_is_scoped()?
-        && atlas_history_schema_exists(pool).await?
-    {
-        sqlx::query("DROP SCHEMA atlas_schema_revisions")
-            .execute(pool)
-            .await
-            .context("restoring dedicated Atlas revision schema after dry-run")?;
-    }
-    let _ = (pool, had_history_schema);
-    Ok(())
-}
-
-async fn run_baseline() -> Result<()> {
-    let pool = open_target_pool().await?;
-    if schema_state(&pool).await? != SchemaState::BaselineRequired {
-        bail!("baseline is allowed only when status is baseline_required");
-    }
-    let baseline_version = verify_adoption_baseline_candidate().await?;
-    let migration_count = remaining_migration_count_after_baseline(baseline_version)?.to_string();
-    run_atlas(&[
-        "migrate",
-        "apply",
-        &migration_count,
-        "--baseline",
-        baseline_version,
-    ])
-    .await?;
-    let artifact_root = atlas_artifact_root()?;
-    let backend = target_backend()?;
-    ensure_schema_prerequisites(&pool, &latest_migration_version(&artifact_root, backend)?).await?;
-    if schema_state(&pool).await? != SchemaState::Managed {
-        bail!("baseline did not introduce the schema contract and common task state");
-    }
-    println!("baseline status=completed baseline_version={baseline_version}");
-    Ok(())
 }
 
 async fn run_post_migrate(command: PostMigrateCommand) -> Result<()> {
@@ -788,13 +572,18 @@ async fn open_target_pool() -> Result<RdbPool> {
         .context("connecting to migration target database")
 }
 
+/// The pool schema migrations run on.
+async fn open_migration_pool() -> Result<RdbPool> {
+    let url = migration_database_url()?;
+    target_backend_for_url(&url)?;
+    #[cfg(feature = "postgres")]
+    let url = postgres_sqlx_database_url(&url)?;
+    grpc_admin::db_migrate::schema::target::connect_for_migration(&url).await
+}
+
 #[cfg(feature = "postgres")]
 fn postgres_sqlx_database_url(target_url: &str) -> Result<String> {
-    let url = Url::parse(target_url).context("parsing PostgreSQL target URL")?;
-    if url
-        .query_pairs()
-        .any(|(key, _)| key == "search_path" || key == "options[search_path]")
-    {
+    if grpc_admin::db_migrate::schema::target::names_search_path(target_url) {
         postgres_schema_url(target_url, &postgres_target_schema(target_url)?)
     } else {
         Ok(target_url.to_string())
@@ -802,52 +591,19 @@ fn postgres_sqlx_database_url(target_url: &str) -> Result<String> {
 }
 
 fn migration_database_url() -> Result<String> {
-    std::env::var("MEMORIES_ATLAS_DATABASE_URL")
-        .or_else(|_| std::env::var("POSTGRES_URL"))
-        .context("MEMORIES_ATLAS_DATABASE_URL or POSTGRES_URL is required")
-}
-
-fn atlas_database_url(target_url: &str) -> Result<String> {
-    if target_url.starts_with("sqlite:") {
-        let url = Url::parse(target_url).context("parsing SQLite target URL for Atlas")?;
-        // SQLx must receive a normal absolute SQLite URL. Atlas instead
-        // requires SQLite's URI-filename form for percent-encoded paths.
-        if url.host_str().is_none() && url.path().starts_with('/') {
-            let query = url
-                .query()
-                .map(|query| format!("?{query}"))
-                .unwrap_or_default();
-            return Ok(format!("sqlite://file:{}{query}", url.path()));
-        }
-        return Ok(target_url.to_string());
+    use grpc_admin::db_migrate::schema::target;
+    static LEGACY_NAME_WARNING: std::sync::Once = std::sync::Once::new();
+    let resolved = target::resolve_database_url(|name| std::env::var(name).ok())?;
+    if resolved.used_legacy_name {
+        LEGACY_NAME_WARNING.call_once(|| {
+            eprintln!(
+                "warning: {} is deprecated; set {} instead",
+                target::LEGACY_DATABASE_URL_ENV,
+                target::DATABASE_URL_ENV
+            );
+        });
     }
-    if !target_url.starts_with("postgres:") && !target_url.starts_with("postgresql:") {
-        return Ok(target_url.to_string());
-    }
-    let mut url = Url::parse(target_url).context("parsing PostgreSQL target URL for Atlas")?;
-    let pairs = url
-        .query_pairs()
-        .filter(|(key, _)| !(key.starts_with("options[") && key.ends_with(']')))
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect::<Vec<_>>();
-    let options_only_search_path = url
-        .query_pairs()
-        .find_map(|(key, value)| (key == "options[search_path]").then(|| value.into_owned()));
-    {
-        let mut query = url.query_pairs_mut();
-        query.clear();
-        query.extend_pairs(
-            pairs
-                .iter()
-                .map(|(key, value)| (key.as_str(), value.as_str())),
-        );
-        if !pairs.iter().any(|(key, _)| key == "search_path")
-            && let Some(schema) = options_only_search_path
-        {
-            query.append_pair("search_path", &schema);
-        }
-    }
-    Ok(url.into())
+    Ok(resolved.url)
 }
 
 async fn ensure_schema_prerequisites(pool: &RdbPool, minimum_version: &str) -> Result<()> {
@@ -856,9 +612,7 @@ async fn ensure_schema_prerequisites(pool: &RdbPool, minimum_version: &str) -> R
         SchemaState::Managed => {}
         SchemaState::NewerThanTool => bail!(NEWER_THAN_TOOL_MESSAGE),
         SchemaState::SchemaCorrupt => bail!(SCHEMA_CORRUPT_MESSAGE),
-        SchemaState::Uninitialized
-        | SchemaState::BaselineRequired
-        | SchemaState::Pending { .. } => {
+        SchemaState::Uninitialized | SchemaState::Unmanaged | SchemaState::Pending { .. } => {
             bail!("schema contract is unavailable; apply the schema migration first")
         }
     }
@@ -879,9 +633,9 @@ async fn ensure_schema_prerequisites(pool: &RdbPool, minimum_version: &str) -> R
 
 async fn post_migration_state_unavailable(pool: &RdbPool) -> Result<bool> {
     match schema_state(pool).await? {
-        SchemaState::Uninitialized
-        | SchemaState::BaselineRequired
-        | SchemaState::Pending { .. } => Ok(true),
+        SchemaState::Uninitialized | SchemaState::Unmanaged | SchemaState::Pending { .. } => {
+            Ok(true)
+        }
         SchemaState::Managed => Ok(false),
         SchemaState::NewerThanTool => bail!(NEWER_THAN_TOOL_MESSAGE),
         SchemaState::SchemaCorrupt => {
@@ -890,599 +644,57 @@ async fn post_migration_state_unavailable(pool: &RdbPool) -> Result<bool> {
     }
 }
 
+/// Where this target's legacy history lives: decided by the URL on
+/// PostgreSQL, always next to the application tables on SQLite.
+fn legacy_history_location() -> Result<LegacyHistoryLocation> {
+    if cfg!(feature = "postgres") {
+        Ok(LegacyHistoryLocation::for_url(&migration_database_url()?))
+    } else {
+        Ok(LegacyHistoryLocation::ApplicationSchema)
+    }
+}
+
+async fn inspect_target(pool: &RdbPool) -> Result<Inspection> {
+    engine::inspect(pool, legacy_history_location()?).await
+}
+
 async fn schema_state(pool: &RdbPool) -> Result<SchemaState> {
-    let has_application_table = table_exists(pool, "thread").await?;
-    let has_history = atlas_history_exists(pool).await?;
-    let has_contract = table_exists(pool, "memories_schema_contract").await?;
-    let has_task_state = table_exists(pool, "memories_data_migration_task_state").await?;
-    if !has_history {
-        return match (has_application_table, has_contract, has_task_state) {
-            (false, false, false) => Ok(SchemaState::Uninitialized),
-            (true, false, false) => Ok(SchemaState::BaselineRequired),
-            _ => Ok(SchemaState::SchemaCorrupt),
-        };
-    }
-
-    if !has_application_table {
-        return Ok(SchemaState::SchemaCorrupt);
-    }
-    let applied_count = match schema_history_shape(pool).await? {
-        HistoryShape::Prefix(applied_count) => applied_count,
-        HistoryShape::NewerThanTool { latest } => {
-            let newer_contract =
-                has_contract && has_task_state && contract_is(pool, &latest).await?;
-            return Ok(if newer_contract {
-                SchemaState::NewerThanTool
-            } else {
-                SchemaState::SchemaCorrupt
-            });
-        }
-        HistoryShape::Invalid => return Ok(SchemaState::SchemaCorrupt),
-    };
-    if !schema_control_tables_match_prefix(pool, applied_count, has_contract, has_task_state)
-        .await?
-    {
-        return Ok(SchemaState::SchemaCorrupt);
-    }
-    if applied_count == atlas_migration_versions().len() {
-        Ok(SchemaState::Managed)
-    } else {
-        Ok(SchemaState::Pending { applied_count })
-    }
-}
-
-enum HistoryShape {
-    /// A valid prefix of the fixed catalog with this many applied versions.
-    Prefix(usize),
-    /// The full fixed catalog followed only by later versions this tool does
-    /// not know: a newer release migrated the database.
-    NewerThanTool {
-        latest: String,
-    },
-    Invalid,
-}
-
-/// Atlas history may stop at a fixed-catalog boundary. Fresh databases start
-/// at v1 with a normal applied revision; adopted schemas require a baseline.
-async fn schema_history_shape(pool: &RdbPool) -> Result<HistoryShape> {
-    let (_, select_sql, _) = atlas_history_sql()?;
-    let history: Vec<(String, i64)> = sqlx::query_as(select_sql)
-        .fetch_all(pool)
-        .await
-        .context("reading Atlas schema revision history")?;
-    let expected = atlas_migration_versions();
-    let Some((first_version, first_type)) = history.first() else {
-        return Ok(HistoryShape::Invalid);
-    };
-    let Some(start_index) = expected.iter().position(|version| version == first_version) else {
-        return Ok(HistoryShape::Invalid);
-    };
-    let first_revision_is_valid = if start_index == 0 {
-        *first_type == ATLAS_BASELINE_REVISION_TYPE || *first_type == ATLAS_APPLIED_REVISION_TYPE
-    } else {
-        adoption_baseline_versions().contains(&first_version.as_str())
-            && *first_type == ATLAS_BASELINE_REVISION_TYPE
-    };
-    if !first_revision_is_valid {
-        return Ok(HistoryShape::Invalid);
-    }
-    let known_count = expected.len() - start_index;
-    let (known, later) = history.split_at(history.len().min(known_count));
-    for (offset, (version, revision_type)) in known.iter().enumerate() {
-        if version != &expected[start_index + offset]
-            || (offset > 0 && *revision_type != ATLAS_APPLIED_REVISION_TYPE)
-        {
-            return Ok(HistoryShape::Invalid);
-        }
-    }
-    let Some((latest, _)) = later.last() else {
-        return Ok(HistoryShape::Prefix(start_index + history.len()));
-    };
-    let catalog_latest = expected.last().map(String::as_str).unwrap_or_default();
-    let later_is_valid = later.iter().all(|(version, revision_type)| {
-        validate_schema_version(version).is_ok()
-            && version.as_str() > catalog_latest
-            && *revision_type == ATLAS_APPLIED_REVISION_TYPE
-    });
-    Ok(if later_is_valid {
-        HistoryShape::NewerThanTool {
-            latest: latest.clone(),
-        }
-    } else {
-        HistoryShape::Invalid
-    })
-}
-
-/// Whether the contract table holds exactly the `rdb_schema` row for `version`.
-async fn contract_is(pool: &RdbPool, version: &str) -> Result<bool> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT contract_key, version FROM memories_schema_contract ORDER BY contract_key ASC",
-    )
-    .fetch_all(pool)
-    .await
-    .context("reading the schema contract")?;
-    Ok(rows == vec![("rdb_schema".to_string(), version.to_string())])
-}
-
-#[cfg(feature = "postgres")]
-const ATLAS_HISTORY_COUNT_SQL: &str =
-    "SELECT COUNT(*) FROM atlas_schema_revisions.atlas_schema_revisions";
-#[cfg(feature = "postgres")]
-const ATLAS_HISTORY_SELECT_SQL: &str =
-    "SELECT version, type FROM atlas_schema_revisions.atlas_schema_revisions ORDER BY version ASC";
-#[cfg(feature = "postgres")]
-const ATLAS_HISTORY_DROP_SQL: &str = "DROP TABLE atlas_schema_revisions.atlas_schema_revisions";
-
-#[cfg(feature = "postgres")]
-const ATLAS_SCOPED_HISTORY_COUNT_SQL: &str = "SELECT COUNT(*) FROM atlas_schema_revisions";
-#[cfg(feature = "postgres")]
-const ATLAS_SCOPED_HISTORY_SELECT_SQL: &str =
-    "SELECT version, type FROM atlas_schema_revisions ORDER BY version ASC";
-#[cfg(feature = "postgres")]
-const ATLAS_SCOPED_HISTORY_DROP_SQL: &str = "DROP TABLE atlas_schema_revisions";
-
-#[cfg(not(feature = "postgres"))]
-const ATLAS_HISTORY_COUNT_SQL: &str = "SELECT COUNT(*) FROM atlas_schema_revisions";
-#[cfg(not(feature = "postgres"))]
-const ATLAS_HISTORY_SELECT_SQL: &str =
-    "SELECT version, type FROM atlas_schema_revisions ORDER BY version ASC";
-#[cfg(not(feature = "postgres"))]
-const ATLAS_HISTORY_DROP_SQL: &str = "DROP TABLE atlas_schema_revisions";
-
-fn atlas_history_sql() -> Result<(&'static str, &'static str, &'static str)> {
-    #[cfg(feature = "postgres")]
-    if postgres_history_is_scoped()? {
-        return Ok((
-            ATLAS_SCOPED_HISTORY_COUNT_SQL,
-            ATLAS_SCOPED_HISTORY_SELECT_SQL,
-            ATLAS_SCOPED_HISTORY_DROP_SQL,
-        ));
-    }
-    Ok((
-        ATLAS_HISTORY_COUNT_SQL,
-        ATLAS_HISTORY_SELECT_SQL,
-        ATLAS_HISTORY_DROP_SQL,
-    ))
-}
-
-#[cfg(feature = "postgres")]
-fn postgres_history_is_scoped() -> Result<bool> {
-    let url = Url::parse(&migration_database_url()?).context("parsing PostgreSQL target URL")?;
-    Ok(url
-        .query_pairs()
-        .any(|(key, _)| key == "search_path" || key == "options[search_path]"))
-}
-
-async fn atlas_history_exists(pool: &RdbPool) -> Result<bool> {
-    #[cfg(feature = "postgres")]
-    {
-        if !postgres_history_is_scoped()? {
-            return sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'atlas_schema_revisions' AND table_name = 'atlas_schema_revisions')",
-            )
-            .fetch_one(pool)
-            .await
-            .context("checking dedicated Atlas revision history");
-        }
-        table_exists(pool, "atlas_schema_revisions").await
-    }
-    #[cfg(not(feature = "postgres"))]
-    {
-        table_exists(pool, "atlas_schema_revisions").await
-    }
-}
-
-/// The contract and common task state are introduced by the third fixed
-/// migration. Before that boundary neither table may exist; from that
-/// boundary onward the single contract row must name the applied prefix tip.
-async fn schema_control_tables_match_prefix(
-    pool: &RdbPool,
-    applied_count: usize,
-    has_contract: bool,
-    has_task_state: bool,
-) -> Result<bool> {
-    let expected = atlas_migration_versions();
-    let controls_are_introduced = applied_count >= schema_contract_migration_index();
-    if !controls_are_introduced {
-        return Ok(!has_contract && !has_task_state);
-    }
-    if !has_contract || !has_task_state {
-        return Ok(false);
-    }
-    contract_is(pool, &expected[applied_count - 1]).await
-}
-
-fn atlas_migration_versions() -> Vec<String> {
-    ATLAS_SUM
-        .lines()
-        .filter_map(|line| line.split_once('_').map(|(version, _)| version))
-        .filter(|version| validate_schema_version(version).is_ok())
-        .map(str::to_string)
-        .collect()
+    Ok(inspect_target(pool).await?.state)
 }
 
 async fn table_exists(pool: &RdbPool, table_name: &str) -> Result<bool> {
-    #[cfg(feature = "postgres")]
-    let sql = "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = $1)";
-    #[cfg(not(feature = "postgres"))]
-    let sql = "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)";
-    sqlx::query_scalar(sql)
-        .bind(table_name)
-        .fetch_one(pool)
+    let mut conn = pool
+        .acquire()
         .await
-        .context("checking migration control table existence")
-}
-
-const ADOPTION_BASELINE_VERSION: &str = "20260803000001";
-const ADOPTION_BASELINE_VERSIONS: [&str; 2] = ["20260803000002", ADOPTION_BASELINE_VERSION];
-
-/// Return candidates from the most specific historical schema to the oldest.
-/// The verification step is authoritative; ordering only improves diagnostics.
-fn adoption_baseline_versions() -> &'static [&'static str] {
-    &ADOPTION_BASELINE_VERSIONS
-}
-
-fn schema_contract_migration_index() -> usize {
-    3
-}
-
-fn remaining_migration_count_after_baseline(baseline_version: &str) -> Result<usize> {
-    let versions = atlas_migration_versions();
-    let baseline_index = versions
-        .iter()
-        .position(|version| version == baseline_version)
-        .context("adoption baseline version is absent from the fixed migration catalog")?;
-    let remaining = versions.len().saturating_sub(baseline_index + 1);
-    if remaining == 0 {
-        bail!("adoption baseline must have a later schema-contract migration");
-    }
-    Ok(remaining)
-}
-
-const ATLAS_BASELINE_REVISION_TYPE: i64 = 1;
-const ATLAS_APPLIED_REVISION_TYPE: i64 = 2;
-
-fn load_atlas_tool_lock(artifact_root: &std::path::Path) -> Result<AtlasToolLock> {
-    let path = artifact_root.join(ATLAS_TOOL_LOCK_FILE);
-    let lock: AtlasToolLock = serde_json::from_slice(
-        &fs::read(&path).with_context(|| format!("reading Atlas tool lock {}", path.display()))?,
-    )
-    .context("parsing Atlas tool lock")?;
-    if lock.version.is_empty() {
-        bail!("Atlas tool lock version must not be empty");
-    }
-    for (platform, metadata) in &lock.platforms {
-        if !metadata.url.starts_with("https://")
-            || metadata.sha256.len() != 64
-            || !metadata.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            bail!("Atlas tool lock has invalid metadata for {platform}");
-        }
-    }
-    Ok(lock)
-}
-
-fn load_seed_expectations(
-    artifact_root: &std::path::Path,
-    backend: &str,
-) -> Result<SeedExpectations> {
-    if backend != "sqlite" && backend != "postgres" {
-        bail!("seed expectations backend must be sqlite or postgres");
-    }
-    let path = artifact_root.join(backend).join("seed-expectations.json");
-    let expectations: SeedExpectations = serde_json::from_slice(
-        &fs::read(&path)
-            .with_context(|| format!("reading seed expectations {}", path.display()))?,
-    )
-    .context("parsing seed expectations")?;
-    validate_schema_version(&expectations.version)?;
-    if expectations.tables.is_empty() {
-        bail!("seed expectations must contain at least one table");
-    }
-    for expectation in &expectations.tables {
-        if !is_safe_sql_identifier(&expectation.table)
-            || !is_safe_sql_identifier(&expectation.key_column)
-            || expectation.keys.is_empty()
-            || expectation.keys.iter().any(|key| key.is_empty())
-            || expectation.keys.windows(2).any(|pair| pair[0] >= pair[1])
-        {
-            bail!("seed expectations contain an invalid table, key column, or key ordering");
-        }
-    }
-    Ok(expectations)
-}
-
-fn is_safe_sql_identifier(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
-}
-
-async fn verify_seed_expectations(
-    pool: &RdbPool,
-    artifact_root: &std::path::Path,
-    backend: &str,
-    target_version: &str,
-) -> Result<()> {
-    let expectations = load_seed_expectations(artifact_root, backend)?;
-    if expectations.version.as_str() > target_version {
-        return Ok(());
-    }
-    for expectation in expectations.tables {
-        let sql = format!(
-            "SELECT {} FROM {} ORDER BY {}",
-            expectation.key_column, expectation.table, expectation.key_column
-        );
-        let mut actual: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
-            .fetch_all(pool)
-            .await
-            .with_context(|| format!("reading seed table {}", expectation.table))?;
-        // Database collation is deployment-specific; compare canonical key order.
-        actual.sort_unstable();
-        if actual != expectation.keys {
-            bail!(
-                "seed_mismatch: table={} key_column={} expected={:?} actual={:?}",
-                expectation.table,
-                expectation.key_column,
-                expectation.keys,
-                actual
-            );
-        }
-    }
-    Ok(())
+        .context("connecting to the migration target")?;
+    grpc_admin::db_migrate::schema::history::table_exists(&mut conn, table_name).await
 }
 
 fn validate_schema_version(version: &str) -> Result<()> {
-    if version.len() != 14 || !version.bytes().all(|byte| byte.is_ascii_digit()) {
-        bail!("schema version must be a 14-digit ASCII timestamp");
-    }
-    Ok(())
-}
-
-async fn run_atlas(args: &[&str]) -> Result<()> {
-    run_atlas_owned(&args.iter().map(ToString::to_string).collect::<Vec<_>>()).await
-}
-
-async fn run_atlas_owned(args: &[String]) -> Result<()> {
-    run_atlas_owned_with_config(args, "migrate.hcl").await
-}
-
-async fn run_atlas_owned_with_config(args: &[String], config_file: &str) -> Result<()> {
-    let output = run_atlas_capture(args, config_file, &[]).await?;
-    if !output.is_empty() {
-        print!("{output}");
-    }
-    Ok(())
-}
-
-async fn run_atlas_capture(
-    args: &[String],
-    config_file: &str,
-    child_env: &[(String, String)],
-) -> Result<String> {
-    let artifact_root = atlas_artifact_root()?;
-    let atlas = artifact_root.join("bin").join("atlas");
-    if !atlas.is_file() {
-        bail!("fixed Atlas binary is missing from the release artifact");
-    }
-    verify_atlas_binary(&atlas, &load_atlas_tool_lock(&artifact_root)?).await?;
-    let config = atlas_config_path(config_file)?;
-    let backend = target_backend()?;
-    verify_atlas_sum(&artifact_root, backend)?;
-    let database_url = atlas_database_url(&migration_database_url()?)?;
-    let mut command = tokio::process::Command::new(&atlas);
-    let output = command
-        .current_dir(&artifact_root)
-        .arg("--config")
-        .arg(config)
-        .arg("--env")
-        .arg(backend)
-        .args(args)
-        .env("MEMORIES_ATLAS_DATABASE_URL", database_url)
-        .envs(child_env.iter().map(|(name, value)| (name, value)))
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .context("starting the fixed Atlas migration engine")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "Atlas migration engine failed with status {}: {}",
-            output.status,
-            redact_database_urls(&stderr)
-        );
-    }
-    String::from_utf8(output.stdout).context("Atlas migration engine returned non-UTF-8 output")
-}
-
-async fn verify_atlas_binary(atlas: &std::path::Path, lock: &AtlasToolLock) -> Result<()> {
-    let platform = lock.platform(current_atlas_platform_name()?)?;
-    let actual = sha256_file(atlas)?;
-    if !actual.eq_ignore_ascii_case(&platform.sha256) {
-        bail!("fixed Atlas binary SHA-256 does not match atlas-tool.lock.json");
-    }
-    let output = tokio::process::Command::new(atlas)
-        .arg("version")
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .context("running fixed Atlas binary version check")?;
-    if !output.status.success() {
-        bail!(
-            "fixed Atlas binary version check failed with status {}",
-            output.status
-        );
-    }
-    let version = String::from_utf8_lossy(&output.stdout);
-    if !version.contains(&lock.version) {
-        bail!("fixed Atlas binary version does not match atlas-tool.lock.json");
-    }
-    Ok(())
-}
-
-fn current_atlas_platform_name() -> Result<&'static str> {
-    atlas_platform_name(std::env::consts::OS, std::env::consts::ARCH)
-}
-
-fn atlas_platform_name(os: &str, arch: &str) -> Result<&'static str> {
-    match (os, arch) {
-        ("linux", "x86_64") => Ok("linux-amd64"),
-        ("macos", "aarch64") => Ok("darwin-arm64"),
-        _ => bail!(
-            "this memories-db-migrate build does not support Atlas on {os}/{arch}; supported platforms are linux/x86_64 and macos/aarch64"
-        ),
-    }
-}
-
-fn sha256_file(path: &std::path::Path) -> Result<String> {
-    grpc_admin::db_migrate::local::files::hash_file(path)
+    migrations::parse_version(version)
+        .map(|_| ())
+        .context("schema version must be a 14-digit ASCII timestamp")
 }
 
 async fn run_verify(requested_version: Option<String>) -> Result<()> {
-    let artifact_root = atlas_artifact_root()?;
-    let backend = target_backend()?;
     let version = match requested_version {
         Some(version) => {
             validate_schema_version(&version)?;
             version
         }
-        None => latest_migration_version(&artifact_root, backend)?,
+        None => migrations::latest_version(),
     };
-    let args = schema_diff_args(backend, &version)?;
-    let output = match backend {
-        "sqlite" => run_atlas_capture(&args, "verify.hcl", &[]).await?,
-        "postgres" => run_postgres_verify(&args).await?,
-        _ => unreachable!("target_backend only returns supported backends"),
-    };
-    if !output.trim().is_empty() {
-        bail!("drift_detected: {}", redact_database_urls(output.trim()));
-    }
     let pool = open_target_pool().await?;
-    match schema_state(&pool).await? {
-        SchemaState::Managed => ensure_schema_prerequisites(&pool, &version).await?,
-        SchemaState::BaselineRequired => {
-            bail!("schema contract is unavailable; run baseline before verify")
-        }
-        SchemaState::NewerThanTool => bail!(NEWER_THAN_TOOL_MESSAGE),
-        SchemaState::Uninitialized | SchemaState::Pending { .. } | SchemaState::SchemaCorrupt => {
-            bail!("schema contract is unavailable; apply the schema migration first")
-        }
-    }
-    verify_seed_expectations(&pool, &artifact_root, backend, &version).await?;
+    // A database this tool cannot manage, or whose history is damaged,
+    // differs from the catalog for that reason; name it instead of listing
+    // the differences.
+    schema_state(&pool).await?.refuse_unmanageable()?;
+    drift::verify(&pool, &version).await?;
+    ensure_schema_prerequisites(&pool, &version).await?;
+    seeds::verify(&pool, &version).await?;
     println!("verify status=verified version={version}");
     Ok(())
 }
-
-/// Verify exactly one known unmanaged schema before Atlas records its baseline.
-/// A candidate mismatch is expected and must leave the target untouched.
-async fn verify_adoption_baseline_candidate() -> Result<&'static str> {
-    let backend = target_backend()?;
-    let mut mismatches = Vec::new();
-    let mut matches = Vec::new();
-    for &version in adoption_baseline_versions() {
-        let args = schema_diff_args(backend, version)?;
-        let output = match backend {
-            "sqlite" => run_atlas_capture(&args, "verify.hcl", &[]).await?,
-            "postgres" => run_postgres_verify(&args).await?,
-            _ => unreachable!("target_backend only returns supported backends"),
-        };
-        if output.trim().is_empty() {
-            matches.push(version);
-            continue;
-        }
-        mismatches.push(format!(
-            "{version}: {}",
-            redact_database_urls(output.trim())
-        ));
-    }
-    match matches.as_slice() {
-        [version] => {
-            let pool = open_target_pool().await?;
-            let artifact_root = atlas_artifact_root()?;
-            verify_seed_expectations(&pool, &artifact_root, backend, version).await?;
-            Ok(version)
-        }
-        [] => Err(LocalFailure::new(
-            ErrorCode::BaselineSchemaMismatch,
-            Resolution::ToolUpdateRequired,
-            format!(
-                "target does not match a supported adoption schema; candidates={}",
-                mismatches.join(" | ")
-            ),
-        )
-        .into()),
-        _ => bail!(
-            "baseline_schema_ambiguous: target matches multiple adoption schemas: {}",
-            matches.join(",")
-        ),
-    }
-}
-
-fn latest_migration_version(artifact_root: &std::path::Path, backend: &str) -> Result<String> {
-    let directory = artifact_root.join(backend).join("migrations");
-    let mut versions = fs::read_dir(&directory)
-        .with_context(|| format!("reading Atlas migration directory {}", directory.display()))?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter_map(|name| name.split_once('_').map(|(version, _)| version.to_owned()))
-        .filter(|version| validate_schema_version(version).is_ok())
-        .collect::<Vec<_>>();
-    versions.sort();
-    versions
-        .pop()
-        .context("Atlas migration directory has no valid migration version")
-}
-
-#[cfg(feature = "postgres")]
-async fn run_postgres_verify(args: &[String]) -> Result<String> {
-    let pool = open_target_pool().await?;
-    let target_url = migration_database_url()?;
-    let schema = format!(
-        "memories_atlas_verify_{}_{}",
-        std::process::id(),
-        command_utils::util::datetime::now_millis()
-    );
-    let environment = postgres_verify_environment(&target_url, &schema)?;
-    let create = format!("CREATE SCHEMA {}", quote_postgres_identifier(&schema));
-    sqlx::query(sqlx::AssertSqlSafe(create))
-        .execute(&pool)
-        .await
-        .context("creating temporary PostgreSQL schema for Atlas verification")?;
-    let result = run_atlas_capture(args, "verify.hcl", &environment).await;
-    let drop = format!("DROP SCHEMA {} CASCADE", quote_postgres_identifier(&schema));
-    let cleanup = sqlx::query(sqlx::AssertSqlSafe(drop))
-        .execute(&pool)
-        .await
-        .context("removing temporary PostgreSQL schema for Atlas verification");
-    match (result, cleanup) {
-        (Ok(output), Ok(_)) => Ok(output),
-        (Err(error), Ok(_)) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(run_error), Err(cleanup_error)) => Err(run_error.context(format!(
-            "Atlas verification also failed to remove its temporary schema: {cleanup_error:#}"
-        ))),
-    }
-}
-
-#[cfg(feature = "postgres")]
-fn postgres_verify_environment(
-    target_url: &str,
-    dev_schema: &str,
-) -> Result<Vec<(String, String)>> {
-    let source_schema = postgres_target_schema(target_url)?;
-    Ok(vec![
-        (
-            "MEMORIES_ATLAS_DATABASE_URL".to_string(),
-            atlas_database_url(&postgres_schema_url(target_url, &source_schema)?)?,
-        ),
-        (
-            "MEMORIES_ATLAS_INTERNAL_DEV_URL".to_string(),
-            atlas_database_url(&postgres_schema_url(target_url, dev_schema)?)?,
-        ),
-    ])
-}
-
 #[cfg(feature = "postgres")]
 fn postgres_target_schema(target_url: &str) -> Result<String> {
     let url = Url::parse(target_url).context("parsing PostgreSQL target URL")?;
@@ -1508,11 +720,6 @@ fn postgres_target_schema(target_url: &str) -> Result<String> {
     // a process boundary or dynamic SQL.
     postgres_schema_url(target_url, &schema)?;
     Ok(schema)
-}
-
-#[cfg(not(feature = "postgres"))]
-async fn run_postgres_verify(_args: &[String]) -> Result<String> {
-    bail!("this memories-db-migrate build does not include PostgreSQL support")
 }
 
 #[cfg(feature = "postgres")]
@@ -1547,139 +754,9 @@ fn postgres_schema_url(target_url: &str, schema: &str) -> Result<String> {
     Ok(url.into())
 }
 
-#[cfg(feature = "postgres")]
+#[cfg(all(test, feature = "postgres"))]
 fn quote_postgres_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
-}
-
-fn redact_database_urls(value: &str) -> String {
-    let mut redacted = value.to_owned();
-    for scheme in ["sqlite:", "postgres:", "postgresql:"] {
-        let mut offset = 0;
-        while let Some(found) = redacted[offset..].find(scheme) {
-            let start = offset + found;
-            let end = redacted[start..]
-                .find(char::is_whitespace)
-                .map(|index| start + index)
-                .unwrap_or(redacted.len());
-            redacted.replace_range(start..end, "<database-url>");
-            offset = start + "<database-url>".len();
-        }
-    }
-    redacted
-}
-
-fn verify_atlas_sum(artifact_root: &std::path::Path, backend: &str) -> Result<()> {
-    let migration_dir = artifact_root.join(backend).join("migrations");
-    let sum_path = migration_dir.join("atlas.sum");
-    let expected = fs::read_to_string(&sum_path)
-        .with_context(|| format!("reading Atlas checksum file {}", sum_path.display()))?;
-    let actual = atlas_sum_text(&migration_dir)?;
-    if expected != actual {
-        bail!("Atlas migration directory checksum does not match atlas.sum");
-    }
-    Ok(())
-}
-
-fn atlas_sum_text(migration_dir: &std::path::Path) -> Result<String> {
-    let mut entries = fs::read_dir(migration_dir)
-        .with_context(|| {
-            format!(
-                "reading Atlas migration directory {}",
-                migration_dir.display()
-            )
-        })?
-        .collect::<std::io::Result<Vec<_>>>()?;
-    entries.retain(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()));
-    entries.sort_by_key(|entry| entry.file_name());
-
-    let mut cumulative = Sha256::new();
-    let mut lines = Vec::new();
-    for entry in entries {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.ends_with(".sql") {
-            continue;
-        }
-        cumulative.update(name.as_bytes());
-        cumulative.update(
-            fs::read(entry.path()).with_context(|| {
-                format!("reading Atlas migration file {}", entry.path().display())
-            })?,
-        );
-        let digest = STANDARD.encode(cumulative.clone().finalize());
-        lines.push((name, digest));
-    }
-    if lines.is_empty() {
-        bail!("Atlas migration directory must contain at least one SQL migration");
-    }
-    let mut directory = Sha256::new();
-    for (name, digest) in &lines {
-        directory.update(name.as_bytes());
-        directory.update(digest.as_bytes());
-    }
-    let mut text = format!("h1:{}\n", STANDARD.encode(directory.finalize()));
-    for (name, digest) in lines {
-        text.push_str(&format!("{name} h1:{digest}\n"));
-    }
-    Ok(text)
-}
-
-fn atlas_config_path(config_file: &str) -> Result<String> {
-    let path = atlas_artifact_root()?.join(config_file);
-    if !path.is_file() {
-        bail!("fixed Atlas configuration is missing");
-    }
-    Ok(format!("file://{}", path.to_string_lossy()))
-}
-
-fn schema_diff_args(backend: &str, version: &str) -> Result<Vec<String>> {
-    validate_schema_version(version)?;
-    if backend != "sqlite" && backend != "postgres" {
-        bail!("schema diff backend must be sqlite or postgres");
-    }
-    Ok(vec![
-        "schema".to_string(),
-        "diff".to_string(),
-        "--from".to_string(),
-        "env://url".to_string(),
-        "--to".to_string(),
-        format!("file://{backend}/migrations?version={version}"),
-        "--exclude".to_string(),
-        "atlas_schema_revisions".to_string(),
-        "--format".to_string(),
-        "{{ sql . \"\" }}".to_string(),
-    ])
-}
-
-#[cfg(test)]
-fn verify_config_uses_internal_dev_url(artifact_root: &std::path::Path) -> Result<bool> {
-    let path = artifact_root.join("verify.hcl");
-    let text = fs::read_to_string(&path)
-        .with_context(|| format!("reading Atlas verification config {}", path.display()))?;
-    Ok(
-        text.contains("MEMORIES_ATLAS_INTERNAL_DEV_URL")
-            && !text.contains("MEMORIES_ATLAS_DEV_URL"),
-    )
-}
-
-fn atlas_artifact_root() -> Result<std::path::PathBuf> {
-    let path = if let Some(path) = std::env::var_os("MEMORIES_ATLAS_DIR") {
-        std::path::PathBuf::from(path)
-    } else if let Ok(executable) = std::env::current_exe()
-        && let Some(parent) = executable.parent()
-        && parent.join("atlas").is_dir()
-    {
-        parent.join("atlas")
-    } else {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("infra")
-            .join("atlas")
-    };
-    if !path.is_dir() {
-        bail!("fixed Atlas release artifact directory is missing");
-    }
-    Ok(path)
 }
 
 fn target_backend() -> Result<&'static str> {
@@ -1711,43 +788,45 @@ fn target_backend_for_url(url: &str) -> Result<&'static str> {
             )
         }
     } else {
-        bail!("MEMORIES_ATLAS_DATABASE_URL must use sqlite:, postgres:, or postgresql:")
+        bail!("MEMORIES_DB_MIGRATE_DATABASE_URL must use sqlite:, postgres:, or postgresql:")
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::atlas_database_url;
-    #[cfg(feature = "postgres")]
-    use super::postgres_verify_environment;
-    use super::{
-        ADOPTION_BASELINE_VERSION, Cli, adoption_baseline_versions, atlas_artifact_root,
-        atlas_config_path, atlas_migration_versions, atlas_platform_name, load_atlas_tool_lock,
-        load_seed_expectations, pending_count_for_schema_state,
-        remaining_migration_count_after_baseline, schema_diff_args,
-        selected_tasks_for_schema_version, target_backend_for_url, validate_schema_version,
-        verify_atlas_sum, verify_config_uses_internal_dev_url,
-    };
     #[cfg(not(feature = "postgres"))]
+    use super::post_migration_state_unavailable;
     use super::{
-        ATLAS_APPLIED_REVISION_TYPE, ATLAS_BASELINE_REVISION_TYPE, SchemaState,
-        post_migration_state_unavailable, run_baseline, run_verify, schema_state,
-        verify_seed_expectations,
+        Cli, SchemaState, migrations, schema_state, selected_tasks_for_schema_version,
+        target_backend_for_url, validate_schema_version,
     };
     #[cfg(feature = "postgres")]
-    use super::{
-        ATLAS_HISTORY_COUNT_SQL, ATLAS_HISTORY_DROP_SQL, ATLAS_HISTORY_SELECT_SQL, SchemaState,
-        postgres_schema_url, quote_postgres_identifier, schema_state,
-    };
+    use super::{postgres_schema_url, postgres_sqlx_database_url, quote_postgres_identifier};
     use anyhow::{Context, Result, bail};
     use clap::Parser;
     use infra_utils::infra::rdb::{Rdb, RdbPool};
     use std::process::Stdio;
     use std::time::Duration;
 
-    const E2E_ENVIRONMENT_VARIABLES: [&str; 11] = [
-        "MEMORIES_ATLAS_DIR",
-        "MEMORIES_ATLAS_DATABASE_URL",
+    /// Apply the compiled catalog up to its second-to-last migration, as the
+    /// previous release left a database: the latest migration and the tasks
+    /// are still pending.
+    async fn apply_previous_release_schema(database_url: &str) {
+        #[cfg(feature = "postgres")]
+        let database_url = &postgres_sqlx_database_url(database_url).unwrap();
+        let pool = grpc_admin::db_migrate::schema::target::connect_for_migration(database_url)
+            .await
+            .unwrap();
+        let catalog = migrations::migrations();
+        migrations::migrator()
+            .run_to(catalog[catalog.len() - 2].version, &pool)
+            .await
+            .unwrap();
+        pool.close().await;
+    }
+
+    const E2E_ENVIRONMENT_VARIABLES: [&str; 10] = [
+        "MEMORIES_DB_MIGRATE_DATABASE_URL",
         "THREAD_VECTOR_ENABLED",
         "THREAD_LANCEDB_URI",
         "THREAD_LANCEDB_TABLE",
@@ -1761,8 +840,8 @@ mod tests {
 
     #[test]
     fn pending_work_neutrality_follows_the_declarations() {
-        use super::{atlas_migration_versions, catalog, pending_work_is_embedding_neutral};
-        let versions = atlas_migration_versions();
+        use super::{catalog, pending_work_is_embedding_neutral};
+        let versions = migrations::versions();
         let latest_only = SchemaState::Pending {
             applied_count: versions.len() - 1,
         };
@@ -1810,11 +889,7 @@ mod tests {
     }
 
     impl ScopedE2eEnvironment {
-        fn configure(
-            artifact_root: &str,
-            database_url: &str,
-            vector_uri: &std::path::Path,
-        ) -> Self {
+        fn configure(database_url: &str, vector_uri: &std::path::Path) -> Self {
             let previous = E2E_ENVIRONMENT_VARIABLES
                 .into_iter()
                 .map(|name| (name, std::env::var_os(name)))
@@ -1822,8 +897,7 @@ mod tests {
             // Acceptance tests run with --test-threads=1, so this scoped
             // process environment cannot be observed by another test.
             unsafe {
-                std::env::set_var("MEMORIES_ATLAS_DIR", artifact_root);
-                std::env::set_var("MEMORIES_ATLAS_DATABASE_URL", database_url);
+                std::env::set_var("MEMORIES_DB_MIGRATE_DATABASE_URL", database_url);
                 std::env::set_var("THREAD_VECTOR_ENABLED", "true");
                 std::env::set_var("THREAD_LANCEDB_URI", vector_uri);
                 std::env::set_var("THREAD_LANCEDB_TABLE", "threads");
@@ -1849,18 +923,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    fn fixed_e2e_atlas_artifact_root() -> Result<String> {
-        let artifact_root = std::env::var("MEMORIES_DB_MIGRATE_E2E_ATLAS_DIR")
-            .context("MEMORIES_DB_MIGRATE_E2E_ATLAS_DIR must be set for the E2E test")?;
-        if !std::path::Path::new(&artifact_root)
-            .join("bin/atlas")
-            .is_file()
-        {
-            bail!("fixed Atlas release artifact must contain bin/atlas");
-        }
-        Ok(artifact_root)
     }
 
     fn e2e_workspace_root() -> Result<std::path::PathBuf> {
@@ -1951,9 +1013,24 @@ mod tests {
         );
     }
 
+    /// A database migrated by the Atlas-based release, as SQL of this
+    /// build's backend (`tests/fixtures/db-migrate/legacy-history`).
+    fn legacy_fixture_sql(name: &str) -> String {
+        let backend = if cfg!(feature = "postgres") {
+            "postgres"
+        } else {
+            "sqlite"
+        };
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/db-migrate/legacy-history")
+            .join(backend)
+            .join(format!("{name}.sql"));
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("reading fixture {}: {error}", path.display()))
+    }
+
     struct MigrationE2eCommand<'a> {
         binary: &'a std::path::Path,
-        artifact_root: &'a str,
         database_url: &'a str,
         vector_uri: &'a std::path::Path,
     }
@@ -1984,8 +1061,7 @@ mod tests {
                 )
                 .env_clear()
                 .args(arguments)
-                .env("MEMORIES_ATLAS_DIR", self.artifact_root)
-                .env("MEMORIES_ATLAS_DATABASE_URL", self.database_url)
+                .env("MEMORIES_DB_MIGRATE_DATABASE_URL", self.database_url)
                 .env("THREAD_VECTOR_ENABLED", "true")
                 .env("THREAD_LANCEDB_URI", self.vector_uri)
                 .env("THREAD_LANCEDB_TABLE", "threads")
@@ -2047,14 +1123,14 @@ mod tests {
     ) -> Result<()> {
         assert_eq!(
             command.database_url, database_url,
-            "fixture pool and Atlas child process must use the same database URL"
+            "fixture pool and the child process must use the same database URL"
         );
         let output = command.run(&["schema", "validate"]).await?;
         assert!(output.contains("schema_validate status=valid"));
         let output = command.run(&["schema", "status"]).await?;
         assert!(output.contains(&format!(
             "schema_status status=uninitialized pending_count={}",
-            atlas_migration_versions().len()
+            migrations::versions().len()
         )));
         let output = command.run(&["schema", "apply", "--dry-run"]).await?;
         assert!(
@@ -2209,144 +1285,47 @@ mod tests {
         assert!(output.contains(
             "post_migrate_verify task_identity=thread-message-times-v1@1 status=verified"
         ));
-        Ok(())
-    }
 
-    async fn seed_adoption_candidate_schema(pool: &RdbPool, version: &str) -> Result<()> {
-        #[cfg(feature = "postgres")]
-        let baseline = include_str!(
-            "../../../infra/atlas/postgres/migrations/20260803000001_adoption_baseline.sql"
+        // A newer release's schema, or a damaged history, differs from this
+        // catalog; verify names that reason rather than reporting drift.
+        let checksum = if cfg!(feature = "postgres") {
+            "'\\x00'::bytea"
+        } else {
+            "x'00'"
+        };
+        let newer_release = format!(
+            "ALTER TABLE thread ADD COLUMN newer_release_column BIGINT; \
+             INSERT INTO {} (version, description, success, checksum, execution_time) \
+             VALUES (20991231000000, 'newer release', TRUE, {checksum}, 1); \
+             UPDATE memories_schema_contract SET version = '20991231000000'",
+            migrations::HISTORY_TABLE
         );
-        #[cfg(not(feature = "postgres"))]
-        let baseline = include_str!(
-            "../../../infra/atlas/sqlite/migrations/20260803000001_adoption_baseline.sql"
+        let damaged_history = format!(
+            "DELETE FROM {} WHERE version = {}",
+            migrations::HISTORY_TABLE,
+            migrations::migrations()[0].version
         );
-        sqlx::raw_sql(baseline).execute(pool).await?;
-
-        if version == "20260803000002" {
-            #[cfg(feature = "postgres")]
-            let message_times = include_str!(
-                "../../../infra/atlas/postgres/migrations/20260803000002_thread_message_times_schema.sql"
-            );
-            #[cfg(not(feature = "postgres"))]
-            let message_times = include_str!(
-                "../../../infra/atlas/sqlite/migrations/20260803000002_thread_message_times_schema.sql"
-            );
-            sqlx::raw_sql(message_times).execute(pool).await?;
+        for (change, reason) in [
+            (newer_release, super::NEWER_THAN_TOOL_MESSAGE),
+            (damaged_history, super::SCHEMA_CORRUPT_MESSAGE),
+        ] {
+            let pool = sqlx::Pool::<Rdb>::connect(&fixture_url).await?;
+            sqlx::raw_sql(sqlx::AssertSqlSafe(change))
+                .execute(&pool)
+                .await?;
+            pool.close().await;
+            let (code, _, stderr) = command.run_with_status(&["schema", "verify"]).await?;
+            assert_eq!(code, Some(1), "{stderr}");
+            assert!(stderr.contains(reason), "{stderr}");
+            assert!(!stderr.contains("drift_detected"), "{stderr}");
         }
         Ok(())
-    }
-
-    async fn run_adoption_baseline_e2e(
-        command: &MigrationE2eCommand<'_>,
-        database_url: &str,
-        candidate_version: &str,
-    ) -> Result<()> {
-        let pool = sqlx::Pool::<Rdb>::connect(database_url).await?;
-        seed_adoption_candidate_schema(&pool, candidate_version).await?;
-        assert_eq!(schema_state(&pool).await?, SchemaState::BaselineRequired);
-        drop(pool);
-
-        let output = command.run(&["schema", "status"]).await?;
-        assert!(output.contains("schema_status status=baseline_required pending_count=unknown"));
-        let output = command.run(&["schema", "apply", "--dry-run"]).await?;
-        assert!(output.contains("required_action=baseline"));
-        let output = command.run(&["schema", "baseline"]).await?;
-        assert!(output.contains(&format!(
-            "baseline status=completed baseline_version={candidate_version}"
-        )));
-        let output = command.run(&["schema", "verify"]).await?;
-        assert!(output.contains("verify status=verified version=20261009000001"));
-
-        let pool = sqlx::Pool::<Rdb>::connect(database_url).await?;
-        assert_eq!(schema_state(&pool).await?, SchemaState::Managed);
-        let contract: String = sqlx::query_scalar(
-            "SELECT version FROM memories_schema_contract WHERE contract_key = 'rdb_schema'",
-        )
-        .fetch_one(&pool)
-        .await?;
-        assert_eq!(contract, "20261009000001");
-        Ok(())
-    }
-
-    #[cfg(not(feature = "postgres"))]
-    async fn run_adoption_baseline_in_process_e2e(
-        artifact_root: &str,
-        database_url: &str,
-        vector_uri: &std::path::Path,
-        candidate_version: &str,
-    ) -> Result<()> {
-        let pool = sqlx::Pool::<Rdb>::connect(database_url).await?;
-        seed_adoption_candidate_schema(&pool, candidate_version).await?;
-        assert_eq!(schema_state(&pool).await?, SchemaState::BaselineRequired);
-        drop(pool);
-
-        let _environment = ScopedE2eEnvironment::configure(artifact_root, database_url, vector_uri);
-        run_baseline().await?;
-        let pool = sqlx::Pool::<Rdb>::connect(database_url).await?;
-        assert_eq!(schema_state(&pool).await?, SchemaState::Managed);
-        drop(pool);
-        run_verify(None).await?;
-        Ok(())
-    }
-
-    #[test]
-    fn adoption_baseline_has_a_valid_version() {
-        validate_schema_version(ADOPTION_BASELINE_VERSION).unwrap();
-    }
-
-    #[test]
-    fn adoption_baseline_candidates_cover_pre_time_and_manual_time_schemas() {
-        assert_eq!(
-            adoption_baseline_versions(),
-            &["20260803000002", "20260803000001"]
-        );
-    }
-
-    #[test]
-    fn baseline_applies_every_migration_after_the_selected_candidate() {
-        assert_eq!(
-            remaining_migration_count_after_baseline("20260803000001").unwrap(),
-            6
-        );
-        assert_eq!(
-            remaining_migration_count_after_baseline("20260803000002").unwrap(),
-            5
-        );
-        assert_eq!(
-            remaining_migration_count_after_baseline("20260803000003").unwrap(),
-            4
-        );
     }
 
     #[test]
     fn schema_version_rejects_non_canonical_values() {
         assert!(validate_schema_version("20260803").is_err());
         assert!(validate_schema_version("2026080300000x").is_err());
-    }
-
-    #[test]
-    fn schema_status_pending_count_is_deterministic_for_safe_states() {
-        assert_eq!(
-            pending_count_for_schema_state(SchemaState::Uninitialized, 4),
-            Some(4)
-        );
-        assert_eq!(
-            pending_count_for_schema_state(SchemaState::Managed, 4),
-            Some(0)
-        );
-        assert_eq!(
-            pending_count_for_schema_state(SchemaState::Pending { applied_count: 1 }, 4),
-            Some(3)
-        );
-        assert_eq!(
-            pending_count_for_schema_state(SchemaState::BaselineRequired, 2),
-            None
-        );
-        assert_eq!(
-            pending_count_for_schema_state(SchemaState::SchemaCorrupt, 2),
-            None
-        );
     }
 
     #[test]
@@ -2392,6 +1371,14 @@ mod tests {
                 "schema_status=\"$(./target/release/memories-db-migrate schema status)\""
             ),
             "Docker smoke migration must preserve schema status failures while checking its structured output"
+        );
+        assert!(
+            DOCKERFILE.contains("MEMORIES_DB_MIGRATE_DATABASE_URL="),
+            "Docker smoke migration must name its target with the current variable"
+        );
+        assert!(
+            !DOCKERFILE.to_lowercase().contains("atlas"),
+            "the image must neither fetch nor ship a third-party migration engine"
         );
     }
 
@@ -2476,23 +1463,6 @@ mod tests {
         assert!(target_backend_for_url("postgres://example.invalid/memories").is_err());
     }
 
-    #[test]
-    fn atlas_sqlite_url_converts_standard_sqlx_absolute_url_only_for_atlas() {
-        let target = "sqlite:///tmp/Lookback%20Test%20%23100%25/%E6%97%A5%E6%9C%AC%E8%AA%9E/default.sqlite3?mode=rwc&cache=shared";
-
-        assert_eq!(
-            atlas_database_url(target).unwrap(),
-            "sqlite://file:/tmp/Lookback%20Test%20%23100%25/%E6%97%A5%E6%9C%AC%E8%AA%9E/default.sqlite3?mode=rwc&cache=shared"
-        );
-    }
-
-    #[test]
-    fn atlas_sqlite_url_keeps_legacy_atlas_uri_unchanged() {
-        let target = "sqlite://file:/tmp/Lookback%20Test/default.sqlite3?mode=rwc";
-
-        assert_eq!(atlas_database_url(target).unwrap(), target);
-    }
-
     #[cfg(feature = "postgres")]
     #[test]
     fn postgres_build_rejects_sqlite_url_before_connecting() {
@@ -2505,18 +1475,18 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    fn postgres_schema_url_scopes_sqlx_and_atlas_to_the_same_schema() {
+    fn postgres_schema_url_scopes_sqlx_to_the_schema() {
         use sqlx::postgres::PgConnectOptions;
         use std::str::FromStr;
 
-        let schema = "memories_atlas_verify_123";
+        let schema = "memories_verify_123";
         let database_url = postgres_schema_url(
             "postgres://user:secret@example.invalid/memories?search_path=old_schema&options%5Bsearch_path%5D=old_schema&sslmode=disable",
             schema,
         )
         .unwrap();
         assert!(
-            database_url.contains("options%5Bsearch_path%5D=memories_atlas_verify_123"),
+            database_url.contains("options%5Bsearch_path%5D=memories_verify_123"),
             "the SQLx-specific option key must be percent-encoded in the PostgreSQL URL"
         );
         let query = url::Url::parse(&database_url)
@@ -2545,274 +1515,13 @@ mod tests {
             PgConnectOptions::from_str(&database_url)
                 .unwrap()
                 .get_options(),
-            Some("-c search_path=memories_atlas_verify_123")
+            Some("-c search_path=memories_verify_123")
         );
-    }
-
-    #[cfg(feature = "postgres")]
-    #[test]
-    fn atlas_postgres_url_removes_sqlx_only_search_path_option() {
-        let url = atlas_database_url(
-            "postgres://user:secret@example.invalid/memories?sslmode=disable&search_path=thread_scope&options%5Bsearch_path%5D=thread_scope",
-        )
-        .unwrap();
-        let query = url::Url::parse(&url)
-            .unwrap()
-            .query_pairs()
-            .map(|(key, value)| (key.into_owned(), value.into_owned()))
-            .collect::<Vec<_>>();
-
-        assert!(query.contains(&("sslmode".to_string(), "disable".to_string())));
-        assert!(query.contains(&("search_path".to_string(), "thread_scope".to_string())));
-        assert!(
-            !query.iter().any(|(key, _)| key == "options[search_path]"),
-            "Atlas/libpq must not receive SQLx-only URL parameters"
-        );
-    }
-
-    #[cfg(feature = "postgres")]
-    #[test]
-    fn atlas_postgres_url_scopes_options_only_search_path() {
-        let url = atlas_database_url(
-            "postgres://user:secret@example.invalid/memories?options%5Bsearch_path%5D=tenant_a",
-        )
-        .unwrap();
-        let query = url::Url::parse(&url).unwrap();
-        assert!(
-            query
-                .query_pairs()
-                .any(|(key, value)| key == "search_path" && value == "tenant_a")
-        );
-        assert!(
-            !query
-                .query_pairs()
-                .any(|(key, _)| key == "options[search_path]")
-        );
-    }
-
-    #[cfg(feature = "postgres")]
-    #[test]
-    fn postgres_uses_dedicated_schema_for_unscoped_atlas_revision_history() {
-        assert_eq!(
-            ATLAS_HISTORY_COUNT_SQL,
-            "SELECT COUNT(*) FROM atlas_schema_revisions.atlas_schema_revisions"
-        );
-        assert_eq!(
-            ATLAS_HISTORY_SELECT_SQL,
-            "SELECT version, type FROM atlas_schema_revisions.atlas_schema_revisions ORDER BY version ASC"
-        );
-        assert_eq!(
-            ATLAS_HISTORY_DROP_SQL,
-            "DROP TABLE atlas_schema_revisions.atlas_schema_revisions"
-        );
-    }
-
-    #[cfg(feature = "postgres")]
-    #[test]
-    fn postgres_verify_environment_scopes_source_and_dev_to_schemas() {
-        let environment = postgres_verify_environment(
-            "postgres://user:secret@example.invalid/memories?sslmode=disable",
-            "memories_atlas_verify_123",
-        )
-        .unwrap();
-
-        assert_eq!(
-            environment,
-            vec![
-                (
-                    "MEMORIES_ATLAS_DATABASE_URL".to_string(),
-                    "postgres://user:secret@example.invalid/memories?sslmode=disable&search_path=public"
-                        .to_string(),
-                ),
-                (
-                    "MEMORIES_ATLAS_INTERNAL_DEV_URL".to_string(),
-                    "postgres://user:secret@example.invalid/memories?sslmode=disable&search_path=memories_atlas_verify_123"
-                        .to_string(),
-                ),
-            ]
-        );
-    }
-
-    #[cfg(feature = "postgres")]
-    #[test]
-    fn postgres_verify_environment_preserves_the_target_schema() {
-        let environment = postgres_verify_environment(
-            "postgres://user:secret@example.invalid/memories?sslmode=disable&search_path=tenant_a&options%5Bsearch_path%5D=tenant_a",
-            "memories_atlas_verify_123",
-        )
-        .unwrap();
-
-        assert_eq!(
-            environment[0],
-            (
-                "MEMORIES_ATLAS_DATABASE_URL".to_string(),
-                "postgres://user:secret@example.invalid/memories?sslmode=disable&search_path=tenant_a"
-                    .to_string(),
-            )
-        );
-    }
-
-    #[cfg(feature = "postgres")]
-    #[test]
-    fn postgres_verify_environment_uses_sqlx_only_target_schema_option() {
-        let environment = postgres_verify_environment(
-            "postgres://user:secret@example.invalid/memories?sslmode=disable&options%5Bsearch_path%5D=tenant_a",
-            "memories_atlas_verify_123",
-        )
-        .unwrap();
-
-        assert!(environment[0].1.ends_with("search_path=tenant_a"));
-    }
-
-    #[cfg(feature = "postgres")]
-    #[test]
-    fn postgres_verify_environment_rejects_conflicting_schema_options() {
-        let error = postgres_verify_environment(
-            "postgres://user:secret@example.invalid/memories?search_path=tenant_a&options%5Bsearch_path%5D=tenant_b",
-            "memories_atlas_verify_123",
-        )
-        .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("conflicting PostgreSQL search_path")
-        );
-    }
-
-    #[test]
-    fn atlas_config_is_resolved_from_the_fixed_artifact_root() {
-        let path = atlas_config_path("migrate.hcl").unwrap();
-        assert!(path.starts_with("file://"));
-        assert!(path.ends_with("infra/atlas/migrate.hcl"));
-    }
-
-    #[test]
-    fn checked_in_atlas_migration_directories_match_their_integrity_sums() {
-        let root = atlas_artifact_root().unwrap();
-        verify_atlas_sum(&root, "sqlite").unwrap();
-        verify_atlas_sum(&root, "postgres").unwrap();
-    }
-
-    #[test]
-    fn atlas_platform_name_supports_server_and_desktop_targets() {
-        assert_eq!(
-            atlas_platform_name("linux", "x86_64").unwrap(),
-            "linux-amd64"
-        );
-        assert_eq!(
-            atlas_platform_name("macos", "aarch64").unwrap(),
-            "darwin-arm64"
-        );
-        assert!(atlas_platform_name("windows", "x86_64").is_err());
-        assert!(atlas_platform_name("macos", "x86_64").is_err());
-    }
-
-    #[test]
-    fn checked_in_atlas_tool_lock_has_fixed_server_and_desktop_downloads() {
-        let lock = load_atlas_tool_lock(&atlas_artifact_root().unwrap()).unwrap();
-        assert!(!lock.version.is_empty());
-        for name in ["linux-amd64", "darwin-arm64"] {
-            let platform = lock.platform(name).unwrap();
-            assert_eq!(
-                platform.url,
-                format!(
-                    "https://release.ariga.io/atlas/atlas-{name}-{}",
-                    lock.version
-                )
-            );
-            assert_eq!(platform.sha256.len(), 64);
-            assert!(platform.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        }
-    }
-
-    #[test]
-    fn sqlite_bundle_builder_uses_the_native_platform_fetcher() {
-        const BUNDLE_BUILDER: &str =
-            include_str!("../../../scripts/build-memories-db-migrate-sqlite.sh");
-        const ATLAS_FETCHER: &str = include_str!("../../../scripts/fetch-atlas.sh");
-
-        assert!(BUNDLE_BUILDER.contains("native_atlas_platform"));
-        assert!(BUNDLE_BUILDER.contains("fetch-atlas.sh"));
-        assert!(ATLAS_FETCHER.contains("darwin-arm64"));
-        assert!(ATLAS_FETCHER.contains("linux-amd64"));
-    }
-
-    #[test]
-    fn checked_in_seed_expectations_are_nonempty_and_backend_equivalent() {
-        let root = atlas_artifact_root().unwrap();
-        let sqlite = load_seed_expectations(&root, "sqlite").unwrap();
-        let postgres = load_seed_expectations(&root, "postgres").unwrap();
-        assert_eq!(sqlite.version, "20260803000001");
-        assert_eq!(sqlite.version, postgres.version);
-        assert!(!sqlite.tables.is_empty());
-        assert_eq!(
-            sqlite
-                .tables
-                .iter()
-                .map(|table| (&table.table, &table.key_column, &table.keys))
-                .collect::<Vec<_>>(),
-            postgres
-                .tables
-                .iter()
-                .map(|table| (&table.table, &table.key_column, &table.keys))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[cfg(not(feature = "postgres"))]
-    #[test]
-    fn seed_expectations_detect_missing_static_rows() {
-        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
-            use sqlx::sqlite::SqlitePoolOptions;
-
-            let root = atlas_artifact_root().unwrap();
-            let expectations = load_seed_expectations(&root, "sqlite").unwrap();
-            let pool = SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect("sqlite::memory:")
-                .await
-                .unwrap();
-            for expectation in &expectations.tables {
-                sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "CREATE TABLE {} ({} TEXT PRIMARY KEY)",
-                    expectation.table, expectation.key_column
-                )))
-                .execute(&pool)
-                .await
-                .unwrap();
-                for key in &expectation.keys {
-                    sqlx::query(sqlx::AssertSqlSafe(format!(
-                        "INSERT INTO {} ({}) VALUES (?)",
-                        expectation.table, expectation.key_column
-                    )))
-                    .bind(key)
-                    .execute(&pool)
-                    .await
-                    .unwrap();
-                }
-            }
-
-            verify_seed_expectations(&pool, &root, "sqlite", &expectations.version)
-                .await
-                .unwrap();
-            sqlx::query("DELETE FROM failure_mode_dictionary WHERE mode = ?")
-                .bind("OTHER")
-                .execute(&pool)
-                .await
-                .unwrap();
-            assert!(
-                verify_seed_expectations(&pool, &root, "sqlite", &expectations.version)
-                    .await
-                    .is_err()
-            );
-        });
     }
 
     #[cfg(not(feature = "postgres"))]
     struct LocalE2e {
         _temporary: tempfile::TempDir,
-        artifact_root: String,
         binary: std::path::PathBuf,
         database_url: String,
         vector_uri: std::path::PathBuf,
@@ -2826,7 +1535,6 @@ mod tests {
             let (database_url, vector_uri) = sqlite_e2e_target_paths(temporary.path());
             let backups = temporary.path().join("backups with space");
             Self {
-                artifact_root: fixed_e2e_atlas_artifact_root().unwrap(),
                 binary: fixed_e2e_release_binary().unwrap(),
                 database_url,
                 vector_uri,
@@ -2838,7 +1546,6 @@ mod tests {
         fn command(&self) -> MigrationE2eCommand<'_> {
             MigrationE2eCommand {
                 binary: &self.binary,
-                artifact_root: &self.artifact_root,
                 database_url: &self.database_url,
                 vector_uri: &self.vector_uri,
             }
@@ -2900,27 +1607,21 @@ mod tests {
             self.vector_uri.parent().unwrap().join("embedding-state")
         }
 
-        /// Migrate to the previous release only, with Atlas alone (no
-        /// task runs), as a database the previous release left behind.
-        fn apply_previous_release(&self) {
-            let previous = atlas_migration_versions().len() - 1;
-            let applied = std::process::Command::new(
-                std::path::Path::new(&self.artifact_root).join("bin/atlas"),
-            )
-            .current_dir(&self.artifact_root)
-            .args(["migrate", "apply", &previous.to_string()])
-            .args(["--config", "file://migrate.hcl", "--env", "sqlite"])
-            .env(
-                "MEMORIES_ATLAS_DATABASE_URL",
-                atlas_database_url(&self.database_url).unwrap(),
-            )
-            .output()
-            .unwrap();
-            assert!(
-                applied.status.success(),
-                "{}",
-                String::from_utf8_lossy(&applied.stderr)
-            );
+        /// Migrate to the previous release only (no task runs), as a
+        /// database the previous release left behind.
+        async fn apply_previous_release(&self) {
+            apply_previous_release_schema(&self.database_url).await;
+        }
+
+        /// Load a database migrated by the Atlas-based release, carrying the
+        /// legacy history.
+        async fn load_legacy_fixture(&self, name: &str) {
+            let pool = self.pool().await;
+            sqlx::raw_sql(sqlx::AssertSqlSafe(legacy_fixture_sql(name)))
+                .execute(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
         }
 
         async fn embedding_attempt(
@@ -2943,7 +1644,7 @@ mod tests {
                 started_at: 1,
                 bundle_digest: None,
                 backup,
-                stage: Stage::PostMigrate,
+                stage: Some(Stage::PostMigrate),
                 status: AttemptStatus::Failed(Resolution::RestoreRequired),
             }
             .store(&self.target())
@@ -2957,13 +1658,13 @@ mod tests {
     /// commit, and nothing is refused when there is no work.
     #[cfg(not(feature = "postgres"))]
     #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
     fn local_apply_e2e_respects_an_unfinished_embedding_migration() {
         use grpc_admin::db_migrate::embedding::attempt::Stage;
         use infra::infra::embedding_space::MarkerState;
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
             let local = LocalE2e::new();
-            local.apply_previous_release();
+            local.apply_previous_release().await;
             local
                 .embedding_attempt(Some(MarkerState::Pending), Stage::RebuildPending)
                 .await;
@@ -3040,13 +1741,13 @@ mod tests {
     /// backup whose vector tables belong to another embedding space.
     #[cfg(not(feature = "postgres"))]
     #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
     fn local_restore_e2e_respects_the_embedding_space() {
         use grpc_admin::db_migrate::embedding::attempt::Stage;
         use infra::infra::embedding_space::MarkerState;
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
             let local = LocalE2e::new();
-            local.apply_previous_release();
+            local.apply_previous_release().await;
             // The thread table exists, so the backup holds it.
             local.embedding_attempt(None, Stage::Backup).await;
             let (code, line) = local.apply().await;
@@ -3142,20 +1843,19 @@ mod tests {
 
     #[cfg(not(feature = "postgres"))]
     #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
     fn bundle_e2e_records_its_identity_and_detects_changes() {
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
-            let artifact_root = fixed_e2e_atlas_artifact_root().unwrap();
             let binary = fixed_e2e_release_binary().unwrap();
             let bundle = tempfile::tempdir().unwrap();
             let bundled_binary = bundle.path().join("memories-db-migrate");
             std::fs::copy(&binary, &bundled_binary).unwrap();
-            let copied = std::process::Command::new("cp")
-                .args(["-R", &artifact_root])
-                .arg(bundle.path().join("atlas"))
-                .status()
-                .unwrap();
-            assert!(copied.success());
+            let shipped_catalog = bundle.path().join(super::bundle_command::CATALOG_DIRECTORY);
+            for (name, content) in super::bundle_command::compiled_files() {
+                let path = shipped_catalog.join(name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, content).unwrap();
+            }
             let run = |arguments: &[&str]| {
                 let output = std::process::Command::new(&bundled_binary)
                     .env_clear()
@@ -3188,14 +1888,23 @@ mod tests {
                 )
             );
 
-            std::fs::write(bundle.path().join("atlas/licenses/ATLAS_LICENSE"), b"").unwrap();
+            // A shipped migration that differs from the compiled one, and a
+            // missing one, both make the bundle invalid.
+            let shipped = bundle.path().join("db-migrate/sqlite/migrations");
+            let first = migrations::file_name(&migrations::migrations()[0]);
+            let original = std::fs::read(shipped.join(&first)).unwrap();
+            std::fs::write(shipped.join(&first), b"-- changed\n").unwrap();
             assert_eq!(run(&["bundle", "verify"]).0, Some(1));
+            std::fs::remove_file(shipped.join(&first)).unwrap();
+            assert_eq!(run(&["bundle", "verify"]).0, Some(1));
+            std::fs::write(shipped.join(&first), original).unwrap();
+            assert_eq!(run(&["bundle", "verify"]).0, Some(0));
         });
     }
 
     #[cfg(not(feature = "postgres"))]
     #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
     fn local_apply_e2e_completes_every_database_state_without_caller_branching() {
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
             // Uninitialized: nothing to protect, so no backup is created.
@@ -3218,23 +1927,58 @@ mod tests {
             );
             assert!(!fresh.backups.exists());
 
-            // baseline_required: adopted automatically, with a backup first.
+            // Fully migrated by the Atlas-based release: only the history
+            // handover is left, which still counts as work and is backed up.
             let legacy = LocalE2e::new();
-            let pool = legacy.pool().await;
-            seed_adoption_candidate_schema(&pool, ADOPTION_BASELINE_VERSION)
-                .await
-                .unwrap();
-            pool.close().await;
+            legacy.load_legacy_fixture("fresh-full").await;
             let (code, line) = legacy.apply().await;
             assert_eq!(code, Some(0), "{line}");
+            assert!(line.starts_with("local_apply status=completed outcome=migrated"));
             let manifest = grpc_admin::db_migrate::local::backup::BackupManifest::load(
                 &LocalE2e::backup_from(&line),
             )
             .unwrap();
-            assert_eq!(manifest.schema_status, "baseline_required");
+            assert_eq!(manifest.schema_status, "managed");
             let pool = legacy.pool().await;
             assert_eq!(schema_state(&pool).await.unwrap(), SchemaState::Managed);
+            assert!(super::inspect_target(&pool).await.unwrap().legacy_history.is_none());
             pool.close().await;
+            assert_eq!(
+                legacy.apply().await.1,
+                "local_apply status=completed outcome=no_op"
+            );
+
+            // Partly migrated by the Atlas-based release: handed over and
+            // completed in one run.
+            let partial = LocalE2e::new();
+            partial.load_legacy_fixture("fresh-partial").await;
+            let (code, line) = partial.apply().await;
+            assert_eq!(code, Some(0), "{line}");
+            let pool = partial.pool().await;
+            assert_eq!(schema_state(&pool).await.unwrap(), SchemaState::Managed);
+            pool.close().await;
+
+            // From before the migration tool: refused untouched.
+            let unmanaged = LocalE2e::new();
+            let pool = unmanaged.pool().await;
+            sqlx::query("CREATE TABLE thread (id BIGINT, memory_kind INTEGER NOT NULL)")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE memory (id BIGINT, memory_kind INTEGER NOT NULL)")
+                .execute(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+            assert_eq!(
+                unmanaged.apply().await,
+                (
+                    Some(1),
+                    "local_apply status=failed stage=plan error_code=unmanaged_schema_unsupported resolution=legacy_upgrade_required"
+                        .to_string()
+                )
+            );
+            assert!(!unmanaged.backups.exists());
 
             // Schema applied but required tasks not run: the tasks' LanceDB
             // directory is part of the backup.
@@ -3272,7 +2016,6 @@ mod tests {
     /// Everything lives in a temporary fixture.
     struct EmbeddingE2e {
         binary: std::path::PathBuf,
-        artifact_root: String,
         /// The URL handed to the binary.
         database_url: String,
         vector_uri: std::path::PathBuf,
@@ -3363,13 +2106,12 @@ mod tests {
             assert_eq!(local.apply().await.0, Some(0));
             let LocalE2e {
                 _temporary,
-                artifact_root,
                 binary,
                 database_url,
                 vector_uri,
                 ..
             } = local;
-            Self::with_database(binary, artifact_root, database_url, vector_uri, _temporary)
+            Self::with_database(binary, database_url, vector_uri, _temporary)
         }
 
         #[cfg(feature = "postgres")]
@@ -3382,30 +2124,12 @@ mod tests {
             e
         }
 
-        /// A schema the previous release left behind: Atlas alone up to the
-        /// previous version, so the latest migration and the tasks are
-        /// still pending.
+        /// A schema the previous release left behind: the latest migration
+        /// and the tasks are still pending.
         #[cfg(feature = "postgres")]
         async fn new_previous_release() -> Self {
             let e = Self::new_postgres().await;
-            let previous = atlas_migration_versions().len() - 1;
-            let applied = std::process::Command::new(
-                std::path::Path::new(&e.artifact_root).join("bin/atlas"),
-            )
-            .current_dir(&e.artifact_root)
-            .args(["migrate", "apply", &previous.to_string()])
-            .args(["--config", "file://migrate.hcl", "--env", "postgres"])
-            .env(
-                "MEMORIES_ATLAS_DATABASE_URL",
-                atlas_database_url(&e.database_url).unwrap(),
-            )
-            .output()
-            .unwrap();
-            assert!(
-                applied.status.success(),
-                "{}",
-                String::from_utf8_lossy(&applied.stderr)
-            );
+            apply_previous_release_schema(&e.database_url).await;
             e
         }
 
@@ -3436,7 +2160,6 @@ mod tests {
             let vector_uri = fixture.path().join("threads.lancedb");
             let mut e = Self::with_database(
                 fixed_e2e_release_binary().unwrap(),
-                fixed_e2e_atlas_artifact_root().unwrap(),
                 postgres_schema_url(&service_url, &schema).unwrap(),
                 vector_uri,
                 fixture,
@@ -3456,7 +2179,6 @@ mod tests {
 
         fn with_database(
             binary: std::path::PathBuf,
-            artifact_root: String,
             database_url: String,
             vector_uri: std::path::PathBuf,
             fixture: tempfile::TempDir,
@@ -3470,7 +2192,6 @@ mod tests {
             .unwrap();
             Self {
                 binary,
-                artifact_root,
                 database_url,
                 state_dir: root.join("embedding-state"),
                 backups: root.join("embedding backups"),
@@ -3531,8 +2252,7 @@ mod tests {
             command
                 .current_dir(self.root())
                 .env_clear()
-                .env("MEMORIES_ATLAS_DIR", &self.artifact_root)
-                .env("MEMORIES_ATLAS_DATABASE_URL", &self.database_url)
+                .env("MEMORIES_DB_MIGRATE_DATABASE_URL", &self.database_url)
                 .env("MEMORY_WORKERS_YAML", &self.workers_yaml)
                 .env("MEMORY_EMBEDDING_STATE_DIR", &self.state_dir)
                 .stdin(Stdio::null());
@@ -3783,7 +2503,7 @@ mod tests {
     /// before anything changes; `inspect` and `plan` still answer and
     /// change nothing.
     #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
     fn embedding_e2e_writers_and_concurrent_commands_are_refused() {
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
             let e = EmbeddingE2e::new().await;
@@ -3845,7 +2565,7 @@ mod tests {
     /// cannot take the work; applied once the migration has ended.
     #[cfg(feature = "postgres")]
     #[test]
-    #[ignore = "requires TEST_POSTGRES_URL, fixed Atlas artifact, and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
+    #[ignore = "requires TEST_POSTGRES_URL and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
     fn release_e2e_respects_writers_and_an_unfinished_embedding_migration() {
         use grpc_admin::db_migrate::embedding::attempt::Stage;
         use infra::infra::embedding_space::MarkerState;
@@ -3895,7 +2615,7 @@ mod tests {
     /// Verification refuses incomplete rebuilds and unaccepted failures,
     /// then the commit ends the attempt in the target space.
     #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
     fn embedding_e2e_finalize_verifies_and_accepts_failures() {
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
             let e = EmbeddingE2e::new().await;
@@ -3979,7 +2699,7 @@ mod tests {
     /// verifying again; one interrupted after `completed` only clears
     /// the markers.
     #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
     fn embedding_e2e_interrupted_finalize_completes_on_rerun() {
         use grpc_admin::db_migrate::embedding::attempt::{self, Stage, Status};
         use infra::infra::embedding_space::MarkerState;
@@ -4060,7 +2780,7 @@ mod tests {
     /// the RDB no longer has, and ends the attempt; reruns and
     /// interrupted runs complete idempotently.
     #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
     fn embedding_e2e_restore_puts_the_backup_back() {
         use grpc_admin::db_migrate::embedding::attempt::{self, CancelOperation, Status};
         use infra::infra::embedding_space::MarkerState;
@@ -4144,7 +2864,7 @@ mod tests {
 
     /// A broken backup manifest is reported before anything changes.
     #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
     fn embedding_e2e_restore_refuses_a_corrupt_backup() {
         use infra::infra::embedding_space::MarkerState;
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
@@ -4179,7 +2899,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
     fn embedding_e2e_switch_resume_and_discard_without_backup() {
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
             let e = EmbeddingE2e::new().await;
@@ -4325,7 +3045,7 @@ mod tests {
     /// identifier (for example another environment's store picked up from
     /// configuration) is refused by changing commands and left untouched.
     #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
     fn embedding_e2e_changes_never_touch_an_unidentified_store() {
         use infra::infra::memory_vector::config::{
             DistanceType, FtsConfig, VectorDBConfig, VectorIndexConfig,
@@ -4413,7 +3133,7 @@ mod tests {
     /// `backup`, no marker yet) is resumed to completion, and one stopped
     /// there can instead be abandoned without changing anything.
     #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
     fn embedding_e2e_interrupted_switch_resumes_or_abandons() {
         use grpc_admin::db_migrate::embedding::attempt::{
             self, AttemptRecord, FORMAT_VERSION, Method, Stage, Status,
@@ -4470,7 +3190,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
     fn embedding_e2e_switch_with_backup_and_abandon_before_changes() {
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
             let e = EmbeddingE2e::new().await;
@@ -4526,28 +3246,11 @@ mod tests {
     /// gains its RDB identifier through the ordinary `local apply`.
     #[cfg(not(feature = "postgres"))]
     #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
     fn local_apply_e2e_adds_the_storage_identifier_to_a_previous_release_database() {
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
             let local = LocalE2e::new();
-            let previous = atlas_migration_versions().len() - 1;
-            let applied = std::process::Command::new(
-                std::path::Path::new(&local.artifact_root).join("bin/atlas"),
-            )
-            .current_dir(&local.artifact_root)
-            .args(["migrate", "apply", &previous.to_string()])
-            .args(["--config", "file://migrate.hcl", "--env", "sqlite"])
-            .env(
-                "MEMORIES_ATLAS_DATABASE_URL",
-                atlas_database_url(&local.database_url).unwrap(),
-            )
-            .output()
-            .unwrap();
-            assert!(
-                applied.status.success(),
-                "{}",
-                String::from_utf8_lossy(&applied.stderr)
-            );
+            local.apply_previous_release().await;
             let pool = local.pool().await;
             assert!(
                 !super::table_exists(&pool, "memories_storage_identity")
@@ -4580,7 +3283,7 @@ mod tests {
 
     #[cfg(not(feature = "postgres"))]
     #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
     fn local_apply_e2e_requires_an_explicit_backup_choice_and_no_other_connection() {
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
             let local = LocalE2e::new();
@@ -4621,38 +3324,29 @@ mod tests {
 
     #[cfg(not(feature = "postgres"))]
     #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
     fn local_apply_e2e_refuses_a_database_of_a_newer_release_without_recording_a_restore() {
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
             const NEWER: &str = "20991231000000";
-            let latest = atlas_migration_versions().last().unwrap().clone();
+            let latest = migrations::latest_version();
             let local = LocalE2e::new();
             assert_eq!(local.apply().await.0, Some(0));
             let record_before = std::fs::read(local.attempt_record()).ok();
             let pool = local.pool().await;
-            {
-                // A newer release records its revision like any applied one;
-                // the temporary table lives on this one connection.
-                let mut connection = pool.acquire().await.unwrap();
-                for (statement, value) in [
-                    (
-                        "CREATE TEMP TABLE newer AS SELECT * FROM atlas_schema_revisions WHERE version = ?",
-                        latest.as_str(),
-                    ),
-                    ("UPDATE newer SET version = ?", NEWER),
-                    ("UPDATE memories_schema_contract SET version = ?", NEWER),
-                ] {
-                    sqlx::query(statement)
-                        .bind(value)
-                        .execute(&mut *connection)
-                        .await
-                        .unwrap();
-                }
-                sqlx::query("INSERT INTO atlas_schema_revisions SELECT * FROM newer")
-                    .execute(&mut *connection)
-                    .await
-                    .unwrap();
-            }
+            // A newer release records its migration like any applied one.
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO {} (version, description, success, checksum, execution_time) \
+                 VALUES ({NEWER}, 'newer release', TRUE, x'00', 1)",
+                migrations::HISTORY_TABLE
+            )))
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("UPDATE memories_schema_contract SET version = ?")
+                .bind(NEWER)
+                .execute(&pool)
+                .await
+                .unwrap();
             pool.close().await;
             assert_eq!(
                 local.apply().await,
@@ -4666,11 +3360,13 @@ mod tests {
 
             // With a tool that knows the newer release, the database is usable.
             let pool = local.pool().await;
-            sqlx::query("DELETE FROM atlas_schema_revisions WHERE version = ?")
-                .bind(NEWER)
-                .execute(&pool)
-                .await
-                .unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {} WHERE version = {NEWER}",
+                migrations::HISTORY_TABLE
+            )))
+            .execute(&pool)
+            .await
+            .unwrap();
             sqlx::query("UPDATE memories_schema_contract SET version = ?")
                 .bind(&latest)
                 .execute(&pool)
@@ -4686,7 +3382,7 @@ mod tests {
 
     #[cfg(not(feature = "postgres"))]
     #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
     fn local_apply_e2e_ignores_the_record_of_a_discarded_database() {
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
             let local = LocalE2e::new();
@@ -4705,7 +3401,7 @@ mod tests {
 
     #[cfg(not(feature = "postgres"))]
     #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
     fn local_apply_e2e_leaves_a_database_from_before_memory_kind_untouched() {
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
             let legacy = LocalE2e::new();
@@ -4734,7 +3430,7 @@ mod tests {
 
     #[cfg(not(feature = "postgres"))]
     #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
     fn local_restore_e2e_returns_to_the_backup_and_unblocks_a_required_restore() {
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
             let local = LocalE2e::new();
@@ -4791,49 +3487,21 @@ mod tests {
 
     #[cfg(not(feature = "postgres"))]
     #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
-    fn sqlite_migration_e2e_with_fixed_atlas_artifact() {
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
+    fn sqlite_migration_e2e_with_release_binary() {
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
-            let artifact_root = fixed_e2e_atlas_artifact_root().unwrap();
             let binary = fixed_e2e_release_binary().unwrap();
             let temporary = tempfile::tempdir().unwrap();
             let (database_url, vector_uri) = sqlite_e2e_target_paths(temporary.path());
-            let _environment =
-                ScopedE2eEnvironment::configure(&artifact_root, &database_url, &vector_uri);
+            let _environment = ScopedE2eEnvironment::configure(&database_url, &vector_uri);
             let command = MigrationE2eCommand {
                 binary: &binary,
-                artifact_root: &artifact_root,
                 database_url: &database_url,
                 vector_uri: &vector_uri,
             };
             run_thread_message_times_migration_e2e(&command, &database_url, None)
                 .await
                 .unwrap();
-        });
-    }
-
-    #[cfg(not(feature = "postgres"))]
-    #[test]
-    #[ignore = "requires fixed Atlas artifact and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
-    fn sqlite_adoption_baseline_e2e_with_fixed_atlas_artifact() {
-        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
-            let artifact_root = fixed_e2e_atlas_artifact_root().unwrap();
-            let binary = fixed_e2e_release_binary().unwrap();
-            for candidate_version in adoption_baseline_versions().iter().rev() {
-                let temporary = tempfile::tempdir().unwrap();
-                let (database_url, vector_uri) = sqlite_e2e_target_paths(temporary.path());
-                let _environment =
-                    ScopedE2eEnvironment::configure(&artifact_root, &database_url, &vector_uri);
-                let command = MigrationE2eCommand {
-                    binary: &binary,
-                    artifact_root: &artifact_root,
-                    database_url: &database_url,
-                    vector_uri: &vector_uri,
-                };
-                run_adoption_baseline_e2e(&command, &database_url, candidate_version)
-                    .await
-                    .unwrap();
-            }
         });
     }
 
@@ -4852,149 +3520,13 @@ mod tests {
         });
     }
 
-    #[cfg(not(feature = "postgres"))]
-    #[test]
-    #[ignore = "requires fixed Atlas artifact"]
-    fn sqlite_adoption_baseline_in_process_with_fixed_atlas_artifact() {
-        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
-            let artifact_root = fixed_e2e_atlas_artifact_root().unwrap();
-            for candidate_version in adoption_baseline_versions().iter().rev() {
-                let temporary = tempfile::tempdir().unwrap();
-                let (database_url, vector_uri) = sqlite_e2e_target_paths(temporary.path());
-                run_adoption_baseline_in_process_e2e(
-                    &artifact_root,
-                    &database_url,
-                    &vector_uri,
-                    candidate_version,
-                )
-                .await
-                .unwrap();
-            }
-        });
-    }
-
     #[cfg(feature = "postgres")]
     #[test]
-    #[ignore = "requires TEST_POSTGRES_URL, fixed Atlas artifact, and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
-    fn postgres_dedicated_history_schema_e2e_with_fixed_atlas_artifact() {
+    #[ignore = "requires TEST_POSTGRES_URL and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
+    fn postgres_migration_e2e_with_release_binary() {
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
             use sqlx::postgres::PgPoolOptions;
 
-            let artifact_root = fixed_e2e_atlas_artifact_root().unwrap();
-            let binary = fixed_e2e_release_binary().unwrap();
-            let service_url = std::env::var("TEST_POSTGRES_URL")
-                .expect("TEST_POSTGRES_URL must be set for the PostgreSQL E2E test");
-            let database_name = format!(
-                "memories_db_migrate_history_{}_{}",
-                std::process::id(),
-                command_utils::util::datetime::now_millis()
-            );
-            let mut url = url::Url::parse(&service_url).unwrap();
-            assert!(
-                !url.query_pairs()
-                    .any(|(key, _)| key == "search_path" || key == "options[search_path]"),
-                "dedicated-history E2E requires an unscoped PostgreSQL URL"
-            );
-            url.set_path(&format!("/{database_name}"));
-            let database_url = url.to_string();
-            let admin_pool = PgPoolOptions::new()
-                .max_connections(1)
-                .connect(&service_url)
-                .await
-                .unwrap();
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "CREATE DATABASE {}",
-                quote_postgres_identifier(&database_name)
-            )))
-            .execute(&admin_pool)
-            .await
-            .unwrap();
-            let temporary = tempfile::tempdir().unwrap();
-            let vector_uri = temporary.path().join("threads.lancedb");
-            let result: Result<()> = async {
-                let _environment =
-                    ScopedE2eEnvironment::configure(&artifact_root, &database_url, &vector_uri);
-                let command = MigrationE2eCommand {
-                    binary: &binary,
-                    artifact_root: &artifact_root,
-                    database_url: &database_url,
-                    vector_uri: &vector_uri,
-                };
-                let status = command.run(&["schema", "status"]).await?;
-                assert!(status.contains("schema_status status=uninitialized"));
-                command.run(&["schema", "apply", "--dry-run"]).await?;
-                let status = command.run(&["schema", "status"]).await?;
-                assert!(status.contains("schema_status status=uninitialized"));
-                let pool = PgPoolOptions::new().connect(&database_url).await?;
-                let schema_left_by_dry_run: bool = sqlx::query_scalar(
-                    "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'atlas_schema_revisions')",
-                )
-                .fetch_one(&pool)
-                .await?;
-                assert!(!schema_left_by_dry_run);
-                sqlx::query("CREATE SCHEMA atlas_schema_revisions")
-                    .execute(&pool)
-                    .await?;
-                drop(pool);
-                command.run(&["schema", "apply", "--dry-run"]).await?;
-                let pool = PgPoolOptions::new().connect(&database_url).await?;
-                let existing_schema_preserved: bool = sqlx::query_scalar(
-                    "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'atlas_schema_revisions')",
-                )
-                .fetch_one(&pool)
-                .await?;
-                assert!(existing_schema_preserved);
-                drop(pool);
-                command.run(&["schema", "apply"]).await?;
-                let pool = PgPoolOptions::new().connect(&database_url).await?;
-                let history_in_dedicated_schema: bool = sqlx::query_scalar(
-                    "SELECT to_regclass('atlas_schema_revisions.atlas_schema_revisions') IS NOT NULL",
-                )
-                .fetch_one(&pool)
-                .await?;
-                assert!(history_in_dedicated_schema);
-                let history_in_public: bool = sqlx::query_scalar(
-                    "SELECT to_regclass('public.atlas_schema_revisions') IS NOT NULL",
-                )
-                .fetch_one(&pool)
-                .await?;
-                assert!(!history_in_public);
-                assert!(super::table_exists(&pool, "memories_schema_contract").await?);
-                assert!(super::table_exists(&pool, "memories_data_migration_task_state").await?);
-                drop(pool);
-                let status = command.run(&["schema", "status"]).await?;
-                assert!(status.contains("schema_status status=managed pending_count=0"));
-                command.run(&["schema", "apply"]).await?;
-                let status = command.run(&["schema", "status"]).await?;
-                assert!(status.contains("schema_status status=managed pending_count=0"));
-                Ok(())
-            }
-            .await;
-            let cleanup = sqlx::query(sqlx::AssertSqlSafe(format!(
-                "DROP DATABASE {} WITH (FORCE)",
-                quote_postgres_identifier(&database_name)
-            )))
-            .execute(&admin_pool)
-            .await;
-            match (result, cleanup) {
-                (Ok(()), Ok(_)) => {}
-                (Err(error), Ok(_)) => panic!("dedicated-history E2E failed: {error:#}"),
-                (Ok(()), Err(error)) => panic!("dedicated-history E2E cleanup failed: {error:#}"),
-                (Err(error), Err(cleanup_error)) => panic!(
-                    "dedicated-history E2E failed: {error:#}; cleanup also failed: {cleanup_error:#}"
-                ),
-            }
-        });
-    }
-
-    #[cfg(feature = "postgres")]
-    #[test]
-    #[ignore = "requires TEST_POSTGRES_URL, fixed Atlas artifact, and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
-    fn postgres_migration_e2e_with_fixed_atlas_artifact() {
-        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
-            use sqlx::postgres::PgPoolOptions;
-
-            let artifact_root = fixed_e2e_atlas_artifact_root().unwrap();
             let binary = fixed_e2e_release_binary().unwrap();
             let service_url = std::env::var("TEST_POSTGRES_URL")
                 .expect("TEST_POSTGRES_URL must be set for the PostgreSQL E2E test");
@@ -5033,10 +3565,9 @@ mod tests {
                 let vector_uri = temporary.path().join("threads.lancedb");
                 let result = {
                     let _environment =
-                        ScopedE2eEnvironment::configure(&artifact_root, &database_url, &vector_uri);
+                        ScopedE2eEnvironment::configure(&database_url, &vector_uri);
                     let command = MigrationE2eCommand {
                         binary: &binary,
-                        artifact_root: &artifact_root,
                         database_url: &database_url,
                         vector_uri: &vector_uri,
                     };
@@ -5060,14 +3591,15 @@ mod tests {
         });
     }
 
+    /// Databases migrated by the Atlas-based release hand their history over
+    /// on the first apply, wherever the URL put that history.
     #[cfg(feature = "postgres")]
     #[test]
-    #[ignore = "requires TEST_POSTGRES_URL, fixed Atlas artifact, and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
-    fn postgres_adoption_baseline_e2e_with_fixed_atlas_artifact() {
+    #[ignore = "requires TEST_POSTGRES_URL and MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
+    fn postgres_legacy_history_handover_e2e_with_release_binary() {
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
             use sqlx::postgres::PgPoolOptions;
 
-            let artifact_root = fixed_e2e_atlas_artifact_root().unwrap();
             let binary = fixed_e2e_release_binary().unwrap();
             let service_url = std::env::var("TEST_POSTGRES_URL")
                 .expect("TEST_POSTGRES_URL must be set for the PostgreSQL E2E test");
@@ -5076,68 +3608,106 @@ mod tests {
                 .connect(&service_url)
                 .await
                 .unwrap();
-            for (candidate_index, candidate_version) in adoption_baseline_versions().iter().rev().enumerate() {
+            for (index, fixture) in ["dedicated-fresh-full", "scoped-fresh-partial"]
+                .into_iter()
+                .enumerate()
+            {
+                let database = format!("mdm_handover_e2e_{}_{index}", std::process::id());
+                for statement in [
+                    format!("DROP DATABASE IF EXISTS {database}"),
+                    format!("CREATE DATABASE {database}"),
+                ] {
+                    sqlx::raw_sql(sqlx::AssertSqlSafe(statement))
+                        .execute(&admin_pool)
+                        .await
+                        .unwrap();
+                }
+                let mut database_url = url::Url::parse(&service_url).unwrap();
+                database_url.set_path(&database);
+                let loader = PgPoolOptions::new()
+                    .max_connections(1)
+                    .connect(database_url.as_str())
+                    .await
+                    .unwrap();
+                sqlx::raw_sql(sqlx::AssertSqlSafe(legacy_fixture_sql(fixture)))
+                    .execute(&loader)
+                    .await
+                    .unwrap();
+                let target_url = if fixture.starts_with("scoped-") {
+                    postgres_schema_url(database_url.as_str(), "memories").unwrap()
+                } else {
+                    database_url.to_string()
+                };
+
                 let temporary = tempfile::tempdir().unwrap();
-                let schema = format!(
-                    "memories_db_migrate_adoption_{}_{}_{}",
-                    std::process::id(),
-                    command_utils::util::datetime::now_millis(),
-                    candidate_index,
-                );
-                let database_url = postgres_schema_url(&service_url, &schema).unwrap();
-                sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "CREATE SCHEMA {}",
-                    quote_postgres_identifier(&schema)
-                )))
-                .execute(&admin_pool)
-                .await
-                .unwrap();
                 let vector_uri = temporary.path().join("threads.lancedb");
                 let result = {
-                    let _environment =
-                        ScopedE2eEnvironment::configure(&artifact_root, &database_url, &vector_uri);
+                    let _environment = ScopedE2eEnvironment::configure(&target_url, &vector_uri);
                     let command = MigrationE2eCommand {
                         binary: &binary,
-                        artifact_root: &artifact_root,
-                        database_url: &database_url,
+                        database_url: &target_url,
                         vector_uri: &vector_uri,
                     };
-                    run_adoption_baseline_e2e(&command, &database_url, candidate_version).await
+                    run_legacy_history_handover_e2e(&command, &loader).await
                 };
-                let cleanup = sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "DROP SCHEMA {} CASCADE",
-                    quote_postgres_identifier(&schema)
+                loader.close().await;
+                let cleanup = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                    "DROP DATABASE IF EXISTS {database} WITH (FORCE)"
                 )))
                 .execute(&admin_pool)
                 .await;
-                match (result, cleanup) {
-                    (Ok(()), Ok(_)) => {}
-                    (Err(error), Ok(_)) => panic!("PostgreSQL adoption baseline E2E failed: {error:#}"),
-                    (Ok(()), Err(error)) => panic!("PostgreSQL adoption E2E schema cleanup failed: {error:#}"),
-                    (Err(run_error), Err(cleanup_error)) => panic!(
-                        "PostgreSQL adoption baseline E2E failed: {run_error:#}; schema cleanup also failed: {cleanup_error:#}"
-                    ),
+                if let Err(error) = result {
+                    panic!("PostgreSQL handover E2E failed for {fixture}: {error:#}");
                 }
+                cleanup.unwrap();
             }
         });
     }
 
-    #[test]
-    fn schema_diff_uses_config_environment_references_not_database_urls() {
-        let args = schema_diff_args("postgres", "20260803000003").unwrap();
-        assert!(args.windows(2).any(|pair| pair == ["--from", "env://url"]));
+    #[cfg(feature = "postgres")]
+    async fn run_legacy_history_handover_e2e(
+        command: &MigrationE2eCommand<'_>,
+        database: &RdbPool,
+    ) -> Result<()> {
+        let legacy_history_count = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relname = 'atlas_schema_revisions'",
+            )
+            .fetch_one(database)
+            .await
+        };
+        let output = command.run(&["schema", "apply", "--dry-run"]).await?;
         assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--exclude", "atlas_schema_revisions"])
+            output.contains("apply_dry_run_history_handover status=required"),
+            "{output}"
         );
-        assert!(args.iter().any(|arg| arg == "--to"));
-        assert!(args.iter().all(|arg| !arg.starts_with("postgres:")));
-        assert!(args.iter().all(|arg| !arg.starts_with("postgresql:")));
-    }
+        assert_eq!(legacy_history_count().await?, 1);
 
-    #[test]
-    fn verify_configuration_accepts_only_the_adapter_internal_dev_url() {
-        assert!(verify_config_uses_internal_dev_url(&atlas_artifact_root().unwrap()).unwrap());
+        let output = command.run(&["schema", "apply"]).await?;
+        assert!(
+            output.contains("apply_history_handover status=completed"),
+            "{output}"
+        );
+        assert!(output.contains("apply status=completed"), "{output}");
+        assert_eq!(legacy_history_count().await?, 0);
+        let dedicated_schema_left: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'atlas_schema_revisions')",
+        )
+        .fetch_one(database)
+        .await?;
+        assert!(!dedicated_schema_left);
+
+        let output = command.run(&["schema", "status"]).await?;
+        assert!(
+            output.contains("schema_status status=managed pending_count=0"),
+            "{output}"
+        );
+        let output = command.run(&["schema", "verify"]).await?;
+        assert!(output.contains("verify status=verified"), "{output}");
+        let output = command.run(&["schema", "apply"]).await?;
+        assert!(!output.contains("apply_history_handover"), "{output}");
+        Ok(())
     }
 
     #[cfg(not(feature = "postgres"))]
@@ -5159,512 +3729,6 @@ mod tests {
             .await
             .unwrap();
             assert!(post_migration_state_unavailable(&pool).await.is_err());
-        });
-    }
-
-    #[cfg(not(feature = "postgres"))]
-    #[test]
-    fn schema_state_distinguishes_a_database_migrated_by_a_newer_release() {
-        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
-            use sqlx::sqlite::SqlitePoolOptions;
-
-            const NEWER: &str = "20991231000000";
-            async fn database(extra: &[&str], contract: &str) -> RdbPool {
-                let pool = SqlitePoolOptions::new()
-                    .max_connections(1)
-                    .connect("sqlite::memory:")
-                    .await
-                    .unwrap();
-                sqlx::raw_sql(
-                    "CREATE TABLE thread (id BIGINT PRIMARY KEY); \
-                     CREATE TABLE atlas_schema_revisions (version TEXT PRIMARY KEY, type BIGINT NOT NULL); \
-                     CREATE TABLE memories_schema_contract (contract_key TEXT PRIMARY KEY, version TEXT NOT NULL); \
-                     CREATE TABLE memories_data_migration_task_state (task_identity TEXT PRIMARY KEY);",
-                )
-                .execute(&pool)
-                .await
-                .unwrap();
-                let known = atlas_migration_versions();
-                let versions = known.iter().map(String::as_str).chain(extra.iter().copied());
-                for version in versions {
-                    sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                        .bind(version)
-                        .bind(ATLAS_APPLIED_REVISION_TYPE)
-                        .execute(&pool)
-                        .await
-                        .unwrap();
-                }
-                sqlx::query(
-                    "INSERT INTO memories_schema_contract (contract_key, version) VALUES ('rdb_schema', ?)",
-                )
-                .bind(contract)
-                .execute(&pool)
-                .await
-                .unwrap();
-                pool
-            }
-
-            let newer = database(&[NEWER], NEWER).await;
-            assert_eq!(
-                schema_state(&newer).await.unwrap(),
-                SchemaState::NewerThanTool
-            );
-            assert_eq!(
-                pending_count_for_schema_state(SchemaState::NewerThanTool, 6),
-                None
-            );
-            // An unknown version below the tool's latest is not a newer release.
-            let gap = database(&["20260801000000"], NEWER).await;
-            assert_eq!(schema_state(&gap).await.unwrap(), SchemaState::SchemaCorrupt);
-            // The contract must follow the newer history it claims.
-            let stale_contract = database(&[NEWER], "20260930000001").await;
-            assert_eq!(
-                schema_state(&stale_contract).await.unwrap(),
-                SchemaState::SchemaCorrupt
-            );
-        });
-    }
-
-    #[cfg(not(feature = "postgres"))]
-    #[test]
-    fn schema_state_accepts_a_valid_history_prefix_as_pending() {
-        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
-            use sqlx::sqlite::SqlitePoolOptions;
-
-            let pool = SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect("sqlite::memory:")
-                .await
-                .unwrap();
-            sqlx::raw_sql(
-                "CREATE TABLE thread (id BIGINT PRIMARY KEY); \
-                 CREATE TABLE atlas_schema_revisions (version TEXT PRIMARY KEY, type BIGINT NOT NULL);",
-            )
-            .execute(&pool)
-            .await
-            .unwrap();
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20260803000001")
-                .bind(ATLAS_BASELINE_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-
-            assert_eq!(
-                schema_state(&pool).await.unwrap(),
-                SchemaState::Pending { applied_count: 1 }
-            );
-            assert_eq!(
-                pending_count_for_schema_state(
-                    SchemaState::Pending { applied_count: 1 },
-                    atlas_migration_versions().len()
-                ),
-                Some(6)
-            );
-
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20260803000002")
-                .bind(ATLAS_APPLIED_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-            assert_eq!(
-                schema_state(&pool).await.unwrap(),
-                SchemaState::Pending { applied_count: 2 }
-            );
-
-            sqlx::raw_sql(
-                "CREATE TABLE memories_schema_contract (contract_key TEXT PRIMARY KEY, version TEXT NOT NULL); \
-                 CREATE TABLE memories_data_migration_task_state (task_identity TEXT PRIMARY KEY);",
-            )
-            .execute(&pool)
-            .await
-            .unwrap();
-            sqlx::query(
-                "INSERT INTO memories_schema_contract (contract_key, version) VALUES ('rdb_schema', ?)",
-            )
-            .bind("20260803000003")
-            .execute(&pool)
-            .await
-            .unwrap();
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20260803000003")
-                .bind(ATLAS_APPLIED_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-            assert_eq!(
-                schema_state(&pool).await.unwrap(),
-                SchemaState::Pending { applied_count: 3 }
-            );
-            sqlx::query("UPDATE memories_schema_contract SET version = ? WHERE contract_key = 'rdb_schema'")
-                .bind("20260920000001")
-                .execute(&pool)
-                .await
-                .unwrap();
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20260920000001")
-                .bind(ATLAS_APPLIED_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-            assert_eq!(
-                schema_state(&pool).await.unwrap(),
-                SchemaState::Pending { applied_count: 4 }
-            );
-            sqlx::query("UPDATE memories_schema_contract SET version = ? WHERE contract_key = 'rdb_schema'")
-                .bind("20260926000001")
-                .execute(&pool)
-                .await
-                .unwrap();
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20260926000001")
-                .bind(ATLAS_APPLIED_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-            assert_eq!(
-                schema_state(&pool).await.unwrap(),
-                SchemaState::Pending { applied_count: 5 }
-            );
-            sqlx::query("UPDATE memories_schema_contract SET version = ? WHERE contract_key = 'rdb_schema'")
-                .bind("20260930000001")
-                .execute(&pool)
-                .await
-                .unwrap();
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20260930000001")
-                .bind(ATLAS_APPLIED_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-            assert_eq!(
-                schema_state(&pool).await.unwrap(),
-                SchemaState::Pending { applied_count: 6 }
-            );
-            sqlx::query("UPDATE memories_schema_contract SET version = ? WHERE contract_key = 'rdb_schema'")
-                .bind("20261009000001")
-                .execute(&pool)
-                .await
-                .unwrap();
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20261009000001")
-                .bind(ATLAS_APPLIED_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-            assert_eq!(schema_state(&pool).await.unwrap(), SchemaState::Managed);
-        });
-    }
-
-    #[cfg(not(feature = "postgres"))]
-    #[test]
-    fn schema_state_accepts_a_fresh_database_history_prefix() {
-        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
-            use sqlx::sqlite::SqlitePoolOptions;
-
-            let pool = SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect("sqlite::memory:")
-                .await
-                .unwrap();
-            sqlx::raw_sql(
-                "CREATE TABLE thread (id BIGINT PRIMARY KEY); \
-                 CREATE TABLE atlas_schema_revisions (version TEXT PRIMARY KEY, type BIGINT NOT NULL);",
-            )
-            .execute(&pool)
-            .await
-            .unwrap();
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20260803000001")
-                .bind(ATLAS_APPLIED_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-
-            assert_eq!(
-                schema_state(&pool).await.unwrap(),
-                SchemaState::Pending { applied_count: 1 }
-            );
-        });
-    }
-
-    #[cfg(not(feature = "postgres"))]
-    #[test]
-    fn schema_state_accepts_a_second_adoption_candidate_baseline_history() {
-        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
-            use sqlx::sqlite::SqlitePoolOptions;
-
-            let pool = SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect("sqlite::memory:")
-                .await
-                .unwrap();
-            sqlx::raw_sql(
-                "CREATE TABLE thread (id BIGINT PRIMARY KEY); \
-                 CREATE TABLE atlas_schema_revisions (version TEXT PRIMARY KEY, type BIGINT NOT NULL); \
-                 CREATE TABLE memories_schema_contract (contract_key TEXT PRIMARY KEY, version TEXT NOT NULL); \
-                 CREATE TABLE memories_data_migration_task_state (task_identity TEXT PRIMARY KEY);",
-            )
-            .execute(&pool)
-            .await
-            .unwrap();
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20260803000002")
-                .bind(ATLAS_BASELINE_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20260803000003")
-                .bind(ATLAS_APPLIED_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-            sqlx::query(
-                "INSERT INTO memories_schema_contract (contract_key, version) VALUES ('rdb_schema', ?)",
-            )
-            .bind("20260803000003")
-            .execute(&pool)
-            .await
-            .unwrap();
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20260920000001")
-                .bind(ATLAS_APPLIED_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-            sqlx::query("UPDATE memories_schema_contract SET version = ?")
-                .bind("20260920000001")
-                .execute(&pool)
-                .await
-                .unwrap();
-
-            assert_eq!(schema_state(&pool).await.unwrap(), SchemaState::Pending { applied_count: 4 });
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20260926000001")
-                .bind(ATLAS_APPLIED_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-            sqlx::query("UPDATE memories_schema_contract SET version = ?")
-                .bind("20260926000001")
-                .execute(&pool)
-                .await
-                .unwrap();
-            assert_eq!(
-                schema_state(&pool).await.unwrap(),
-                SchemaState::Pending { applied_count: 5 }
-            );
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20260930000001")
-                .bind(ATLAS_APPLIED_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-            sqlx::query("UPDATE memories_schema_contract SET version = ?")
-                .bind("20260930000001")
-                .execute(&pool)
-                .await
-                .unwrap();
-            assert_eq!(
-                schema_state(&pool).await.unwrap(),
-                SchemaState::Pending { applied_count: 6 }
-            );
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20261009000001")
-                .bind(ATLAS_APPLIED_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-            sqlx::query("UPDATE memories_schema_contract SET version = ?")
-                .bind("20261009000001")
-                .execute(&pool)
-                .await
-                .unwrap();
-            assert_eq!(schema_state(&pool).await.unwrap(), SchemaState::Managed);
-        });
-    }
-
-    #[cfg(not(feature = "postgres"))]
-    #[test]
-    fn schema_state_rejects_empty_gapped_unknown_and_contract_mismatched_atlas_history() {
-        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
-            use sqlx::sqlite::SqlitePoolOptions;
-
-            let pool = SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect("sqlite::memory:")
-                .await
-                .unwrap();
-            assert_eq!(schema_state(&pool).await.unwrap(), SchemaState::Uninitialized);
-
-            sqlx::raw_sql("CREATE TABLE thread (id BIGINT PRIMARY KEY);")
-                .execute(&pool)
-                .await
-                .unwrap();
-            assert_eq!(
-                schema_state(&pool).await.unwrap(),
-                SchemaState::BaselineRequired
-            );
-
-            sqlx::raw_sql("CREATE TABLE atlas_schema_revisions (version TEXT PRIMARY KEY, type BIGINT NOT NULL); \
-                CREATE TABLE memories_schema_contract (contract_key TEXT PRIMARY KEY, version TEXT NOT NULL);")
-            .execute(&pool)
-            .await
-            .unwrap();
-            assert_eq!(schema_state(&pool).await.unwrap(), SchemaState::SchemaCorrupt);
-
-            sqlx::raw_sql(
-                "CREATE TABLE memories_data_migration_task_state (task_identity TEXT PRIMARY KEY);",
-            )
-            .execute(&pool)
-            .await
-            .unwrap();
-            assert_eq!(schema_state(&pool).await.unwrap(), SchemaState::SchemaCorrupt);
-
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20260803000001")
-                .bind(ATLAS_BASELINE_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-            sqlx::query(
-                "INSERT INTO memories_schema_contract (contract_key, version) VALUES ('rdb_schema', ?)",
-            )
-            .bind("20260803000002")
-            .execute(&pool)
-            .await
-            .unwrap();
-            assert_eq!(schema_state(&pool).await.unwrap(), SchemaState::SchemaCorrupt);
-
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20260803000002")
-                .bind(ATLAS_APPLIED_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-            sqlx::query("UPDATE memories_schema_contract SET version = ?")
-                .bind("20260803000002")
-                .execute(&pool)
-                .await
-                .unwrap();
-            assert_eq!(schema_state(&pool).await.unwrap(), SchemaState::SchemaCorrupt);
-
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20260803000003")
-                .bind(ATLAS_APPLIED_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-            sqlx::query("UPDATE memories_schema_contract SET version = ?")
-                .bind("20260920000001")
-                .execute(&pool)
-                .await
-                .unwrap();
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20260920000001")
-                .bind(ATLAS_APPLIED_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-            assert_eq!(schema_state(&pool).await.unwrap(), SchemaState::Pending { applied_count: 4 });
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20260926000001")
-                .bind(ATLAS_APPLIED_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-            sqlx::query("UPDATE memories_schema_contract SET version = ?")
-                .bind("20260926000001")
-                .execute(&pool)
-                .await
-                .unwrap();
-            assert_eq!(
-                schema_state(&pool).await.unwrap(),
-                SchemaState::Pending { applied_count: 5 }
-            );
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20260930000001")
-                .bind(ATLAS_APPLIED_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-            sqlx::query("UPDATE memories_schema_contract SET version = ?")
-                .bind("20260930000001")
-                .execute(&pool)
-                .await
-                .unwrap();
-            assert_eq!(
-                schema_state(&pool).await.unwrap(),
-                SchemaState::Pending { applied_count: 6 }
-            );
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20261009000001")
-                .bind(ATLAS_APPLIED_REVISION_TYPE)
-                .execute(&pool)
-                .await
-                .unwrap();
-            sqlx::query("UPDATE memories_schema_contract SET version = ?")
-                .bind("20261009000001")
-                .execute(&pool)
-                .await
-                .unwrap();
-            assert_eq!(schema_state(&pool).await.unwrap(), SchemaState::Managed);
-
-            let invalid_pool = SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect("sqlite::memory:")
-                .await
-                .unwrap();
-            sqlx::raw_sql(
-                "CREATE TABLE thread (id BIGINT PRIMARY KEY); \
-                 CREATE TABLE atlas_schema_revisions (version TEXT PRIMARY KEY, type BIGINT NOT NULL); \
-                 CREATE TABLE memories_schema_contract (contract_key TEXT PRIMARY KEY, version TEXT NOT NULL); \
-                 CREATE TABLE memories_data_migration_task_state (task_identity TEXT PRIMARY KEY);",
-            )
-            .execute(&invalid_pool)
-            .await
-            .unwrap();
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20260803000002")
-                .bind(ATLAS_APPLIED_REVISION_TYPE)
-                .execute(&invalid_pool)
-                .await
-                .unwrap();
-            sqlx::query(
-                "INSERT INTO memories_schema_contract (contract_key, version) VALUES ('rdb_schema', ?)",
-            )
-            .bind("20260803000002")
-            .execute(&invalid_pool)
-            .await
-            .unwrap();
-            assert_eq!(
-                schema_state(&invalid_pool).await.unwrap(),
-                SchemaState::SchemaCorrupt,
-                "a history prefix cannot skip the adoption baseline"
-            );
-
-            sqlx::query("DELETE FROM atlas_schema_revisions")
-                .execute(&invalid_pool)
-                .await
-                .unwrap();
-            sqlx::query("UPDATE memories_schema_contract SET version = ?")
-                .bind("20260803000003")
-                .execute(&invalid_pool)
-                .await
-                .unwrap();
-            sqlx::query("INSERT INTO atlas_schema_revisions (version, type) VALUES (?, ?)")
-                .bind("20260803000003")
-                .bind(ATLAS_APPLIED_REVISION_TYPE)
-                .execute(&invalid_pool)
-                .await
-                .unwrap();
-            assert_eq!(
-                schema_state(&invalid_pool).await.unwrap(),
-                SchemaState::SchemaCorrupt,
-                "an unknown history version must not be treated as a pending prefix"
-            );
         });
     }
 }

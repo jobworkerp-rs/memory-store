@@ -22,8 +22,9 @@ pub const THREAD_GROUPS_USER_IDS_V3_GENERATION: u32 = 3;
 pub const THREAD_GROUPS_USER_IDS_V3_IDENTITY: &str = "thread-groups-user-ids-v1@3";
 pub const THREAD_GROUPS_USER_IDS_V4_IDENTITY: &str = "thread-groups-user-ids-v1@4";
 
-const CATALOG_JSON: &str = include_str!("../../../infra/atlas/post-migration-tasks.json");
-const HISTORY_JSON: &str = include_str!("../../../infra/atlas/post-migration-task-history.json");
+const CATALOG_JSON: &str = include_str!("../../../infra/db-migrate/post-migration-tasks.json");
+const HISTORY_JSON: &str =
+    include_str!("../../../infra/db-migrate/post-migration-task-history.json");
 
 /// File names and contents of the catalog compiled into this binary, so that a
 /// release bundle can prove that it ships the same catalog.

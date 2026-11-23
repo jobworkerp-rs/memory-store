@@ -1,7 +1,7 @@
 //! Shared fixtures for the ThreadGroup repository tests.
 //!
 //! The schema under test is the *committed* SQLite migration
-//! (`infra/atlas/sqlite/migrations/20260920000001_thread_group_schema.sql`),
+//! (`infra/db-migrate/sqlite/migrations/20260920000001_thread_group_schema.sql`),
 //! applied verbatim onto a throwaway temp-file database so these tests
 //! never touch the shared `test_db.sqlite3` used by the other repos. The trailing
 //! `UPDATE memories_schema_contract ...` statement is the only thing
@@ -29,12 +29,12 @@ pub use crate::sql::IN_LIST_CHUNK_SIZE;
 
 const BASE_SCHEMA: &str = include_str!("../../../sql/sqlite/001_schema.sql");
 const THREAD_GROUP_SCHEMA: &str =
-    include_str!("../../../atlas/sqlite/migrations/20260920000001_thread_group_schema.sql");
+    include_str!("../../../db-migrate/sqlite/migrations/20260920000001_thread_group_schema.sql");
 const MEMORY_RELATION_SCHEMA: &str = include_str!(
-    "../../../atlas/sqlite/migrations/20260926000001_thread_group_memory_relation.sql"
+    "../../../db-migrate/sqlite/migrations/20260926000001_thread_group_memory_relation.sql"
 );
 const USER_ID_SCHEMA: &str =
-    include_str!("../../../atlas/sqlite/migrations/20260930000001_thread_group_user_ids.sql");
+    include_str!("../../../db-migrate/sqlite/migrations/20260930000001_thread_group_user_ids.sql");
 
 /// Deterministic base timestamp; individual tests offset from it.
 pub const T0: i64 = 1_700_000_000_000;

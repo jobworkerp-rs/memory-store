@@ -616,10 +616,7 @@ impl CodexArgs {
     /// single bool. Default is `true` (spec §3.4); `--no-link-tool-calls`
     /// wins when present.
     pub fn effective_link_tool_calls(&self) -> bool {
-        if self.no_link_tool_calls {
-            return false;
-        }
-        true
+        !self.no_link_tool_calls
     }
 }
 

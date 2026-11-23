@@ -36,17 +36,25 @@ _Avoid_: データ移行、バックフィル
 既存レコードの内容、参照、または派生値を、再開可能なバッチ処理で補完・変換・検証する保守作業。
 _Avoid_: スキーマ移行、DDL
 
-**baseline**:
-移行ツール導入前から存在する DB が、指定スキーマ版の要件を満たすことを検証して、以後のスキーマ移行管理へ取り込む操作。
-_Avoid_: SQL 適用、レコード加工
+**移行履歴**:
+対象 DB に適用済みのスキーマ移行の版と、その内容の同一性を記録した、移行ツールの内部状態。アプリケーションは参照しない。
+_Avoid_: schema contract、後続データ移行タスクの状態
+
+**旧移行履歴**:
+以前の移行エンジンが記録した移行履歴。現在の移行ツールは読み取って引き継ぐだけで、追記しない。
+_Avoid_: 移行履歴、schema contract
+
+**履歴の引き継ぎ**:
+旧移行履歴を検証したうえで移行履歴へ一度だけ写し、旧移行履歴を取り除く操作。スキーマも業務レコードも変更しない。
+_Avoid_: スキーマ移行、baseline
 
 **schema contract**:
 アプリケーションが起動時の RDB スキーマ互換性を判定するための、移行カタログで管理された版情報。
-_Avoid_: migration executor の履歴、schema の同一性検証結果
+_Avoid_: 移行履歴、schema の同一性検証結果
 
 **schema verification**:
-特定時点の RDB が migration directory、実 schema、静的 seed の要件を満たすかを確認する運用上の検証結果。DB に保持する永続的な状態ではない。
-_Avoid_: schema contract、migration history
+特定時点の RDB が移行カタログ、実 schema、静的 seed の要件を満たすかを確認する運用上の検証結果。DB に保持する永続的な状態ではない。
+_Avoid_: schema contract、移行履歴
 
 **静的 seed expectation**:
 全環境で同じ値であるべき参照データの、版に対応付いた行・列・件数の期待値。利用者ごとの業務レコードは含めない。
@@ -58,11 +66,11 @@ _Avoid_: 対象 DB、業務データの保管先
 
 **検証 lease**:
 検証用 DB の一時的な所有と回収状態を表す運用上の記録。対象 DB のスキーマや業務データには含めない。
-_Avoid_: schema contract、migration history
+_Avoid_: schema contract、移行履歴
 
 **後続データ移行タスク**:
 特定のスキーマ版を導入した後に選択され、独自の再開状態と検証を持つデータ移行の実装単位。
-_Avoid_: スキーマ移行、Atlas revision history
+_Avoid_: スキーマ移行、移行履歴
 
 **後続データ移行タスク世代**:
 同じタスク ID における、処理契約と checkpoint の解釈が不変な版。タスク ID と世代の組が実行・完了の単位となる。
@@ -78,7 +86,7 @@ _Avoid_: 通常のアプリケーション起動、schema contract
 
 **release control store**:
 移行 run と検証 lease を管理する deployment control-plane の永続ストア。対象 RDB には含めない。
-_Avoid_: target RDB、migration history
+_Avoid_: target RDB、移行履歴
 
 ## ThreadGroup 用語
 

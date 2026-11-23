@@ -6,12 +6,10 @@
 //! and whether a failure may be retried.
 
 use super::{
-    PostMigrateCommand, PostMigrateRunArgs, SchemaState, atlas_artifact_root,
-    bundle_command::running_bundle_digest, current_schema_contract_version,
-    latest_migration_version, migration_database_url, pending_required_tasks,
-    pending_work_is_embedding_neutral, required_tasks_left_to_run, run_apply, run_baseline,
-    run_post_migrate, run_verify, schema_state, selected_tasks_for_schema_version,
-    verify_atlas_sum,
+    PostMigrateCommand, PostMigrateRunArgs, SchemaState, bundle_command::verified_bundle_digest,
+    current_schema_contract_version, inspect_target, migration_database_url,
+    pending_required_tasks, pending_work_is_embedding_neutral, required_tasks_left_to_run,
+    run_apply, run_post_migrate, run_verify, schema_state, selected_tasks_for_schema_version,
 };
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
@@ -31,6 +29,7 @@ use grpc_admin::db_migrate::{
         target::{SqliteTarget, TargetFiles},
         writer::ensure_no_other_connection,
     },
+    schema::migrations,
     task_resources,
 };
 use infra_utils::infra::rdb::RdbPool;
@@ -136,13 +135,24 @@ struct Plan {
     state: SchemaState,
     contract_version: Option<String>,
     schema_up_to_date: bool,
+    /// The legacy history still awaits its handover.
+    legacy_history: bool,
     /// Required tasks that are not completed with the current definition.
     pending_tasks: Vec<catalog::TaskCatalogEntry>,
 }
 
 impl Plan {
     fn has_work(&self) -> bool {
-        !self.schema_up_to_date || !self.pending_tasks.is_empty()
+        !self.schema_up_to_date || self.legacy_history || !self.pending_tasks.is_empty()
+    }
+
+    /// `schema apply` has something to do: migrations or the handover.
+    fn needs_schema_apply(&self) -> bool {
+        self.legacy_history
+            || matches!(
+                self.state,
+                SchemaState::Uninitialized | SchemaState::Pending { .. }
+            )
     }
 }
 
@@ -161,7 +171,7 @@ impl Progress {
         self.stage = stage;
         println!("{}", progress_line(stage));
         if let (Some(target), Some(attempt)) = (&self.target, &mut self.attempt) {
-            attempt.stage = stage;
+            attempt.stage = Some(stage);
             attempt.store(target)?;
         }
         Ok(())
@@ -176,7 +186,7 @@ impl Progress {
         };
         let changed_data = matches!(
             self.stage,
-            Stage::Baseline | Stage::SchemaApply | Stage::PostMigrate | Stage::Verify
+            Stage::SchemaApply | Stage::PostMigrate | Stage::Verify
         );
         if changed_data
             && let Some(target) = &self.target
@@ -265,11 +275,9 @@ async fn apply(args: &LocalApplyArgs, progress: &mut Progress) -> Result<Success
     progress.target = Some(target.clone());
     let files = target.inspect_files()?;
     refuse_pending_restore(&target, files, progress)?;
-    let artifact_root = atlas_artifact_root().map_err(bundle_invalid)?;
     catalog::load_catalog().map_err(bundle_invalid)?;
-    verify_atlas_sum(&artifact_root, "sqlite").map_err(bundle_invalid)?;
-    let latest_version =
-        latest_migration_version(&artifact_root, "sqlite").map_err(bundle_invalid)?;
+    let bundle_digest = verified_bundle_digest().map_err(bundle_invalid)?;
+    let latest_version = migrations::latest_version();
     if files == TargetFiles::Present {
         // Closed again before the writer check, which must not see this
         // process's own connection.
@@ -288,6 +296,7 @@ async fn apply(args: &LocalApplyArgs, progress: &mut Progress) -> Result<Success
             state: SchemaState::Uninitialized,
             contract_version: None,
             schema_up_to_date: false,
+            legacy_history: false,
             pending_tasks: selected_required_tasks(&latest_version)?,
         },
         TargetFiles::Present => {
@@ -321,13 +330,12 @@ async fn apply(args: &LocalApplyArgs, progress: &mut Progress) -> Result<Success
     let _embedding_guard = guard_embedding(&target, Work::Apply { neutral }, None).await?;
 
     let started_at = command_utils::util::datetime::now_millis();
-    let bundle_digest = running_bundle_digest();
     progress.attempt = Some(AttemptRecord {
         attempt_id: format!("{started_at}-{}", std::process::id()),
         started_at,
         bundle_digest: bundle_digest.clone(),
         backup: None,
-        stage: Stage::Backup,
+        stage: Some(Stage::Backup),
         status: AttemptStatus::Running,
     });
     progress.enter(Stage::Backup)?;
@@ -358,15 +366,8 @@ async fn apply(args: &LocalApplyArgs, progress: &mut Progress) -> Result<Success
         }
     }
 
-    progress.enter(Stage::Baseline)?;
-    if plan.state == SchemaState::BaselineRequired {
-        run_baseline().await?;
-    }
     progress.enter(Stage::SchemaApply)?;
-    if matches!(
-        plan.state,
-        SchemaState::Uninitialized | SchemaState::Pending { .. }
-    ) {
+    if plan.needs_schema_apply() {
         run_apply(false).await?;
     }
     progress.enter(Stage::PostMigrate)?;
@@ -418,7 +419,8 @@ async fn plan_present(
 }
 
 async fn plan_existing(pool: &RdbPool, latest_version: &str) -> Result<Plan> {
-    let state = schema_state(pool).await?;
+    let inspection = inspect_target(pool).await?;
+    let state = inspection.state;
     match state {
         SchemaState::SchemaCorrupt => {
             return fail(
@@ -436,6 +438,15 @@ async fn plan_existing(pool: &RdbPool, latest_version: &str) -> Result<Plan> {
                 "a newer release has migrated this database",
             );
         }
+        // Adopting a database from before the migration tool needs the
+        // release that still carried the adoption candidates.
+        SchemaState::Unmanaged => {
+            return fail(
+                ErrorCode::UnmanagedSchemaUnsupported,
+                Resolution::LegacyUpgradeRequired,
+                "the database predates the migration tool",
+            );
+        }
         _ => {}
     }
     let contract_version = match state {
@@ -448,6 +459,7 @@ async fn plan_existing(pool: &RdbPool, latest_version: &str) -> Result<Plan> {
     Ok(Plan {
         schema_up_to_date: state == SchemaState::Managed
             && contract_version.as_deref() == Some(latest_version),
+        legacy_history: inspection.legacy_history.is_some(),
         state,
         contract_version,
         pending_tasks,
@@ -548,9 +560,7 @@ async fn open_existing(target: &SqliteTarget) -> Result<RdbPool> {
 
 async fn restore(args: &LocalRestoreArgs) -> Result<()> {
     let target = sqlite_target()?;
-    let artifact_root = atlas_artifact_root().map_err(bundle_invalid)?;
-    let latest_version =
-        latest_migration_version(&artifact_root, "sqlite").map_err(bundle_invalid)?;
+    let latest_version = migrations::latest_version();
     let manifest = BackupManifest::load(&args.backup)?;
     let _embedding_guard = guard_embedding(
         &target,
@@ -654,7 +664,7 @@ mod tests {
             started_at: 1,
             bundle_digest: None,
             backup: backup.map(PathBuf::from),
-            stage: Stage::PostMigrate,
+            stage: Some(Stage::PostMigrate),
             status: resolution.map_or(AttemptStatus::Running, AttemptStatus::Failed),
         }
     }

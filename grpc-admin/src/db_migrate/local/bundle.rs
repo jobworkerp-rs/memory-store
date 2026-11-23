@@ -91,8 +91,12 @@ mod tests {
     fn bundle() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("memories-db-migrate"), b"binary").unwrap();
-        std::fs::create_dir_all(root.path().join("atlas/sqlite/migrations")).unwrap();
-        std::fs::write(root.path().join("atlas/sqlite/migrations/1.sql"), b"create").unwrap();
+        std::fs::create_dir_all(root.path().join("db-migrate/sqlite/migrations")).unwrap();
+        std::fs::write(
+            root.path().join("db-migrate/sqlite/migrations/1.sql"),
+            b"create",
+        )
+        .unwrap();
         root
     }
 
@@ -116,15 +120,15 @@ mod tests {
         let root = bundle();
         let before = content_digest(root.path()).unwrap();
         std::fs::write(
-            root.path().join("atlas/sqlite/migrations/1.sql"),
+            root.path().join("db-migrate/sqlite/migrations/1.sql"),
             b"changed",
         )
         .unwrap();
         assert_ne!(content_digest(root.path()).unwrap(), before);
         let after_edit = content_digest(root.path()).unwrap();
         std::fs::rename(
-            root.path().join("atlas/sqlite/migrations/1.sql"),
-            root.path().join("atlas/sqlite/migrations/2.sql"),
+            root.path().join("db-migrate/sqlite/migrations/1.sql"),
+            root.path().join("db-migrate/sqlite/migrations/2.sql"),
         )
         .unwrap();
         assert_ne!(content_digest(root.path()).unwrap(), after_edit);
