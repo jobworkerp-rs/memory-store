@@ -1,8 +1,7 @@
 //! Pluggable media body storage (image memory feature).
 //!
 //! The DB (`media_object`) holds metadata only; the bytes live behind a
-//! `MediaStorage` backend. Design: `ai-docs/image-memory-design-storage.md`
-//! §5.
+//! `MediaStorage` backend.
 //!
 //! object-safety: the backend is selected at runtime via
 //! `MEDIA_STORAGE_BACKEND`, so the trait must stay dyn-compatible. A

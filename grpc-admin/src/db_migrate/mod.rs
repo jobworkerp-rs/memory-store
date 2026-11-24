@@ -49,6 +49,15 @@ pub fn task_resources(implementation: &str) -> &'static [TaskResource] {
     }
 }
 
+/// Resources changed by `tasks`, which a backup taken before running them
+/// must cover together with the database.
+pub fn tasks_resources(tasks: &[catalog::TaskCatalogEntry]) -> Vec<TaskResource> {
+    tasks
+        .iter()
+        .flat_map(|task| task_resources(&task.implementation).iter().copied())
+        .collect()
+}
+
 /// Fixed-registry contract for a release-bound post-schema migration task.
 ///
 /// Implementations are selected only by a catalog entry validated by the

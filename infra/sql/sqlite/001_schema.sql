@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS `media_object` (
     `alt`             TEXT,                                -- accessibility / caption
     `ref_count`       BIGINT      NOT NULL DEFAULT 0,      -- number of referencing memories
     -- 0=active / 1=orphan / 2=deleted-failed / 3=unresolvable / 4=promoting / 5=deleting
-    -- (6-state machine; see ai-docs/image-memory-design.md 1/3 §3.1.1)
+    -- (6-state machine)
     `gc_state`        INT         NOT NULL DEFAULT 0,
     `metadata`        JSON,                                -- EXIF / inline base64 (inline backend only)
     `created_at`      BIGINT      NOT NULL,

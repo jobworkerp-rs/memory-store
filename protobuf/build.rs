@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "protobuf/llm_memory/data/thread_vector.proto",
                 "protobuf/llm_memory/service/memory_vector.proto",
                 "protobuf/llm_memory/service/thread_vector.proto",
-                // thread-reflection (ai-docs/thread-reflection-spec.md)
+                // thread-reflection
                 "protobuf/llm_memory/data/reflection.proto",
                 "protobuf/llm_memory/data/reflection_filter.proto",
                 "protobuf/llm_memory/service/reflection.proto",

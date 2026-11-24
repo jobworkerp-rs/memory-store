@@ -6,7 +6,7 @@
 //! and whether a failure may be retried.
 
 use super::{
-    PostMigrateCommand, PostMigrateRunArgs, SchemaState, bundle_command::verified_bundle_digest,
+    PostMigrateCommand, PostMigrateRunArgs, SchemaState, bundle_command::running_bundle_identity,
     current_schema_contract_version, inspect_target, migration_database_url,
     pending_required_tasks, pending_work_is_embedding_neutral, required_tasks_left_to_run,
     run_apply, run_post_migrate, run_verify, schema_state, selected_tasks_for_schema_version,
@@ -21,7 +21,7 @@ use grpc_admin::db_migrate::{
         backup::{BackupInfo, BackupManifest, apply_retention, create_backup},
         output::{
             Command, ErrorCode, FailureLine, LocalFailure, Outcome, Resolution, Stage, SuccessLine,
-            classify, fail, progress_line,
+            fail, progress_line,
         },
         preflight::{check_memory_kind_era, check_thread_group_references},
         resources::backup_resources,
@@ -30,7 +30,7 @@ use grpc_admin::db_migrate::{
         writer::ensure_no_other_connection,
     },
     schema::migrations,
-    task_resources,
+    tasks_resources,
 };
 use infra_utils::infra::rdb::RdbPool;
 use std::path::PathBuf;
@@ -122,14 +122,6 @@ fn sqlite_target() -> Result<SqliteTarget> {
     SqliteTarget::from_url(&url)
 }
 
-fn bundle_invalid(error: anyhow::Error) -> anyhow::Error {
-    classify(
-        error,
-        ErrorCode::BundleInvalid,
-        Resolution::ToolUpdateRequired,
-    )
-}
-
 /// What the database needs, determined before anything changes.
 struct Plan {
     state: SchemaState,
@@ -139,6 +131,10 @@ struct Plan {
     legacy_history: bool,
     /// Required tasks that are not completed with the current definition.
     pending_tasks: Vec<catalog::TaskCatalogEntry>,
+    /// Required tasks this run executes: unlike `pending_tasks`, tasks already
+    /// completed with their current definition are left out once task state
+    /// exists, even while schema migrations are pending.
+    tasks_to_run: Vec<catalog::TaskCatalogEntry>,
 }
 
 impl Plan {
@@ -275,8 +271,7 @@ async fn apply(args: &LocalApplyArgs, progress: &mut Progress) -> Result<Success
     progress.target = Some(target.clone());
     let files = target.inspect_files()?;
     refuse_pending_restore(&target, files, progress)?;
-    catalog::load_catalog().map_err(bundle_invalid)?;
-    let bundle_digest = verified_bundle_digest().map_err(bundle_invalid)?;
+    let bundle_digest = running_bundle_identity()?;
     let latest_version = migrations::latest_version();
     if files == TargetFiles::Present {
         // Closed again before the writer check, which must not see this
@@ -292,13 +287,17 @@ async fn apply(args: &LocalApplyArgs, progress: &mut Progress) -> Result<Success
 
     progress.enter(Stage::Plan)?;
     let plan = match files {
-        TargetFiles::Missing => Plan {
-            state: SchemaState::Uninitialized,
-            contract_version: None,
-            schema_up_to_date: false,
-            legacy_history: false,
-            pending_tasks: selected_required_tasks(&latest_version)?,
-        },
+        TargetFiles::Missing => {
+            let tasks = selected_required_tasks(&latest_version)?;
+            Plan {
+                state: SchemaState::Uninitialized,
+                contract_version: None,
+                schema_up_to_date: false,
+                legacy_history: false,
+                pending_tasks: tasks.clone(),
+                tasks_to_run: tasks,
+            }
+        }
         TargetFiles::Present => {
             let pool = open_existing(&target).await?;
             let planned = plan_present(&pool, &latest_version, progress).await;
@@ -318,13 +317,7 @@ async fn apply(args: &LocalApplyArgs, progress: &mut Progress) -> Result<Success
         progress.enter(Stage::Preflight)?;
     }
     let neutral = match files {
-        TargetFiles::Present => {
-            let pool = open_existing(&target).await?;
-            let to_run =
-                required_tasks_left_to_run(&pool, plan.state, &latest_version, "sqlite").await;
-            pool.close().await;
-            pending_work_is_embedding_neutral(plan.state, &to_run?)
-        }
+        TargetFiles::Present => pending_work_is_embedding_neutral(plan.state, &plan.tasks_to_run),
         TargetFiles::Missing => false,
     };
     let _embedding_guard = guard_embedding(&target, Work::Apply { neutral }, None).await?;
@@ -343,12 +336,9 @@ async fn apply(args: &LocalApplyArgs, progress: &mut Progress) -> Result<Success
         && plan.state != SchemaState::Uninitialized
     {
         ensure_no_other_connection(&target)?;
-        let resources = plan
-            .pending_tasks
-            .iter()
-            .flat_map(|task| task_resources(&task.implementation).iter().copied())
-            .collect::<Vec<_>>();
-        let resources = backup_resources(&resources, |key| std::env::var(key).ok())?;
+        let resources = backup_resources(&tasks_resources(&plan.tasks_to_run), |key| {
+            std::env::var(key).ok()
+        })?;
         let embedding_space_id = if resources.is_empty() {
             None
         } else {
@@ -456,6 +446,7 @@ async fn plan_existing(pool: &RdbPool, latest_version: &str) -> Result<Plan> {
         _ => None,
     };
     let pending_tasks = pending_required_tasks(pool, state, latest_version, "sqlite").await?;
+    let tasks_to_run = required_tasks_left_to_run(pool, state, latest_version, "sqlite").await?;
     Ok(Plan {
         schema_up_to_date: state == SchemaState::Managed
             && contract_version.as_deref() == Some(latest_version),
@@ -463,6 +454,7 @@ async fn plan_existing(pool: &RdbPool, latest_version: &str) -> Result<Plan> {
         state,
         contract_version,
         pending_tasks,
+        tasks_to_run,
     })
 }
 

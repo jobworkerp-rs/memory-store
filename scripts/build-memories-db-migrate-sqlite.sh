@@ -12,9 +12,9 @@ fi
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 case "$(uname -s)-$(uname -m)" in
-  Linux-x86_64 | Darwin-arm64) ;;
+  Linux-x86_64 | Linux-aarch64 | Darwin-arm64) ;;
   *)
-    echo "unsupported native platform: $(uname -s)/$(uname -m); supported platforms are Linux/x86_64 and Darwin/arm64" >&2
+    echo "unsupported native platform: $(uname -s)/$(uname -m); supported platforms are Linux/x86_64, Linux/aarch64 and Darwin/arm64" >&2
     exit 1
     ;;
 esac

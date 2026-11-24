@@ -11,8 +11,7 @@
 -- then apply this numbered migration for the table and indexes.
 --
 -- gc_state is a 6-state machine (0=active / 1=orphan / 2=deleted-failed /
--- 3=unresolvable / 4=promoting / 5=deleting). See
--- ai-docs/image-memory-design.md 1/3 §3.1.1 for the state transitions.
+-- 3=unresolvable / 4=promoting / 5=deleting).
 CREATE TABLE IF NOT EXISTS `media_object` (
     `id`              BIGINT      NOT NULL PRIMARY KEY,
     `kind`            INT         NOT NULL,

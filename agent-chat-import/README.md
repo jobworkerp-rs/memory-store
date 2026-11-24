@@ -421,8 +421,7 @@ when that real session finishes. A `thread_id` is always a decimal string, so
 IDs larger than JavaScript's safe integer range remain exact. `import_completed`
 is emitted once before the import command exits and contains the final aggregate
 and per-session results. For `plain`, it is emitted before the optional prune
-RPC, so a prune failure does not suppress the event. Its contract is documented in
-[`docs/memories-import-event-spec_ja.md`](../docs/memories-import-event-spec_ja.md).
+RPC, so a prune failure does not suppress the event.
 
 `source` is the CLI subcommand name: `claude-code`, `codex`, or `plain`.
 `session_key` is the stable canonical channel used across retries; for `plain`,

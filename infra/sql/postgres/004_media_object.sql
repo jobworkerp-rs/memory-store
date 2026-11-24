@@ -4,8 +4,7 @@
 -- existing deployments (ADD COLUMN / CREATE ... IF NOT EXISTS).
 --
 -- gc_state is a 6-state machine (0=active / 1=orphan / 2=deleted-failed /
--- 3=unresolvable / 4=promoting / 5=deleting). See
--- ai-docs/image-memory-design.md 1/3 §3.1.1 for the state transitions.
+-- 3=unresolvable / 4=promoting / 5=deleting).
 ALTER TABLE memory ADD COLUMN IF NOT EXISTS media_object_id BIGINT;
 CREATE INDEX IF NOT EXISTS memory_media_object_id ON memory (media_object_id);
 

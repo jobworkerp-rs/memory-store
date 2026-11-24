@@ -70,6 +70,46 @@ app (business logic + Stretto cache)
 
 Proto definitions live under `protobuf/protobuf/llm_memory/`.
 
+## Install
+
+Prebuilt binaries are attached to each [GitHub Release](https://github.com/jobworkerp-rs/memory-store/releases).
+They use SQLite with the Lindera tokenizer; for PostgreSQL, use the container
+image (`ghcr.io/jobworkerp-rs/memory-store`) or build from source.
+
+| Asset | Requirements |
+|---|---|
+| `memory-store-x86_64-unknown-linux-gnu.tar.gz` | Linux on x86_64 with glibc 2.39 or later (e.g. Ubuntu 24.04, Debian 13, RHEL 10). |
+| `memory-store-aarch64-unknown-linux-gnu.tar.gz` | Linux on aarch64, with the same requirements. |
+| `memory-store-aarch64-apple-darwin.tar.gz` | macOS 14.0 or later on Apple Silicon. |
+
+Each archive contains `front` (the gRPC server), `memories-import`, the SQLite
+migration bundle `migration-bundle/` (see [SQLite migration bundle](#sqlite-migration-bundle)),
+`LICENSE`, `THIRD-PARTY-LICENSES.txt`, the READMEs, and `dot.env` as a
+configuration example. Lindera dictionaries are not included; set
+`LANCE_LANGUAGE_MODEL_HOME` to their location. Verify the download with
+`SHA256SUMS` from the same release, and optionally verify its build provenance
+with the GitHub CLI:
+
+```text
+sha256sum --ignore-missing -c SHA256SUMS
+gh attestation verify memory-store-<target>.tar.gz --repo jobworkerp-rs/memory-store
+tar -xzf memory-store-<target>.tar.gz
+memory-store-<target>/front --version
+```
+
+On macOS, check the asset you downloaded with `shasum`:
+
+```text
+grep ' memory-store-aarch64-apple-darwin.tar.gz$' SHA256SUMS | shasum -a 256 -c
+```
+
+The macOS binaries are ad-hoc signed and not notarized. If a browser download
+is blocked by Gatekeeper, download it with `curl` or remove the quarantine
+attribute with `xattr -d com.apple.quarantine`.
+
+Copy `dot.env` to `.env` next to where you run the binaries and adjust it
+(see [Setup and Run](#setup-and-run)).
+
 ## Build
 
 ```bash
@@ -99,10 +139,12 @@ The build supports Linux/x86_64 and macOS/Apple Silicon. It packages the native
 `memories-db-migrate` binary, which carries the whole migration catalog (on
 macOS the build checks that it starts on macOS 14.0 or later), a `db-migrate/`
 copy of the SQLite catalog for the application's provenance records, and a
-`bundle-manifest.json` recording the content digest. `memories-db-migrate bundle
-verify` and every `local apply` check that the copy is exactly the compiled
-catalog and that the digest matches. No third-party migration engine is
-shipped.
+`bundle-manifest.json` recording the content digest. Every `local apply` checks
+that the copy is exactly the compiled catalog. `memories-db-migrate bundle
+verify`, which the build runs before completing the bundle, also checks that the
+digest matches; an application that adds files or signs the binary when it
+packages the bundle changes that digest, so `bundle verify` applies to the bundle
+as built. No third-party migration engine is shipped.
 
 Before opening the database, stop all database writers and run the bundle's
 `memories-db-migrate local apply --maintenance-window-ack` with either
@@ -113,9 +155,7 @@ command decides whether migration is needed, takes the backup, verifies the
 result, and decides whether a failed run may be retried; `local restore
 --maintenance-window-ack --backup <backup>` restores a backup. Applications
 judge the result only by the exit code and the final structured stdout line
-(including `error_code`) and must not apply SQL directly. See
-[docs/database-migration-tool-spec_ja.md](docs/database-migration-tool-spec_ja.md)
-for the contract.
+(including `error_code`) and must not apply SQL directly.
 
 ### Migration tool E2E tests
 
@@ -234,9 +274,7 @@ worker in `workflows/auto-embedding-workers.yaml`. Its `model_id` /
 the distance identify the *embedding space*, which every vector table records.
 The server refuses to start when the configured space differs from the
 recorded one; moving to another model goes through
-`memories-db-migrate embedding` (`plan` → `switch` → rebuild → `finalize`). See
-[docs/embedding-space-management-spec_ja.md](docs/embedding-space-management-spec_ja.md)
-and, for servers, [docs/vectordb-rebuild-runbook_ja.md](docs/vectordb-rebuild-runbook_ja.md).
+`memories-db-migrate embedding` (`plan` → `switch` → rebuild → `finalize`).
 Workers whose behaviour depends on the model are registered under per-space
 names (`<base>-<first 16 hex digits of the space ID>`), so two spaces never
 share a worker definition in jobworkerp.
@@ -321,11 +359,6 @@ Memory, thread, and reflection intent vector stores use an N-row chunk schema:
 one logical entity can produce multiple rows keyed by `vector_kind` and
 `chunk_index`. A schema fingerprint mismatch fails at startup.
 
-Operational guides:
-
-- [docs/vectordb-rebuild-runbook.md](docs/vectordb-rebuild-runbook.md)
-- [docs/lancedb-search-index-maintenance-runbook_ja.md](docs/lancedb-search-index-maintenance-runbook_ja.md)
-
 ## Tests
 
 ```bash
@@ -373,8 +406,7 @@ cargo run --release --bin cleanup-orphan-media -- --help
 
 - [yaml-workers.md](yaml-workers.md): memories-specific jobworkerp worker YAML
 - [agent-chat-import/README.md](agent-chat-import/README.md): import CLI and generation worker registration
-- [docs/image-memory-operations-guide.md](docs/image-memory-operations-guide.md): image memory operations
 
 ## License
 
-MIT
+MIT License. See [LICENSE](LICENSE).

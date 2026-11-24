@@ -1,8 +1,10 @@
 [package]
 name = "app"
-version = "0.0.1"
-authors = ["sutr"]
-edition = "2024"
+license.workspace = true
+publish = false
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
 
 [dependencies]
 

@@ -1,5 +1,4 @@
-//! Reflection RDB layer (Phase B of ai-docs/thread-reflection-spec.md
-//! implementation).
+//! Reflection RDB layer.
 //!
 //! Submodules:
 //! - `rdb`           — `thread_reflection_index` sidecar CRUD + filtered

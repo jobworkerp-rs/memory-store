@@ -1,3 +1,5 @@
+# Maintained in the private source repository and published here by its
+# release sync together with the rest of .github/; edit it there, not here.
 name: CI
 on:
   pull_request:
@@ -8,7 +10,8 @@ permissions:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-24.04
     steps:
       - name: Remove large packages
         run: |
@@ -26,10 +29,11 @@ jobs:
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/bin/
@@ -39,7 +43,7 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
       - name: Set Toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -63,7 +67,8 @@ jobs:
         run: cargo check --workspace --features lindera
 
   test-sqlite:
-    runs-on: ubuntu-latest
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
       redis:
@@ -95,10 +100,11 @@ jobs:
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/bin/
@@ -107,7 +113,7 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-cargo-test-sqlite-${{ hashFiles('**/Cargo.lock') }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: Run test (SQLite)
         run: cargo test -- --test-threads=1
         env:
@@ -115,7 +121,8 @@ jobs:
           RUST_BACKTRACE: 1
 
   test-postgres:
-    runs-on: ubuntu-latest
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
       postgres:
@@ -158,10 +165,11 @@ jobs:
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/bin/
@@ -170,7 +178,7 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-cargo-test-postgres-${{ hashFiles('**/Cargo.lock') }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: Run test (PostgreSQL)
         run: cargo test --features postgres -- --test-threads=1
         env:

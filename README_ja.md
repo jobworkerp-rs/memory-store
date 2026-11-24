@@ -69,6 +69,45 @@ app (business logic + Stretto cache)
 
 Proto 定義は `protobuf/protobuf/llm_memory/` にあります。
 
+## インストール
+
+ビルド済みのバイナリを、各 [GitHub Release](https://github.com/jobworkerp-rs/memory-store/releases) に添付しています。
+SQLite と Lindera トークナイザーを使う構成です。PostgreSQL を使う場合は、コンテナイメージ
+（`ghcr.io/jobworkerp-rs/memory-store`）を使うか、ソースからビルドしてください。
+
+| アセット | 動作環境 |
+|---|---|
+| `memory-store-x86_64-unknown-linux-gnu.tar.gz` | x86_64 の Linux（glibc 2.39 以降。例: Ubuntu 24.04、Debian 13、RHEL 10） |
+| `memory-store-aarch64-unknown-linux-gnu.tar.gz` | aarch64 の Linux（要件は同じ） |
+| `memory-store-aarch64-apple-darwin.tar.gz` | Apple Silicon の macOS 14.0 以降 |
+
+各アーカイブには、`front`（gRPC サーバー）、`memories-import`、SQLite 移行バンドル
+`migration-bundle/`（[SQLite マイグレーションバンドル](#sqlite-マイグレーションバンドル)を参照）、`LICENSE`、
+`THIRD-PARTY-LICENSES.txt`、README、設定例の `dot.env` が入っています。Lindera の辞書は
+含まれないので、`LANCE_LANGUAGE_MODEL_HOME` に辞書の場所を指定してください。
+ダウンロードしたファイルは同じリリースの `SHA256SUMS` で確かめてください。
+GitHub CLI でビルドの来歴（provenance）も確かめられます。
+
+```text
+sha256sum --ignore-missing -c SHA256SUMS
+gh attestation verify memory-store-<target>.tar.gz --repo jobworkerp-rs/memory-store
+tar -xzf memory-store-<target>.tar.gz
+memory-store-<target>/front --version
+```
+
+macOS では、ダウンロードしたアセットを `shasum` で確かめます。
+
+```text
+grep ' memory-store-aarch64-apple-darwin.tar.gz$' SHA256SUMS | shasum -a 256 -c
+```
+
+macOS のバイナリは ad-hoc 署名で、公証（notarization）はしていません。ブラウザーでの
+ダウンロードが Gatekeeper に止められる場合は、`curl` でダウンロードするか、
+`xattr -d com.apple.quarantine` で quarantine 属性を外してください。
+
+`dot.env` を、バイナリを実行する場所に `.env` としてコピーし、編集してください
+（[セットアップと実行](#セットアップと実行)を参照）。
+
 ## ビルド
 
 ```bash
@@ -97,8 +136,11 @@ CARGO_BUILD_JOBS=1 scripts/build-memories-db-migrate-sqlite.sh /path/to/memories
 このビルドは Linux/x86_64 および macOS/Apple Silicon をサポートします。ネイティブの
 `memories-db-migrate` バイナリ（migration 一式を組み込み済み、macOS では 14.0 以上で起動できることを
 ビルド時に検査）と、利用側の provenance 用の SQLite カタログの写し `db-migrate/` をパッケージ化し、
-内容 digest を記録した `bundle-manifest.json` を含めます。`memories-db-migrate bundle verify` と
-毎回の `local apply` は、写しが組み込み済みのカタログと過不足なく一致することと、digest の一致を検証します。
+内容 digest を記録した `bundle-manifest.json` を含めます。毎回の `local apply` は、写しが組み込み済みの
+カタログと過不足なく一致することを検証します。ビルドが bundle の完成前に実行する
+`memories-db-migrate bundle verify` は、これに加えて digest の一致も検証します。利用側のアプリケーションが
+同梱時にファイルを追加したり実行ファイルに署名したりすると digest は変わるため、`bundle verify` が対象とするのは
+生成した直後の bundle です。
 第三者の migration engine は同梱しません。
 
 データベースを開く前に、すべてのデータベース書き込み処理を停止し、バンドル内の
@@ -110,7 +152,6 @@ CARGO_BUILD_JOBS=1 scripts/build-memories-db-migrate-sqlite.sh /path/to/memories
 復元は `local restore --maintenance-window-ack --backup <バックアップ>` で行います。
 アプリケーションは終了コードと stdout 最終行の構造化行（`error_code` など）だけで判定し、
 SQL を直接適用してはいけません。
-契約の詳細は [docs/database-migration-tool-spec_ja.md](docs/database-migration-tool-spec_ja.md) を参照してください。
 
 ### マイグレーションツールの E2E 試験
 
@@ -226,12 +267,9 @@ cargo run --release --features lindera --bin front
 `tokenizer_model_id`、`MEMORY_EMBEDDING_MODEL_REVISION`、ベクトルの次元、距離関数で
 「embedding 空間」が決まり、各ベクトルテーブルに記録されます。設定の空間が記録と異なると
 サーバーは起動しません。別のモデルへの移行は `memories-db-migrate embedding`
-（`plan` → `switch` → 再構築 → `finalize`）で行います。詳細は
-[docs/embedding-space-management-spec_ja.md](docs/embedding-space-management-spec_ja.md)、
-サーバー運用の手順は [docs/vectordb-rebuild-runbook_ja.md](docs/vectordb-rebuild-runbook_ja.md)
-を参照してください。モデルに依存するワーカーは、空間ごとの名前
-（`<基底の名前>-<空間 ID の先頭 16 桁>`）で登録されるので、異なる空間が jobworkerp 上の
-同じワーカー定義を共有することはありません。
+（`plan` → `switch` → 再構築 → `finalize`）で行います。モデルに依存するワーカーは、
+空間ごとの名前（`<基底の名前>-<空間 ID の先頭 16 桁>`）で登録されるので、異なる空間が
+jobworkerp 上の同じワーカー定義を共有することはありません。
 
 | 変数 | デフォルト | 説明 |
 |---|---|---|
@@ -312,11 +350,6 @@ cargo run --release --features lindera --bin front
 1 つの論理エンティティから `vector_kind` と `chunk_index` をキーとする複数行が生成されます。
 スキーマフィンガープリントが一致しない場合、起動時に失敗します。
 
-運用ガイド:
-
-- [docs/vectordb-rebuild-runbook.md](docs/vectordb-rebuild-runbook.md)
-- [docs/lancedb-search-index-maintenance-runbook_ja.md](docs/lancedb-search-index-maintenance-runbook_ja.md)
-
 ## テスト
 
 ```bash
@@ -363,8 +396,7 @@ cargo run --release --bin cleanup-orphan-media -- --help
 
 - [yaml-workers.md](yaml-workers.md): memories 固有の jobworkerp ワーカー YAML
 - [agent-chat-import/README.md](agent-chat-import/README.md): インポート CLI と生成ワーカー登録
-- [docs/image-memory-operations-guide.md](docs/image-memory-operations-guide.md): 画像メモリの運用
 
 ## ライセンス
 
-MIT
+MIT License です。[LICENSE](LICENSE) を参照してください。

@@ -1,4 +1,4 @@
--- Phase 5: Thread Reflection (ai-docs/thread-reflection-spec.md §3)
+-- Phase 5: Thread Reflection
 --
 -- Adds the storage backbone for self-reflection records over agent
 -- trajectories. Reflection memories themselves live in the existing

@@ -25,6 +25,7 @@ pub const DEFAULT_PLAIN_SOURCE_NAME: &str = "plain";
 #[derive(Parser, Debug)]
 #[command(
     name = "memories-import",
+    version,
     about = "Import agent chat history (Claude Code, Codex CLI, OpenCode SQLite, plain text trees) into memories",
     subcommand_required = true,
     arg_required_else_help = true
@@ -925,6 +926,18 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once(&"memories-import").chain(args.iter()))
+    }
+
+    // The release checks the archive by running `memories-import --version`
+    // and comparing it with the release tag.
+    #[test]
+    fn version_flag_reports_the_package_version() {
+        let err = parse(&["--version"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(
+            err.to_string(),
+            format!("memories-import {}\n", env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]

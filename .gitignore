@@ -1,4 +1,9 @@
-.claude/
+# Only the ai-docs-kit curation skill is tracked, so scheduled curation runs
+# can use it; local Claude Code settings stay untracked. The directory itself
+# is re-included because global ignore files commonly list `.claude/`.
+!/.claude/
+/.claude/*
+!/.claude/skills/
 .codex
 .env
 # Image-memory e2e integration env (minio keys / jobworkerp addr / DB).
@@ -27,7 +32,6 @@ target/
 .vscode
 refine/
 docker-compose-test.yml
-CLAUDE.md
 __pycache__/
 /lancedb-maintenance/
 /.serena/

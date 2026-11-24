@@ -4,6 +4,15 @@ use dotenvy::dotenv;
 // start front_server
 #[tokio::main]
 async fn main() -> Result<()> {
+    // The server takes no arguments; --version alone lets the release check
+    // the binary without starting it.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--version")
+    {
+        println!("{} {}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     dotenv().ok();
 
     // tracing init runs BEFORE the structured-error contract is active:

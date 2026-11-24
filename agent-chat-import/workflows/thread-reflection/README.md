@@ -74,4 +74,3 @@ item that ended without an outcome (timed out or aborted) counts as failed.
 ## Related
 
 - embedding/model operations: [../../../workflows/thread-reflection/README.md](../../../workflows/thread-reflection/README.md)
-- API guide: [../../../docs/thread-reflection-guide.md](../../../docs/thread-reflection-guide.md)

@@ -37,7 +37,7 @@ mod embedding_migrate;
 mod embedding_finish;
 
 #[derive(Debug, Parser)]
-#[command(name = "memories-db-migrate")]
+#[command(name = "memories-db-migrate", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -303,8 +303,8 @@ async fn pending_required_tasks(
 
 /// Required tasks that will actually run: a task already completed with
 /// its current definition is skipped by `post-migrate run` even while
-/// schema migrations are pending, so the embedding neutrality of the work
-/// is judged without it.
+/// schema migrations are pending, so neither the embedding neutrality of
+/// the work nor the resources a backup must cover depend on it.
 async fn required_tasks_left_to_run(
     pool: &RdbPool,
     state: SchemaState,
@@ -865,6 +865,18 @@ mod tests {
         ));
     }
 
+    // The release checks the bundle by running `memories-db-migrate --version`
+    // and comparing it with the release tag.
+    #[test]
+    fn version_flag_reports_the_package_version() {
+        let err = Cli::try_parse_from(["memories-db-migrate", "--version"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(
+            err.to_string(),
+            format!("memories-db-migrate {}\n", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
     #[test]
     fn release_apply_command_accepts_maintenance_acknowledgement() {
         Cli::try_parse_from([
@@ -923,6 +935,77 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A ThreadVector row as the embedding callback writes it, carrying the
+    /// thread's message times.
+    fn e2e_thread_vector_row(
+        thread_id: i64,
+        user_id: i64,
+        memory_kind: i32,
+        first_message_at: Option<i64>,
+        last_message_at: Option<i64>,
+    ) -> infra::infra::thread_vector::record::ThreadVectorRecord {
+        infra::infra::thread_vector::record::ThreadVectorRecord {
+            thread_id,
+            vector_kind: "text".to_string(),
+            chunk_index: 0,
+            begin_position: 0,
+            end_position: 7,
+            user_id,
+            memory_kind,
+            content: "fixture".to_string(),
+            description: Some("fixture".to_string()),
+            labels: vec![],
+            embedding: vec![0.1, 0.2, 0.3, 0.4],
+            embedding_model: Some("test".to_string()),
+            channel: None,
+            created_at: 10,
+            updated_at: 20,
+            first_message_at,
+            last_message_at,
+            indexed_at: 30,
+        }
+    }
+
+    /// A memory vector table named `memories` at `uri` holding one row.
+    async fn write_e2e_memory_vectors(
+        uri: &std::path::Path,
+    ) -> infra::infra::memory_vector::repository::MemoryVectorRepositoryImpl {
+        use infra::infra::memory_vector::{
+            config::{DistanceType, FtsConfig, VectorDBConfig, VectorIndexConfig},
+            record::MemoryVectorRecord,
+            repository::MemoryVectorRepositoryImpl,
+        };
+        let repo = MemoryVectorRepositoryImpl::new(VectorDBConfig {
+            uri: uri.to_string_lossy().into_owned(),
+            table_name: "memories".into(),
+            vector_size: 4,
+            distance_type: DistanceType::Cosine,
+            fts: FtsConfig::default(),
+            vector_index: VectorIndexConfig::default(),
+        })
+        .await
+        .unwrap();
+        let data = protobuf::llm_memory::data::MemoryData {
+            content: "x".into(),
+            ..Default::default()
+        };
+        let row = MemoryVectorRecord::from_chunk_with_content(
+            1,
+            &data,
+            &[0.5; 4],
+            Some("m"),
+            "text",
+            0,
+            0,
+            1,
+            "x".into(),
+        );
+        repo.replace_kinds_upsert(1, &["text"], vec![row])
+            .await
+            .unwrap();
+        repo
     }
 
     fn e2e_workspace_root() -> Result<std::path::PathBuf> {
@@ -1176,28 +1259,7 @@ mod tests {
         )
         .await?;
         vector
-            .batch_upsert(vec![
-                infra::infra::thread_vector::record::ThreadVectorRecord {
-                    thread_id: 1,
-                    vector_kind: "text".to_string(),
-                    chunk_index: 0,
-                    begin_position: 0,
-                    end_position: 7,
-                    user_id: 1,
-                    memory_kind: 1,
-                    content: "fixture".to_string(),
-                    description: Some("fixture".to_string()),
-                    labels: vec![],
-                    embedding: vec![0.1, 0.2, 0.3, 0.4],
-                    embedding_model: Some("test".to_string()),
-                    channel: None,
-                    created_at: 10,
-                    updated_at: 20,
-                    first_message_at: None,
-                    last_message_at: None,
-                    indexed_at: 30,
-                },
-            ])
+            .batch_upsert(vec![e2e_thread_vector_row(1, 1, 1, None, None)])
             .await?;
 
         let output = command.run(&["post-migrate", "status"]).await?;
@@ -1531,11 +1593,17 @@ mod tests {
     #[cfg(not(feature = "postgres"))]
     impl LocalE2e {
         fn new() -> Self {
+            Self::with_binary(fixed_e2e_release_binary().unwrap())
+        }
+
+        /// A fresh target driven by `binary`, such as the one of a packaged
+        /// bundle.
+        fn with_binary(binary: std::path::PathBuf) -> Self {
             let temporary = tempfile::tempdir().unwrap();
             let (database_url, vector_uri) = sqlite_e2e_target_paths(temporary.path());
             let backups = temporary.path().join("backups with space");
             Self {
-                binary: fixed_e2e_release_binary().unwrap(),
+                binary,
                 database_url,
                 vector_uri,
                 backups,
@@ -1845,10 +1913,11 @@ mod tests {
     #[test]
     #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
     fn bundle_e2e_records_its_identity_and_detects_changes() {
+        use super::bundle_command::packaging;
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
             let binary = fixed_e2e_release_binary().unwrap();
             let bundle = tempfile::tempdir().unwrap();
-            let bundled_binary = bundle.path().join("memories-db-migrate");
+            let bundled_binary = bundle.path().join(packaging::EXECUTABLE);
             std::fs::copy(&binary, &bundled_binary).unwrap();
             let shipped_catalog = bundle.path().join(super::bundle_command::CATALOG_DIRECTORY);
             for (name, content) in super::bundle_command::compiled_files() {
@@ -1868,11 +1937,10 @@ mod tests {
                 )
             };
 
-            let (code, unidentified) = run(&["bundle", "verify"]);
-            assert_eq!(code, Some(1));
+            const VERIFY_FAILED: &str = "bundle_verify status=failed error_code=bundle_invalid";
             assert_eq!(
-                unidentified,
-                "bundle_verify status=failed error_code=bundle_invalid"
+                run(&["bundle", "verify"]),
+                (Some(1), VERIFY_FAILED.to_string())
             );
             let (code, written) = run(&["bundle", "manifest", "--source-revision", "abc"]);
             assert_eq!(code, Some(0), "{written}");
@@ -1899,6 +1967,49 @@ mod tests {
             assert_eq!(run(&["bundle", "verify"]).0, Some(1));
             std::fs::write(shipped.join(&first), original).unwrap();
             assert_eq!(run(&["bundle", "verify"]).0, Some(0));
+
+            // An application packaging the bundle adds its provenance record
+            // and signs the executable after the manifest is written. Only the
+            // build-time check compares the content digest.
+            packaging::add_provenance_record(bundle.path());
+            packaging::sign_executable(bundle.path());
+            assert_eq!(
+                run(&["bundle", "verify"]),
+                (Some(1), VERIFY_FAILED.to_string())
+            );
+            let packaged = LocalE2e::with_binary(bundled_binary.clone());
+            assert_eq!(
+                packaged.apply().await,
+                (
+                    Some(0),
+                    "local_apply status=completed outcome=migrated".to_string()
+                )
+            );
+            let record = grpc_admin::db_migrate::local::attempt::AttemptRecord::load(
+                &packaged.target(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                record.status,
+                grpc_admin::db_migrate::local::attempt::AttemptStatus::Succeeded
+            );
+            assert_eq!(record.bundle_digest, Some(digest));
+
+            // A shipped catalog of another release still stops the run before
+            // anything is created.
+            std::fs::write(shipped.join(&first), b"-- changed\n").unwrap();
+            let mismatched = LocalE2e::with_binary(bundled_binary.clone());
+            assert_eq!(
+                mismatched.apply().await,
+                (
+                    Some(1),
+                    "local_apply status=failed stage=preflight error_code=bundle_invalid resolution=tool_update_required"
+                        .to_string()
+                )
+            );
+            assert!(!mismatched.database().exists());
+            assert!(!mismatched.attempt_record().exists());
         });
     }
 
@@ -2007,6 +2118,147 @@ mod tests {
                 tasks_pending.apply().await.1,
                 "local_apply status=completed outcome=no_op"
             );
+        });
+    }
+
+    /// Databases a desktop application left behind when it migrated with the
+    /// v0.0.13 tool at startup (`tests/fixtures/db-migrate/legacy-history`).
+    #[cfg(not(feature = "postgres"))]
+    const V0_0_13_FIXTURES: [&str; 3] = [
+        "v0.0.13-fresh",
+        "v0.0.13-legacy-ddl-000001",
+        "v0.0.13-memory-kind-000001",
+    ];
+
+    #[cfg(not(feature = "postgres"))]
+    impl LocalE2e {
+        /// The vector stores the application keeps in one LanceDB directory:
+        /// memory vectors, and thread rows only for the threads the server
+        /// embedded after the migration (here all but the first), carrying
+        /// the database's message times.
+        async fn write_application_vector_stores(&self) {
+            let pool = self.pool().await;
+            // A dump does not keep the journal mode the server had set.
+            sqlx::query("PRAGMA journal_mode=WAL")
+                .execute(&pool)
+                .await
+                .unwrap();
+            type ThreadRow = (i64, i64, i32, Option<i64>, Option<i64>);
+            let threads: Vec<ThreadRow> = sqlx::query_as(
+                "SELECT id, user_id, memory_kind, first_message_at, last_message_at FROM thread ORDER BY id",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+            let (_, embedded) = threads.split_first().expect("the fixture carries threads");
+            assert!(!embedded.is_empty(), "the fixture carries threads");
+
+            write_e2e_memory_vectors(&self.vector_uri).await;
+            // The thread store is opened with the configuration the binary
+            // reads, so both agree on its table.
+            let _environment =
+                ScopedE2eEnvironment::configure(&self.database_url, &self.vector_uri);
+            infra::infra::thread_vector::repository::ThreadVectorRepositoryImpl::new(
+                infra::infra::thread_vector::config::ThreadVectorDBConfig::from_env().unwrap(),
+            )
+            .await
+            .unwrap()
+            .batch_upsert(
+                embedded
+                    .iter()
+                    .map(|&(id, user_id, kind, first, last)| {
+                        e2e_thread_vector_row(id, user_id, kind, first, last)
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        }
+
+        async fn vector_store_versions(&self) -> Vec<(&'static str, u64)> {
+            let uri = self.vector_uri.to_string_lossy();
+            let mut versions = Vec::new();
+            for table in ["memories", "threads"] {
+                let handle = infra::infra::vector_table::open_existing(&uri, table)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{table} exists"));
+                versions.push((table, handle.version().await.unwrap()));
+            }
+            versions
+        }
+    }
+
+    /// The first apply hands over the legacy history and completes the
+    /// catalog; the vector stores are neither changed nor copied, since no
+    /// task left to run touches them. The second apply has nothing to do.
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary"]
+    fn local_apply_e2e_completes_databases_of_the_v0_0_13_release() {
+        infra_utils::infra::test::TEST_RUNTIME.block_on(async {
+            for fixture in V0_0_13_FIXTURES {
+                let e2e = LocalE2e::new();
+                e2e.load_legacy_fixture(fixture).await;
+                e2e.write_application_vector_stores().await;
+                let versions = e2e.vector_store_versions().await;
+
+                let (code, line) = e2e.apply().await;
+                assert_eq!(code, Some(0), "{fixture}: {line}");
+                assert!(
+                    line.starts_with("local_apply status=completed outcome=migrated"),
+                    "{fixture}: {line}"
+                );
+                let manifest = grpc_admin::db_migrate::local::backup::BackupManifest::load(
+                    &LocalE2e::backup_from(&line),
+                )
+                .unwrap();
+                assert!(
+                    manifest.resources.is_empty(),
+                    "{fixture}: {:?}",
+                    manifest.resources
+                );
+                assert_eq!(manifest.embedding_space_id, None, "{fixture}");
+
+                let pool = e2e.pool().await;
+                assert_eq!(
+                    schema_state(&pool).await.unwrap(),
+                    SchemaState::Managed,
+                    "{fixture}"
+                );
+                assert!(
+                    super::inspect_target(&pool)
+                        .await
+                        .unwrap()
+                        .legacy_history
+                        .is_none(),
+                    "{fixture}"
+                );
+                let recorded: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM memories_schema_migrations")
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(recorded, migrations::versions().len() as i64, "{fixture}");
+                pool.close().await;
+                assert_eq!(
+                    e2e.vector_store_versions().await,
+                    versions,
+                    "{fixture}: the vector stores are untouched"
+                );
+
+                let backups = std::fs::read_dir(&e2e.backups).unwrap().count();
+                assert_eq!(
+                    e2e.apply().await,
+                    (
+                        Some(0),
+                        "local_apply status=completed outcome=no_op".to_string()
+                    ),
+                    "{fixture}"
+                );
+                assert_eq!(std::fs::read_dir(&e2e.backups).unwrap().count(), backups);
+            }
         });
     }
 
@@ -3047,43 +3299,11 @@ mod tests {
     #[test]
     #[ignore = "requires MEMORIES_DB_MIGRATE_E2E_BINARY release binary (and TEST_POSTGRES_URL for postgres)"]
     fn embedding_e2e_changes_never_touch_an_unidentified_store() {
-        use infra::infra::memory_vector::config::{
-            DistanceType, FtsConfig, VectorDBConfig, VectorIndexConfig,
-        };
-        use infra::infra::memory_vector::record::MemoryVectorRecord;
-        use infra::infra::memory_vector::repository::MemoryVectorRepositoryImpl;
         infra_utils::infra::test::TEST_RUNTIME.block_on(async {
             let e = EmbeddingE2e::new().await;
             e.add_thread("topic").await;
             let foreign = e.root().join("foreign.lancedb");
-            let repo = MemoryVectorRepositoryImpl::new(VectorDBConfig {
-                uri: foreign.to_string_lossy().into_owned(),
-                table_name: "memories".into(),
-                vector_size: 4,
-                distance_type: DistanceType::Cosine,
-                fts: FtsConfig::default(),
-                vector_index: VectorIndexConfig::default(),
-            })
-            .await
-            .unwrap();
-            let data = protobuf::llm_memory::data::MemoryData {
-                content: "x".into(),
-                ..Default::default()
-            };
-            let row = MemoryVectorRecord::from_chunk_with_content(
-                1,
-                &data,
-                &[0.5; 4],
-                Some("m"),
-                "text",
-                0,
-                0,
-                1,
-                "x".into(),
-            );
-            repo.replace_kinds_upsert(1, &["text"], vec![row])
-                .await
-                .unwrap();
+            let repo = write_e2e_memory_vectors(&foreign).await;
             let version = repo.table_handle().version().await.unwrap();
 
             let output = e

@@ -58,4 +58,3 @@ jobworkerp-client job enqueue-workflow \
 ## 関連ドキュメント
 
 - embedding / model 切替運用: `../../../workflows/thread-reflection/README_ja.md`
-- API guide: `../../../docs/thread-reflection-guide_ja.md`

@@ -1,8 +1,6 @@
 //! `MediaApp` — Upload / Register / Find / Resolve / Delete.
 //!
-//! The whole concurrency story lives in
-//! `ai-docs/image-memory-design-storage.md` §7. The non-obvious
-//! invariants this module must hold:
+//! The non-obvious concurrency invariants this module must hold:
 //!
 //! - Upload is 3 stages with deliberate tx boundaries: temp write →
 //!   tx1 reservation INSERT (committed immediately so a concurrent

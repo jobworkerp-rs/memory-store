@@ -1,0 +1,277 @@
+# Maintained in the private source repository and published here by its
+# release sync together with the rest of .github/; edit it there, not here.
+# The release sync pushes a vMAJOR.MINOR.PATCH tag, which builds the memories
+# binaries (front, memories-import) and the SQLite migration bundle
+# (memories-db-migrate) for every supported platform and attaches the
+# archives, SHA256SUMS and build provenance attestations to the GitHub Release
+# for the tag. The binaries use the SQLite backend with the Lindera tokenizer;
+# the PostgreSQL server is published as the container image of
+# publish-image.yml. Tests run before the image is published there and in the
+# private CI before a release is tagged; this workflow only builds, so that
+# the build of every published artifact is publicly visible.
+#
+# Only a tag push (which needs write access) may start this workflow, the
+# build jobs get a read-only token and run on GitHub-hosted runners only, and
+# every job is limited to GitHub so that the private source, which tracks this
+# file, never runs it. The private source checks these rules on every change.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+# A re-pushed tag re-runs this; let a fresh run supersede an in-flight one
+# without cancelling (avoid a half-uploaded release).
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+# `shell: bash` makes every step run as `bash -e -o pipefail`.
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  # The license listing of every crate linked into the binaries, shipped in
+  # each archive. It fails on a license about.toml does not accept.
+  licenses:
+    name: Third-party licenses
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - name: Install cargo-about
+        uses: sutr-app/portable-binary-release/install-cargo-about@7e7d28fa9aa973cac57b1fbb8e556861f9467481 # v1.0.1
+
+      - name: Generate license listing
+        run: |
+          mkdir -p dist
+          bash scripts/generate-third-party-licenses.sh dist/THIRD-PARTY-LICENSES.txt
+
+      - name: Upload license listing
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: third-party-licenses
+          path: dist/THIRD-PARTY-LICENSES.txt
+          if-no-files-found: error
+
+  build:
+    name: Build ${{ matrix.name }}
+    if: github.server_url == 'https://github.com'
+    needs: licenses
+    runs-on: ${{ matrix.runs_on }}
+    # Few rustc processes at a time through the LanceDB stack.
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux binaries link glibc dynamically. Building on Ubuntu 24.04
+          # sets the floor to glibc 2.39, which the binary check enforces and
+          # README.md documents. Each is built natively on its architecture,
+          # as the migration bundle script requires, so the binary check can
+          # run it. The workspace links LanceDB and DataFusion, so the number
+          # of parallel rustc processes is set to what the runner's memory
+          # holds (16 GB here, 7 GB on macOS).
+          - name: linux-x86_64
+            runs_on: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            extra_env: CARGO_BUILD_JOBS=2
+          - name: linux-aarch64
+            runs_on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            extra_env: CARGO_BUILD_JOBS=2
+          # The macOS minimum of the migration bundle
+          # (scripts/build-memories-db-migrate-sqlite.sh); every binary of the
+          # archive is built for it.
+          - name: darwin-arm64
+            runs_on: macos-15
+            target: aarch64-apple-darwin
+            extra_env: MACOSX_DEPLOYMENT_TARGET=14.0 CARGO_BUILD_JOBS=1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Export platform settings
+        env:
+          EXTRA_ENV: ${{ matrix.extra_env }}
+        run: |
+          for kv in ${EXTRA_ENV}; do
+            echo "${kv}" >>"${GITHUB_ENV}"
+          done
+
+      - name: Install protoc
+        uses: sutr-app/portable-binary-release/install-protoc@7e7d28fa9aa973cac57b1fbb8e556861f9467481 # v1.0.1
+
+      # No Rust cache: GitHub scopes caches to the ref, and a tag-only
+      # workflow can never restore what a previous tag saved.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - name: Show build environment
+        env:
+          EXTRA_ENV: ${{ matrix.extra_env }}
+        run: |
+          uname -a
+          if [ "$(uname -s)" = Darwin ]; then
+            sw_vers
+            xcrun --show-sdk-version || true
+          else
+            grep -E '^(NAME|VERSION)=' /etc/os-release
+            # sed reads all input: `head` could SIGPIPE the writer under pipefail.
+            ldd --version | sed -n 1p
+          fi
+          rustc --version --verbose
+          "${PROTOC}" --version
+          echo "platform settings: ${EXTRA_ENV}"
+
+      # The same build as the migration bundle script's (the workflow test
+      # checks the arguments), so that the script below reuses it; --locked
+      # keeps the release to Cargo.lock.
+      - name: Build
+        run: cargo build --release --locked --features lindera
+
+      # Outside the checkout: the bundle records whether the tree was dirty.
+      - name: Build migration bundle
+        run: bash scripts/build-memories-db-migrate-sqlite.sh "${RUNNER_TEMP}/migration-bundle"
+
+      - name: Download license listing
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: third-party-licenses
+          path: licenses
+
+      - name: Release version
+        id: built
+        run: echo "version=${GITHUB_REF_NAME#v}" >>"${GITHUB_OUTPUT}"
+
+      # What makes a release unusable on the user's machine. Linux binaries
+      # link only the C runtimes every glibc system provides, no newer than
+      # the documented floor; macOS binaries link only system libraries and
+      # start on the documented macOS. Each binary must report
+      # "<name> <release version>". memories-db-migrate is checked as the
+      # bundle ships it.
+      - name: Verify binaries
+        uses: sutr-app/portable-binary-release/verify-binary@7e7d28fa9aa973cac57b1fbb8e556861f9467481 # v1.0.1
+        with:
+          files: |
+            target/release/front
+            target/release/memories-import
+            ${{ runner.temp }}/migration-bundle/memories-db-migrate
+          kind: executable
+          max-glibc: '2.39'
+          max-glibcxx: '3.4.33'
+          macos-deployment-target: ${{ env.MACOSX_DEPLOYMENT_TARGET }}
+          allowed-deps: >-
+            libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 librt.so.1 libgcc_s.so.1
+            libstdc++.so.6 ld-linux-x86-64.so.2 ld-linux-aarch64.so.1
+            /usr/lib/* /System/Library/*
+          expected-version: ${{ steps.built.outputs.version }}
+
+      # COPYFILE_DISABLE keeps macOS tar from adding AppleDouble (._*) files.
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+          COPYFILE_DISABLE: '1'
+        run: |
+          stage="memory-store-${TARGET}"
+          mkdir -p "dist/${stage}"
+          cp target/release/front target/release/memories-import "dist/${stage}/"
+          cp -R "${RUNNER_TEMP}/migration-bundle" "dist/${stage}/migration-bundle"
+          cp LICENSE licenses/THIRD-PARTY-LICENSES.txt README.md README_ja.md dot.env "dist/${stage}/"
+          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
+          rm -rf "dist/${stage:?}"
+          ls -l dist
+
+      # Stored uncompressed: the archive is already gzip-compressed.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  # Holds the release write token and signs the provenance of what the build
+  # jobs produced.
+  publish:
+    name: Publish GitHub Release
+    if: github.server_url == 'https://github.com'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          # The build matrix names (linux-x86_64, ...), not the license listing.
+          pattern: '*-*64'
+          path: dist
+          merge-multiple: true
+
+      # The sync commit body lists the changes since the previous public
+      # release and ends with an "Upstream-Tag: <tag>" trailer. A tag on an
+      # older sync commit means the release had no public source changes.
+      - name: Write checksums and release notes
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          ls -l dist
+          (cd dist && sha256sum -- *.tar.gz >SHA256SUMS && cat SHA256SUMS)
+          message=$(git log -1 --format=%B HEAD)
+          if printf '%s\n' "${message}" | grep -Fqx "Upstream-Tag: ${TAG_NAME}"; then
+            printf '%s\n' "${message}" | awk 'NR > 2 && !/^Upstream-Tag: /' >release-notes.md
+          else
+            echo "No source changes since the previous release." >release-notes.md
+          fi
+          cat release-notes.md
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS

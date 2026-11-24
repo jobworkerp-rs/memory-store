@@ -36,11 +36,11 @@ impl BundleManifest {
         Ok(manifest)
     }
 
-    /// The recorded identity, when the bundle at `root` still matches it.
+    /// The recorded identity, when the bundle at `root` still has the content
+    /// it had when the manifest was written.
     pub fn verify(root: &Path) -> Result<Self> {
         let manifest = Self::load(root)?;
-        let actual = content_digest(root)?;
-        if manifest.format != MANIFEST_FORMAT || manifest.content_digest != actual {
+        if manifest.content_digest != content_digest(root)? {
             return Err(invalid(format!(
                 "bundle content at {} does not match {MANIFEST_FILE}",
                 root.display()
@@ -49,12 +49,21 @@ impl BundleManifest {
         Ok(manifest)
     }
 
+    /// The recorded identity, without comparing it with the current content.
     pub fn load(root: &Path) -> Result<Self> {
         let path = root.join(MANIFEST_FILE);
         let bytes = std::fs::read(&path)
             .map_err(|error| invalid(format!("{} is unreadable: {error}", path.display())))?;
-        serde_json::from_slice(&bytes)
-            .map_err(|error| invalid(format!("{} is invalid: {error}", path.display())))
+        let manifest: Self = serde_json::from_slice(&bytes)
+            .map_err(|error| invalid(format!("{} is invalid: {error}", path.display())))?;
+        if manifest.format != MANIFEST_FORMAT {
+            return Err(invalid(format!(
+                "{} has the unsupported format {:?}",
+                path.display(),
+                manifest.format
+            )));
+        }
+        Ok(manifest)
     }
 }
 
@@ -132,6 +141,22 @@ mod tests {
         )
         .unwrap();
         assert_ne!(content_digest(root.path()).unwrap(), after_edit);
+    }
+
+    #[test]
+    fn a_manifest_of_another_format_is_invalid() {
+        let root = bundle();
+        let mut manifest = BundleManifest::write(root.path(), "abc123", false).unwrap();
+        manifest.format = "memories-db-migrate-bundle-v0".to_string();
+        std::fs::write(
+            root.path().join(MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            code(BundleManifest::load(root.path()).unwrap_err()),
+            Some(ErrorCode::BundleInvalid)
+        );
     }
 
     #[test]

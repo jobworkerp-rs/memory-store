@@ -632,8 +632,7 @@ do:
         # `failure_mode_dictionary` table; it is migration-only and
         # stable. Keep in sync with the FailureMode enum
         # (protobuf/.../reflection.proto) and the JSON Schema /
-        # system_prompt list above, and with spec Appendix A
-        # (ai-docs/reflection/thread-reflection-spec.md §F-G7 / §N-10).
+        # system_prompt list above.
         # ============================================================
         # NOTE: jobworkerp's `set` task evaluates every key in the same
         # block against the SAME context snapshot — values defined

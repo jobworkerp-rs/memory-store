@@ -42,9 +42,6 @@
 //! | `EmbeddingRebuildInconsistent`  | `markers`                       |
 //! | `EmbeddingStorageMismatch`      | `mismatches`                    |
 //! | `Other`                         | `component`                     |
-//!
-//! See `agent-app/ai-docs/sidecar-startup-failure-handling.md` for the
-//! agent-app side of this contract.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

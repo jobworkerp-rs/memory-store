@@ -68,5 +68,4 @@ grpcurl -plaintext -d '{
 ## 関連ドキュメント
 
 - generation workflow: `../../agent-chat-import/workflows/thread-reflection/README_ja.md`
-- API guide: `../../docs/thread-reflection-guide_ja.md`
 - embedding pipeline: `../auto-embedding.yaml` / `../auto-embedding-workers.yaml`

@@ -12,6 +12,9 @@ pub const LEGACY_FIXTURES: &[&str] = &[
     "adopted-000001",
     "adopted-000002",
     "legacy-ddl-000001",
+    "v0.0.13-fresh",
+    "v0.0.13-legacy-ddl-000001",
+    "v0.0.13-memory-kind-000001",
 ];
 #[cfg(feature = "postgres")]
 pub const LEGACY_FIXTURES: &[&str] = &[

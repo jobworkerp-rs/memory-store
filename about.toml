@@ -1,0 +1,36 @@
+# cargo-about settings for THIRD-PARTY-LICENSES.txt, the license listing
+# shipped with every release archive (scripts/generate-third-party-licenses.sh).
+#
+# Only the licenses below may appear in a release. A dependency under any
+# other license fails the listing, and with it CI and the release build, so
+# adding one is a deliberate review of this list.
+# Earlier entries are preferred when a crate offers a choice.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "Unicode-3.0",
+    "Zlib",
+    "MIT-0",
+]
+
+# Every release target, so platform-specific dependencies are listed too.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]
+
+# This project's own crates (publish = false) are covered by LICENSE.
+private = { ignore = true }
+
+# Reached through lance-index (dirs). MPL-2.0 is file-level copyleft, so the
+# unmodified crate may be linked; it is accepted for this crate only.
+[option-ext]
+accepted = ["MPL-2.0"]

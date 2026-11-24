@@ -672,8 +672,7 @@ channel / `external_id` / `agent:<source-name>` ラベルすべての prefix に
 import全体の終了前には、`import_completed`を1件出力する。plain では任意の prune RPC より前に
 出力するため、prune 失敗でもこの event は抑制されない。このeventには全セッションの
 最終集計と`sessions`配列が含まれ、parse errorなどsession keyを確定できない失敗では
-`session_key: null`を使用する。詳細なフィールド定義は
-[`docs/memories-import-event-spec_ja.md`](../docs/memories-import-event-spec_ja.md)を参照。
+`session_key: null`を使用する。
 既存の`thread_created`と`session_completed`のJSON形状は変更しない。現時点のexit codeは
 従来どおりsession error（plainでは既存のprune判定も含む）がある場合に1であり、将来
 `import_completed`を主な判定経路へ移行する予定である。

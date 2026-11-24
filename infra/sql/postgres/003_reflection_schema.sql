@@ -1,4 +1,4 @@
--- Phase 5: Thread Reflection (ai-docs/thread-reflection-spec.md §3)
+-- Phase 5: Thread Reflection
 --
 -- PostgreSQL mirror of infra/sql/sqlite/003_reflection_schema.sql.
 -- Differences vs sqlite:
